@@ -4,6 +4,9 @@
 //!   [`device::RenderDevice`] per app.
 //! - [`graph`]: linear list of [`graph::RenderNode`]s executed in
 //!   order against a [`wgpu::TextureView`].
+//! - [`lattice`]: pixel-space layout primitive ([`Viewport`])
+//!   for restricting a render node to a sub-region of the
+//!   framebuffer (e.g. carving out an egui side-panel area).
 //! - [`raymarch`]: ready-made fullscreen-triangle ray-march nodes
 //!   (Euclidean, geodesic, hyperslice 4D); the engine's main render
 //!   path until rasterised geometry shows up.
@@ -14,6 +17,8 @@
 
 pub mod device;
 pub mod graph;
+pub mod lattice;
 pub mod raymarch;
 
+pub use lattice::Viewport;
 pub use raymarch::{GeodesicRayMarchNode, RayMarchNode, RayMarchUniforms};

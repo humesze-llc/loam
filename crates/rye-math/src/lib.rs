@@ -34,7 +34,9 @@ pub mod space;
 pub mod spherical;
 pub mod tangent;
 
-pub use bivector::{Bivector, Bivector2, Bivector3, Bivector4, Rotor, Rotor2, Rotor3, Rotor4};
+pub use bivector::{
+    Bivector, Bivector2, Bivector3, Bivector4, Plane4, Rotor, Rotor2, Rotor3, Rotor4,
+};
 pub use blended::{BlendedSpace, BlendingField, ConformallyFlat, LinearBlendX};
 pub use euclidean::{EuclideanR3, Iso3};
 pub use euclidean_r2::{EuclideanR2, Iso2};

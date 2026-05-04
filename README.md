@@ -38,7 +38,7 @@ The engine is pre-1.0. The `Space` and `WgslSpace` trait surfaces are stable and
 | Example | Demonstrates |
 |---|---|
 | `blended` | First-class `BlendedSpace<E³, H³>` demo. Checkerboard floor and spheres under a smooth metric transition. Visibly distinct E³ side, transition zone, and Poincaré-chart H³ side in one view. WASD fly-through, drag to look. |
-| `polytope_smoke` | 4D polytope rendering via `Hyperslice4DNode`. Pentatope, tesseract, 16-cell, 24-cell rotating under user-composed `Bivector4` velocity (toggle planes 1..6, watch slice signatures morph). Doubles as the integration showcase for `rye-text` and the named-combo readout. |
+| `rotate_polytopes` | Interactive 4D-rotation demo over `Hyperslice4DNode`. All six convex regular polychora (pentatope through 600-cell) rotating under user-composed `Bivector4` velocity (toggle planes 1..6, watch slice signatures morph). Drag-and-drop shape-row reordering, a composer for sequenced rotor terms, and a live `exp(...)` formula popup. |
 | `pentatope_slice` | Live-physics 4D viewer. A pentatope falls onto a 4D floor and the 3D viewport renders its cross-section at user-controlled `w₀` (↑/↓ to scrub). |
 | `hypersphere` | Drop up to 32 4D balls onto a 4D floor under gravity. Two modes: **slice** (3D cross-section at `w₀`) and **ghost** (`G` toggle; full 4D extent as translucent volume). |
 | `fractal_app` | Mandelbulb scene on the `rye-app` framework with `Camera<S>` and `OrbitController<S>`. Reference for what an app looks like on the framework. |

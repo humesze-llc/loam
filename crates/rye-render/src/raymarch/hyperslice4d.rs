@@ -49,6 +49,7 @@
 
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
+use rye_math::Rotor4;
 use wgpu::*;
 
 use crate::device::RenderDevice;
@@ -170,8 +171,11 @@ impl BodyUniform {
     /// Build a polytope body. `shape_index` references the kernel's
     /// shape table (0 = pentatope, 1 = tesseract, ...). `size` is
     /// the polytope's circumradius in world coords. `rotor` is the
-    /// body's Rotor4 orientation as `[s, b_xy, b_xz, b_xw, b_yz,
-    /// b_yw, b_zw, ps]`.
+    /// body's Rotor4 orientation packed as
+    /// `[s, b_xy, b_xz, b_xw, b_yz, b_yw, b_zw, ps]`; the same
+    /// order produced by `<[f32; 8]>::from(Rotor4)`. Prefer
+    /// [`Self::polytope_with_rotor`] when the caller already has a
+    /// [`Rotor4`].
     pub fn polytope(
         position: [f32; 4],
         shape_index: u32,
@@ -188,6 +192,20 @@ impl BodyUniform {
             rotor,
             ..Self::default()
         }
+    }
+
+    /// Same as [`Self::polytope`] but takes a [`Rotor4`] directly,
+    /// using rye-math's canonical `[f32; 8]` packing. Use this from
+    /// app / example code so the GPU rotor field order isn't spelled
+    /// out by hand at the call site.
+    pub fn polytope_with_rotor(
+        position: [f32; 4],
+        shape_index: u32,
+        size: f32,
+        rotor: Rotor4,
+        color: [f32; 3],
+    ) -> Self {
+        Self::polytope(position, shape_index, size, rotor.into(), color)
     }
 }
 
@@ -214,8 +232,14 @@ pub struct Hyperslice4DUniforms {
     /// Number of active body slots. Cast from `u32` to `f32` for
     /// std140 alignment (the kernel rounds back to integer).
     pub body_count: f32,
-    pub _pad3: f32,
-    pub _pad4: f32,
+    /// Pixel offset of the viewport's top-left corner within the
+    /// framebuffer. Lets the fragment shader convert `frag_pos.xy`
+    /// (always framebuffer-space) into normalised viewport
+    /// coordinates: `uv = (frag_pos.xy - viewport_origin) /
+    /// resolution`. Both axes are zero when the scene fills the
+    /// full framebuffer; the side-panel case sets `viewport_origin =
+    /// [panel_width, 0]` and `resolution` to the carved-out region.
+    pub viewport_origin: [f32; 2],
     /// Four scalar knobs for user-shader-side parameters. Same
     /// shape as `RayMarchUniforms::params` for symmetry.
     pub params: [f32; 4],
@@ -240,8 +264,7 @@ impl Default for Hyperslice4DUniforms {
             tick: 0.0,
             w_slice: 0.0,
             body_count: 0.0,
-            _pad3: 0.0,
-            _pad4: 0.0,
+            viewport_origin: [0.0, 0.0],
             params: [0.0; 4],
             bodies: [BodyUniform::default(); MAX_BODIES],
         }
@@ -305,8 +328,7 @@ struct Uniforms {
     tick: f32,
     w_slice: f32,
     body_count: f32,
-    _pad3: f32,
-    _pad4: f32,
+    viewport_origin: vec2<f32>,
     params: vec4<f32>,
     bodies: array<BodyUniform, MAX_BODIES>,
 };
@@ -618,7 +640,12 @@ fn ground_color(p: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let uv = (frag_pos.xy / u.resolution) * 2.0 - vec2<f32>(1.0, 1.0);
+    // `frag_pos.xy` is in framebuffer coordinates regardless of any
+    // `set_viewport` carve-out. Subtract the viewport's top-left
+    // origin and normalise by the viewport size (passed in
+    // `u.resolution`) so the centre of the visible region maps to
+    // NDC (0, 0) and the camera stays centred.
+    let uv = ((frag_pos.xy - u.viewport_origin) / u.resolution) * 2.0 - vec2<f32>(1.0, 1.0);
     let aspect = u.resolution.x / u.resolution.y;
     let ndc = vec2<f32>(uv.x * aspect, -uv.y);
     let rd = normalize(
@@ -817,6 +844,50 @@ impl Hyperslice4DNode {
     /// Override the active body count without rewriting slot data.
     pub fn set_body_count(&mut self, count: usize) {
         self.uniforms.body_count = count.min(MAX_BODIES) as f32;
+    }
+}
+
+impl Hyperslice4DNode {
+    /// Like [`RenderNode::execute`] but draws into a sub-region of the
+    /// framebuffer instead of fullscreen. The clear still covers the
+    /// whole attached area; only the fragment shader is restricted to
+    /// the viewport. Use this when an egui side-panel occludes part
+    /// of the window: pass the panel-aware viewport (typically
+    /// [`crate::Viewport::right_of_left_panel`]) and update the
+    /// scene's `u.resolution` to match so the camera aspect stays
+    /// correct.
+    pub fn execute_in_viewport(
+        &mut self,
+        rd: &RenderDevice,
+        view: &wgpu::TextureView,
+        viewport: crate::Viewport,
+    ) -> Result<()> {
+        let mut encoder = rd.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("hyperslice4d encoder"),
+        });
+        {
+            let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("hyperslice4d pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(self.clear_color),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            viewport.apply(&mut rp);
+            rp.set_pipeline(&self.pipeline);
+            rp.set_bind_group(0, &self.bind_group, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        rd.queue.submit(Some(encoder.finish()));
+        Ok(())
     }
 }
 
@@ -1247,6 +1318,39 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         assert!(HYPERSLICE_KERNEL_WGSL.contains("1.41421356"));
     }
 
+    /// `polytope_with_rotor` must produce the same uniform bytes as
+    /// `polytope` when the latter is fed the canonical `[f32; 8]`
+    /// packing of the same `Rotor4`. Catches a future drift where
+    /// either side reorders the rotor fields without the other.
+    #[test]
+    fn polytope_with_rotor_matches_manual_packing() {
+        let rotor = Rotor4 {
+            s: 0.5,
+            xy: 0.1,
+            xz: 0.2,
+            xw: 0.3,
+            yz: 0.4,
+            yw: 0.6,
+            zw: 0.7,
+            xyzw: 0.8,
+        };
+        let manual = BodyUniform::polytope(
+            [1.0, 2.0, 3.0, 4.0],
+            SHAPE_24CELL,
+            0.7,
+            rotor.into(),
+            [0.9, 0.4, 0.1],
+        );
+        let helper = BodyUniform::polytope_with_rotor(
+            [1.0, 2.0, 3.0, 4.0],
+            SHAPE_24CELL,
+            0.7,
+            rotor,
+            [0.9, 0.4, 0.1],
+        );
+        assert_eq!(bytemuck::bytes_of(&manual), bytemuck::bytes_of(&helper));
+    }
+
     /// `BodyUniform::polytope(shape_index, ..)` writes the same numeric
     /// table the kernel branches on. Catches the failure mode where one
     /// side renumbers without the other.
@@ -1386,7 +1490,7 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
     }
 
     /// Shallow ray with clear path to floor converges within budget.
-    /// Pins the iteration-cap fix (192 → 384).
+    /// Pins the iteration-cap fix (192 -> 384).
     #[test]
     fn cpu_march_converges_on_shallow_ray_to_floor() {
         let ro = Vec3::new(0.0, 2.5, 5.0);

@@ -7,18 +7,18 @@
 //!
 //! The emitted WGSL fragment defines:
 //!
-//! - `CELL_INRADIUS_UNIT: f32` — shared inradius constant for both
+//! - `CELL_INRADIUS_UNIT: f32`: shared inradius constant for both
 //!   polytopes at unit circumradius (`φ²/(2√2)`).
-//! - `CELL120_FACE_NORMALS: array<vec4<f32>, 120>` — 120-cell face
+//! - `CELL120_FACE_NORMALS: array<vec4<f32>, 120>`: 120-cell face
 //!   directions (= 600-cell vertex set).
-//! - `CELL600_FACE_NORMALS: array<vec4<f32>, 600>` — 600-cell face
+//! - `CELL600_FACE_NORMALS: array<vec4<f32>, 600>`: 600-cell face
 //!   directions (= 120-cell vertex set).
-//! - `CELL120_VERTICES: array<vec4<f32>, 600>` — 120-cell vertex set,
+//! - `CELL120_VERTICES: array<vec4<f32>, 600>`: 120-cell vertex set,
 //!   used by the |S|=4 vertex-lookup branch of the 120-cell Wolfe SDF.
-//! - `CELL600_VERTICES: array<vec4<f32>, 120>` — analogous for
+//! - `CELL600_VERTICES: array<vec4<f32>, 120>`: analogous for
 //!   600-cell.
-//! - `cell120_sdf_local(p: vec4<f32>) -> f32` — true-Euclidean SDF.
-//! - `cell600_sdf_local(p: vec4<f32>) -> f32` — true-Euclidean SDF.
+//! - `cell120_sdf_local(p: vec4<f32>) -> f32`: true-Euclidean SDF.
+//! - `cell600_sdf_local(p: vec4<f32>) -> f32`: true-Euclidean SDF.
 //!
 //! Both SDFs use Wolfe's greedy hyperplane projection (matching the
 //! CPU port in `rye_physics::euclidean_r4::polytope_sdf_wolfe`):
@@ -44,7 +44,7 @@ use rye_physics::euclidean_r4::{
 /// dispatch branches are inert at runtime.
 ///
 /// The kernel's `body_polytope_sdf_4d` always references both function
-/// names — naga rejects the WGSL otherwise — so callers must include
+/// names: naga rejects the WGSL otherwise: so callers must include
 /// either this stub or [`polytope_extended_sdfs_wgsl`]. The stub is
 /// tiny (~150 bytes) and adds zero register pressure; prefer it when
 /// the scene contains no 120-cell or 600-cell bodies.
