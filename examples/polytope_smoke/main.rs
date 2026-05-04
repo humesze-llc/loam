@@ -65,7 +65,7 @@ use rye_app::{
     egui, run_with_config, App, BottomOverlay, Camera, FrameCtx, OrbitController, RunConfig,
     SetupCtx,
 };
-use rye_math::{Bivector, Bivector4, EuclideanR3, Rotor4};
+use rye_math::{Bivector, Bivector4, EuclideanR3, Plane4, Rotor4};
 use rye_render::{
     device::RenderDevice,
     raymarch::{
@@ -105,8 +105,6 @@ const CONTROL_H: f32 = 29.0;
 const W_SCRUB_RATE: f32 = 0.5;
 const W_RANGE: f32 = 1.5;
 
-const IDENTITY_ROTOR: [f32; 8] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-
 /// Base rotation angular rate (rad/s). Scaled by `rate_scale` per
 /// frame so +/- can speed it up or slow it down.
 const BASE_ROTATION_RATE: f32 = std::f32::consts::TAU * 0.3;
@@ -122,16 +120,18 @@ const BODY_SIZE: f32 = 0.7;
 const BODY_Y: f32 = 0.9;
 
 /// One polytope's metadata: shape index in the kernel's table,
-/// per-body color, short display label, and long mathematical name
-/// shown in card tooltips. The long name uses the
-/// `pentatope` / `tesseract` / `hexadecachoron` family — the
+/// per-body fragment color (driven into `BodyUniform.color` on the
+/// GPU side, NOT the panel's card color — those are uniformly grey
+/// in the redesigned UI), short display label, and long
+/// mathematical name shown in card tooltips. The long name uses
+/// the `pentatope` / `tesseract` / `hexadecachoron` family — the
 /// `*-plex` aliases (pentaplex, dodecaplex, ...) are deliberately
 /// avoided since "plex" is dimension-generalized rather than
 /// being the actual 4D name.
 #[derive(Copy, Clone)]
 struct ShapeEntry {
     shape: u32,
-    color: [f32; 3],
+    body_color: [f32; 3],
     label: &'static str,
     long_name: &'static str,
 }
@@ -143,25 +143,25 @@ struct ShapeEntry {
 const DEFAULT_ROW: &[ShapeEntry] = &[
     ShapeEntry {
         shape: SHAPE_24CELL,
-        color: [0.95, 0.45, 0.85],
+        body_color: [0.95, 0.45, 0.85],
         label: "24-cell",
         long_name: "icositetrachoron",
     },
     ShapeEntry {
         shape: SHAPE_PENTATOPE,
-        color: [0.95, 0.55, 0.30],
+        body_color: [0.95, 0.55, 0.30],
         label: "5-cell",
         long_name: "pentatope",
     },
     ShapeEntry {
         shape: SHAPE_16CELL,
-        color: [0.55, 0.95, 0.40],
+        body_color: [0.55, 0.95, 0.40],
         label: "16-cell",
         long_name: "hexadecachoron",
     },
     ShapeEntry {
         shape: SHAPE_TESSERACT,
-        color: [0.30, 0.55, 0.95],
+        body_color: [0.30, 0.55, 0.95],
         label: "8-cell",
         long_name: "tesseract",
     },
@@ -175,37 +175,37 @@ fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
     Ok(match n.as_str() {
         "5-cell" | "5cell" | "pentatope" | "pentachoron" | "tetrahedron" => ShapeEntry {
             shape: SHAPE_PENTATOPE,
-            color: [0.95, 0.55, 0.30],
+            body_color: [0.95, 0.55, 0.30],
             label: "5-cell",
             long_name: "pentatope",
         },
         "8-cell" | "8cell" | "tesseract" | "hypercube" | "cube" => ShapeEntry {
             shape: SHAPE_TESSERACT,
-            color: [0.30, 0.55, 0.95],
+            body_color: [0.30, 0.55, 0.95],
             label: "8-cell",
             long_name: "tesseract",
         },
         "16-cell" | "16cell" | "hexadecachoron" | "octahedron" => ShapeEntry {
             shape: SHAPE_16CELL,
-            color: [0.55, 0.95, 0.40],
+            body_color: [0.55, 0.95, 0.40],
             label: "16-cell",
             long_name: "hexadecachoron",
         },
         "24-cell" | "24cell" | "icositetrachoron" | "cuboctahedron" => ShapeEntry {
             shape: SHAPE_24CELL,
-            color: [0.95, 0.45, 0.85],
+            body_color: [0.95, 0.45, 0.85],
             label: "24-cell",
             long_name: "icositetrachoron",
         },
         "120-cell" | "120cell" | "hecatonicosachoron" | "dodecahedron" => ShapeEntry {
             shape: SHAPE_120CELL,
-            color: [0.40, 0.85, 0.85],
+            body_color: [0.40, 0.85, 0.85],
             label: "120-cell",
             long_name: "hecatonicosachoron",
         },
         "600-cell" | "600cell" | "hexacosichoron" | "icosahedron" => ShapeEntry {
             shape: SHAPE_600CELL,
-            color: [0.95, 0.85, 0.40],
+            body_color: [0.95, 0.85, 0.40],
             label: "600-cell",
             long_name: "hexacosichoron",
         },
@@ -243,64 +243,15 @@ fn body_position(slot: usize, n: usize) -> [f32; 4] {
 // ---------------------------------------------------------------------------
 // Rotation planes
 // ---------------------------------------------------------------------------
-
-/// One of the six elementary 4D rotation planes. Pressing the
-/// matching number key toggles that plane's contribution to the
-/// per-frame angular-velocity bivector; multiple planes sum.
-///
-/// Sum-of-bivectors composition is **commutative** (vector space
-/// addition), so toggle order doesn't matter, only the active
-/// set does. That sidesteps the "cycle mode produces unpredictable
-/// results because rotor multiplication is non-commutative"
-/// problem of an earlier sequential-composition design.
-///
-/// The three w-involving planes (xw, yw, zw) pull visible axes
-/// into the hidden dimension and produce the slice-shape changes
-/// the viewer is built to show. The three pure-3D planes (xy, xz,
-/// yz) just rotate the cross-section as a rigid 3D shape; they're
-/// included for completeness and because composing them with
-/// w-planes produces non-commuting bivector sums whose `exp` does
-/// non-trivial things in SO(4).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Plane {
-    Xy = 0,
-    Xz = 1,
-    Xw = 2,
-    Yz = 3,
-    Yw = 4,
-    Zw = 5,
-}
-
-const PLANES: [Plane; 6] = [
-    Plane::Xy,
-    Plane::Xz,
-    Plane::Xw,
-    Plane::Yz,
-    Plane::Yw,
-    Plane::Zw,
-];
-
-impl Plane {
-    fn label(self) -> &'static str {
-        match self {
-            Plane::Xy => "xy",
-            Plane::Xz => "xz",
-            Plane::Xw => "xw",
-            Plane::Yz => "yz",
-            Plane::Yw => "yw",
-            Plane::Zw => "zw",
-        }
-    }
-
-    /// Unit-rate bivector for this plane. Component order matches
-    /// `Bivector4::new(xy, xz, xw, yz, yw, zw)`. The single nonzero
-    /// component is at index `self as usize`.
-    fn unit_bivector(self) -> Bivector4 {
-        let mut c = [0.0_f32; 6];
-        c[self as usize] = 1.0;
-        Bivector4::new(c[0], c[1], c[2], c[3], c[4], c[5])
-    }
-}
+//
+// `Plane4` (rye-math) is the basis-bivector enumeration; this demo
+// drives angular velocity by summing `Plane4::unit_bivector()`
+// values for the toggled planes. Sum-of-bivectors composition is
+// **commutative** (vector-space addition), so toggle order doesn't
+// matter — only the active *set* does. The three w-involving
+// planes pull visible axes into the hidden dimension and drive the
+// slice-shape changes the viewer was built to show; the three
+// pure-3D planes act as ordinary 3D rotations on the cross-section.
 
 /// Angular velocity from the active set: sum of unit bivectors of
 /// active planes, scaled by base rate × rate_scale.
@@ -308,7 +259,7 @@ fn angular_velocity(active: &[bool; 6], rate_scale: f32) -> Bivector4 {
     let mut omega = Bivector4::ZERO;
     for (i, &on) in active.iter().enumerate() {
         if on {
-            omega = omega + PLANES[i].unit_bivector();
+            omega = omega + Plane4::ALL[i].unit_bivector();
         }
     }
     omega * (BASE_ROTATION_RATE * rate_scale)
@@ -331,7 +282,7 @@ fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> Bivector4 {
 }
 
 /// Name a recognizable combination of active planes. Indices match
-/// `PLANES`: `0=xy 1=xz 2=xw 3=yz 4=yw 5=zw`. Order-independent,
+/// `Plane4::ALL`: `0=xy 1=xz 2=xw 3=yz 4=yw 5=zw`. Order-independent,
 /// only the active *set* matters.
 ///
 /// Curated entries cover common 4D-geometry classics: single
@@ -382,13 +333,6 @@ fn combo_name(active: &[bool; 6]) -> Option<&'static str> {
     })
 }
 
-/// Pack a `Rotor4` into the `[f32; 8]` slot expected by
-/// `BodyUniform.rotor`. Component order:
-/// `[s, xy, xz, xw, yz, yw, zw, xyzw]`.
-fn rotor_to_slot(r: Rotor4) -> [f32; 8] {
-    [r.s, r.xy, r.xz, r.xw, r.yz, r.yw, r.zw, r.xyzw]
-}
-
 // ---------------------------------------------------------------------------
 // Font discovery (portable system-font fallback)
 // ---------------------------------------------------------------------------
@@ -415,7 +359,7 @@ struct PolytopeSmokeApp {
     rot_state: Rotor4,
     /// Toggle bitmap for the six rotation planes; sum of active
     /// planes' unit bivectors becomes the per-frame angular
-    /// velocity. See [`PLANES`] for the index -> plane mapping.
+    /// velocity. See [`Plane4::ALL`] for the index -> plane mapping.
     active: [bool; 6],
     rate_scale: f32,
     /// Accumulated time spent rotating (advances only while
@@ -481,7 +425,7 @@ struct PolytopeSmokeApp {
     /// here; "Add" commits this list as a new term in `seq` and
     /// clears the draft. Bivector planes only — the optional
     /// scalar attaches to a committed term, not to the draft.
-    draft: Vec<Plane>,
+    draft: Vec<Plane4>,
 }
 
 /// One term in the rotor-composition sequence: a sum of unit
@@ -502,7 +446,7 @@ struct PolytopeSmokeApp {
 struct RotorTerm {
     /// Unit-bivector planes summed inside `exp(...)`. Non-empty
     /// for a term to display; an empty term is dropped.
-    planes: Vec<Plane>,
+    planes: Vec<Plane4>,
     /// Optional scalar prefix `phi` in radians. `None` means the
     /// raw bivector sum (unit magnitude); `Some(phi)` scales the
     /// whole sum before `exp()`. Default `Some(FRAC_PI_2)` when
@@ -547,7 +491,7 @@ enum RotationMode {
 #[derive(Clone, Debug)]
 enum DeferredAction {
     /// `+xy` etc. button on the plane row: append to draft.
-    DraftPush(Plane),
+    DraftPush(Plane4),
     /// `Add` button on the draft preview: commit current draft as a
     /// new RotorTerm in seq, clear draft.
     SeqCommitDraft,
@@ -990,39 +934,18 @@ fn chevron_button(ui: &mut egui::Ui, up: bool, hover: &str) -> egui::Response {
     response.on_hover_text(hover)
 }
 
-/// Paint a 6-dot drag-handle indicator (2 columns × 3 rows) inside
-/// `rect`. Drawn as filled circles, not glyphs, so it's legible
-/// regardless of which font egui is using — avoiding the
-/// missing-glyph rendering that hits Braille / Dingbats characters
-/// like ⠿ or ✕ on egui's default font.
-#[allow(dead_code)]
-fn paint_six_dots(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let dx = 3.0;
-    let dy = 4.0;
-    let radius = 1.4;
-    for col in 0..2 {
-        for row in 0..3 {
-            let x = cx + (col as f32 - 0.5) * dx;
-            let y = cy + (row as f32 - 1.0) * dy;
-            painter.circle_filled(egui::pos2(x, y), radius, color);
-        }
-    }
-}
-
 impl PolytopeSmokeApp {
     /// Drive every body in the row with the same rotor, lets the
     /// user directly compare slice signatures under identical 4D motion.
-    fn write_all(&mut self, rotor: [f32; 8]) {
+    fn write_all(&mut self, rotor: Rotor4) {
         let n = self.row.len();
         for (slot, entry) in self.row.iter().enumerate() {
-            let body = BodyUniform::polytope(
+            let body = BodyUniform::polytope_with_rotor(
                 body_position(slot, n),
                 entry.shape,
                 BODY_SIZE,
                 rotor,
-                entry.color,
+                entry.body_color,
             );
             self.node.set_body(slot, body);
         }
@@ -1064,7 +987,7 @@ impl PolytopeSmokeApp {
         // Mode-specific UI.
         if self.rotation_mode == RotationMode::Active {
             ui.horizontal(|ui| {
-                for (active, plane) in self.active.iter_mut().zip(PLANES.iter()) {
+                for (active, plane) in self.active.iter_mut().zip(Plane4::ALL.iter()) {
                     ui.checkbox(active, plane.label());
                 }
                 // Combo name (e.g., "isoclinic xw+yz") inline on the
@@ -1084,7 +1007,7 @@ impl PolytopeSmokeApp {
 
         // Plane buttons append into the draft.
         ui.horizontal_wrapped(|ui| {
-            for plane in PLANES.iter() {
+            for plane in Plane4::ALL.iter() {
                 if ui
                     .small_button(format!("+{}", plane.label()))
                     .on_hover_text("Add to the current draft term")
@@ -1443,7 +1366,7 @@ impl PolytopeSmokeApp {
                 for term in &terms {
                     self.rot_state = (term.delta() * self.rot_state).normalize();
                 }
-                self.write_all(rotor_to_slot(self.rot_state));
+                self.write_all(self.rot_state);
             }
             if ui.button("Clear").clicked() {
                 self.seq.clear();
@@ -1871,7 +1794,7 @@ impl PolytopeSmokeApp {
                 RotationMode::Composer => angular_velocity_from_seq(&self.seq, self.rate_scale),
             };
             self.rot_state = (omega * self.rot_time).exp().normalize();
-            self.write_all(rotor_to_slot(self.rot_state));
+            self.write_all(self.rot_state);
         }
     }
 
@@ -1960,18 +1883,18 @@ impl PolytopeSmokeApp {
     /// index, so a single body update is not enough.
     fn rebuild_bodies(&mut self) {
         let n = self.row.len();
-        let rotor = rotor_to_slot(self.rot_state);
+        let rotor = self.rot_state;
         let bodies: Vec<BodyUniform> = self
             .row
             .iter()
             .enumerate()
             .map(|(slot, entry)| {
-                BodyUniform::polytope(
+                BodyUniform::polytope_with_rotor(
                     body_position(slot, n),
                     entry.shape,
                     BODY_SIZE,
                     rotor,
-                    entry.color,
+                    entry.body_color,
                 )
             })
             .collect();
@@ -1991,7 +1914,7 @@ impl PolytopeSmokeApp {
         // off-mode's terms aren't contributing to omega.
         match self.rotation_mode {
             RotationMode::Active => {
-                let active_planes: Vec<&'static str> = PLANES
+                let active_planes: Vec<&'static str> = Plane4::ALL
                     .iter()
                     .zip(self.active.iter())
                     .filter(|(_, on)| **on)
@@ -2055,7 +1978,7 @@ impl PolytopeSmokeApp {
         self.rot_state = Rotor4::IDENTITY;
         self.rot_time = 0.0;
         self.draft.clear();
-        self.write_all(IDENTITY_ROTOR);
+        self.write_all(Rotor4::IDENTITY);
     }
 }
 
@@ -2094,12 +2017,12 @@ impl App for PolytopeSmokeApp {
             .iter()
             .enumerate()
             .map(|(slot, entry)| {
-                BodyUniform::polytope(
+                BodyUniform::polytope_with_rotor(
                     body_position(slot, n),
                     entry.shape,
                     BODY_SIZE,
-                    IDENTITY_ROTOR,
-                    entry.color,
+                    Rotor4::IDENTITY,
+                    entry.body_color,
                 )
             })
             .collect();
@@ -2130,7 +2053,7 @@ impl App for PolytopeSmokeApp {
             slider_down_held: false,
             rotate: false,
             rot_state: Rotor4::IDENTITY,
-            // Default: xw spin enabled (active[2] = Plane::Xw). A
+            // Default: xw spin enabled (active[2] = Plane4::Xw). A
             // first-time user who hits "Spin" before toggling any
             // checkbox now sees motion immediately — the most
             // characteristic 4D rotation, pulling the visible x-axis
@@ -2178,7 +2101,7 @@ impl App for PolytopeSmokeApp {
             if omega.magnitude_squared() > 0.0 {
                 let delta = omega.exp();
                 self.rot_state = (delta * self.rot_state).normalize();
-                self.write_all(rotor_to_slot(self.rot_state));
+                self.write_all(self.rot_state);
             }
         }
 
