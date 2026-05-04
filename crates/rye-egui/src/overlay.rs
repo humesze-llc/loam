@@ -21,22 +21,32 @@
 //! `screen.bottom()`). The TOP edge animates over a configurable
 //! duration via [`Context::animate_value_with_time`] toward the
 //! panel's target height — by default, the natural content size
-//! captured from the previous frame's render (so the panel hugs
-//! its content with no dead space, and shrinks/grows smoothly
-//! when content changes between frames). A caller can override
-//! with [`target_h`](Self::target_h) to pin a fixed height
-//! (HUDs that scroll internally rather than resize).
+//! (so the panel hugs its content with no dead space, and grows
+//! / shrinks smoothly when content changes between frames). A
+//! caller can override with [`target_h`](Self::target_h) to pin
+//! a fixed height (HUDs that scroll internally rather than
+//! resize).
+//!
+//! The natural content size is measured by rendering the user's
+//! content closure **twice per frame**: once invisibly via
+//! [`Ui::set_invisible`] to capture this frame's height, then
+//! again for real at the correctly-anchored position. Two
+//! passes are what let the bottom edge stay rock-solid on the
+//! very frame content size changes — a single-pass design with
+//! stale-measurement positioning always lags by one frame at
+//! transitions and the user perceives the lag as flicker. The
+//! measure pass disables widgets so interaction-gated side
+//! effects (clicks, drags, slider edits) only fire in the
+//! visible pass.
 //!
 //! Content is rendered inside an internal
-//! [`ScrollArea`](egui::ScrollArea) configured with
-//! `stick_to_bottom(true)`, so when the animated height is
-//! transiently smaller than the content (mid-transition), the
-//! TOP scrolls out of view while the bottom (always-visible
-//! footer) stays on screen. After settling, content fits
-//! exactly inside the panel.
+//! [`ScrollArea`](egui::ScrollArea) so that mid-transition,
+//! when the animated height is transiently smaller than the
+//! natural content, the TOP scrolls out of view while the
+//! bottom (always-visible footer) stays on screen.
 //!
 //! Render content in normal top-down order — the ScrollArea's
-//! bottom-stick handles the clip-from-top behavior, no layout
+//! bottom-anchored offset handles clip-from-top, no layout
 //! reversal needed.
 //!
 //! ## Why not [`TopBottomPanel`](egui::TopBottomPanel)?
@@ -135,30 +145,52 @@ impl BottomOverlay {
     /// [`InnerResponse`].
     ///
     /// `content` should render in normal top-down order (mode
-    /// header / body / footer style); the overlay clips from the
-    /// TOP during shrinks via an internal `ScrollArea` with
-    /// `stick_to_bottom`, so widgets rendered late (the footer)
-    /// stay in view throughout collapse animations. After the
-    /// transition settles, the panel hugs its content exactly.
-    pub fn show<R>(self, ctx: &Context, content: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
+    /// header / body / footer style). The overlay sizes to its
+    /// content (or to a caller-pinned `target_h`); height
+    /// transitions animate smoothly, and during shrinks the TOP
+    /// is clipped via an internal `ScrollArea` so widgets
+    /// rendered late (the footer) stay in view.
+    ///
+    /// `content` is called *twice per frame*: once invisibly to
+    /// measure this frame's natural content height, then again
+    /// for the actual paint at the correctly-anchored position.
+    /// The measure pass uses [`Ui::set_invisible`], which
+    /// disables widgets and skips painting, so interaction-gated
+    /// side effects (button clicks, drag drops, slider edits)
+    /// only fire in the visible pass. The two-pass shape is what
+    /// lets the bottom edge stay anchored on the very frame
+    /// content size changes — a single-pass design with
+    /// stale-measurement positioning always lags by one frame at
+    /// transitions and the user perceives the lag as flicker.
+    pub fn show<R>(self, ctx: &Context, mut content: impl FnMut(&mut Ui) -> R) -> InnerResponse<R> {
         let screen = ctx.content_rect();
+        let frame = self.frame.unwrap_or_default();
+        let frame_margin = frame.inner_margin.top as f32 + frame.inner_margin.bottom as f32;
 
-        // Target height for this frame: caller's pinned value if
-        // set, otherwise last frame's measured natural content
-        // height (the panel hugs its content with no dead space).
-        // Default 60.0 covers the very first frame before any
-        // measurement exists; subsequent frames overwrite this.
-        let measured_id = self.id.with("measured_h");
-        let target = self.target_h.unwrap_or_else(|| {
-            ctx.memory(|m| m.data.get_temp::<f32>(measured_id))
-                .unwrap_or(60.0)
-        });
+        // Pass 1: measure pass. Render content invisibly off-
+        // screen to capture this frame's natural content height.
+        // `Ui::set_invisible` disables widgets (no interaction)
+        // and skips painting; widgets still allocate space, so
+        // `min_rect` reflects the natural laid-out size.
+        let measure_id = self.id.with("measure-area");
+        let measure_resp = Area::new(measure_id)
+            .order(egui::Order::Background)
+            .interactable(false)
+            .fixed_pos(Pos2::new(-99_999.0, -99_999.0))
+            .show(ctx, |ui| {
+                ui.set_invisible();
+                ui.set_min_width(self.width);
+                ui.set_max_width(self.width);
+                frame.show(ui, |ui| {
+                    content(ui);
+                });
+            });
+        let natural_h = measure_resp.response.rect.height();
 
-        // Animate the displayed height toward the target. egui's
-        // `animate_value_with_time` smoothly interpolates frame-to-
-        // frame; on the frame where target changes, this returns
-        // the previous frame's value, then lerps over
-        // `transition_secs`.
+        // Animate the displayed height toward the target. Auto-
+        // size mode uses this frame's natural height; pinned
+        // mode uses caller-supplied target_h.
+        let target = self.target_h.unwrap_or(natural_h);
         let smooth_h =
             ctx.animate_value_with_time(self.id.with("smooth_h"), target, self.transition_secs);
 
@@ -168,59 +200,37 @@ impl BottomOverlay {
         let area_x = screen.center().x - self.width / 2.0;
         let area_y = screen.bottom() - self.margin_y - smooth_h;
 
-        let frame = self.frame.unwrap_or_default();
-        let frame_margin = frame.inner_margin.top as f32 + frame.inner_margin.bottom as f32;
-
+        // Pass 2: visible paint at the correct anchored position.
+        // Inner ScrollArea's offset is computed from THIS frame's
+        // natural_h so the content's bottom always sits at the
+        // viewport's bottom — even on the very frame content
+        // size changes.
         Area::new(self.id)
             .fixed_pos(Pos2::new(area_x, area_y))
             .constrain(false)
             .show(ctx, |ui| {
                 ui.set_min_width(self.width);
                 ui.set_max_width(self.width);
-                // Pin the outer ui's height to the animated value.
-                // This is load-bearing: egui's `Area` keeps its
-                // `state.size` sticky from the previous frame, and
-                // a child `ScrollArea`'s outer size clamps to the
-                // *available* space (which equals last frame's
-                // state.size). Without explicit `set_*_height`, the
-                // size round-trips through itself and never grows
-                // past the initial value when target increases.
-                // Locking via `set_min_height`/`set_max_height`
-                // makes the animated value authoritative for the
-                // ui's height, so `state.size` correctly tracks the
-                // animation each frame.
+                // Pin outer ui height to the animated value.
+                // Without this, egui's `Area` keeps `state.size`
+                // sticky and the inner ScrollArea's available
+                // space round-trips through itself, never growing
+                // past the initial value.
                 ui.set_min_height(smooth_h);
                 ui.set_max_height(smooth_h);
                 frame
                     .show(ui, |ui| {
-                        // ScrollArea with `stick_to_bottom(true)`
-                        // anchors the bottom of the content to the
-                        // bottom of the viewport. The ScrollArea
-                        // fills the locked-height ui; when content
-                        // exceeds that, the TOP scrolls out of view
-                        // rather than the bottom — always-visible
-                        // controls (footer) stay on screen during
-                        // collapse animations.
-                        let so = egui::ScrollArea::vertical()
+                        let scroll_offset =
+                            (natural_h - frame_margin - (smooth_h - frame_margin)).max(0.0);
+                        egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
-                            .stick_to_bottom(true)
+                            .vertical_scroll_offset(scroll_offset)
                             .scroll_bar_visibility(
                                 egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                             )
                             .id_salt(self.id.with("scroll"))
-                            .show(ui, content);
-                        // Capture the natural content size for next
-                        // frame's auto-size target. ScrollArea's
-                        // `content_size` is the unclamped natural
-                        // size of the inner content; add the frame's
-                        // inner_margin to get the panel's total
-                        // height. Skip when caller pinned target_h
-                        // (no point feeding the auto-size loop).
-                        if self.target_h.is_none() {
-                            let natural = so.content_size.y + frame_margin;
-                            ctx.memory_mut(|m| m.data.insert_temp(measured_id, natural));
-                        }
-                        so.inner
+                            .show(ui, |ui| content(ui))
+                            .inner
                     })
                     .inner
             })
@@ -284,11 +294,14 @@ mod tests {
         );
     }
 
-    /// The content closure must be called every frame `show` is
-    /// invoked (egui is immediate-mode; if the closure isn't run,
-    /// the content widgets never exist).
+    /// The content closure runs twice per frame (measure pass +
+    /// visible pass), so over N frames it should be invoked
+    /// exactly 2 * N times. The measure pass is what lets the
+    /// overlay anchor its bottom on a growth frame, so this
+    /// double-invocation is by design — callers should keep
+    /// non-interaction side effects idempotent / cheap.
     #[test]
-    fn content_closure_runs_each_frame() {
+    fn content_closure_runs_twice_per_frame() {
         let ctx = egui::Context::default();
         let mut count = 0;
         for _ in 0..7 {
@@ -301,7 +314,11 @@ mod tests {
                     });
             });
         }
-        assert_eq!(count, 7, "content closure should run once per frame");
+        assert_eq!(
+            count, 14,
+            "content closure runs twice per frame (measure + visible passes); \
+             expected 2*7=14 calls over 7 frames, got {count}"
+        );
     }
 
     /// When the overlay is at a large `target_h`, the rate-row-style
@@ -520,6 +537,53 @@ mod tests {
             h_expanded > h_collapsed + 50.0,
             "expanded auto-sized panel ({h_expanded:.1}) should be much taller \
              than collapsed ({h_collapsed:.1})"
+        );
+    }
+
+    /// Regression test for the "panel flickers low for one frame
+    /// when content grows" bug. The setup mimics the user-reported
+    /// scenario: settle the overlay in collapsed state (footer-only
+    /// content), then on the next frame suddenly render expanded
+    /// content (body + footer). On THAT first frame, the footer's
+    /// rendered rect must still be inside the overlay's visible rect
+    /// — not scrolled off the bottom because the inner ScrollArea
+    /// was still using last frame's offset.
+    #[test]
+    fn footer_stays_visible_on_first_growth_frame() {
+        let ctx = egui::Context::default();
+        // Phase 1: settle in collapsed state (footer only).
+        for _ in 0..30 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                BottomOverlay::new("growth-test")
+                    .width(400.0)
+                    .show(ctx, |ui| {
+                        ui.label("footer 1");
+                        ui.label("footer 2");
+                    });
+            });
+        }
+        // Phase 2: ONE frame with sudden growth — body added on top.
+        let mut footer_rect = egui::Rect::NOTHING;
+        let mut overlay_rect = egui::Rect::NOTHING;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let resp = BottomOverlay::new("growth-test")
+                .width(400.0)
+                .show(ctx, |ui| {
+                    for i in 0..6 {
+                        ui.label(format!("body line {i}"));
+                    }
+                    ui.separator();
+                    ui.label("footer 1");
+                    footer_rect = ui.label("footer 2").rect;
+                });
+            overlay_rect = resp.response.rect;
+        });
+        assert!(
+            overlay_rect.intersects(footer_rect),
+            "on the first frame after content grew, footer rect ({footer_rect:?}) \
+             must still intersect overlay rect ({overlay_rect:?}) — otherwise the \
+             ScrollArea's stale offset is showing the top of the new content where \
+             the footer should be"
         );
     }
 
