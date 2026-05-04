@@ -569,25 +569,29 @@ enum DragPayload {
     Entry(usize, usize),
 }
 
-/// Drop-in replacement for `Ui::dnd_drag_source` that COLLAPSES
-/// the original slot in the parent layout when the source is being
-/// dragged, instead of leaving a card-shaped placeholder behind
-/// alongside the floating tooltip preview. The body paints into a
-/// Tooltip layer that follows the cursor (egui's standard drag
-/// preview); the parent layout instead allocates a `placeholder`-
-/// sized rect that animates 1.0 → 0.0 in width over ~120 ms when
-/// drag begins, so neighbouring widgets slide in to fill the slot.
+/// Drop-in replacement for `Ui::dnd_drag_source` that takes the
+/// dragged item out of the parent layout entirely while the drag
+/// is in flight. The body paints into a Tooltip layer that follows
+/// the cursor (egui's standard drag preview); the parent layout
+/// allocates **zero space** for the dragged item — neighbouring
+/// widgets fill its old slot instantly, and the make-room gap at
+/// the drop target is the slot the item will eventually occupy on
+/// drop.
 ///
-/// `egui::Ui::dnd_drag_source` uses `scope_builder` for the dragged
-/// path, which advances the parent cursor by the body's natural
-/// width — that's why the original slot stays visible alongside the
-/// tooltip preview. We bypass `scope_builder` via `Ui::new_child`,
-/// which does *not* advance the parent cursor.
+/// This matches `egui_dnd`'s shape and keeps the row's total width
+/// constant from drag through drop, so dropping doesn't trigger a
+/// horizontal layout shift on the frame the item slot is replaced
+/// with the actual card.
+///
+/// `egui::Ui::dnd_drag_source`'s dragged path uses `scope_builder`
+/// which advances the parent cursor by the body's natural width —
+/// that's why egui's stock helper leaves the original slot
+/// allocated. We bypass `scope_builder` via `Ui::new_child`, which
+/// does NOT advance the parent cursor.
 fn dnd_drag_source_collapsing<P>(
     ui: &mut egui::Ui,
     id: egui::Id,
     payload: P,
-    placeholder: egui::Vec2,
     body: impl FnOnce(&mut egui::Ui),
 ) -> egui::Response
 where
@@ -596,9 +600,6 @@ where
     let ctx = ui.ctx().clone();
     let is_dragged = ctx.is_being_dragged(id);
     if !is_dragged {
-        // Reset the collapse animation while not dragged so the
-        // next drag starts from a fully-expanded placeholder.
-        let _ = ctx.animate_value_with_time(id.with("collapse"), 1.0, 0.0);
         return ui.dnd_drag_source(id, payload, body).response;
     }
     egui::DragAndDrop::set_payload(&ctx, payload);
@@ -610,13 +611,12 @@ where
         let delta = pos - body_rect.center();
         ctx.transform_layer_shapes(layer_id, egui::emath::TSTransform::from_translation(delta));
     }
-    let collapse_t = ctx.animate_value_with_time(id.with("collapse"), 0.0, 0.12);
-    let placeholder_w = (placeholder.x * collapse_t).max(0.5);
-    let (_, resp) = ui.allocate_exact_size(
-        egui::vec2(placeholder_w, placeholder.y),
-        egui::Sense::hover(),
-    );
-    resp
+    // Register a hit-rect at the body's natural position so callers
+    // (context menus, hover text) still get a usable response, but
+    // do NOT allocate space in the parent layout. This is the
+    // whole point: the dragged card occupies zero width in the
+    // row while the drag is in flight.
+    ui.interact(body_rect, id, egui::Sense::hover())
 }
 
 /// Animated "make room" insertion gap at one slot of a horizontal
@@ -1169,11 +1169,32 @@ impl PolytopeSmokeApp {
                 ui.ctx().memory(|m| m.data.get_temp(term_row_rect_id));
             let term_drop_idx = last_term_row_rect
                 .and_then(|rect| drop_target_idx(ui.ctx(), dragging_term, rect, self.seq.len()));
+            // Width of the currently-dragged term card, captured
+            // last frame. Used as the gap's open width so the
+            // gap matches the slot the card will eventually
+            // occupy — without this, gap-vs-card width mismatch
+            // produces a one-frame horizontal layout shift on
+            // drop. Falls back to a sensible default.
+            let dragged_term_idx =
+                match egui::DragAndDrop::payload::<DragPayload>(ui.ctx()).as_deref() {
+                    Some(DragPayload::Term(i)) => Some(*i),
+                    _ => None,
+                };
+            let dragged_term_width = dragged_term_idx
+                .map(|i| ui.make_persistent_id(("term-card", i)).with("width"))
+                .and_then(|key| ui.ctx().memory(|m| m.data.get_temp::<f32>(key)))
+                .unwrap_or(72.0);
             let term_row_resp = ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for term_idx in 0..self.seq.len() {
                     let gap_id = ui.make_persistent_id(("term-gap", term_idx));
-                    if make_room_gap(ui, term_drop_idx == Some(term_idx), gap_id, term_h, 72.0) {
+                    if make_room_gap(
+                        ui,
+                        term_drop_idx == Some(term_idx),
+                        gap_id,
+                        term_h,
+                        dragged_term_width,
+                    ) {
                         if let Some(arc) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx())
                         {
                             if let DragPayload::Term(from) = *arc {
@@ -1208,7 +1229,6 @@ impl PolytopeSmokeApp {
                         ui,
                         card_id,
                         DragPayload::Term(term_idx),
-                        egui::vec2(72.0, term_h),
                         |ui| {
                             if ui.ctx().is_being_dragged(card_id) {
                                 force_opaque_active(ui);
@@ -1305,6 +1325,16 @@ impl PolytopeSmokeApp {
                             }
                         }
                     }
+                    // Capture this term's outer width so the make-
+                    // room gap can match it on the frame this term
+                    // is dragged. Skipped when this is the dragged
+                    // card (its `card_resp.rect` is the collapsing
+                    // placeholder, not the term's natural width).
+                    if !ui.ctx().is_being_dragged(card_id) {
+                        let width_key = card_id.with("width");
+                        let w = card_resp.rect.width();
+                        ui.ctx().memory_mut(|m| m.data.insert_temp(width_key, w));
+                    }
                     let has_scalar = self.seq[term_idx].scalar.is_some();
                     let menu_resp = card_resp.interact(egui::Sense::click());
                     menu_resp.context_menu(|ui| {
@@ -1337,7 +1367,7 @@ impl PolytopeSmokeApp {
                     term_drop_idx == Some(self.seq.len()),
                     trailing_id,
                     term_h,
-                    72.0,
+                    dragged_term_width,
                 ) {
                     if let Some(arc) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx()) {
                         if let DragPayload::Term(from) = *arc {
@@ -1510,38 +1540,31 @@ impl PolytopeSmokeApp {
                             };
                             let stroke = egui::Stroke::new(1.0 + pickup_t * 1.5, stroke_color);
                             let card_id = drag_id;
-                            let drag_resp = dnd_drag_source_collapsing(
-                                ui,
-                                card_id,
-                                i,
-                                egui::vec2(SHAPE_CARD_WIDTH + 8.0, row_h),
-                                |ui| {
-                                    if ui.ctx().is_being_dragged(card_id) {
-                                        force_opaque_active(ui);
-                                    }
-                                    egui::Frame::default()
-                                        .fill(card_fill)
-                                        .stroke(stroke)
-                                        .inner_margin(egui::Margin::symmetric(4, 6))
-                                        .corner_radius(egui::CornerRadius::same(3))
-                                        .show(ui, |ui| {
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(SHAPE_CARD_WIDTH, 0.0),
-                                                egui::Layout::top_down(egui::Align::Center),
-                                                |ui| {
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(entry.label)
-                                                                .strong(),
-                                                        )
-                                                        .selectable(false)
-                                                        .wrap_mode(egui::TextWrapMode::Extend),
-                                                    );
-                                                },
-                                            );
-                                        });
-                                },
-                            );
+                            let drag_resp = dnd_drag_source_collapsing(ui, card_id, i, |ui| {
+                                if ui.ctx().is_being_dragged(card_id) {
+                                    force_opaque_active(ui);
+                                }
+                                egui::Frame::default()
+                                    .fill(card_fill)
+                                    .stroke(stroke)
+                                    .inner_margin(egui::Margin::symmetric(4, 6))
+                                    .corner_radius(egui::CornerRadius::same(3))
+                                    .show(ui, |ui| {
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(SHAPE_CARD_WIDTH, 0.0),
+                                            egui::Layout::top_down(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(entry.label).strong(),
+                                                    )
+                                                    .selectable(false)
+                                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                                );
+                                            },
+                                        );
+                                    });
+                            });
                             drag_resp
                                 .on_hover_cursor(egui::CursorIcon::Grab)
                                 .on_hover_text(entry.long_name)
@@ -2560,18 +2583,14 @@ mod drag_tests {
         let card_pos = egui::pos2(60.0, 30.0);
         let render = |ctx: &egui::Context| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let _ =
-                    dnd_drag_source_collapsing(ui, id, 42_usize, egui::vec2(80.0, 30.0), |ui| {
-                        egui::Frame::default()
-                            .fill(egui::Color32::DARK_GRAY)
-                            .inner_margin(egui::Margin::symmetric(4, 6))
-                            .show(ui, |ui| {
-                                ui.allocate_exact_size(
-                                    egui::vec2(80.0, 18.0),
-                                    egui::Sense::hover(),
-                                );
-                            });
-                    });
+                let _ = dnd_drag_source_collapsing(ui, id, 42_usize, |ui| {
+                    egui::Frame::default()
+                        .fill(egui::Color32::DARK_GRAY)
+                        .inner_margin(egui::Margin::symmetric(4, 6))
+                        .show(ui, |ui| {
+                            ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
+                        });
+                });
             });
         };
         let _ = ctx.run(warmup_input(0.0), render);
@@ -2767,20 +2786,18 @@ mod drag_tests {
                 .show(ctx, |ui| {
                     ui.set_invisible();
                     let id = ui.make_persistent_id("test-card");
-                    let _ =
-                        dnd_drag_source_collapsing(ui, id, 7_usize, egui::vec2(80.0, 30.0), |ui| {
-                            ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
-                        });
+                    let _ = dnd_drag_source_collapsing(ui, id, 7_usize, |ui| {
+                        ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
+                    });
                 });
             let _ = egui::Area::new(egui::Id::new("visible"))
                 .fixed_pos(egui::pos2(0.0, 0.0))
                 .movable(false)
                 .show(ctx, |ui| {
                     let id = ui.make_persistent_id("test-card");
-                    let _ =
-                        dnd_drag_source_collapsing(ui, id, 7_usize, egui::vec2(80.0, 30.0), |ui| {
-                            ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
-                        });
+                    let _ = dnd_drag_source_collapsing(ui, id, 7_usize, |ui| {
+                        ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
+                    });
                 });
         };
         let _ = ctx.run(warmup_input(0.0), render);
@@ -2796,18 +2813,14 @@ mod drag_tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let id = ui.make_persistent_id(("test-card", 0_usize));
                 *captured_id = Some(id);
-                let _ =
-                    dnd_drag_source_collapsing(ui, id, 99_usize, egui::vec2(80.0, 30.0), |ui| {
-                        egui::Frame::default()
-                            .fill(egui::Color32::DARK_GRAY)
-                            .inner_margin(egui::Margin::symmetric(4, 6))
-                            .show(ui, |ui| {
-                                ui.allocate_exact_size(
-                                    egui::vec2(80.0, 18.0),
-                                    egui::Sense::hover(),
-                                );
-                            });
-                    });
+                let _ = dnd_drag_source_collapsing(ui, id, 99_usize, |ui| {
+                    egui::Frame::default()
+                        .fill(egui::Color32::DARK_GRAY)
+                        .inner_margin(egui::Margin::symmetric(4, 6))
+                        .show(ui, |ui| {
+                            ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
+                        });
+                });
             });
         };
         let card_pos = egui::pos2(60.0, 30.0);
