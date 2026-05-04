@@ -56,8 +56,8 @@
 use anyhow::{anyhow, Result};
 use glam::{Vec3, Vec4};
 use rye_app::{
-    egui, run_with_config, App, BottomOverlay, Camera, FrameCtx, OrbitController, RunConfig,
-    SetupCtx,
+    egui, run_with_config, App, BottomOverlay, Camera, FrameCtx, LinearIndicator, OrbitController,
+    RotorVisualizer, RunConfig, SetupCtx,
 };
 use rye_math::{Bivector, Bivector4, EuclideanR3, Plane4, Rotor4};
 use rye_render::{
@@ -382,6 +382,21 @@ struct RotatePolytopesApp {
     /// want to see exactly which bivectors and scalars compose into
     /// the current orientation.
     show_formula: bool,
+
+    /// Filmstrip mode: render `strip_count` thumbnails across the
+    /// scene area, each at an evenly-spaced `w_slice` value across
+    /// `[-W_RANGE, W_RANGE]`. Lets the user see the full 4D extent
+    /// of every polytope at once instead of scrubbing one slice.
+    strip_view: bool,
+    /// Number of cells in the multi-slice strip. Range 3..=21.
+    strip_count: usize,
+    /// Show the read-only `rye_egui::LinearIndicator` for the
+    /// current `w_slice` plane. Top-left fixed area when on.
+    show_w_indicator: bool,
+    /// Show the `rye_egui::RotorVisualizer` for the current
+    /// angular-velocity bivector. Surfaces the SO(4) double-
+    /// rotation structure as one or two labeled arcs.
+    show_rotor_viz: bool,
 
     /// Which rotation source drives the continuous spin: the
     /// six-checkbox active set (`Active`), or the composed
@@ -962,6 +977,10 @@ impl RotatePolytopesApp {
             ui.selectable_value(&mut staged, RotationMode::Composer, "Composer")
                 .on_hover_text("Sum of bivectors from the composed sequence");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut self.show_rotor_viz, "Rotor viz")
+                    .on_hover_text("Top-right SO(4) plane decomposition of the angular velocity");
+                ui.checkbox(&mut self.show_w_indicator, "w indicator")
+                    .on_hover_text("Top-left scrub bar showing where the slice plane sits");
                 ui.checkbox(&mut self.show_formula, "Show formula")
                     .on_hover_text("Top-right popup with the live exp(...) form of the rotor");
             });
@@ -969,6 +988,24 @@ impl RotatePolytopesApp {
         if staged != self.rotation_mode {
             self.pending_mode = Some(staged);
         }
+        // Filmstrip toggle row. Sliders' w_slice is ignored when
+        // strip is on (cells span the whole range), so a separate
+        // row is the clearest place for this view-mode switch.
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.strip_view, "Filmstrip")
+                .on_hover_text(
+                    "Render N cells across the scene at evenly-spaced w_slice; \
+                     replaces the single-slice view",
+                );
+            if self.strip_view {
+                ui.add(
+                    egui::DragValue::new(&mut self.strip_count)
+                        .range(3..=21)
+                        .speed(0.2)
+                        .prefix("cells: "),
+                );
+            }
+        });
 
         // Mode-specific UI.
         if self.rotation_mode == RotationMode::Active {
@@ -2050,6 +2087,10 @@ impl App for RotatePolytopesApp {
             expanded: false,
             show_help: false,
             show_formula: false,
+            strip_view: false,
+            strip_count: 11,
+            show_w_indicator: true,
+            show_rotor_viz: true,
             rotation_mode: RotationMode::Active,
             pending_mode: None,
             pending_actions: Vec::new(),
@@ -2187,6 +2228,47 @@ impl App for RotatePolytopesApp {
             }
         }
 
+        // Top-left under the title: read-only `w` slice indicator.
+        // Hidden in filmstrip mode (the strip itself answers
+        // "where in the w-extent are we").
+        if self.show_w_indicator && !self.strip_view {
+            egui::Area::new(egui::Id::new("rotate-polytopes-w-indicator"))
+                .anchor(egui::Align2::LEFT_TOP, [20.0, 92.0])
+                .show(ctx, |ui| {
+                    egui::Frame::popup(&ctx.style())
+                        .inner_margin(6.0)
+                        .show(ui, |ui| {
+                            LinearIndicator::new("w", self.w_slice, -W_RANGE..=W_RANGE)
+                                .desired_width(180.0)
+                                .show(ui);
+                        });
+                });
+        }
+
+        // Top-right under the formula popup: SO(4) rotation
+        // visualizer. The omega bivector for the active rotation
+        // source decomposes into one or two simple rotation planes.
+        if self.show_rotor_viz {
+            let omega = match self.rotation_mode {
+                RotationMode::Active => angular_velocity(&self.active, self.rate_scale),
+                RotationMode::Composer => angular_velocity_from_seq(&self.seq, self.rate_scale),
+            };
+            // Stack below the formula popup if it's open. The
+            // formula's typical height is ~50pt; the rotor viz is
+            // ~52pt tall, so a 80pt stagger keeps them from
+            // overlapping when both are shown.
+            let y_offset = if self.show_formula { 80.0 } else { 16.0 };
+            egui::Area::new(egui::Id::new("rotate-polytopes-rotor-viz"))
+                .anchor(egui::Align2::RIGHT_TOP, [-16.0, y_offset])
+                .show(ctx, |ui| {
+                    egui::Frame::popup(&ctx.style())
+                        .inner_margin(6.0)
+                        .show(ui, |ui| {
+                            RotorVisualizer::new(omega, "omega").show(ui);
+                        });
+                });
+        }
+
         // Bottom-anchored unified controls overlay. Sliders + rate
         // row always visible; the rest expands above on chevron/H.
         self.render_overlay(ctx);
@@ -2239,13 +2321,35 @@ impl App for RotatePolytopesApp {
         // skip a bottom strip.
         let cfg = &rd.surface_bundle.config;
         let viewport = Viewport::full([cfg.width, cfg.height]);
-        {
-            let u = self.node.uniforms_mut();
-            u.resolution = viewport.resolution_f32();
-            u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+        if self.strip_view {
+            // Filmstrip: tile the framebuffer with N cells, each at
+            // an evenly-spaced `w_slice` from `-W_RANGE` to
+            // `+W_RANGE`. The freeze-frame view of the 4D extent.
+            let cells = viewport.split_horizontal(self.strip_count as u32);
+            let n = cells.len().max(1);
+            let strip: Vec<(Viewport, f32)> = cells
+                .into_iter()
+                .enumerate()
+                .map(|(i, vp)| {
+                    let t = if n == 1 {
+                        0.0
+                    } else {
+                        i as f32 / (n - 1) as f32
+                    };
+                    let w = -W_RANGE + t * (2.0 * W_RANGE);
+                    (vp, w)
+                })
+                .collect();
+            self.node.execute_strip(rd, view, &strip)
+        } else {
+            {
+                let u = self.node.uniforms_mut();
+                u.resolution = viewport.resolution_f32();
+                u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+            }
+            self.node.flush_uniforms(&rd.queue);
+            self.node.execute_in_viewport(rd, view, viewport)
         }
-        self.node.flush_uniforms(&rd.queue);
-        self.node.execute_in_viewport(rd, view, viewport)
     }
 
     fn title(&self, _fps: f32) -> std::borrow::Cow<'static, str> {

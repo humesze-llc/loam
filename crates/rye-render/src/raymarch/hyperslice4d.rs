@@ -900,7 +900,7 @@ impl Hyperslice4DNode {
     /// first, which clears) so the underlying texture is built up
     /// cell-by-cell. The uniform buffer is rewritten per cell to
     /// switch `w_slice` and `resolution`; callers must NOT rely on
-    /// `self.uniforms()` to reflect the post-call state — the last
+    /// `self.uniforms()` to reflect the post-call state, the last
     /// cell's `w_slice` is what's left in the buffer.
     ///
     /// Cells where `viewport.width == 0` are skipped (degenerate
