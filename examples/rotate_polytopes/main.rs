@@ -1,42 +1,36 @@
-//! Smoke test for the polytope path in `Hyperslice4DNode`. Renders
-//! the first four convex regular polychora, 5-cell, tesseract,
-//! 16-cell, 24-cell, in a row on a 4D `y = 0` floor, with
-//! user-controllable `w`-slice scrubbing and a per-plane toggle
-//! UI for arbitrary 4D rotations. The user composes their own
-//! motion by toggling individual rotation planes (1..6 -> xy, xz,
-//! xw, yz, yw, zw); active planes' bivectors sum into the
-//! per-frame angular velocity, which integrates into a rotor via
-//! `(ω · dt).exp()`. Sum-of-bivectors composition is commutative,
-//! so toggle-order doesn't matter and the result is always
-//! predictable from the visible "active" set.
+//! Interactive demo of 4D rotation over `Hyperslice4DNode`. Renders
+//! a row of convex regular polychora (5-cell, tesseract, 16-cell,
+//! 24-cell by default; 120-cell and 600-cell selectable via
+//! `--shapes` or the in-app `+` button) on a 4D `y = 0` floor,
+//! with `w`-slice scrubbing and two UIs for composing arbitrary
+//! 4D rotations.
 //!
-//! All six convex regular 4-polytopes ship; the 120-cell and 600-cell
-//! use a Rust-side face-hyperplane generator (their orbit sets are
-//! too large to inline as WGSL literals). Their SDFs run a
-//! true-Euclidean Wolfe greedy hyperplane projection, not a
+//! In **Active set** mode the user toggles individual rotation
+//! planes (1..6 -> xy, xz, xw, yz, yw, zw); active planes'
+//! bivectors sum into the per-frame angular velocity, which
+//! integrates into a rotor via `(ω · dt).exp()`. Sum-of-bivectors
+//! composition is commutative, so toggle order doesn't matter and
+//! the result is always predictable from the visible active set.
+//!
+//! In **Composer** mode the user builds a sequence of `RotorTerm`s
+//! (each a sum of planes with an optional scalar magnitude),
+//! reorders them with drag-and-drop, and either applies them as a
+//! one-shot rotor multiplication or feeds the seq into the
+//! continuous-spin angular velocity.
+//!
+//! All six convex regular 4-polytopes ship; the 120-cell and
+//! 600-cell use a Rust-side face-hyperplane generator (their orbit
+//! sets are too large to inline as WGSL literals). Their SDFs run
+//! a true-Euclidean Wolfe greedy hyperplane projection, not a
 //! max-plane lower bound.
 //!
 //! All live state and controls help are drawn as a `rye-egui`
-//! overlay via the `App::ui` hook; the window title stays static.
-//!
-//! What this verifies (visually):
-//!
-//! - The kernel's polytope SDF compiles + executes (no naga errors,
-//!   no shader runtime panics).
-//! - Pentatope cross-sections morph through the 5-cell's slice
-//!   shapes as `w_slice` scrubs.
-//! - The Rotor4 inverse-sandwich path correctly transforms world
-//!   points into body-local for evaluating the polytope SDF,
-//!   single-plane and compound 4D rotations both produce coherent
-//!   slice morphs.
-//! - `rye-egui` overlay composes cleanly on top of
-//!   `Hyperslice4DNode`'s output (the framework paints the egui
-//!   pass after `App::render` returns).
+//! overlay via the `App::ui` hook.
 //!
 //! ## Controls
 //!
 //! - **Mouse left-drag**: orbit camera.
-//! - **↑ / ↓**: scrub `w`-slice (0.5 u/s).
+//! - **Up / Down arrows**: scrub `w`-slice (0.5 u/s).
 //! - **T**: toggle 4D rotation (pause/resume freezes orientation
 //!   in place, does NOT snap back to identity).
 //! - **1..6**: toggle the corresponding rotation plane on/off.
@@ -46,7 +40,7 @@
 //!   isoclinic xw+yz; `3+5+6` = three w-planes drift through
 //!   SO(4). Pure-3D combinations (`1+2+4`) just rotate the
 //!   cross-section as a rigid 3D shape.
-//! - **+ / −**: adjust the global rotation rate.
+//! - **+ / -**: adjust the global rotation rate.
 //! - **R**: full reset, slice, rate, all toggles off, AND
 //!   orientation back to canonical pose.
 //! - **Esc**: exit.
@@ -339,10 +333,10 @@ fn combo_name(active: &[bool; 6]) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// PolytopeSmokeApp
+// RotatePolytopesApp
 // ---------------------------------------------------------------------------
 
-struct PolytopeSmokeApp {
+struct RotatePolytopesApp {
     space: EuclideanR3,
     camera: Camera<EuclideanR3>,
     orbit: OrbitController<EuclideanR3>,
@@ -763,7 +757,7 @@ fn add_button(ui: &mut egui::Ui) -> egui::Response {
     response
 }
 
-/// `↻` retry button: a clockwise arc with an arrowhead, painted
+/// `R` retry button: a clockwise arc with an arrowhead, painted
 /// from primitives. Replaces a font glyph (egui's default font has
 /// patchy coverage of the Mathematical Operators block where
 /// circular-arrow code points live).
@@ -926,7 +920,7 @@ fn chevron_button(ui: &mut egui::Ui, up: bool, hover: &str) -> egui::Response {
     response.on_hover_text(hover)
 }
 
-impl PolytopeSmokeApp {
+impl RotatePolytopesApp {
     /// Drive every body in the row with the same rotor, lets the
     /// user directly compare slice signatures under identical 4D motion.
     fn write_all(&mut self, rotor: Rotor4) {
@@ -1405,7 +1399,7 @@ impl PolytopeSmokeApp {
             last_row_rect.and_then(|rect| drop_target_idx(ui.ctx(), dragging_shape, rect, row_len));
         let row_rect = egui::ScrollArea::horizontal()
             .auto_shrink([false, true])
-            .id_salt("polytope-smoke-shapes-scroll")
+            .id_salt("rotate-polytopes-shapes-scroll")
             .show(ui, |ui| {
                 let row_response =
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
@@ -1579,7 +1573,7 @@ impl PolytopeSmokeApp {
             return;
         }
         let mut open = self.show_help;
-        egui::Window::new("About Polytope Smoke Test")
+        egui::Window::new("About 4D Polytope Rotation")
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -1692,7 +1686,7 @@ impl PolytopeSmokeApp {
             .corner_radius(visuals.window_corner_radius)
             .inner_margin(10.0);
 
-        BottomOverlay::new("polytope-smoke-overlay")
+        BottomOverlay::new("rotate-polytopes-overlay")
             .width(area_w)
             .margin_y(pad)
             .frame(frame)
@@ -1795,7 +1789,7 @@ impl PolytopeSmokeApp {
     /// utility cluster on the same line:
     ///
     /// ```text
-    ///                  [<<] [<] [▶/⏸] [>] [>>]      [Reset] [?] [^]
+    ///                  [<<] [<] [play/pause] [>] [>>]      [Reset] [?] [^]
     ///                            ×1.00
     /// ```
     ///
@@ -1811,7 +1805,7 @@ impl PolytopeSmokeApp {
             // doesn't enter into the centering math at all.
             //
             // `PLAY_GROUP_W` is empirically the natural width of the
-            // 6-widget cluster (`<<` `<` ▶/⏸ `>` `>>` ↻ plus default
+            // 6-widget cluster (`<<` `<` play/pause `>` `>>` refresh plus default
             // item spacing). If button labels or padding change,
             // re-tune here.
             const PLAY_GROUP_W: f32 = 215.0;
@@ -1839,7 +1833,7 @@ impl PolytopeSmokeApp {
             // Right cluster: claims the rest of the row with a
             // right-to-left sub-layout so widgets stack at the right
             // edge regardless of where the cursor is. Reset moved to
-            // the play group as ↻; this cluster is now just the
+            // the play group as refresh; this cluster is now just the
             // help and expand toggles.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if chevron_button(
@@ -1974,7 +1968,7 @@ impl PolytopeSmokeApp {
     }
 }
 
-impl App for PolytopeSmokeApp {
+impl App for RotatePolytopesApp {
     type Space = EuclideanR3;
 
     fn setup(ctx: &mut SetupCtx<'_>) -> Result<Self> {
@@ -1998,7 +1992,7 @@ impl App for PolytopeSmokeApp {
             .rd
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("polytope_smoke shader"),
+                label: Some("rotate_polytopes shader"),
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
         let mut node =
@@ -2138,11 +2132,11 @@ impl App for PolytopeSmokeApp {
         // rather than just another label.
         let cfg = &frame.rd.surface_bundle.config;
         let (fb_w, fb_h) = (cfg.width, cfg.height);
-        egui::Area::new(egui::Id::new("polytope-smoke-title"))
+        egui::Area::new(egui::Id::new("rotate-polytopes-title"))
             .anchor(egui::Align2::LEFT_TOP, [20.0, 18.0])
             .show(ctx, |ui| {
                 ui.add(egui::Label::new(
-                    egui::RichText::new("Polytope Smoke Test")
+                    egui::RichText::new("4D Polytope Rotation")
                         .size(22.0)
                         .strong()
                         .color(egui::Color32::WHITE),
@@ -2170,7 +2164,7 @@ impl App for PolytopeSmokeApp {
                 None
             };
             if !formula.is_empty() || name.is_some() {
-                egui::Area::new(egui::Id::new("polytope-smoke-formula"))
+                egui::Area::new(egui::Id::new("rotate-polytopes-formula"))
                     .anchor(egui::Align2::RIGHT_TOP, [-16.0, 16.0])
                     .show(ctx, |ui| {
                         egui::Frame::popup(&ctx.style())
@@ -2258,25 +2252,25 @@ impl App for PolytopeSmokeApp {
         // Window title is now decorative, all live state is in the
         // overlay. Keep the title static so OS task switchers show
         // a stable label.
-        std::borrow::Cow::Borrowed("polytope smoke")
+        std::borrow::Cow::Borrowed("rotate polytopes")
     }
 }
 
 fn main() -> Result<()> {
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("polytope smoke")
+            .with_title("rotate polytopes")
             .with_visible(false),
         ..RunConfig::default()
     };
-    run_with_config::<PolytopeSmokeApp>(config)
+    run_with_config::<RotatePolytopesApp>(config)
 }
 
 // ---------------------------------------------------------------------------
 // Layout regression tests
 // ---------------------------------------------------------------------------
 //
-// `cargo test --example polytope_smoke` to run.
+// `cargo test --example rotate_polytopes` to run.
 //
 // These tests headless-render the shape row through `egui::Context::run`
 // and inspect the actual placed-rect positions of every card and the
@@ -2559,7 +2553,7 @@ mod drag_tests {
     /// `Id::new` for stable per-row-index keys.
     #[test]
     fn id_new_starts_drag() {
-        let id = egui::Id::new(("polytope-smoke-shape-card-test", 0_usize));
+        let id = egui::Id::new(("rotate-polytopes-shape-card-test", 0_usize));
         let ctx = drive_drag(id);
         assert!(
             ctx.is_being_dragged(id),

@@ -604,7 +604,7 @@ mod tests {
         );
     }
 
-    /// Mimics polytope_smoke's pattern: an outer `BottomOverlay`
+    /// Mimics rotate_polytopes's pattern: an outer `BottomOverlay`
     /// containing a body section (with its own inner horizontal
     /// `ScrollArea`), then sliders, then a footer. Verifies that
     /// when the overlay is at a `target_h` smaller than the natural
