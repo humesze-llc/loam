@@ -412,6 +412,15 @@ impl Bivector4 {
         }
     }
 
+    /// Unit basis bivector at index `i` in `Plane4`'s ordering:
+    /// `0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw`. Panics if `i >= 6`.
+    /// Use [`Plane4::unit_bivector`] for the type-safe form.
+    pub fn basis(i: usize) -> Self {
+        let mut c = [0.0_f32; 6];
+        c[i] = 1.0;
+        Self::new(c[0], c[1], c[2], c[3], c[4], c[5])
+    }
+
     /// `|B|² = Σ α²_ij` over all six components. Equal to the sum of
     /// squared eigenvalue magnitudes: `θ₁² + θ₂²`.
     pub fn magnitude_squared(self) -> f32 {
@@ -489,6 +498,51 @@ impl Bivector4 {
             yw: self.xz,
             zw: -self.xy,
         }
+    }
+}
+
+/// One of the six elementary 4D rotation planes — a basis bivector
+/// of [`Bivector4`]. Indices and label match `Bivector4`'s field
+/// order: `0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw`.
+///
+/// The three w-involving planes (`xw`, `yw`, `zw`) pull visible
+/// axes into the hidden 4th dimension; the three pure-3D planes
+/// (`xy`, `xz`, `yz`) act as ordinary 3D rotations on the 3D
+/// cross-section. Sum-of-bivectors composition is **commutative**
+/// (vector-space addition), so building `omega = sum_of_planes ·
+/// rate` is order-independent and the resulting rotor `omega.exp()`
+/// depends only on the *set* of active planes, not their order.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(usize)]
+pub enum Plane4 {
+    Xy = 0,
+    Xz = 1,
+    Xw = 2,
+    Yz = 3,
+    Yw = 4,
+    Zw = 5,
+}
+
+impl Plane4 {
+    /// All six planes in the canonical `Bivector4` field order.
+    pub const ALL: [Self; 6] = [Self::Xy, Self::Xz, Self::Xw, Self::Yz, Self::Yw, Self::Zw];
+
+    /// Lowercase two-letter label, e.g. `"xy"`. Stable identifier
+    /// suitable for UI labels, debug output, and serialization keys.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Xy => "xy",
+            Self::Xz => "xz",
+            Self::Xw => "xw",
+            Self::Yz => "yz",
+            Self::Yw => "yw",
+            Self::Zw => "zw",
+        }
+    }
+
+    /// Unit-magnitude basis bivector for this plane.
+    pub fn unit_bivector(self) -> Bivector4 {
+        Bivector4::basis(self as usize)
     }
 }
 
@@ -678,6 +732,13 @@ impl Rotor4 {
         xyzw: 0.0,
     };
 
+    /// Identity rotor packed into the `[s, xy, xz, xw, yz, yw, zw,
+    /// xyzw]` slot order used by GPU uniform buffers (matches the
+    /// `From<Rotor4> for [f32; 8]` packing). Convenience for
+    /// initializing `BodyUniform.rotor` etc. without having to spell
+    /// out the eight-tuple at every call site.
+    pub const IDENTITY_SLOT: [f32; 8] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
     /// Squared norm under the reverse: `<R̃·R>_0`. For a proper rotor
     /// this is `1`. Used internally for renormalization after long
     /// chains of compositions.
@@ -717,6 +778,16 @@ impl Rotor4 {
 impl Default for Rotor4 {
     fn default() -> Self {
         Self::IDENTITY
+    }
+}
+
+/// Pack into the `[s, xy, xz, xw, yz, yw, zw, xyzw]` slot order
+/// used by GPU uniform buffers (e.g. `rye-render`'s `BodyUniform`).
+/// Centralizing this packing convention here means downstream
+/// crates and examples never spell out the field order by hand.
+impl From<Rotor4> for [f32; 8] {
+    fn from(r: Rotor4) -> Self {
+        [r.s, r.xy, r.xz, r.xw, r.yz, r.yw, r.zw, r.xyzw]
     }
 }
 
@@ -1703,5 +1774,70 @@ mod tests {
         let b = Bivector4::new(1.0, 0.0, 0.0, 0.0, 0.0, 0.0); // e_xy
         assert_vec4_close_tol(b.contract_vec(Vec4::Z), Vec4::ZERO, 1e-6);
         assert_vec4_close_tol(b.contract_vec(Vec4::W), Vec4::ZERO, 1e-6);
+    }
+
+    /// `Plane4::ALL[i].unit_bivector()` must equal `Bivector4::basis(i)`,
+    /// and both must agree with `Bivector4`'s field ordering — index
+    /// `i` sets exactly the i-th field to 1.
+    #[test]
+    fn plane4_unit_bivector_matches_bivector4_field_order() {
+        // Order: 0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw.
+        let expected = [
+            Bivector4::new(1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            Bivector4::new(0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+            Bivector4::new(0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+            Bivector4::new(0.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+            Bivector4::new(0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+            Bivector4::new(0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        ];
+        for (i, plane) in Plane4::ALL.iter().enumerate() {
+            assert_eq!(
+                plane.unit_bivector(),
+                expected[i],
+                "Plane4::{plane:?} did not produce the expected basis bivector"
+            );
+            assert_eq!(
+                Bivector4::basis(i),
+                expected[i],
+                "Bivector4::basis({i}) drifted from Plane4 ordering"
+            );
+        }
+    }
+
+    #[test]
+    fn plane4_label_matches_field_name() {
+        assert_eq!(Plane4::Xy.label(), "xy");
+        assert_eq!(Plane4::Xz.label(), "xz");
+        assert_eq!(Plane4::Xw.label(), "xw");
+        assert_eq!(Plane4::Yz.label(), "yz");
+        assert_eq!(Plane4::Yw.label(), "yw");
+        assert_eq!(Plane4::Zw.label(), "zw");
+    }
+
+    /// `From<Rotor4> for [f32; 8]` packs in the order `[s, xy, xz,
+    /// xw, yz, yw, zw, xyzw]`. This pinned ordering is what GPU
+    /// uniform buffers (e.g. `BodyUniform.rotor`) consume; a future
+    /// refactor that swaps fields must also update this conversion
+    /// in lockstep, and this test catches the mismatch.
+    #[test]
+    fn rotor4_to_slot_packs_in_canonical_order() {
+        let r = Rotor4 {
+            s: 1.0,
+            xy: 2.0,
+            xz: 3.0,
+            xw: 4.0,
+            yz: 5.0,
+            yw: 6.0,
+            zw: 7.0,
+            xyzw: 8.0,
+        };
+        let slot: [f32; 8] = r.into();
+        assert_eq!(slot, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn rotor4_identity_slot_matches_into_identity() {
+        let from_into: [f32; 8] = Rotor4::IDENTITY.into();
+        assert_eq!(Rotor4::IDENTITY_SLOT, from_into);
     }
 }
