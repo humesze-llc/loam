@@ -2771,6 +2771,123 @@ mod drag_tests {
         );
     }
 
+    /// Simulates dragging a card from one slot to another and
+    /// verifies that the row's total width is INVARIANT through
+    /// the drag → drop transition. If the dragged card takes some
+    /// space during drag and a different amount after drop, OR if
+    /// the make-room gap's width doesn't match the dropped card's
+    /// slot width, the OTHER cards shift horizontally on drop —
+    /// the rubberband the user sees.
+    ///
+    /// Render N "cards" with stable widths via the same helper
+    /// (`dnd_drag_source_collapsing` + `make_room_gap`) the live
+    /// shape row uses, simulate a press + drag-past-threshold +
+    /// hover-over-target + release, and capture neighbouring card
+    /// positions on the last drag frame and on the post-drop
+    /// frame.
+    #[test]
+    fn shape_row_total_width_invariant_through_drop() {
+        const N: usize = 4;
+        const CARD_W: f32 = SHAPE_CARD_WIDTH + 8.0;
+        const SPACING: f32 = 4.0;
+        let ctx = egui::Context::default();
+        // We measure widths under a "card 0 is being dragged"
+        // scenario (drop at trailing slot N) and compare with the
+        // post-drop scenario (no drag in flight, all cards rendered
+        // normally).
+        let target_slot = N;
+
+        let mut total_during_drag = 0.0_f32;
+        let render_during_drag = |ctx: &egui::Context, total: &mut f32| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.x = SPACING;
+                    let drop_idx = Some(target_slot);
+                    for i in 0..N {
+                        // Make-room gap before card i.
+                        let gap_id = ui.make_persistent_id(("gap", i));
+                        let _ = make_room_gap(ui, drop_idx == Some(i), gap_id, 18.0, CARD_W);
+                        let card_id = ui.make_persistent_id(("card", i));
+                        let _ = dnd_drag_source_collapsing(ui, card_id, i, |ui| {
+                            egui::Frame::default()
+                                .inner_margin(egui::Margin::symmetric(4, 6))
+                                .show(ui, |ui| {
+                                    ui.allocate_exact_size(
+                                        egui::vec2(SHAPE_CARD_WIDTH, 0.0),
+                                        egui::Sense::hover(),
+                                    );
+                                });
+                        });
+                    }
+                    // Trailing gap.
+                    let trail_id = ui.make_persistent_id(("gap", N));
+                    let _ = make_room_gap(ui, drop_idx == Some(N), trail_id, 18.0, CARD_W);
+                    *total = ui.min_rect().width();
+                });
+            });
+        };
+
+        // Drive a real drag on card `dragged_idx`. Card centers
+        // are predictable: card 0 center = CARD_W/2 = 36.
+        let card0_center = egui::pos2(CARD_W / 2.0, 9.0);
+        let _ = ctx.run(warmup_input(0.0), |c| {
+            render_during_drag(c, &mut total_during_drag)
+        });
+        let _ = ctx.run(pointer_press(0.05, card0_center), |c| {
+            render_during_drag(c, &mut total_during_drag)
+        });
+        // Move past drag threshold AND past the row to land at
+        // the trailing slot. card0_center is at x=36, drag to x=400.
+        let target_pos = egui::pos2(400.0, 9.0);
+        let _ = ctx.run(pointer_move(0.10, target_pos), |c| {
+            render_during_drag(c, &mut total_during_drag)
+        });
+        // Several frames at the same target so the gap can settle
+        // open at full width.
+        for k in 0..15 {
+            let t = 0.15 + (k as f64) * 0.02;
+            let _ = ctx.run(pointer_move(t, target_pos), |c| {
+                render_during_drag(c, &mut total_during_drag)
+            });
+        }
+        let drag_total = total_during_drag;
+        let dragged_id = ctx.dragged_id();
+        // Release.
+        let mut release_input = egui::RawInput::default();
+        release_input.screen_rect = Some(screen());
+        release_input.time = Some(0.6);
+        release_input
+            .events
+            .push(egui::Event::PointerMoved(target_pos));
+        release_input.events.push(egui::Event::PointerButton {
+            pos: target_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let _ = ctx.run(release_input, |c| {
+            render_during_drag(c, &mut total_during_drag)
+        });
+        // Frame after release: drag is over, no make-room gap, no
+        // dragged card collapse. Re-render to measure post-drop.
+        let _ = ctx.run(warmup_input(0.65), |c| {
+            render_during_drag(c, &mut total_during_drag)
+        });
+        let post_drop_total = total_during_drag;
+
+        eprintln!(
+            "drag_total = {drag_total:.1}, post_drop_total = {post_drop_total:.1}, \
+             dragged_id = {dragged_id:?}"
+        );
+        let drift = (drag_total - post_drop_total).abs();
+        assert!(
+            drift < 1.0,
+            "row total width must stay constant from drag → drop, otherwise \
+             cards rubberband horizontally on release. drag={drag_total:.1}, \
+             post_drop={post_drop_total:.1}, drift={drift:.1}"
+        );
+    }
+
     /// Same regression check applied to `dnd_drag_source_collapsing`:
     /// the helper must round-trip through a content closure that
     /// runs in two egui layers without producing a same-id-in-two-
