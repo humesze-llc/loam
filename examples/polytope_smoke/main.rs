@@ -569,11 +569,56 @@ enum DragPayload {
     Entry(usize, usize),
 }
 
-/// Insertion-point indicator and drop target between term cards.
-/// During a drag of any `DragPayload`, paints all gaps faintly so
-/// the user can see where drops are accepted; the gap currently
-/// under the cursor is painted brighter (the "live target") to
-/// match the convention used by Trello / Notion / Linear etc.
+/// Drop-in replacement for `Ui::dnd_drag_source` that COLLAPSES
+/// the original slot in the parent layout when the source is being
+/// dragged, instead of leaving a card-shaped placeholder behind
+/// alongside the floating tooltip preview. The body paints into a
+/// Tooltip layer that follows the cursor (egui's standard drag
+/// preview); the parent layout instead allocates a `placeholder`-
+/// sized rect that animates 1.0 → 0.0 in width over ~120 ms when
+/// drag begins, so neighbouring widgets slide in to fill the slot.
+///
+/// `egui::Ui::dnd_drag_source` uses `scope_builder` for the dragged
+/// path, which advances the parent cursor by the body's natural
+/// width — that's why the original slot stays visible alongside the
+/// tooltip preview. We bypass `scope_builder` via `Ui::new_child`,
+/// which does *not* advance the parent cursor.
+fn dnd_drag_source_collapsing<P>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    payload: P,
+    placeholder: egui::Vec2,
+    body: impl FnOnce(&mut egui::Ui),
+) -> egui::Response
+where
+    P: 'static + Send + Sync,
+{
+    let ctx = ui.ctx().clone();
+    let is_dragged = ctx.is_being_dragged(id);
+    if !is_dragged {
+        // Reset the collapse animation while not dragged so the
+        // next drag starts from a fully-expanded placeholder.
+        let _ = ctx.animate_value_with_time(id.with("collapse"), 1.0, 0.0);
+        return ui.dnd_drag_source(id, payload, body).response;
+    }
+    egui::DragAndDrop::set_payload(&ctx, payload);
+    let layer_id = egui::LayerId::new(egui::Order::Tooltip, id);
+    let mut child = ui.new_child(egui::UiBuilder::new().layer_id(layer_id));
+    body(&mut child);
+    let body_rect = child.min_rect();
+    if let Some(pos) = ctx.pointer_interact_pos() {
+        let delta = pos - body_rect.center();
+        ctx.transform_layer_shapes(layer_id, egui::emath::TSTransform::from_translation(delta));
+    }
+    let collapse_t = ctx.animate_value_with_time(id.with("collapse"), 0.0, 0.12);
+    let placeholder_w = (placeholder.x * collapse_t).max(0.5);
+    let (_, resp) = ui.allocate_exact_size(
+        egui::vec2(placeholder_w, placeholder.y),
+        egui::Sense::hover(),
+    );
+    resp
+}
+
 /// Animated "make room" insertion gap at one slot of a horizontal
 /// row. The slot whose `is_target` is `true` expands to `open_width`
 /// over ~120 ms; others stay at zero width. Cards on either side
@@ -594,7 +639,15 @@ fn make_room_gap(
     if smooth_w >= 0.5 {
         let _ = ui.allocate_exact_size(egui::vec2(smooth_w, height), egui::Sense::hover());
     }
-    is_target && ui.ctx().input(|i| i.pointer.any_released())
+    let dropped = is_target && ui.ctx().input(|i| i.pointer.any_released());
+    if dropped {
+        // Snap the gap closed instantly on drop. Without this, the
+        // gap animates from `open_width` → 0 over the next ~120 ms
+        // while the row's right side rubberbands leftward as the
+        // gap closes — a visible "settle" the user reads as jank.
+        let _ = ui.ctx().animate_value_with_time(slot_id, 0.0, 0.0);
+    }
+    dropped
 }
 
 /// Map cursor x-position over a row's bounding `row_rect` to a
@@ -1143,125 +1196,139 @@ impl PolytopeSmokeApp {
                     } else {
                         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
                     };
-                    let frame = egui::Frame::default()
-                        .fill(ui.visuals().widgets.noninteractive.bg_fill)
-                        .stroke(stroke)
-                        .inner_margin(3.0)
-                        .corner_radius(egui::CornerRadius::same(3));
-                    let (_, payload) = ui.dnd_drop_zone::<DragPayload, _>(frame, |ui| {
-                        let drag_resp =
-                            ui.dnd_drag_source(card_id, DragPayload::Term(term_idx), |ui| {
-                                if ui.ctx().is_being_dragged(card_id) {
-                                    force_opaque_active(ui);
-                                }
-                                ui.horizontal(|ui| {
-                                    // Scalar prefix is hidden by default;
-                                    // shown in light red when present so it
-                                    // reads as "this is the magnitude, not
-                                    // a bivector". Add via right-click on
-                                    // the term.
-                                    let term = &mut self.seq[term_idx];
-                                    if let Some(phi) = term.scalar.as_mut() {
-                                        let mut deg = phi.to_degrees();
-                                        let phi_color = egui::Color32::from_rgb(255, 150, 150);
-                                        ui.scope(|ui| {
-                                            let v = ui.visuals_mut();
-                                            v.widgets.inactive.fg_stroke.color = phi_color;
-                                            v.widgets.hovered.fg_stroke.color = phi_color;
-                                            v.widgets.active.fg_stroke.color = phi_color;
-                                            v.override_text_color = Some(phi_color);
-                                            if ui
-                                                .add(
-                                                    egui::DragValue::new(&mut deg)
-                                                        .speed(0.0)
-                                                        .suffix("°")
-                                                        .range(-720.0..=720.0),
-                                                )
-                                                .on_hover_text("Click to type a new angle")
-                                                .changed()
-                                            {
-                                                *phi = deg.to_radians();
-                                            }
-                                        });
-                                        ui.monospace("·");
-                                    }
-                                    // Bivector body: literal math notation
-                                    // — parens only when there are 2+
-                                    // planes. Each plane is its own drag
-                                    // source for cross-term migration.
-                                    let n_planes = self.seq[term_idx].planes.len();
-                                    let need_parens = n_planes > 1;
-                                    if need_parens {
-                                        ui.monospace("(");
-                                    }
-                                    for plane_idx in 0..n_planes {
-                                        if plane_idx > 0 {
-                                            ui.monospace("+");
+                    // Term card: Frame is INSIDE the drag source so
+                    // the entire card (background + stroke + math
+                    // expression) follows the cursor as the tooltip
+                    // when dragged. Drop detection for cross-term
+                    // plane migration (`DragPayload::Entry`) is done
+                    // manually on the card's rect — `dnd_drop_zone`
+                    // would have to wrap the source, which forces
+                    // the frame outside the source body.
+                    let card_resp = dnd_drag_source_collapsing(
+                        ui,
+                        card_id,
+                        DragPayload::Term(term_idx),
+                        egui::vec2(72.0, term_h),
+                        |ui| {
+                            if ui.ctx().is_being_dragged(card_id) {
+                                force_opaque_active(ui);
+                            }
+                            egui::Frame::default()
+                                .fill(ui.visuals().widgets.noninteractive.bg_fill)
+                                .stroke(stroke)
+                                .inner_margin(3.0)
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let term = &mut self.seq[term_idx];
+                                        if let Some(phi) = term.scalar.as_mut() {
+                                            let mut deg = phi.to_degrees();
+                                            let phi_color = egui::Color32::from_rgb(255, 150, 150);
+                                            ui.scope(|ui| {
+                                                let v = ui.visuals_mut();
+                                                v.widgets.inactive.fg_stroke.color = phi_color;
+                                                v.widgets.hovered.fg_stroke.color = phi_color;
+                                                v.widgets.active.fg_stroke.color = phi_color;
+                                                v.override_text_color = Some(phi_color);
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(&mut deg)
+                                                            .speed(0.0)
+                                                            .suffix("°")
+                                                            .range(-720.0..=720.0),
+                                                    )
+                                                    .on_hover_text("Click to type a new angle")
+                                                    .changed()
+                                                {
+                                                    *phi = deg.to_radians();
+                                                }
+                                            });
+                                            ui.monospace("·");
                                         }
-                                        let pill_id = ui.make_persistent_id((
-                                            "plane-pill",
-                                            term_idx,
-                                            plane_idx,
-                                        ));
-                                        let plane_label =
-                                            self.seq[term_idx].planes[plane_idx].label();
-                                        ui.dnd_drag_source(
-                                            pill_id,
-                                            DragPayload::Entry(term_idx, plane_idx),
-                                            |ui| {
-                                                ui.monospace(plane_label);
-                                            },
-                                        )
-                                        .response
-                                        .on_hover_cursor(egui::CursorIcon::Grab);
-                                    }
-                                    if need_parens {
-                                        ui.monospace(")");
-                                    }
+                                        let n_planes = self.seq[term_idx].planes.len();
+                                        let need_parens = n_planes > 1;
+                                        if need_parens {
+                                            ui.monospace("(");
+                                        }
+                                        for plane_idx in 0..n_planes {
+                                            if plane_idx > 0 {
+                                                ui.monospace("+");
+                                            }
+                                            let pill_id = ui.make_persistent_id((
+                                                "plane-pill",
+                                                term_idx,
+                                                plane_idx,
+                                            ));
+                                            let plane_label =
+                                                self.seq[term_idx].planes[plane_idx].label();
+                                            ui.dnd_drag_source(
+                                                pill_id,
+                                                DragPayload::Entry(term_idx, plane_idx),
+                                                |ui| {
+                                                    ui.monospace(plane_label);
+                                                },
+                                            )
+                                            .response
+                                            .on_hover_cursor(egui::CursorIcon::Grab);
+                                        }
+                                        if need_parens {
+                                            ui.monospace(")");
+                                        }
+                                    });
                                 });
-                            });
-                        // Right-click context menu on the term body. Hosts
-                        // delete + scalar add/remove so neither needs a
-                        // visible button cluttering the math expression.
-                        // `Sense::click()` is required for context_menu
-                        // to fire — the drag-source response is hover-
-                        // only by default.
-                        let has_scalar = self.seq[term_idx].scalar.is_some();
-                        let menu_resp = drag_resp.response.interact(egui::Sense::click());
-                        menu_resp.context_menu(|ui| {
-                            if ui
-                                .button(if has_scalar {
-                                    "Remove scalar (φ)"
-                                } else {
-                                    "Add scalar (φ = 90°)"
-                                })
-                                .clicked()
+                        },
+                    );
+                    // Manual Entry drop detection on the card's rect.
+                    // Skipped for the dragged card itself (its
+                    // response rect is the placeholder, not the
+                    // card body — and dropping a plane onto your own
+                    // term is a no-op anyway).
+                    let is_self_dragged = ui.ctx().is_being_dragged(card_id);
+                    if !is_self_dragged {
+                        let card_rect = card_resp.rect;
+                        let dragging_entry = matches!(
+                            egui::DragAndDrop::payload::<DragPayload>(ui.ctx()).as_deref(),
+                            Some(DragPayload::Entry(_, _))
+                        );
+                        let cursor = ui.ctx().input(|i| i.pointer.hover_pos());
+                        let hovered =
+                            dragging_entry && cursor.is_some_and(|p| card_rect.contains(p));
+                        if hovered && ui.ctx().input(|i| i.pointer.any_released()) {
+                            if let Some(arc) =
+                                egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx())
                             {
-                                if has_scalar {
-                                    remove_scalar = Some(term_idx);
-                                } else {
-                                    add_scalar = Some(term_idx);
+                                if let DragPayload::Entry(from_t, idx) = *arc {
+                                    if from_t != term_idx {
+                                        entry_moves.push((from_t, idx, term_idx));
+                                    }
                                 }
-                                ui.close_kind(egui::UiKind::Menu);
                             }
-                            ui.separator();
-                            if ui.button("Delete term").clicked() {
-                                remove_term = Some(term_idx);
-                                ui.close_kind(egui::UiKind::Menu);
-                            }
-                        });
-                    });
-                    if let Some(p) = payload {
-                        match *p {
-                            DragPayload::Term(from) if from != term_idx => {
-                                term_moves.push((from, term_idx));
-                            }
-                            DragPayload::Entry(from_t, idx) if from_t != term_idx => {
-                                entry_moves.push((from_t, idx, term_idx));
-                            }
-                            _ => {}
                         }
                     }
+                    let has_scalar = self.seq[term_idx].scalar.is_some();
+                    let menu_resp = card_resp.interact(egui::Sense::click());
+                    menu_resp.context_menu(|ui| {
+                        if ui
+                            .button(if has_scalar {
+                                "Remove scalar (φ)"
+                            } else {
+                                "Add scalar (φ = 90°)"
+                            })
+                            .clicked()
+                        {
+                            if has_scalar {
+                                remove_scalar = Some(term_idx);
+                            } else {
+                                add_scalar = Some(term_idx);
+                            }
+                            ui.close_kind(egui::UiKind::Menu);
+                        }
+                        ui.separator();
+                        if ui.button("Delete term").clicked() {
+                            remove_term = Some(term_idx);
+                            ui.close_kind(egui::UiKind::Menu);
+                        }
+                    });
                 }
                 // Trailing insertion gap: drop after the last term.
                 let trailing_id = ui.make_persistent_id(("term-gap", self.seq.len()));
@@ -1276,6 +1343,18 @@ impl PolytopeSmokeApp {
                         if let DragPayload::Term(from) = *arc {
                             term_moves.push((from, self.seq.len()));
                         }
+                    }
+                }
+                // Reset per-index term animation state when a
+                // mutation will fire — same reasoning as the
+                // shape-row reset: ids resolve correctly only
+                // inside this ui scope.
+                if !term_moves.is_empty() || !entry_moves.is_empty() || remove_term.is_some() {
+                    let ctx = ui.ctx();
+                    for i in 0..32 {
+                        let card_id = ui.make_persistent_id(("term-card", i));
+                        let _ = ctx.animate_value_with_time(card_id.with("pickup"), 0.0, 0.0);
+                        let _ = ctx.animate_value_with_time(card_id.with("collapse"), 1.0, 0.0);
                     }
                 }
             });
@@ -1391,13 +1470,21 @@ impl PolytopeSmokeApp {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         for (i, entry) in self.row.iter().enumerate() {
                             // Animated insertion gap before card i.
+                            // `ui.make_persistent_id` (NOT `Id::new`)
+                            // is load-bearing: `BottomOverlay` runs
+                            // its content closure twice per frame
+                            // (measure pass off-screen + visible
+                            // pass), and same-id-in-different-layer
+                            // breaks egui's hit-testing. Per-pass
+                            // ui scope makes the same source resolve
+                            // to different ids between passes.
                             let gap_id = ui.make_persistent_id(("shape-gap", i));
                             if make_room_gap(
                                 ui,
                                 drop_idx == Some(i),
                                 gap_id,
                                 row_h,
-                                SHAPE_CARD_WIDTH + 16.0,
+                                SHAPE_CARD_WIDTH + 8.0,
                             ) {
                                 if let Some(arc) =
                                     egui::DragAndDrop::take_payload::<usize>(ui.ctx())
@@ -1423,33 +1510,39 @@ impl PolytopeSmokeApp {
                             };
                             let stroke = egui::Stroke::new(1.0 + pickup_t * 1.5, stroke_color);
                             let card_id = drag_id;
-                            let drag_resp = ui.dnd_drag_source(card_id, i, |ui| {
-                                if ui.ctx().is_being_dragged(card_id) {
-                                    force_opaque_active(ui);
-                                }
-                                egui::Frame::default()
-                                    .fill(card_fill)
-                                    .stroke(stroke)
-                                    .inner_margin(egui::Margin::symmetric(4, 6))
-                                    .corner_radius(egui::CornerRadius::same(3))
-                                    .show(ui, |ui| {
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(SHAPE_CARD_WIDTH, 0.0),
-                                            egui::Layout::top_down(egui::Align::Center),
-                                            |ui| {
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(entry.label).strong(),
-                                                    )
-                                                    .selectable(false)
-                                                    .wrap_mode(egui::TextWrapMode::Extend),
-                                                );
-                                            },
-                                        );
-                                    });
-                            });
+                            let drag_resp = dnd_drag_source_collapsing(
+                                ui,
+                                card_id,
+                                i,
+                                egui::vec2(SHAPE_CARD_WIDTH + 8.0, row_h),
+                                |ui| {
+                                    if ui.ctx().is_being_dragged(card_id) {
+                                        force_opaque_active(ui);
+                                    }
+                                    egui::Frame::default()
+                                        .fill(card_fill)
+                                        .stroke(stroke)
+                                        .inner_margin(egui::Margin::symmetric(4, 6))
+                                        .corner_radius(egui::CornerRadius::same(3))
+                                        .show(ui, |ui| {
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(SHAPE_CARD_WIDTH, 0.0),
+                                                egui::Layout::top_down(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(entry.label)
+                                                                .strong(),
+                                                        )
+                                                        .selectable(false)
+                                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                },
+                            );
                             drag_resp
-                                .response
                                 .on_hover_cursor(egui::CursorIcon::Grab)
                                 .on_hover_text(entry.long_name)
                                 .interact(egui::Sense::click())
@@ -1496,6 +1589,26 @@ impl PolytopeSmokeApp {
                                     }
                                 }
                             });
+                        }
+                        // Per-index animation state is keyed by ids
+                        // resolved against THIS ui's scope. After a
+                        // reorder, the cards now sitting at the old
+                        // indices would otherwise inherit the
+                        // previous occupants' `pickup_t = 1.0` and
+                        // ghost-fade. Snap defaults here, while the
+                        // ui scope still resolves to the same ids
+                        // we used during rendering — outside this
+                        // closure, `ui.make_persistent_id(...)`
+                        // would resolve to *different* ids.
+                        if !shape_moves.is_empty() || remove_idx.is_some() {
+                            let ctx = ui.ctx();
+                            for i in 0..=MAX_ROW_LEN {
+                                let card_id = ui.make_persistent_id(("shape-card", i));
+                                let _ =
+                                    ctx.animate_value_with_time(card_id.with("pickup"), 0.0, 0.0);
+                                let _ =
+                                    ctx.animate_value_with_time(card_id.with("collapse"), 1.0, 0.0);
+                            }
                         }
                     });
                 row_response.response.rect
@@ -1848,47 +1961,60 @@ impl PolytopeSmokeApp {
     /// composed sequence (each term parenthesized when it's a sum).
     /// Empty string when nothing is contributing.
     fn formula_string(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        let active_planes: Vec<&'static str> = PLANES
-            .iter()
-            .zip(self.active.iter())
-            .filter(|(_, on)| **on)
-            .map(|(p, _)| p.label())
-            .collect();
-        if !active_planes.is_empty() {
-            let bivec = if active_planes.len() == 1 {
-                active_planes[0].to_string()
-            } else {
-                format!("({})", active_planes.join(" + "))
-            };
-            parts.push(format!(
-                "exp({} · {:.2}·t)",
-                bivec,
-                self.rate_scale * BASE_ROTATION_RATE / std::f32::consts::TAU
-            ));
-        }
-        for term in &self.seq {
-            if term.planes.is_empty() {
-                continue;
+        // The rotation source is exclusive — only one mode drives
+        // the spin at a time. The formula popup must reflect THAT
+        // mode's expression, not concatenate both, otherwise the
+        // user reads it as "we're applying both" when in fact the
+        // off-mode's terms aren't contributing to omega.
+        match self.rotation_mode {
+            RotationMode::Active => {
+                let active_planes: Vec<&'static str> = PLANES
+                    .iter()
+                    .zip(self.active.iter())
+                    .filter(|(_, on)| **on)
+                    .map(|(p, _)| p.label())
+                    .collect();
+                if active_planes.is_empty() {
+                    return String::new();
+                }
+                let bivec = if active_planes.len() == 1 {
+                    active_planes[0].to_string()
+                } else {
+                    format!("({})", active_planes.join(" + "))
+                };
+                format!(
+                    "exp({} · {:.2}·t)",
+                    bivec,
+                    self.rate_scale * BASE_ROTATION_RATE / std::f32::consts::TAU
+                )
             }
-            let plane_str = term
-                .planes
-                .iter()
-                .map(|p| p.label())
-                .collect::<Vec<_>>()
-                .join(" + ");
-            let bivec = if term.planes.len() > 1 {
-                format!("({plane_str})")
-            } else {
-                plane_str
-            };
-            let body = match term.scalar {
-                Some(phi) => format!("{:.0}° · {}", phi.to_degrees(), bivec),
-                None => bivec,
-            };
-            parts.push(format!("exp({body})"));
+            RotationMode::Composer => {
+                let parts: Vec<String> = self
+                    .seq
+                    .iter()
+                    .filter(|t| !t.planes.is_empty())
+                    .map(|term| {
+                        let plane_str = term
+                            .planes
+                            .iter()
+                            .map(|p| p.label())
+                            .collect::<Vec<_>>()
+                            .join(" + ");
+                        let bivec = if term.planes.len() > 1 {
+                            format!("({plane_str})")
+                        } else {
+                            plane_str
+                        };
+                        let body = match term.scalar {
+                            Some(phi) => format!("{:.0}° · {}", phi.to_degrees(), bivec),
+                            None => bivec,
+                        };
+                        format!("exp({body})")
+                    })
+                    .collect();
+                parts.join(" · ")
+            }
         }
-        parts.join(" · ")
     }
 
     /// Full reset: pause spin, slice, rate, active set, orientation,
@@ -2096,7 +2222,15 @@ impl App for PolytopeSmokeApp {
         // section.
         if self.show_formula {
             let formula = self.formula_string();
-            let name = combo_name(&self.active);
+            // Combo name ("isoclinic xw+yz" etc.) is an Active-mode
+            // label — it describes the active-set bivector, not the
+            // composer's seq. Suppress it in Composer mode so the
+            // popup reads as the seq's expression alone.
+            let name = if self.rotation_mode == RotationMode::Active {
+                combo_name(&self.active)
+            } else {
+                None
+            };
             if !formula.is_empty() || name.is_some() {
                 egui::Area::new(egui::Id::new("polytope-smoke-formula"))
                     .anchor(egui::Align2::RIGHT_TOP, [-16.0, 16.0])
@@ -2358,5 +2492,340 @@ mod alignment_tests {
         let rects = capture_row_rects(&row);
         assert_cards_h_uniform(&rects, "default + 120-cell + 600-cell");
         assert_top_aligned(&rects, "default + 120-cell + 600-cell");
+    }
+}
+
+/// Drag-and-drop regression tests for `dnd_drag_source_collapsing`.
+/// The headless `egui::Context::run` driver lets us simulate a
+/// pointer press + drag-past-threshold and assert the helper's
+/// drag detection still wakes up. Two prior regressions this guards
+/// against:
+///   1. Switching the drag id from `ui.make_persistent_id` to
+///      `egui::Id::new` accidentally broke detection (this exists
+///      to verify the helper works with both kinds of id).
+///   2. Wrapping the body in a `Frame` (so the whole card follows
+///      the cursor) must not eat the drag's hit-test rect — the
+///      drag rect is the body's rect, which equals the Frame's
+///      outer rect after `Frame::show`.
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+
+    fn screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0))
+    }
+
+    /// Egui's drag detection uses `time - press_start_time` against
+    /// `Options::max_click_duration`. Without advancing `time`
+    /// between frames, every press is "still within click window"
+    /// and `is_decidedly_dragging` returns false, even with
+    /// movement. We thread a monotonic clock so each frame's input
+    /// has `time = N * 50ms` — well past the default click duration.
+    fn pointer_press(time: f64, pos: egui::Pos2) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(screen());
+        input.time = Some(time);
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input
+    }
+
+    fn pointer_move(time: f64, pos: egui::Pos2) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(screen());
+        input.time = Some(time);
+        input.events.push(egui::Event::PointerMoved(pos));
+        input
+    }
+
+    fn warmup_input(time: f64) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(screen());
+        input.time = Some(time);
+        input
+    }
+
+    /// Simulate "click on card, then drag past the drag threshold"
+    /// against `dnd_drag_source_collapsing` and assert that
+    /// `ctx.is_being_dragged(id)` becomes true. Press alone is not
+    /// enough; egui requires movement past `start_drag_threshold`
+    /// (~6 px) before flipping the drag flag.
+    fn drive_drag(id: egui::Id) -> egui::Context {
+        let ctx = egui::Context::default();
+        let card_pos = egui::pos2(60.0, 30.0);
+        let render = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ =
+                    dnd_drag_source_collapsing(ui, id, 42_usize, egui::vec2(80.0, 30.0), |ui| {
+                        egui::Frame::default()
+                            .fill(egui::Color32::DARK_GRAY)
+                            .inner_margin(egui::Margin::symmetric(4, 6))
+                            .show(ui, |ui| {
+                                ui.allocate_exact_size(
+                                    egui::vec2(80.0, 18.0),
+                                    egui::Sense::hover(),
+                                );
+                            });
+                    });
+            });
+        };
+        let _ = ctx.run(warmup_input(0.0), render);
+        let _ = ctx.run(pointer_press(0.05, card_pos), render);
+        let _ = ctx.run(pointer_move(0.10, card_pos + egui::vec2(20.0, 0.0)), render);
+        let _ = ctx.run(pointer_move(0.15, card_pos + egui::vec2(40.0, 0.0)), render);
+        ctx
+    }
+
+    /// Baseline: stock `Ui::dnd_drag_source` must start a drag with
+    /// our test driver. If THIS fails, the test driver is wrong (not
+    /// the helper); the helper-specific tests below are then
+    /// meaningless until the driver is fixed.
+    #[test]
+    fn baseline_stock_dnd_drag_source_starts_drag() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("baseline-test");
+        let mut last_rect = egui::Rect::NOTHING;
+        let render = |ctx: &egui::Context, last_rect: &mut egui::Rect| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let resp = ui.dnd_drag_source(id, 1_usize, |ui| {
+                    egui::Frame::default()
+                        .fill(egui::Color32::DARK_GRAY)
+                        .inner_margin(egui::Margin::symmetric(4, 6))
+                        .show(ui, |ui| {
+                            ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
+                        });
+                });
+                *last_rect = resp.response.rect;
+            });
+        };
+        let card_pos = egui::pos2(60.0, 30.0);
+        let _ = ctx.run(warmup_input(0.0), |c| render(c, &mut last_rect));
+        let _ = ctx.run(pointer_press(0.05, card_pos), |c| render(c, &mut last_rect));
+        let _ = ctx.run(pointer_move(0.10, card_pos + egui::vec2(20.0, 0.0)), |c| {
+            render(c, &mut last_rect)
+        });
+        let _ = ctx.run(pointer_move(0.15, card_pos + egui::vec2(40.0, 0.0)), |c| {
+            render(c, &mut last_rect)
+        });
+        assert!(
+            ctx.is_being_dragged(id),
+            "stock dnd_drag_source should detect drag with this driver"
+        );
+    }
+
+    /// `egui::Id::new(...)` keys must drive `dnd_drag_source_collapsing`
+    /// just as well as `ui.make_persistent_id`. The regression that
+    /// motivated this test: shape and term cards stopped responding
+    /// to drags after a refactor that switched their drag ids to
+    /// `Id::new` for stable per-row-index keys.
+    #[test]
+    fn id_new_starts_drag() {
+        let id = egui::Id::new(("polytope-smoke-shape-card-test", 0_usize));
+        let ctx = drive_drag(id);
+        assert!(
+            ctx.is_being_dragged(id),
+            "drag should be active after press + move past threshold; \
+             dnd_drag_source_collapsing failed to wire up the drag rect"
+        );
+        assert!(
+            egui::DragAndDrop::has_payload_of_type::<usize>(&ctx),
+            "drag payload should be set after drag starts"
+        );
+    }
+
+    /// Regression test for the bug the user hit: drag-source ids
+    /// keyed by `egui::Id::new(...)` (i.e., NOT scoped to the
+    /// rendering ui) collide across `BottomOverlay`'s two passes
+    /// and silently break drag detection in release / panic the
+    /// `debug_assert!` in debug. The production fix is to derive
+    /// the drag id from the per-pass ui scope via
+    /// `ui.make_persistent_id(...)` so the two passes see
+    /// distinct ids.
+    ///
+    /// We can't directly test drag detection inside Areas in
+    /// headless `Context::run` (Area-routed input doesn't seem to
+    /// reach the interaction step the same way it does in a real
+    /// winit-driven loop). Instead we verify that:
+    /// 1. Rendering the same source closure in two `Area`s with
+    ///    different layers does NOT trigger the debug-assert when
+    ///    ids are scoped per-ui (`make_persistent_id`).
+    /// 2. The IDs actually ARE distinct between the two passes.
+    /// The first part — running this test without panic in debug
+    /// — is what catches a regression to globally-stable ids.
+    #[test]
+    fn make_persistent_id_per_pass_avoids_layer_collision() {
+        let ctx = egui::Context::default();
+        let mut measure_id: Option<egui::Id> = None;
+        let mut visible_id: Option<egui::Id> = None;
+        let render = |ctx: &egui::Context,
+                      measure_id: &mut Option<egui::Id>,
+                      visible_id: &mut Option<egui::Id>| {
+            let _ = egui::Area::new(egui::Id::new("measure"))
+                .order(egui::Order::Background)
+                .interactable(false)
+                .fixed_pos(egui::pos2(-99_999.0, -99_999.0))
+                .show(ctx, |ui| {
+                    ui.set_invisible();
+                    let id = ui.make_persistent_id("test-card");
+                    *measure_id = Some(id);
+                    let _ = ui.dnd_drag_source(id, 7_usize, |ui| {
+                        ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
+                    });
+                });
+            let _ = egui::Area::new(egui::Id::new("visible"))
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .movable(false)
+                .show(ctx, |ui| {
+                    let id = ui.make_persistent_id("test-card");
+                    *visible_id = Some(id);
+                    let _ = ui.dnd_drag_source(id, 7_usize, |ui| {
+                        ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
+                    });
+                });
+        };
+        // Render without panicking. If a future change reverts to
+        // `egui::Id::new(...)` for the drag id, both passes resolve
+        // to the same id, the same id ends up in two layers, and
+        // egui's `debug_assert!` panics here.
+        let _ = ctx.run(warmup_input(0.0), |c| {
+            render(c, &mut measure_id, &mut visible_id)
+        });
+        let _ = ctx.run(warmup_input(0.05), |c| {
+            render(c, &mut measure_id, &mut visible_id)
+        });
+        let measure_id = measure_id.expect("measure ran");
+        let visible_id = visible_id.expect("visible ran");
+        assert_ne!(
+            measure_id, visible_id,
+            "ui.make_persistent_id resolves through per-ui scope, so the same \
+             source must produce different ids in measure vs visible passes; \
+             if these ids ever match, the next regression is the debug_assert \
+             in egui's WidgetRects::insert"
+        );
+    }
+
+    /// Regression test for the "card snaps to the right for a frame"
+    /// bug: the make-room gap's `open_width` must match the rendered
+    /// card slot's outer width (the Frame's outer rect, not the
+    /// inner content), otherwise dropping a card causes a one-frame
+    /// horizontal layout shift as the gap closes and the card
+    /// occupies a slightly-different-sized slot.
+    #[test]
+    fn shape_gap_open_width_matches_card_slot_width() {
+        let ctx = egui::Context::default();
+        let mut card_outer_w = 0.0_f32;
+        let _ = ctx.run(warmup_input(0.0), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let resp = egui::Frame::default()
+                    .fill(egui::Color32::DARK_GRAY)
+                    .inner_margin(egui::Margin::symmetric(4, 6))
+                    .corner_radius(egui::CornerRadius::same(3))
+                    .show(ui, |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(SHAPE_CARD_WIDTH, 0.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new("test").strong())
+                                        .selectable(false)
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                );
+                            },
+                        );
+                    });
+                card_outer_w = resp.response.rect.width();
+            });
+        });
+        let gap_open_width = SHAPE_CARD_WIDTH + 8.0;
+        let drift = (gap_open_width - card_outer_w).abs();
+        assert!(
+            drift < 1.0,
+            "make-room gap open width ({gap_open_width:.1}) must match the \
+             rendered shape card outer width ({card_outer_w:.1}); a mismatch \
+             produces a one-frame horizontal rubberband when the gap closes \
+             and the card takes its slot. drift = {drift:.1} pt"
+        );
+    }
+
+    /// Same regression check applied to `dnd_drag_source_collapsing`:
+    /// the helper must round-trip through a content closure that
+    /// runs in two egui layers without producing a same-id-in-two-
+    /// layers panic.
+    #[test]
+    fn collapsing_helper_in_two_pass_no_layer_collision() {
+        let ctx = egui::Context::default();
+        let render = |ctx: &egui::Context| {
+            let _ = egui::Area::new(egui::Id::new("measure"))
+                .order(egui::Order::Background)
+                .interactable(false)
+                .fixed_pos(egui::pos2(-99_999.0, -99_999.0))
+                .show(ctx, |ui| {
+                    ui.set_invisible();
+                    let id = ui.make_persistent_id("test-card");
+                    let _ =
+                        dnd_drag_source_collapsing(ui, id, 7_usize, egui::vec2(80.0, 30.0), |ui| {
+                            ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
+                        });
+                });
+            let _ = egui::Area::new(egui::Id::new("visible"))
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .movable(false)
+                .show(ctx, |ui| {
+                    let id = ui.make_persistent_id("test-card");
+                    let _ =
+                        dnd_drag_source_collapsing(ui, id, 7_usize, egui::vec2(80.0, 30.0), |ui| {
+                            ui.allocate_exact_size(egui::vec2(80.0, 18.0), egui::Sense::hover());
+                        });
+                });
+        };
+        let _ = ctx.run(warmup_input(0.0), render);
+        let _ = ctx.run(warmup_input(0.05), render);
+    }
+
+    /// `ui.make_persistent_id(...)` keys must also work — protect
+    /// against a future regression that hard-codes one id flavour.
+    #[test]
+    fn make_persistent_id_starts_drag() {
+        let ctx = egui::Context::default();
+        let render = |ctx: &egui::Context, captured_id: &mut Option<egui::Id>| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let id = ui.make_persistent_id(("test-card", 0_usize));
+                *captured_id = Some(id);
+                let _ =
+                    dnd_drag_source_collapsing(ui, id, 99_usize, egui::vec2(80.0, 30.0), |ui| {
+                        egui::Frame::default()
+                            .fill(egui::Color32::DARK_GRAY)
+                            .inner_margin(egui::Margin::symmetric(4, 6))
+                            .show(ui, |ui| {
+                                ui.allocate_exact_size(
+                                    egui::vec2(80.0, 18.0),
+                                    egui::Sense::hover(),
+                                );
+                            });
+                    });
+            });
+        };
+        let card_pos = egui::pos2(60.0, 30.0);
+        let mut id = None;
+        let _ = ctx.run(warmup_input(0.0), |ctx| render(ctx, &mut id));
+        let _ = ctx.run(pointer_press(0.05, card_pos), |ctx| render(ctx, &mut id));
+        let _ = ctx.run(
+            pointer_move(0.10, card_pos + egui::vec2(20.0, 0.0)),
+            |ctx| render(ctx, &mut id),
+        );
+        let _ = ctx.run(
+            pointer_move(0.15, card_pos + egui::vec2(40.0, 0.0)),
+            |ctx| render(ctx, &mut id),
+        );
+        let id = id.expect("captured id");
+        assert!(
+            ctx.is_being_dragged(id),
+            "drag should be active for make_persistent_id keys too"
+        );
     }
 }
