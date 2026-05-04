@@ -889,6 +889,74 @@ impl Hyperslice4DNode {
         rd.queue.submit(Some(encoder.finish()));
         Ok(())
     }
+
+    /// Render a "strip" of N independent slices into one texture,
+    /// each cell at a different `w_slice` value. Useful for the
+    /// multi-slice filmstrip view of a 4D shape: a row of N
+    /// thumbnails at evenly-spaced `w` shows the whole 4D extent
+    /// without scrubbing.
+    ///
+    /// Each cell gets its own pass with `LoadOp::Load` (except the
+    /// first, which clears) so the underlying texture is built up
+    /// cell-by-cell. The uniform buffer is rewritten per cell to
+    /// switch `w_slice` and `resolution`; callers must NOT rely on
+    /// `self.uniforms()` to reflect the post-call state — the last
+    /// cell's `w_slice` is what's left in the buffer.
+    ///
+    /// Cells where `viewport.width == 0` are skipped (degenerate
+    /// strip layouts when the available area is narrower than the
+    /// requested cell count).
+    pub fn execute_strip(
+        &mut self,
+        rd: &RenderDevice,
+        view: &wgpu::TextureView,
+        cells: &[(crate::Viewport, f32)],
+    ) -> Result<()> {
+        for (cell_idx, (viewport, w_slice)) in cells.iter().enumerate() {
+            if viewport.width == 0 || viewport.height == 0 {
+                continue;
+            }
+            // Update per-cell uniforms: w_slice + the resolution
+            // for this cell so the kernel's UV math (camera aspect,
+            // viewport-origin subtraction) lands inside the cell.
+            self.uniforms_mut().w_slice = *w_slice;
+            self.uniforms_mut().resolution = viewport.resolution_f32();
+            self.uniforms_mut().viewport_origin = [viewport.x as f32, viewport.y as f32];
+            self.flush_uniforms(&rd.queue);
+
+            let load = if cell_idx == 0 {
+                LoadOp::Clear(self.clear_color)
+            } else {
+                LoadOp::Load
+            };
+            let mut encoder = rd.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("hyperslice4d strip cell encoder"),
+            });
+            {
+                let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("hyperslice4d strip cell pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations {
+                            load,
+                            store: StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                viewport.apply(&mut rp);
+                rp.set_pipeline(&self.pipeline);
+                rp.set_bind_group(0, &self.bind_group, &[]);
+                rp.draw(0..3, 0..1);
+            }
+            rd.queue.submit(Some(encoder.finish()));
+        }
+        Ok(())
+    }
 }
 
 impl RenderNode for Hyperslice4DNode {
