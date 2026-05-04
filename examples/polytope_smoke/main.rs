@@ -61,7 +61,10 @@
 
 use anyhow::{anyhow, Result};
 use glam::{Vec3, Vec4};
-use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use rye_app::{
+    egui, run_with_config, App, BottomOverlay, Camera, FrameCtx, OrbitController, RunConfig,
+    SetupCtx,
+};
 use rye_math::{Bivector, Bivector4, EuclideanR3, Rotor4};
 use rye_render::{
     device::RenderDevice,
@@ -80,11 +83,24 @@ use winit::window::WindowAttributes;
 /// `MAX_BODIES` (32) at startup.
 const MAX_ROW_LEN: usize = 8;
 
-/// Width in pixels of the egui side panel; used to compute the
-/// scene viewport so the polytope render fills only the area to
-/// the right of the panel. Must match the `default_width` passed
-/// to `egui::SidePanel::left` below.
-const PANEL_WIDTH: u32 = 300;
+/// Uniform width for shape cards in the row. Wide enough to fit
+/// the longest label ("120-cell" / "600-cell") in bold without the
+/// label wrapping — wrapping would make those cards taller than
+/// the others, which egui's horizontal cross-alignment then turns
+/// into a descending staircase as the row's running max-height
+/// grows past earlier (now lower-aligned) cards. Labels also use
+/// `WrapMode::Extend` as a belt-and-suspenders check.
+const SHAPE_CARD_WIDTH: f32 = 64.0;
+
+/// Unified height for every interactive widget in the bottom
+/// overlay: rate / play / chevron / + / ↻ buttons, drop pipes, and
+/// shape cards (via their Frame's inner_margin). Sized to match
+/// the cards' natural rendered height — strong-styled body text in
+/// egui's default font measures ~17 pt, plus the cards' 6-pt
+/// vertical inner_margin = 29 pt. Keeping all controls at this
+/// same height removes the height mismatch that previously made
+/// the + button appear higher than the cards.
+const CONTROL_H: f32 = 29.0;
 
 const W_SCRUB_RATE: f32 = 0.5;
 const W_RANGE: f32 = 1.5;
@@ -106,37 +122,48 @@ const BODY_SIZE: f32 = 0.7;
 const BODY_Y: f32 = 0.9;
 
 /// One polytope's metadata: shape index in the kernel's table,
-/// per-body color, display label (used in the overlay).
+/// per-body color, short display label, and long mathematical name
+/// shown in card tooltips. The long name uses the
+/// `pentatope` / `tesseract` / `hexadecachoron` family — the
+/// `*-plex` aliases (pentaplex, dodecaplex, ...) are deliberately
+/// avoided since "plex" is dimension-generalized rather than
+/// being the actual 4D name.
 #[derive(Copy, Clone)]
 struct ShapeEntry {
     shape: u32,
     color: [f32; 3],
     label: &'static str,
+    long_name: &'static str,
 }
 
-/// Default row when no `--shapes` argument is given. The four
-/// non-H4 polytopes; pass `--shapes 120-cell 600-cell` to render
-/// the H4 pair instead.
+/// Default row when no `--shapes` argument is given. Ordered to put
+/// the 24-cell first (most "4D-distinct" cross-section), then the
+/// pentatope / 16-cell / tesseract triple — visually contrasting
+/// shapes left-to-right.
 const DEFAULT_ROW: &[ShapeEntry] = &[
+    ShapeEntry {
+        shape: SHAPE_24CELL,
+        color: [0.95, 0.45, 0.85],
+        label: "24-cell",
+        long_name: "icositetrachoron",
+    },
     ShapeEntry {
         shape: SHAPE_PENTATOPE,
         color: [0.95, 0.55, 0.30],
         label: "5-cell",
-    },
-    ShapeEntry {
-        shape: SHAPE_TESSERACT,
-        color: [0.30, 0.55, 0.95],
-        label: "8-cell",
+        long_name: "pentatope",
     },
     ShapeEntry {
         shape: SHAPE_16CELL,
         color: [0.55, 0.95, 0.40],
         label: "16-cell",
+        long_name: "hexadecachoron",
     },
     ShapeEntry {
-        shape: SHAPE_24CELL,
-        color: [0.95, 0.45, 0.85],
-        label: "24-cell",
+        shape: SHAPE_TESSERACT,
+        color: [0.30, 0.55, 0.95],
+        label: "8-cell",
+        long_name: "tesseract",
     },
 ];
 
@@ -150,31 +177,37 @@ fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
             shape: SHAPE_PENTATOPE,
             color: [0.95, 0.55, 0.30],
             label: "5-cell",
+            long_name: "pentatope",
         },
         "8-cell" | "8cell" | "tesseract" | "hypercube" | "cube" => ShapeEntry {
             shape: SHAPE_TESSERACT,
             color: [0.30, 0.55, 0.95],
             label: "8-cell",
+            long_name: "tesseract",
         },
         "16-cell" | "16cell" | "hexadecachoron" | "octahedron" => ShapeEntry {
             shape: SHAPE_16CELL,
             color: [0.55, 0.95, 0.40],
             label: "16-cell",
+            long_name: "hexadecachoron",
         },
         "24-cell" | "24cell" | "icositetrachoron" | "cuboctahedron" => ShapeEntry {
             shape: SHAPE_24CELL,
             color: [0.95, 0.45, 0.85],
             label: "24-cell",
+            long_name: "icositetrachoron",
         },
         "120-cell" | "120cell" | "hecatonicosachoron" | "dodecahedron" => ShapeEntry {
             shape: SHAPE_120CELL,
             color: [0.40, 0.85, 0.85],
             label: "120-cell",
+            long_name: "hecatonicosachoron",
         },
         "600-cell" | "600cell" | "hexacosichoron" | "icosahedron" => ShapeEntry {
             shape: SHAPE_600CELL,
             color: [0.95, 0.85, 0.40],
             label: "600-cell",
+            long_name: "hexacosichoron",
         },
         _ => {
             return Err(anyhow!(
@@ -281,6 +314,22 @@ fn angular_velocity(active: &[bool; 6], rate_scale: f32) -> Bivector4 {
     omega * (BASE_ROTATION_RATE * rate_scale)
 }
 
+/// Angular velocity from a composed seq: sum over terms of
+/// `scalar * sum_of_unit_bivectors_in_term`, scaled by rate_scale.
+/// Bivector addition is commutative, so term order is irrelevant
+/// in this continuous mode (it matters for the multiplicative
+/// `Apply` action, but that's a separate one-shot path).
+fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> Bivector4 {
+    let mut omega = Bivector4::ZERO;
+    for term in seq {
+        let phi = term.scalar.unwrap_or(1.0);
+        for plane in &term.planes {
+            omega = omega + plane.unit_bivector() * phi;
+        }
+    }
+    omega * (BASE_ROTATION_RATE * rate_scale)
+}
+
 /// Name a recognizable combination of active planes. Indices match
 /// `PLANES`: `0=xy 1=xz 2=xw 3=yz 4=yw 5=zw`. Order-independent,
 /// only the active *set* matters.
@@ -374,43 +423,514 @@ struct PolytopeSmokeApp {
     /// periodicities in compound-bivector animations.
     rot_time: f32,
 
-    /// Whether the egui control panel is visible. When false the
-    /// scene fills the full window and a tiny "Show controls" button
-    /// floats top-left. Toggle with **H** or the panel's "Hide"
-    /// button.
-    show_panel: bool,
+    /// Whether the bottom controls overlay is expanded. When
+    /// `false` only the always-on slider strip + rate row is shown
+    /// at the bottom; when `true` the strip extends upward to also
+    /// show the rotation-mode tabs, mode-specific UI, and shape
+    /// row. Toggle via the `^` / `v` chevron button or the **H**
+    /// key. There is no longer a side panel: the scene renders to
+    /// the full window and the overlay floats over it.
+    expanded: bool,
+
+    /// Whether the modal "About / help" window is open. Triggered
+    /// by clicking the `?` button; closes via the window's title-
+    /// bar X (egui's `Window::open(&mut bool)` flips it).
+    show_help: bool,
+
+    /// Whether the top-right rotation-formula popup is rendered.
+    /// Off by default — the formula is dense for newcomers; the
+    /// expanded section has a checkbox to turn it on for users who
+    /// want to see exactly which bivectors and scalars compose into
+    /// the current orientation.
+    show_formula: bool,
+
+    /// Which rotation source drives the continuous spin: the
+    /// six-checkbox active set (`Active`), or the composed
+    /// sequence's bivector sum (`Composer`). Both share the rate
+    /// scale and time slider; switching mode re-points the omega
+    /// derivation. The composer mode collapses the seq's terms into
+    /// a single bivector velocity (sum of `scalar * planes` per
+    /// term) — order doesn't matter for continuous-mode since
+    /// bivector addition is commutative.
+    rotation_mode: RotationMode,
 
     /// Sequence of [`RotorTerm`]s the user is building in the panel.
     /// Apply composes them onto `rot_state` left-to-right via rotor
-    /// multiplication. Singletons multiply their own rotor; groups
-    /// sum their bivectors first then exp once.
+    /// multiplication.
     seq: Vec<RotorTerm>,
+    /// In-progress draft for the next term. Plane buttons append
+    /// here; "Add" commits this list as a new term in `seq` and
+    /// clears the draft. Bivector planes only — the optional
+    /// scalar attaches to a committed term, not to the draft.
+    draft: Vec<Plane>,
 }
 
-/// One term in the rotor-composition sequence.
-#[derive(Clone, Debug)]
-enum RotorTerm {
-    /// Singleton: one plane and an angle in radians.
-    /// Composed as `(plane.bivector * angle).exp()`.
-    Single { plane: Plane, angle: f32 },
-    /// Additive group: two or more (plane, angle) entries summed
-    /// as bivectors before the single `exp()`. Order within the
-    /// group does not matter (bivector addition is commutative).
-    Group(Vec<(Plane, f32)>),
+/// One term in the rotor-composition sequence: a sum of unit
+/// bivectors with an optional leading scalar (angle in radians).
+///
+/// Without a scalar the term is `exp(sum_of_unit_bivectors)`,
+/// which is the natural unit-magnitude rotation along the term's
+/// bivector direction. With a scalar `phi` it becomes
+/// `exp(phi * sum_of_unit_bivectors)`. The scalar is optional by
+/// design: most uses ("rotate 90° in xy") want a scalar, but the
+/// "raw direction" form (just the bivector itself) is useful for
+/// composing isoclinics where the magnitude is implicit.
+///
+/// Bivector addition within a term is commutative, so plane order
+/// inside a term doesn't matter. Rotor multiplication between
+/// terms is non-commutative, so the seq's term order does.
+#[derive(Clone, Debug, Default)]
+struct RotorTerm {
+    /// Unit-bivector planes summed inside `exp(...)`. Non-empty
+    /// for a term to display; an empty term is dropped.
+    planes: Vec<Plane>,
+    /// Optional scalar prefix `phi` in radians. `None` means the
+    /// raw bivector sum (unit magnitude); `Some(phi)` scales the
+    /// whole sum before `exp()`. Default `Some(FRAC_PI_2)` when
+    /// the user adds a scalar via the panel.
+    scalar: Option<f32>,
 }
 
 impl RotorTerm {
     /// Compose this term as a delta rotor.
     fn delta(&self) -> Rotor4 {
-        match self {
-            RotorTerm::Single { plane, angle } => (plane.unit_bivector() * *angle).exp(),
-            RotorTerm::Group(entries) => {
-                let mut sum = Bivector4::ZERO;
-                for (plane, angle) in entries {
-                    sum = sum + plane.unit_bivector() * *angle;
-                }
-                sum.exp()
-            }
+        let mut sum = Bivector4::ZERO;
+        for plane in &self.planes {
+            sum = sum + plane.unit_bivector();
+        }
+        let phi = self.scalar.unwrap_or(1.0);
+        (sum * phi).exp()
+    }
+}
+
+/// Continuous-rotation source. Two distinct UIs (active-set
+/// checkboxes vs composed sequence) populate the angular velocity
+/// independently; the user picks which one drives `omega` for the
+/// spin animation via a tab at the top of the rotation section.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RotationMode {
+    /// Sum of unit bivectors of planes whose checkboxes are on.
+    /// The classic toggleable mode: 1..6 keys / panel checkboxes.
+    Active,
+    /// Sum of bivectors derived from the composed seq: each term
+    /// contributes `scalar.unwrap_or(1.0) * sum_of_unit_bivectors`.
+    /// Apply (one-shot rotor multiplication) is still available in
+    /// this mode and is independent of the spin animation.
+    Composer,
+}
+
+/// Drag-and-drop payload for the rotor sequence UI. Terms (whole
+/// cards) and plane entries (pills inside cards) both ride this
+/// single enum so a term card can be a single drop zone that
+/// branches on the variant: a `Term` payload reorders the seq, an
+/// `Entry` payload migrates a plane into this term.
+#[derive(Clone, Copy, Debug)]
+enum DragPayload {
+    /// The whole term at this seq index is being dragged.
+    Term(usize),
+    /// `Entry(term_idx, plane_idx)`: a single plane pill from the
+    /// given term is being dragged.
+    Entry(usize, usize),
+}
+
+/// Insertion-point indicator and drop target between term cards.
+/// During a drag of any `DragPayload`, paints all gaps faintly so
+/// the user can see where drops are accepted; the gap currently
+/// under the cursor is painted brighter (the "live target") to
+/// match the convention used by Trello / Notion / Linear etc.
+fn drop_pipe(ui: &mut egui::Ui, height: f32) -> Option<DragPayload> {
+    let ctx = ui.ctx().clone();
+    let dragging = egui::DragAndDrop::payload::<DragPayload>(&ctx).is_some();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, height), egui::Sense::hover());
+    // Hit area extends ±40pt above and below the row so a card
+    // dragged a bit too high or too low still snaps to a drop
+    // target. Without this, dragging slightly outside the row's
+    // vertical extent canceled the drop. Using `contains_pointer`
+    // on the original rect alone (without expansion) was the
+    // cause of "card too high → no drop" returns.
+    let hit = rect.expand2(egui::vec2(0.0, 40.0));
+    let cursor = ctx.input(|i| i.pointer.hover_pos());
+    let hovered = dragging && cursor.is_some_and(|p| hit.contains(p));
+    if hovered {
+        // Visible line is TALLER than the row (50pt total) so it
+        // sticks out above and below the dragged card's floating
+        // preview — the drop indicator stays visible even with
+        // the card directly under the cursor obscuring most of
+        // the gap.
+        let line_half_h = 25.0;
+        let cy = rect.center().y;
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.center().x, cy - line_half_h),
+                egui::pos2(rect.center().x, cy + line_half_h),
+            ],
+            egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 200, 60)),
+        );
+    }
+    if hovered && ctx.input(|i| i.pointer.any_released()) {
+        return egui::DragAndDrop::take_payload::<DragPayload>(&ctx).map(|arc| *arc);
+    }
+    None
+}
+
+/// Same as [`drop_pipe`] for the shape row; payload is the shape
+/// source index so it doesn't collide with the rotor seq's
+/// `DragPayload`.
+fn shape_drop_pipe(ui: &mut egui::Ui, height: f32) -> Option<usize> {
+    let ctx = ui.ctx().clone();
+    let dragging = egui::DragAndDrop::payload::<usize>(&ctx).is_some();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, height), egui::Sense::hover());
+    let hit = rect.expand2(egui::vec2(0.0, 40.0));
+    let cursor = ctx.input(|i| i.pointer.hover_pos());
+    let hovered = dragging && cursor.is_some_and(|p| hit.contains(p));
+    if hovered {
+        let line_half_h = 25.0;
+        let cy = rect.center().y;
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.center().x, cy - line_half_h),
+                egui::pos2(rect.center().x, cy + line_half_h),
+            ],
+            egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 200, 60)),
+        );
+    }
+    if hovered && ctx.input(|i| i.pointer.any_released()) {
+        return egui::DragAndDrop::take_payload::<usize>(&ctx).map(|arc| *arc);
+    }
+    None
+}
+
+/// Inside a `dnd_drag_source` body, force fully-opaque widget
+/// visuals on the current ui when the source is being dragged.
+/// egui paints the body to a Tooltip layer when dragged, where
+/// widgets never register hover and therefore default to the
+/// dimmed `inactive` style; this override lifts inactive +
+/// noninteractive fills/strokes to match `active` so the floating
+/// ghost reads as a solid card.
+///
+/// (Earlier we tried routing the dragged source through an
+/// off-screen `Area` to also collapse the original layout slot;
+/// egui's `Area::constrain` clamps fixed-pos to the screen rect by
+/// default and the constraint, combined with Tooltip-layer
+/// translation, ended up painting a stale rectangle anchored at
+/// `(0, 0)`. Going back to the standard dnd_drag_source path keeps
+/// the original slot allocated but visible-as-empty during drag,
+/// which is the egui-native behavior; we accept that for now.)
+fn force_opaque_active(ui: &mut egui::Ui) {
+    let active = ui.visuals().widgets.active;
+    let v = ui.visuals_mut();
+    v.widgets.inactive.bg_fill = active.bg_fill;
+    v.widgets.inactive.weak_bg_fill = active.weak_bg_fill;
+    v.widgets.inactive.fg_stroke = active.fg_stroke;
+    v.widgets.inactive.bg_stroke = active.bg_stroke;
+    v.widgets.noninteractive.bg_fill = active.bg_fill;
+    v.widgets.noninteractive.weak_bg_fill = active.weak_bg_fill;
+}
+
+/// "Pickup" pulse intensity in `[0.0, 1.0]` for the card identified
+/// by `drag_id`. Animates from 0 → 1 in 120 ms when the source
+/// starts being dragged, and back to 0 over the same time when the
+/// drag ends. Use it to interpolate stroke width / color / scale on
+/// the dragged frame so the card visibly "lifts" on pickup.
+fn drag_pickup_t(ctx: &egui::Context, drag_id: egui::Id) -> f32 {
+    let target = if ctx.is_being_dragged(drag_id) {
+        1.0
+    } else {
+        0.0
+    };
+    ctx.animate_value_with_time(drag_id.with("pickup"), target, 0.12)
+}
+
+/// Rate "skip" button drawn as one or two solid triangles —
+/// matches the play/pause button's media-player vocabulary so the
+/// whole row reads as a single set of media controls. Highlights
+/// when `*rate == value`; clicking when already selected resets
+/// `rate = 1.0` (lets the user step out of a non-default rate
+/// without the global Reset).
+///
+/// `double = true` paints two adjacent triangles (`<<` / `>>`),
+/// `false` paints one (`<` / `>`). `forward = true` points right.
+fn rate_toggle(
+    ui: &mut egui::Ui,
+    rate: &mut f32,
+    value: f32,
+    double: bool,
+    forward: bool,
+) -> egui::Response {
+    let selected = (*rate - value).abs() < 1e-6;
+    let size = egui::vec2(28.0, CONTROL_H);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let style = ui.style().interact_selectable(&response, selected);
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(2),
+        style.bg_fill,
+        style.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let color = style.fg_stroke.color;
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let r_w = 4.5_f32;
+    let r_h = 5.5_f32;
+    let triangle_at = |tip_x: f32| -> Vec<egui::Pos2> {
+        if forward {
+            vec![
+                egui::pos2(tip_x - r_w * 0.5, cy - r_h),
+                egui::pos2(tip_x - r_w * 0.5, cy + r_h),
+                egui::pos2(tip_x + r_w * 0.7, cy),
+            ]
+        } else {
+            vec![
+                egui::pos2(tip_x + r_w * 0.5, cy - r_h),
+                egui::pos2(tip_x + r_w * 0.5, cy + r_h),
+                egui::pos2(tip_x - r_w * 0.7, cy),
+            ]
+        }
+    };
+    if double {
+        let offset = 4.0;
+        ui.painter().add(egui::Shape::convex_polygon(
+            triangle_at(cx - offset),
+            color,
+            egui::Stroke::NONE,
+        ));
+        ui.painter().add(egui::Shape::convex_polygon(
+            triangle_at(cx + offset),
+            color,
+            egui::Stroke::NONE,
+        ));
+    } else {
+        ui.painter().add(egui::Shape::convex_polygon(
+            triangle_at(cx),
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+    if response.clicked() {
+        *rate = if selected { 1.0 } else { value };
+    }
+    response.on_hover_text(format!("Set rate to ×{value} (click again to reset to ×1)"))
+}
+
+/// `+` button painted as two crossed bars on a button-styled rect.
+/// Same primitive-shape vocabulary as the play / rate / chevron
+/// buttons so the row reads as one consistent set of custom-painted
+/// controls (avoids the `menu_button`'s default-padding height
+/// mismatch with the shape cards).
+fn add_button(ui: &mut egui::Ui) -> egui::Response {
+    // Slightly shorter than `CONTROL_H` because the cards' tinted
+    // backgrounds carry more visual weight than this neutral
+    // button's outline — equal heights made the + read as
+    // visually taller than the cards next to it.
+    let size = egui::vec2(28.0, CONTROL_H - 2.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let style = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(2),
+        style.bg_fill,
+        style.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let arm = 5.5_f32;
+    let thick = 2.0_f32;
+    let color = style.fg_stroke.color;
+    ui.painter().rect_filled(
+        egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(arm * 2.0, thick)),
+        egui::CornerRadius::ZERO,
+        color,
+    );
+    ui.painter().rect_filled(
+        egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(thick, arm * 2.0)),
+        egui::CornerRadius::ZERO,
+        color,
+    );
+    response
+}
+
+/// `↻` retry button: a clockwise arc with an arrowhead, painted
+/// from primitives. Replaces a font glyph (egui's default font has
+/// patchy coverage of the Mathematical Operators block where
+/// circular-arrow code points live).
+fn refresh_button(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::vec2(28.0, CONTROL_H);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let style = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(2),
+        style.bg_fill,
+        style.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let radius = 6.5_f32;
+    let stroke = egui::Stroke::new(1.6, style.fg_stroke.color);
+    use std::f32::consts::PI;
+    // Clockwise arc starting just past the top, sweeping ~280°.
+    // egui's y-axis points down, so positive angles sweep clockwise
+    // visually.
+    let start_angle: f32 = -PI / 2.0 + 0.45;
+    let sweep: f32 = PI * 1.55;
+    let n = 16;
+    let points: Vec<egui::Pos2> = (0..=n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            let angle = start_angle + t * sweep;
+            egui::pos2(cx + radius * angle.cos(), cy + radius * angle.sin())
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(points, stroke));
+    // Arrowhead at the START of the arc (the top-right gap), pointing
+    // in the direction the arc would continue if it kept going CW.
+    let arrow_size = 3.5_f32;
+    let anchor = egui::pos2(
+        cx + radius * start_angle.cos(),
+        cy + radius * start_angle.sin(),
+    );
+    let tan = start_angle - PI / 2.0;
+    let perp = tan + PI / 2.0;
+    let tip = egui::pos2(
+        anchor.x + arrow_size * tan.cos(),
+        anchor.y + arrow_size * tan.sin(),
+    );
+    let base_l = egui::pos2(
+        anchor.x + arrow_size * 0.8 * perp.cos(),
+        anchor.y + arrow_size * 0.8 * perp.sin(),
+    );
+    let base_r = egui::pos2(
+        anchor.x - arrow_size * 0.8 * perp.cos(),
+        anchor.y - arrow_size * 0.8 * perp.sin(),
+    );
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![tip, base_l, base_r],
+        style.fg_stroke.color,
+        egui::Stroke::NONE,
+    ));
+    response
+}
+
+/// Single button that toggles between a play triangle (when
+/// `playing == false`) and a pause symbol (two bars, when
+/// `playing == true`). Painted as primitive shapes so it's
+/// font-independent and reads as a media-player control on every
+/// platform. Returns the response so the caller reads `.clicked()`.
+fn play_pause_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
+    let size = egui::vec2(36.0, CONTROL_H);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let style = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(3),
+        style.bg_fill,
+        style.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let color = style.fg_stroke.color;
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    if playing {
+        // Pause: two vertical bars.
+        let bar_w = 4.0;
+        let bar_h = 12.0;
+        let gap = 3.0;
+        let half_gap = gap / 2.0;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(cx - half_gap - bar_w, cy - bar_h / 2.0),
+                egui::vec2(bar_w, bar_h),
+            ),
+            egui::CornerRadius::ZERO,
+            color,
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(cx + half_gap, cy - bar_h / 2.0),
+                egui::vec2(bar_w, bar_h),
+            ),
+            egui::CornerRadius::ZERO,
+            color,
+        );
+    } else {
+        // Play: filled rightward triangle.
+        let r_h = 7.0;
+        let r_w = 8.0;
+        let p1 = egui::pos2(cx - r_w * 0.4, cy - r_h);
+        let p2 = egui::pos2(cx - r_w * 0.4, cy + r_h);
+        let p3 = egui::pos2(cx + r_w * 0.7, cy);
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![p1, p2, p3],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+    response
+}
+
+/// Allocate a clickable button with a custom-painted up- or down-
+/// chevron (`^` / `v`, drawn as two stroked line segments). Used
+/// instead of a font glyph so it doesn't depend on the egui font
+/// having Mathematical Operators (∧/∨) coverage. Returns the
+/// response so the caller can read `.clicked()`.
+fn chevron_button(ui: &mut egui::Ui, up: bool, hover: &str) -> egui::Response {
+    let size = egui::vec2(28.0, CONTROL_H);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let style = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(2),
+        style.bg_fill,
+        style.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let dx = 6.0;
+    let dy = 4.0;
+    let stroke = egui::Stroke::new(2.0, style.fg_stroke.color);
+    if up {
+        ui.painter().line_segment(
+            [egui::pos2(cx - dx, cy + dy), egui::pos2(cx, cy - dy)],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [egui::pos2(cx + dx, cy + dy), egui::pos2(cx, cy - dy)],
+            stroke,
+        );
+    } else {
+        ui.painter().line_segment(
+            [egui::pos2(cx - dx, cy - dy), egui::pos2(cx, cy + dy)],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [egui::pos2(cx + dx, cy - dy), egui::pos2(cx, cy + dy)],
+            stroke,
+        );
+    }
+    response.on_hover_text(hover)
+}
+
+/// Paint a 6-dot drag-handle indicator (2 columns × 3 rows) inside
+/// `rect`. Drawn as filled circles, not glyphs, so it's legible
+/// regardless of which font egui is using — avoiding the
+/// missing-glyph rendering that hits Braille / Dingbats characters
+/// like ⠿ or ✕ on egui's default font.
+#[allow(dead_code)]
+fn paint_six_dots(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let dx = 3.0;
+    let dy = 4.0;
+    let radius = 1.4;
+    for col in 0..2 {
+        for row in 0..3 {
+            let x = cx + (col as f32 - 0.5) * dx;
+            let y = cy + (row as f32 - 1.0) * dy;
+            painter.circle_filled(egui::pos2(x, y), radius, color);
         }
     }
 }
@@ -432,199 +952,319 @@ impl PolytopeSmokeApp {
         }
     }
 
-    /// Body of the egui control panel, rendered inside a vertical
-    /// scroll area so a long panel doesn't clip on small windows.
-    fn render_panel_body(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.label("Slice");
-        ui.add(
-            egui::Slider::new(&mut self.w_slice, -W_RANGE..=W_RANGE)
-                .text("w")
-                .fixed_decimals(3),
-        );
+    /// Expanded section of the bottom overlay: rotation-mode tabs,
+    /// the active-set checkboxes (Active mode) or the composer
+    /// (Composer mode), and the shape row. Always-visible controls
+    /// (Spin/Pause, rate buttons, sliders) live below this in
+    /// `render_overlay` and are rendered separately.
+    fn render_expanded_body(&mut self, ui: &mut egui::Ui) {
+        // Mode tab: which source drives the continuous spin. Two
+        // sub-panels swap below. The formula-display toggle sits at
+        // the right of the same row — it's a viewport-level option
+        // (independent of mode), not a mode setting itself.
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.rotation_mode, RotationMode::Active, "Active set")
+                .on_hover_text("Six checkbox-toggled bivectors (xy, xz, ...)");
+            ui.selectable_value(&mut self.rotation_mode, RotationMode::Composer, "Composer")
+                .on_hover_text("Sum of bivectors from the composed sequence");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut self.show_formula, "Show formula")
+                    .on_hover_text("Top-right popup with the live exp(...) form of the rotor");
+            });
+        });
 
-        ui.separator();
-        ui.label("Rotation (continuous)");
-        let (status_word, status_color) = if self.rotate {
-            ("spinning", egui::Color32::from_rgb(102, 255, 153))
-        } else {
-            ("paused", egui::Color32::from_rgb(242, 217, 76))
-        };
-        ui.horizontal(|ui| {
-            ui.colored_label(status_color, status_word);
-            if ui
-                .button(if self.rotate { "Pause" } else { "Spin" })
-                .clicked()
-            {
-                self.rotate = !self.rotate;
-            }
-            ui.label(format!("t = {:.2}s", self.rot_time));
-        });
-        ui.add(
-            egui::Slider::new(&mut self.rate_scale, 0.0..=8.0)
-                .text("rate")
-                .fixed_decimals(2),
-        );
-        // Active-set checkboxes: which planes contribute to the
-        // angular velocity while spinning. Two columns of three.
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                for (active, plane) in self.active[..3].iter_mut().zip(&PLANES[..3]) {
+        // Mode-specific UI.
+        if self.rotation_mode == RotationMode::Active {
+            ui.horizontal(|ui| {
+                for (active, plane) in self.active.iter_mut().zip(PLANES.iter()) {
                     ui.checkbox(active, plane.label());
                 }
-            });
-            ui.vertical(|ui| {
-                for (active, plane) in self.active[3..].iter_mut().zip(&PLANES[3..]) {
-                    ui.checkbox(active, plane.label());
+                // Combo name (e.g., "isoclinic xw+yz") inline on the
+                // same row as the checkboxes — saves a row of
+                // vertical space and the name reads as a label
+                // applied to the active set right next to it.
+                if let Some(name) = combo_name(&self.active) {
+                    ui.add_space(8.0);
+                    ui.colored_label(egui::Color32::from_rgb(255, 217, 140), name);
                 }
             });
-        });
-        if let Some(name) = combo_name(&self.active) {
-            ui.colored_label(egui::Color32::from_rgb(255, 217, 140), name);
+            return self.render_shapes_section(ui);
         }
 
+        // Composer mode below.
         ui.separator();
-        ui.label("Compose (one-shot)");
-        // Add buttons sit at the top of the section so the user
-        // builds a sequence by appending downward.
+
+        // Plane buttons append into the draft.
         ui.horizontal_wrapped(|ui| {
             for plane in PLANES.iter() {
                 if ui
                     .small_button(format!("+{}", plane.label()))
-                    .on_hover_text("Append a 90° term to the sequence")
+                    .on_hover_text("Add to the current draft term")
                     .clicked()
                 {
-                    self.seq.push(RotorTerm::Single {
-                        plane: *plane,
-                        angle: std::f32::consts::FRAC_PI_2,
-                    });
+                    self.draft.push(*plane);
                 }
             }
         });
 
-        // Per-term row: drag handle, plane(s) + angle(s), Group/Ungroup, X.
-        let mut moves: Vec<(usize, usize)> = Vec::new();
-        let mut remove_term: Option<usize> = None;
-        let mut group_with_prev: Option<usize> = None;
-        let mut ungroup: Option<usize> = None;
-        for (i, term) in self.seq.iter_mut().enumerate() {
-            let drag_id = ui.make_persistent_id(("seq-term", i));
-            ui.horizontal(|ui| {
-                let drag_resp = ui.dnd_drag_source(drag_id, i, |ui| {
-                    ui.label(egui::RichText::new("⠿").size(16.0).strong());
-                });
-                drag_resp
-                    .response
-                    .on_hover_cursor(egui::CursorIcon::Grab)
-                    .on_hover_text("Drag to reorder");
-                match term {
-                    RotorTerm::Single { plane, angle } => {
-                        ui.monospace(plane.label());
-                        let mut deg = angle.to_degrees();
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut deg)
-                                    .suffix("°")
-                                    .speed(1.0)
-                                    .range(-360.0..=360.0),
-                            )
-                            .on_hover_text("Drag to scrub; double-click to type")
-                            .changed()
-                        {
-                            *angle = deg.to_radians();
+        // Draft preview rendered as a card matching the committed-
+        // term style. Add commits to seq; Discard scraps the draft.
+        // No "make continuous" action here — the mode tab governs
+        // continuous rotation now, the seq drives it directly.
+        if !self.draft.is_empty() {
+            egui::Frame::group(ui.style())
+                .inner_margin(4.0)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("draft").small().weak());
+                        let multi = self.draft.len() > 1;
+                        if multi {
+                            ui.monospace("(");
                         }
-                        if i > 0
-                            && ui
-                                .small_button("(+)")
-                                .on_hover_text("Group with previous (additive bivector sum)")
-                                .clicked()
-                        {
-                            group_with_prev = Some(i);
-                        }
-                    }
-                    RotorTerm::Group(entries) => {
-                        ui.monospace("(");
-                        for (k, (plane, angle)) in entries.iter_mut().enumerate() {
+                        for (k, plane) in self.draft.iter().enumerate() {
                             if k > 0 {
                                 ui.monospace("+");
                             }
                             ui.monospace(plane.label());
-                            let mut deg = angle.to_degrees();
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut deg)
-                                        .suffix("°")
-                                        .speed(1.0)
-                                        .range(-360.0..=360.0),
-                                )
-                                .changed()
-                            {
-                                *angle = deg.to_radians();
-                            }
                         }
-                        ui.monospace(")");
+                        if multi {
+                            ui.monospace(")");
+                        }
+                        ui.add_space(8.0);
                         if ui
-                            .small_button("ungrp")
-                            .on_hover_text("Split back into singletons")
+                            .small_button("Add")
+                            .on_hover_text("Commit as one-shot term in sequence")
                             .clicked()
                         {
-                            ungroup = Some(i);
+                            self.seq.push(RotorTerm {
+                                planes: self.draft.clone(),
+                                scalar: None,
+                            });
+                            self.draft.clear();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("×").size(14.0))
+                                    .min_size(egui::vec2(22.0, 22.0)),
+                            )
+                            .on_hover_text("Discard draft")
+                            .clicked()
+                        {
+                            self.draft.clear();
+                        }
+                    });
+                });
+        }
+
+        // Sequence: each term is a single-row card. Whole card is
+        // its own drag source (no separate ⠿ handle); the card body
+        // is also a drop zone that branches on payload variant —
+        // Term payloads reorder, Entry payloads migrate a plane in.
+        // Insertion pipes between cards give precise drop indication
+        // for the Term-reorder path.
+        let mut term_moves: Vec<(usize, usize)> = Vec::new();
+        let mut entry_moves: Vec<(usize, usize, usize)> = Vec::new();
+        let mut remove_term: Option<usize> = None;
+        let mut remove_scalar: Option<usize> = None;
+        let mut add_scalar: Option<usize> = None;
+
+        if !self.seq.is_empty() {
+            ui.label("Sequence:");
+            // Card-row height: matches `CONTROL_H` so the pipes are
+            // the same height as the term cards, keeping the row's
+            // cross-alignment stable.
+            let pipe_height = CONTROL_H;
+            ui.horizontal_wrapped(|ui| {
+                for term_idx in 0..self.seq.len() {
+                    // Insertion pipe before this term (insert-at = term_idx).
+                    if let Some(DragPayload::Term(from)) = drop_pipe(ui, pipe_height) {
+                        if from != term_idx {
+                            term_moves.push((from, term_idx));
+                        }
+                    }
+                    if term_idx > 0 {
+                        ui.label(egui::RichText::new("·").size(16.0).strong());
+                    }
+                    let card_id = ui.make_persistent_id(("term-card", term_idx));
+                    let pickup_t = drag_pickup_t(ui.ctx(), card_id);
+                    let stroke = if pickup_t > 0.0 {
+                        egui::Stroke::new(
+                            1.0 + pickup_t * 1.5,
+                            egui::Color32::from_rgb(255, 200, 60),
+                        )
+                    } else {
+                        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+                    };
+                    let frame = egui::Frame::default()
+                        .fill(ui.visuals().widgets.noninteractive.bg_fill)
+                        .stroke(stroke)
+                        .inner_margin(3.0)
+                        .corner_radius(egui::CornerRadius::same(3));
+                    let (_, payload) = ui.dnd_drop_zone::<DragPayload, _>(frame, |ui| {
+                        let drag_resp =
+                            ui.dnd_drag_source(card_id, DragPayload::Term(term_idx), |ui| {
+                                if ui.ctx().is_being_dragged(card_id) {
+                                    force_opaque_active(ui);
+                                }
+                                ui.horizontal(|ui| {
+                                    // Scalar prefix is hidden by default;
+                                    // shown in light red when present so it
+                                    // reads as "this is the magnitude, not
+                                    // a bivector". Add via right-click on
+                                    // the term.
+                                    let term = &mut self.seq[term_idx];
+                                    if let Some(phi) = term.scalar.as_mut() {
+                                        let mut deg = phi.to_degrees();
+                                        let phi_color = egui::Color32::from_rgb(255, 150, 150);
+                                        ui.scope(|ui| {
+                                            let v = ui.visuals_mut();
+                                            v.widgets.inactive.fg_stroke.color = phi_color;
+                                            v.widgets.hovered.fg_stroke.color = phi_color;
+                                            v.widgets.active.fg_stroke.color = phi_color;
+                                            v.override_text_color = Some(phi_color);
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(&mut deg)
+                                                        .speed(0.0)
+                                                        .suffix("°")
+                                                        .range(-720.0..=720.0),
+                                                )
+                                                .on_hover_text("Click to type a new angle")
+                                                .changed()
+                                            {
+                                                *phi = deg.to_radians();
+                                            }
+                                        });
+                                        ui.monospace("·");
+                                    }
+                                    // Bivector body: literal math notation
+                                    // — parens only when there are 2+
+                                    // planes. Each plane is its own drag
+                                    // source for cross-term migration.
+                                    let n_planes = self.seq[term_idx].planes.len();
+                                    let need_parens = n_planes > 1;
+                                    if need_parens {
+                                        ui.monospace("(");
+                                    }
+                                    for plane_idx in 0..n_planes {
+                                        if plane_idx > 0 {
+                                            ui.monospace("+");
+                                        }
+                                        let pill_id = ui.make_persistent_id((
+                                            "plane-pill",
+                                            term_idx,
+                                            plane_idx,
+                                        ));
+                                        let plane_label =
+                                            self.seq[term_idx].planes[plane_idx].label();
+                                        ui.dnd_drag_source(
+                                            pill_id,
+                                            DragPayload::Entry(term_idx, plane_idx),
+                                            |ui| {
+                                                ui.monospace(plane_label);
+                                            },
+                                        )
+                                        .response
+                                        .on_hover_cursor(egui::CursorIcon::Grab);
+                                    }
+                                    if need_parens {
+                                        ui.monospace(")");
+                                    }
+                                });
+                            });
+                        // Right-click context menu on the term body. Hosts
+                        // delete + scalar add/remove so neither needs a
+                        // visible button cluttering the math expression.
+                        // `Sense::click()` is required for context_menu
+                        // to fire — the drag-source response is hover-
+                        // only by default.
+                        let has_scalar = self.seq[term_idx].scalar.is_some();
+                        let menu_resp = drag_resp.response.interact(egui::Sense::click());
+                        menu_resp.context_menu(|ui| {
+                            if ui
+                                .button(if has_scalar {
+                                    "Remove scalar (φ)"
+                                } else {
+                                    "Add scalar (φ = 90°)"
+                                })
+                                .clicked()
+                            {
+                                if has_scalar {
+                                    remove_scalar = Some(term_idx);
+                                } else {
+                                    add_scalar = Some(term_idx);
+                                }
+                                ui.close_kind(egui::UiKind::Menu);
+                            }
+                            ui.separator();
+                            if ui.button("Delete term").clicked() {
+                                remove_term = Some(term_idx);
+                                ui.close_kind(egui::UiKind::Menu);
+                            }
+                        });
+                    });
+                    if let Some(p) = payload {
+                        match *p {
+                            DragPayload::Term(from) if from != term_idx => {
+                                term_moves.push((from, term_idx));
+                            }
+                            DragPayload::Entry(from_t, idx) if from_t != term_idx => {
+                                entry_moves.push((from_t, idx, term_idx));
+                            }
+                            _ => {}
                         }
                     }
                 }
-                if ui.small_button("X").clicked() {
-                    remove_term = Some(i);
+                // Trailing pipe: drop after the last term.
+                if let Some(DragPayload::Term(from)) = drop_pipe(ui, pipe_height) {
+                    term_moves.push((from, self.seq.len()));
                 }
             });
-            // Drop zone after each term.
-            let (_, payload) =
-                ui.dnd_drop_zone::<usize, ()>(egui::Frame::default().inner_margin(1.0), |ui| {
-                    ui.allocate_space(egui::vec2(ui.available_width(), 3.0));
-                });
-            if let Some(src) = payload {
-                let from = *src;
-                let to = if from < i { i } else { i + 1 };
-                if from != to && from != to.saturating_sub(1) {
-                    moves.push((from, to));
-                }
-            }
         }
 
-        if let Some(i) = group_with_prev {
-            let cur = self.seq.remove(i);
-            let prev = self.seq.remove(i - 1);
-            let mut entries = Vec::new();
-            match prev {
-                RotorTerm::Single { plane, angle } => entries.push((plane, angle)),
-                RotorTerm::Group(items) => entries.extend(items),
+        // Apply deferred mutations in an order that keeps indices valid.
+        if let Some(i) = add_scalar {
+            if let Some(t) = self.seq.get_mut(i) {
+                t.scalar = Some(std::f32::consts::FRAC_PI_2);
             }
-            match cur {
-                RotorTerm::Single { plane, angle } => entries.push((plane, angle)),
-                RotorTerm::Group(items) => entries.extend(items),
-            }
-            self.seq.insert(i - 1, RotorTerm::Group(entries));
         }
-        if let Some(i) = ungroup {
-            if let RotorTerm::Group(entries) = self.seq.remove(i) {
-                for (k, (plane, angle)) in entries.into_iter().enumerate() {
-                    self.seq.insert(i + k, RotorTerm::Single { plane, angle });
+        if let Some(i) = remove_scalar {
+            if let Some(t) = self.seq.get_mut(i) {
+                t.scalar = None;
+            }
+        }
+        // Cross-term entry migrations. Sort by (source term, plane idx
+        // descending) so removals don't shift earlier indices.
+        entry_moves.sort_by_key(|(from, idx, _)| (*from, std::cmp::Reverse(*idx)));
+        for (from_t, idx, to_t) in entry_moves {
+            if let Some(src) = self.seq.get_mut(from_t) {
+                if idx < src.planes.len() {
+                    let plane = src.planes.remove(idx);
+                    if let Some(dest) = self.seq.get_mut(to_t) {
+                        dest.planes.push(plane);
+                    }
                 }
             }
         }
-        if let Some(i) = remove_term {
-            self.seq.remove(i);
-        }
-        for (from, to) in moves {
+        // Drop emptied terms (after entry moves).
+        self.seq.retain(|t| !t.planes.is_empty());
+        for (from, to) in term_moves {
             if from < self.seq.len() {
                 let item = self.seq.remove(from);
                 let dest = if to > from { to - 1 } else { to };
                 self.seq.insert(dest.min(self.seq.len()), item);
             }
         }
+        if let Some(i) = remove_term {
+            if i < self.seq.len() {
+                self.seq.remove(i);
+            }
+        }
 
         ui.horizontal(|ui| {
             let apply = ui
                 .add_enabled(!self.seq.is_empty(), egui::Button::new("Apply"))
+                .on_hover_text("Compose seq onto rot_state (one-shot)")
                 .clicked();
             if apply {
                 let terms = self.seq.clone();
@@ -638,8 +1278,16 @@ impl PolytopeSmokeApp {
             }
         });
 
+        self.render_shapes_section(ui);
+    }
+
+    /// Shape row + add-menu + drag-and-drop reorder. Extracted as a
+    /// method so it can be called from both rotation modes (after
+    /// the active-set checkboxes in `Active`, after the seq +
+    /// Apply/Clear in `Composer`).
+    fn render_shapes_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        ui.label("Shapes (drag to reorder)");
+        ui.label("Shapes (drop a card onto another to insert there)");
         let has_heavy = self
             .row
             .iter()
@@ -650,55 +1298,165 @@ impl PolytopeSmokeApp {
                 "120/600-cell SDFs are heavy; expect <60 fps.",
             );
         }
-        // Add buttons FIRST so the user enters a shape and sees it
-        // appear at the right end of the cards row immediately.
         let mut row_changed = false;
-        if self.row.len() < MAX_ROW_LEN {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Add:");
-                for shape_name in [
-                    "5-cell", "8-cell", "16-cell", "24-cell", "120-cell", "600-cell",
-                ] {
-                    if ui.small_button(shape_name).clicked() {
-                        if let Ok(entry) = parse_shape_name(shape_name) {
-                            self.row.push(entry);
-                            row_changed = true;
-                        }
-                    }
-                }
-            });
-        }
 
+        // Cards in a horizontally scrolling area: never wraps, so
+        // resizing the panel doesn't reflow the row. Drag-and-drop
+        // works the same; insertion pipes between cards mark drop
+        // points.
         let mut remove_idx: Option<usize> = None;
         let mut shape_moves: Vec<(usize, usize)> = Vec::new();
         let row_len = self.row.len();
-        ui.horizontal_wrapped(|ui| {
-            for (i, entry) in self.row.iter().enumerate() {
-                let drag_id = ui.make_persistent_id(("shape-card", i));
-                let drag_resp = ui.dnd_drag_source(drag_id, i, |ui| {
-                    ui.group(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(entry.label);
-                            if row_len > 1 && ui.small_button("X").clicked() {
-                                remove_idx = Some(i);
+        let pipe_height = CONTROL_H;
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, true])
+            .id_salt("polytope-smoke-shapes-scroll")
+            .show(ui, |ui| {
+                // Top-align the row's cross axis (`Align::Min`).
+                // egui's Center alignment for horizontal layouts
+                // sizes each widget's frame as `max(child, avail)`
+                // and recenters within it — when widget heights
+                // vary, this produces a converging-staircase pattern
+                // (each subsequent widget pulled halfway toward the
+                // accumulating avail center). Top-align skips that
+                // step entirely: every widget lands with its top at
+                // the row's top edge. The alignment fix is verified
+                // by `alignment_tests::*` below; the regression we
+                // saw 14 → 18.5 → 20.75 → 21.88 collapses to a flat
+                // 8 → 8 → 8 → 8 once Top-align is in place.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    for (i, entry) in self.row.iter().enumerate() {
+                        if let Some(from) = shape_drop_pipe(ui, pipe_height) {
+                            if from != i {
+                                shape_moves.push((from, i));
+                            }
+                        }
+                        let drag_id = ui.make_persistent_id(("shape-card", i));
+                        let pickup_t = drag_pickup_t(ui.ctx(), drag_id);
+                        // Card fill = saturated body color so the
+                        // mapping card → polytope is unambiguous at a
+                        // glance. Full alpha (no premultiply tricks)
+                        // because earlier the underdriven values just
+                        // looked gray.
+                        let [r, g, b] = entry.color;
+                        let card_fill = egui::Color32::from_rgb(
+                            (r * 200.0).min(255.0) as u8,
+                            (g * 200.0).min(255.0) as u8,
+                            (b * 200.0).min(255.0) as u8,
+                        );
+                        let stroke_color = if pickup_t > 0.0 {
+                            egui::Color32::from_rgb(255, 200, 60)
+                        } else {
+                            egui::Color32::from_rgb(
+                                (r * 255.0).min(255.0) as u8,
+                                (g * 255.0).min(255.0) as u8,
+                                (b * 255.0).min(255.0) as u8,
+                            )
+                        };
+                        let stroke = egui::Stroke::new(1.0 + pickup_t * 1.5, stroke_color);
+                        // Frame is rendered INSIDE the drag-source's
+                        // body so the entire card (background +
+                        // stroke + label) follows the cursor when
+                        // dragged. Previously the Frame was the
+                        // dnd_drop_zone's frame argument, which kept
+                        // the Frame at the original position while
+                        // only the inner label floated to the cursor
+                        // — a "ghost text" effect rather than a card
+                        // pickup. Drop detection is also done
+                        // manually here: the auto-highlight that
+                        // dnd_drop_zone applies to its frame would
+                        // light up every card during drag (the
+                        // "every position is a drop target" look the
+                        // user already objected to); the pipes
+                        // between cards handle the visual indicator.
+                        let card_id = drag_id;
+                        let drag_resp = ui.dnd_drag_source(card_id, i, |ui| {
+                            if ui.ctx().is_being_dragged(card_id) {
+                                force_opaque_active(ui);
+                            }
+                            egui::Frame::default()
+                                .fill(card_fill)
+                                .stroke(stroke)
+                                .inner_margin(egui::Margin::symmetric(4, 6))
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .show(ui, |ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(SHAPE_CARD_WIDTH, 0.0),
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(entry.label)
+                                                        .strong()
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .selectable(false)
+                                                .wrap_mode(egui::TextWrapMode::Extend),
+                                            );
+                                        },
+                                    );
+                                });
+                        });
+                        // Manual drop detection on the card's rect.
+                        // Hit area extends ±40pt vertically so drops
+                        // a bit above or below the row still register
+                        // — matches the pipes' extended hit zone, so
+                        // the user can't accidentally cancel a drop
+                        // by drifting slightly outside the row's
+                        // exact y-band.
+                        let card_rect = drag_resp.response.rect;
+                        let card_hit = card_rect.expand2(egui::vec2(0.0, 40.0));
+                        let dragging = egui::DragAndDrop::payload::<usize>(ui.ctx()).is_some();
+                        let cursor = ui.ctx().input(|i| i.pointer.hover_pos());
+                        let card_hovered = dragging && cursor.is_some_and(|p| card_hit.contains(p));
+                        if card_hovered && ui.ctx().input(|i| i.pointer.any_released()) {
+                            if let Some(arc) = egui::DragAndDrop::take_payload::<usize>(ui.ctx()) {
+                                let from = *arc;
+                                if from != i {
+                                    shape_moves.push((from, i));
+                                }
+                            }
+                        }
+                        drag_resp
+                            .response
+                            .on_hover_cursor(egui::CursorIcon::Grab)
+                            .on_hover_text(entry.long_name)
+                            .interact(egui::Sense::click())
+                            .context_menu(|ui| {
+                                if row_len > 1 && ui.button("Remove from row").clicked() {
+                                    remove_idx = Some(i);
+                                    ui.close_kind(egui::UiKind::Menu);
+                                }
+                            });
+                    }
+                    // Trailing pipe: drop at end of row.
+                    if let Some(from) = shape_drop_pipe(ui, pipe_height) {
+                        shape_moves.push((from, self.row.len()));
+                    }
+                    // "+" trigger inline with the shape cards.
+                    // Custom-painted plus on a 28×24 button rect so
+                    // the height matches the cards exactly and the
+                    // visual vocabulary matches the play / rate /
+                    // chevron buttons (no font-glyph dependency).
+                    if self.row.len() < MAX_ROW_LEN {
+                        let plus_resp = add_button(ui).on_hover_text("Add a shape to the row");
+                        egui::Popup::menu(&plus_resp).show(|ui| {
+                            ui.set_min_width(80.0);
+                            for shape_name in [
+                                "5-cell", "8-cell", "16-cell", "24-cell", "120-cell", "600-cell",
+                            ] {
+                                if ui.button(shape_name).clicked() {
+                                    if let Ok(entry) = parse_shape_name(shape_name) {
+                                        self.row.push(entry);
+                                        row_changed = true;
+                                    }
+                                    ui.close_kind(egui::UiKind::Menu);
+                                }
                             }
                         });
-                    });
-                });
-                drag_resp.response.on_hover_cursor(egui::CursorIcon::Grab);
-                let (_, payload) =
-                    ui.dnd_drop_zone::<usize, ()>(egui::Frame::default().inner_margin(2.0), |ui| {
-                        ui.allocate_space(egui::vec2(4.0, 30.0));
-                    });
-                if let Some(src) = payload {
-                    let from = *src;
-                    let to = if from < i { i } else { i + 1 };
-                    if from != to && from != to.saturating_sub(1) {
-                        shape_moves.push((from, to));
                     }
-                }
-            }
-        });
+                });
+            });
         if let Some(i) = remove_idx {
             self.row.remove(i);
             row_changed = true;
@@ -714,6 +1472,281 @@ impl PolytopeSmokeApp {
         if row_changed {
             self.rebuild_bodies();
         }
+    }
+
+    /// Modal help window — shown when `self.show_help` is `true`.
+    /// Closes via the window's title-bar X (egui's
+    /// `Window::open(&mut bool)` flips the bool).
+    fn render_help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let mut open = self.show_help;
+        egui::Window::new("About Polytope Smoke Test")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(560.0, 460.0))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("What this program shows");
+                    ui.label(
+                        "You're looking at the 3D cross-sections of a row of \
+                         four-dimensional polytopes. As they rotate through 4D \
+                         space, their cross-sections morph in characteristic ways \
+                         — that's the whole point of the demo: to make 4D shape \
+                         intuition reachable for someone in 3D.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("3D cross-sections, briefly");
+                    ui.label(
+                        "A cross-section is what you get when a higher-\
+                         dimensional object passes through a lower-dimensional \
+                         space. A 3D apple intersecting a 2D table at any moment \
+                         gives a 2D shape (a circle, an oval, a curve), and the \
+                         shape changes as the apple moves.",
+                    );
+                    ui.label(
+                        "The same idea works one dimension up: a 4D polytope \
+                         passing through 3D space gives a 3D shape at every \
+                         instant. The hidden 4th axis is conventionally called \
+                         w. As w changes, the polytope's 3D cross-section morphs \
+                         — that is what the w slider scrubs through.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("The shapes");
+                    ui.label("All six convex regular 4-polytopes (\"polychora\") ship:");
+                    ui.label("• 5-cell (pentatope) — 5 tetrahedra; the 4D simplex.");
+                    ui.label("• 8-cell (tesseract) — 8 cubes; the 4D cube.");
+                    ui.label(
+                        "• 16-cell (hexadecachoron) — 16 tetrahedra; \
+                         the 4D analog of the octahedron.",
+                    );
+                    ui.label(
+                        "• 24-cell (icositetrachoron) — 24 octahedra; \
+                         uniquely 4-dimensional, no 3D analog.",
+                    );
+                    ui.label("• 120-cell (hecatonicosachoron) — 120 dodecahedra.");
+                    ui.label(
+                        "• 600-cell (hexacosichoron) — 600 tetrahedra; \
+                         the 4D analog of the icosahedron.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("Rotation");
+                    ui.label(
+                        "4D space has six independent rotation planes, not three: \
+                         xy, xz, xw, yz, yw, zw. In 3D you spin around an axis; \
+                         in 4D you spin in a plane (the bivector picture). The \
+                         three planes that include w (xw, yw, zw) pull a visible \
+                         axis through the hidden 4th dimension and produce the \
+                         interesting cross-section morphs. The three pure-3D \
+                         planes (xy, xz, yz) just rotate the cross-section as a \
+                         rigid 3D shape.",
+                    );
+                    ui.label(
+                        "Active set mode: toggle which planes contribute. The \
+                         angular velocity is the sum of the active unit \
+                         bivectors. Composer mode: build a sequence of terms \
+                         (each term is a sum of planes, optionally scaled by a \
+                         scalar φ) — the seq sums into the angular velocity.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("Controls");
+                    ui.label("• w slider: scrub the slicing hyperplane along the 4th axis.");
+                    ui.label("• t slider: scrub the rotation animation by absolute time.");
+                    ui.label("• Play / Pause: start or pause the spin.");
+                    ui.label("• << < > >>: set the rate to ×0.25 / ×0.5 / ×2 / ×4.");
+                    ui.label("• Reset (R): zero everything.");
+                    ui.label("• ^ / v (H): expand or collapse the controls overlay.");
+                    ui.label("• 1..6: toggle a plane in the active set.");
+                    ui.label("• T: toggle spin.");
+                    ui.label("• Up / Down arrows: scrub the w-slice with the keyboard.");
+                    ui.label("• Drag in the viewport: orbit the camera.");
+                });
+            });
+        self.show_help = open;
+    }
+
+    /// Unified bottom-of-window controls overlay. The expanded
+    /// section (mode tabs, mode-specific UI, shape row) appears
+    /// when `self.expanded`; the slider strip + rate row are always
+    /// visible. The whole overlay is a single translucent popup
+    /// painted over the full-window scene — there's no side panel
+    /// anymore, and the scene fills the entire viewport.
+    fn render_overlay(&mut self, ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        let pad = 16.0;
+        let area_w = (screen.width() - 2.0 * pad).max(280.0);
+
+        // `BottomOverlay` auto-sizes to its content and animates
+        // height transitions smoothly, so when the user toggles
+        // expand or switches rotation modes the panel grows /
+        // shrinks to exactly fit the new content with no dead
+        // space and no flicker.
+        let visuals = &ctx.style().visuals;
+        let frame = egui::Frame::default()
+            .fill(visuals.window_fill)
+            .stroke(visuals.window_stroke)
+            .corner_radius(visuals.window_corner_radius)
+            .inner_margin(10.0);
+
+        BottomOverlay::new("polytope-smoke-overlay")
+            .width(area_w)
+            .margin_y(pad)
+            .frame(frame)
+            .show(ctx, |ui| {
+                // Render top-down: body at top, sliders, rate row at
+                // bottom. `BottomOverlay`'s internal ScrollArea
+                // anchors the bottom, so the rate row stays visible
+                // throughout collapse animations.
+                if self.expanded {
+                    self.render_expanded_body(ui);
+                    ui.separator();
+                }
+                self.render_slider_strip(ui, area_w);
+                self.render_rate_row(ui);
+            });
+    }
+
+    /// Two big sliders (w, t) with fixed-width monospace value
+    /// labels. `area_w` is the parent's content width in points.
+    fn render_slider_strip(&mut self, ui: &mut egui::Ui, area_w: f32) {
+        // Sliders use `show_value(false)` + a separately-allocated
+        // fixed-width monospace label per row, so the slider's
+        // bounding rect width never changes as the value's char
+        // count does (e.g., "0.5" → "0.50" → "12.34"). Without this
+        // stabilization, the popup Frame's painted rect oscillates
+        // each frame as the spin advances `rot_time`, and the
+        // entire overlay visibly jitters.
+        // No leading axis-name cell — the axis is folded into the
+        // trailing value (e.g. "w +0.000", "t  8.70s"), so the
+        // slider hugs the frame's left edge with no dead space.
+        // Trailing cell is fixed-width monospace so the value's
+        // char count never makes the slider rect oscillate as the
+        // spin advances `rot_time`.
+        const VALUE_CELL_W: f32 = 86.0;
+        let slider_w = (area_w - VALUE_CELL_W - 16.0).max(140.0);
+        ui.spacing_mut().slider_width = slider_w;
+        let value_layout = egui::Layout::left_to_right(egui::Align::Center);
+
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut self.w_slice, -W_RANGE..=W_RANGE).show_value(false));
+            ui.allocate_ui_with_layout(egui::vec2(VALUE_CELL_W, 14.0), value_layout, |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(format!("w {:>+.3}", self.w_slice)).monospace(),
+                ));
+            });
+        });
+        let mut t_dragged = false;
+        ui.horizontal(|ui| {
+            let resp = ui.add(egui::Slider::new(&mut self.rot_time, 0.0..=30.0).show_value(false));
+            ui.allocate_ui_with_layout(egui::vec2(VALUE_CELL_W, 14.0), value_layout, |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(format!("t {:>5.2}s", self.rot_time)).monospace(),
+                ));
+            });
+            t_dragged = resp.dragged();
+        });
+        // Gate the scrub-from-zero recomputation on `.dragged()` so
+        // it ONLY fires while the user is actively scrubbing the
+        // slider. Using `.changed()` here misfired every frame the
+        // spin's `rot_time += dt_secs` accumulator advanced the
+        // value, producing the snap the user reported when toggling
+        // active checkboxes (omega would shift, and re-deriving
+        // `exp(omega_new * t)` from an accumulated `t` is a
+        // discontinuous jump rather than the smooth integrated path).
+        if t_dragged {
+            let omega = match self.rotation_mode {
+                RotationMode::Active => angular_velocity(&self.active, self.rate_scale),
+                RotationMode::Composer => angular_velocity_from_seq(&self.seq, self.rate_scale),
+            };
+            self.rot_state = (omega * self.rot_time).exp().normalize();
+            self.write_all(rotor_to_slot(self.rot_state));
+        }
+    }
+
+    /// Always-visible single row directly under the sliders.
+    /// Center-justified play/rate cluster with the right-aligned
+    /// utility cluster on the same line:
+    ///
+    /// ```text
+    ///                  [<<] [<] [▶/⏸] [>] [>>]      [Reset] [?] [^]
+    ///                            ×1.00
+    /// ```
+    ///
+    /// Rate buttons toggle: clicking a highlighted preset clears it
+    /// back to ×1.00 (the default) so the user can switch out of a
+    /// non-default rate without resetting everything.
+    fn render_rate_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            // True row centering: leading pad = (total_w - group_w) /
+            // 2 so the play group's center sits exactly at the row's
+            // midpoint. The right cluster is anchored to the right
+            // edge separately via Layout::right_to_left, so it
+            // doesn't enter into the centering math at all.
+            //
+            // `PLAY_GROUP_W` is empirically the natural width of the
+            // 6-widget cluster (`<<` `<` ▶/⏸ `>` `>>` ↻ plus default
+            // item spacing). If button labels or padding change,
+            // re-tune here.
+            const PLAY_GROUP_W: f32 = 215.0;
+            let total_w = ui.available_width();
+            let leading = ((total_w - PLAY_GROUP_W) / 2.0).max(8.0);
+
+            ui.add_space(leading);
+            rate_toggle(ui, &mut self.rate_scale, 0.25, true, false);
+            rate_toggle(ui, &mut self.rate_scale, 0.5, false, false);
+            if play_pause_button(ui, self.rotate)
+                .on_hover_text("Toggle continuous rotation (Space)")
+                .clicked()
+            {
+                self.rotate = !self.rotate;
+            }
+            rate_toggle(ui, &mut self.rate_scale, 2.0, false, true);
+            rate_toggle(ui, &mut self.rate_scale, 4.0, true, true);
+            if refresh_button(ui)
+                .on_hover_text("Reset slice, rate, active set, orientation, time (R)")
+                .clicked()
+            {
+                self.reset();
+            }
+
+            // Right cluster: claims the rest of the row with a
+            // right-to-left sub-layout so widgets stack at the right
+            // edge regardless of where the cursor is. Reset moved to
+            // the play group as ↻; this cluster is now just the
+            // help and expand toggles.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if chevron_button(
+                    ui,
+                    !self.expanded,
+                    if self.expanded {
+                        "Collapse (H)"
+                    } else {
+                        "Expand controls (H)"
+                    },
+                )
+                .clicked()
+                {
+                    self.expanded = !self.expanded;
+                }
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("?").strong())
+                            .min_size(egui::vec2(22.0, 22.0)),
+                    )
+                    .on_hover_text("About this program")
+                    .clicked()
+                {
+                    self.show_help = true;
+                }
+            });
+        });
     }
 
     /// Rebuild the full body uniform array from the current row +
@@ -740,14 +1773,70 @@ impl PolytopeSmokeApp {
         self.node.set_bodies(&bodies);
     }
 
-    /// Full reset: slice, rate, active set, orientation, time
-    /// accumulator. Slice resets to centre regardless of row.
+    /// Render a compact formula for what's currently driving the
+    /// rotor: the continuous active-set bivector (multiplied by the
+    /// rate and time, when nonzero) followed by the multiplicative
+    /// composed sequence (each term parenthesized when it's a sum).
+    /// Empty string when nothing is contributing.
+    fn formula_string(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let active_planes: Vec<&'static str> = PLANES
+            .iter()
+            .zip(self.active.iter())
+            .filter(|(_, on)| **on)
+            .map(|(p, _)| p.label())
+            .collect();
+        if !active_planes.is_empty() {
+            let bivec = if active_planes.len() == 1 {
+                active_planes[0].to_string()
+            } else {
+                format!("({})", active_planes.join(" + "))
+            };
+            parts.push(format!(
+                "exp({} · {:.2}·t)",
+                bivec,
+                self.rate_scale * BASE_ROTATION_RATE / std::f32::consts::TAU
+            ));
+        }
+        for term in &self.seq {
+            if term.planes.is_empty() {
+                continue;
+            }
+            let plane_str = term
+                .planes
+                .iter()
+                .map(|p| p.label())
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let bivec = if term.planes.len() > 1 {
+                format!("({plane_str})")
+            } else {
+                plane_str
+            };
+            let body = match term.scalar {
+                Some(phi) => format!("{:.0}° · {}", phi.to_degrees(), bivec),
+                None => bivec,
+            };
+            parts.push(format!("exp({body})"));
+        }
+        parts.join(" · ")
+    }
+
+    /// Full reset: pause spin, slice, rate, active set, orientation,
+    /// time, draft. Reset implies "stop", so `rotate` flips off too —
+    /// otherwise the next frame's `update()` would immediately start
+    /// spinning the freshly-reset state, which the user almost never
+    /// wants.
     fn reset(&mut self) {
+        self.rotate = false;
         self.w_slice = 0.0;
         self.rate_scale = 1.0;
-        self.active = [false; 6];
+        // Restore the xw-only default active set so a first-time
+        // user resetting and then hitting Spin sees motion.
+        self.active = [false, false, true, false, false, false];
         self.rot_state = Rotor4::IDENTITY;
         self.rot_time = 0.0;
+        self.draft.clear();
         self.write_all(IDENTITY_ROTOR);
     }
 }
@@ -823,11 +1912,20 @@ impl App for PolytopeSmokeApp {
             slider_down_held: false,
             rotate: false,
             rot_state: Rotor4::IDENTITY,
-            active: [false; 6],
+            // Default: xw spin enabled (active[2] = Plane::Xw). A
+            // first-time user who hits "Spin" before toggling any
+            // checkbox now sees motion immediately — the most
+            // characteristic 4D rotation, pulling the visible x-axis
+            // through the hidden w-axis.
+            active: [false, false, true, false, false, false],
             rate_scale: 1.0,
             rot_time: 0.0,
-            show_panel: true,
+            expanded: false,
+            show_help: false,
+            show_formula: false,
+            rotation_mode: RotationMode::Active,
             seq: Vec::new(),
+            draft: Vec::new(),
         })
     }
 
@@ -851,7 +1949,11 @@ impl App for PolytopeSmokeApp {
         // orientation in place, see KeyT handler.
         if self.rotate {
             self.rot_time += dt_secs;
-            let omega = angular_velocity(&self.active, self.rate_scale) * dt_secs;
+            let omega_per_sec = match self.rotation_mode {
+                RotationMode::Active => angular_velocity(&self.active, self.rate_scale),
+                RotationMode::Composer => angular_velocity_from_seq(&self.seq, self.rate_scale),
+            };
+            let omega = omega_per_sec * dt_secs;
             // No-op when no planes are active; skip the exp+mul.
             if omega.magnitude_squared() > 0.0 {
                 let delta = omega.exp();
@@ -887,66 +1989,73 @@ impl App for PolytopeSmokeApp {
     }
 
     fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
-        if self.show_panel {
-            egui::SidePanel::left("polytope-smoke-controls")
-                .resizable(false)
-                .default_width(PANEL_WIDTH as f32)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.heading("polytope smoke");
-                        // Right-aligned cluster: ?-circle and < collapse.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(egui::Button::new("<").min_size(egui::vec2(22.0, 22.0)))
-                                .on_hover_text("Hide controls panel (H)")
-                                .clicked()
-                            {
-                                self.show_panel = false;
-                            }
-                            ui.add(
-                                egui::Button::new(egui::RichText::new("?").strong())
-                                    .min_size(egui::vec2(22.0, 22.0)),
-                            )
-                            .on_hover_ui(|ui| {
-                                ui.label("Up / Down: scrub w-slice");
-                                ui.label("T: toggle spin");
-                                ui.label("R: reset");
-                                ui.label("1..6: toggle plane in active set (xy xz xw yz yw zw)");
-                                ui.label("+ / -: rate scale");
-                                ui.label("H: hide / show this panel");
-                                ui.label("Esc: exit");
-                                ui.label("Mouse drag in viewport: orbit camera");
-                            });
-                        });
-                    });
-                    ui.label(format!("{:.0} fps", frame.fps));
+        // Disable Ctrl+/Ctrl- keyboard-zoom. egui's built-in zoom
+        // changes pixels_per_point but the wgpu surface stays at the
+        // native resolution, so the scene ends up letter-boxed
+        // (black bars) and the tessellator complains about clipped
+        // geometry. UI scale stays at native PPP; the scene already
+        // supports mouse-wheel orbit-zoom.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| self.render_panel_body(ui));
-                });
-        } else {
-            egui::Area::new(egui::Id::new("polytope-smoke-show"))
-                .anchor(egui::Align2::LEFT_TOP, [8.0, 8.0])
-                .show(ctx, |ui| {
-                    if ui
-                        .add(egui::Button::new(">").min_size(egui::vec2(24.0, 24.0)))
-                        .on_hover_text("Show controls panel (H)")
-                        .clicked()
-                    {
-                        self.show_panel = true;
-                    }
-                });
+        // Top-left: title + fps + framebuffer size. Replaces the old
+        // panel header now that the side panel is gone. Larger
+        // typography so the title reads as the program's nameplate
+        // rather than just another label.
+        let cfg = &frame.rd.surface_bundle.config;
+        let (fb_w, fb_h) = (cfg.width, cfg.height);
+        egui::Area::new(egui::Id::new("polytope-smoke-title"))
+            .anchor(egui::Align2::LEFT_TOP, [20.0, 18.0])
+            .show(ctx, |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new("Polytope Smoke Test")
+                        .size(22.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                ));
+                ui.add(egui::Label::new(
+                    egui::RichText::new(format!("{:.0} fps   {}×{}", frame.fps, fb_w, fb_h))
+                        .size(13.0)
+                        .color(egui::Color32::from_gray(190)),
+                ));
+            });
+
+        // Top-right: live rotation formula and the combo name. Off
+        // by default (the math notation is dense for newcomers);
+        // toggled by the "Show formula" checkbox in the expanded
+        // section.
+        if self.show_formula {
+            let formula = self.formula_string();
+            let name = combo_name(&self.active);
+            if !formula.is_empty() || name.is_some() {
+                egui::Area::new(egui::Id::new("polytope-smoke-formula"))
+                    .anchor(egui::Align2::RIGHT_TOP, [-16.0, 16.0])
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(&ctx.style())
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                                if !formula.is_empty() {
+                                    ui.add(egui::Label::new(
+                                        egui::RichText::new(&formula).monospace(),
+                                    ));
+                                }
+                                if let Some(n) = name {
+                                    ui.add(egui::Label::new(
+                                        egui::RichText::new(n)
+                                            .color(egui::Color32::from_rgb(255, 217, 140)),
+                                    ));
+                                }
+                            });
+                    });
+            }
         }
 
-        // Bottom-right: window size, handy for screenshots.
-        let cfg = &frame.rd.surface_bundle.config;
-        let (w, h) = (cfg.width, cfg.height);
-        egui::Area::new(egui::Id::new("polytope-smoke-size"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -16.0])
-            .show(ctx, |ui| {
-                ui.weak(format!("{w}x{h}"));
-            });
+        // Bottom-anchored unified controls overlay. Sliders + rate
+        // row always visible; the rest expands above on chevron/H.
+        self.render_overlay(ctx);
+
+        // Modal help window (opened by the `?` button).
+        self.render_help_window(ctx);
     }
 
     fn on_event(&mut self, ev: &winit::event::WindowEvent, _ctx: &mut FrameCtx<'_>) {
@@ -963,11 +2072,13 @@ impl App for PolytopeSmokeApp {
             KeyCode::ArrowUp => self.slider_up_held = pressed,
             KeyCode::ArrowDown => self.slider_down_held = pressed,
             KeyCode::KeyR if pressed => self.reset(),
-            KeyCode::KeyH if pressed => self.show_panel = !self.show_panel,
-            KeyCode::KeyT if pressed => {
+            KeyCode::KeyH if pressed => self.expanded = !self.expanded,
+            KeyCode::KeyT | KeyCode::Space if pressed => {
                 // Pause / resume only, DO NOT touch rot_state. The
                 // bodies keep their current orientation when paused
-                // and resume from there when toggled back on.
+                // and resume from there when toggled back on. Both
+                // T (legacy) and Space (media-player convention)
+                // bind to the same toggle.
                 self.rotate = !self.rotate;
             }
             // Plane toggles. Sum-of-bivectors composition is
@@ -980,32 +2091,17 @@ impl App for PolytopeSmokeApp {
             KeyCode::Digit4 | KeyCode::Numpad4 if pressed => self.active[3] = !self.active[3],
             KeyCode::Digit5 | KeyCode::Numpad5 if pressed => self.active[4] = !self.active[4],
             KeyCode::Digit6 | KeyCode::Numpad6 if pressed => self.active[5] = !self.active[5],
-            // Numpad and main-row +/- both adjust rate by 0.25
-            // additively. Floored at 0.0 (effectively pause via
-            // rate=0); ceiling at 8.0 keeps the integration stable.
-            KeyCode::Equal | KeyCode::NumpadAdd if pressed => {
-                self.rate_scale = (self.rate_scale + 0.25).min(8.0);
-            }
-            KeyCode::Minus | KeyCode::NumpadSubtract if pressed => {
-                self.rate_scale = (self.rate_scale - 0.25).max(0.0);
-            }
             _ => {}
         }
     }
 
     fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
-        // Hyperslice scene rendered into the area not covered by the
-        // egui panel. `u.resolution` is the viewport size and
-        // `u.viewport_origin` is its top-left in framebuffer pixels;
-        // together they let the kernel compute the correct UV inside
-        // the carved-out region. The egui overlay paints on top
-        // after this returns.
+        // Scene renders to the full window. The bottom controls
+        // overlay floats on top — `BottomOverlay` is an Area, not
+        // a docked panel, so the scene viewport doesn't need to
+        // skip a bottom strip.
         let cfg = &rd.surface_bundle.config;
-        let viewport = if self.show_panel {
-            Viewport::right_of_left_panel(PANEL_WIDTH, [cfg.width, cfg.height])
-        } else {
-            Viewport::full([cfg.width, cfg.height])
-        };
+        let viewport = Viewport::full([cfg.width, cfg.height]);
         {
             let u = self.node.uniforms_mut();
             u.resolution = viewport.resolution_f32();
@@ -1031,4 +2127,165 @@ fn main() -> Result<()> {
         ..RunConfig::default()
     };
     run_with_config::<PolytopeSmokeApp>(config)
+}
+
+// ---------------------------------------------------------------------------
+// Layout regression tests
+// ---------------------------------------------------------------------------
+//
+// `cargo test --example polytope_smoke` to run.
+//
+// These tests headless-render the shape row through `egui::Context::run`
+// and inspect the actual placed-rect positions of every card and the
+// trailing `+` button. They guard against the "descending staircase"
+// regression where adding a long-label shape (120/600-cell) caused
+// label-wrapping to grow that card's frame, which in turn pushed
+// egui's horizontal Center cross-alignment to recompute against a
+// new max-height — leaving earlier cards aligned to the old (lower)
+// center while the new card centered higher.
+//
+// `egui::Context` works fine without a renderer for layout-only
+// tests; nothing here touches the GPU.
+
+#[cfg(test)]
+mod alignment_tests {
+    use super::*;
+
+    /// Headless-render the same widget layout as `render_shapes_section`
+    /// (minus the surrounding ScrollArea + Frame::popup, which don't
+    /// affect intra-row alignment) and capture each card's response
+    /// rect plus the trailing `+` button's rect.
+    fn capture_row_rects(row: &[ShapeEntry]) -> Vec<egui::Rect> {
+        let ctx = egui::Context::default();
+        let mut rects = Vec::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // Top-align cross-axis: with `Align::Min` egui places
+                // each widget at the row's top edge, skipping the
+                // `frame_size.y = max(child, avail)` recursion that
+                // Center alignment uses (and that recursion is what
+                // produced the converging staircase tops 14 → 18.5
+                // → 20.75 → 21.88 — each card pulled halfway toward
+                // the avail.center as `avail` grew with placed
+                // widgets).
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    for (i, entry) in row.iter().enumerate() {
+                        let drag_id = ui.make_persistent_id(("shape-card", i));
+                        let frame = egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(80, 80, 80))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::GRAY))
+                            .inner_margin(egui::Margin::symmetric(4, 6))
+                            .corner_radius(egui::CornerRadius::same(3));
+                        let (inner_resp, _) = ui.dnd_drop_zone::<usize, _>(frame, |ui| {
+                            let _ = ui.dnd_drag_source(drag_id, i, |ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(SHAPE_CARD_WIDTH, 0.0),
+                                    egui::Layout::top_down(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(entry.label)
+                                                    .strong()
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .selectable(false)
+                                            .wrap_mode(egui::TextWrapMode::Extend),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+                        rects.push(inner_resp.response.rect);
+                    }
+                    let plus = add_button(ui);
+                    rects.push(plus.rect);
+                });
+            });
+        });
+        rects
+    }
+
+    fn rect_table(rects: &[egui::Rect]) -> String {
+        rects
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                format!(
+                    "[{i}] top={:.2} bottom={:.2} center.y={:.2} h={:.2}",
+                    r.top(),
+                    r.bottom(),
+                    r.center().y,
+                    r.height()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n        ")
+    }
+
+    /// All widgets must share a top y. With Top-align cross-axis,
+    /// this is the meaningful invariant — heights may vary (the +
+    /// button is intentionally 2pt shorter than the cards) but
+    /// tops align.
+    fn assert_top_aligned(rects: &[egui::Rect], context: &str) {
+        if rects.is_empty() {
+            return;
+        }
+        let first_top = rects[0].top();
+        for (i, rect) in rects.iter().enumerate() {
+            let top = rect.top();
+            assert!(
+                (top - first_top).abs() < 0.5,
+                "{context}: widget {i} top={top:.2} differs from widget 0's \
+                 top={first_top:.2}\n        {table}",
+                table = rect_table(rects),
+            );
+        }
+    }
+
+    /// Cards (everything except the trailing + button) must have
+    /// uniform height. The + is excluded because it's intentionally
+    /// 2pt shorter for visual balance.
+    fn assert_cards_h_uniform(rects: &[egui::Rect], context: &str) {
+        if rects.len() < 2 {
+            return;
+        }
+        let cards = &rects[..rects.len() - 1];
+        let first_h = cards[0].height();
+        for (i, rect) in cards.iter().enumerate() {
+            let h = rect.height();
+            assert!(
+                (h - first_h).abs() < 0.5,
+                "{context}: card {i} height={h:.2} differs from card 0's \
+                 height={first_h:.2}\n        {table}",
+                table = rect_table(rects),
+            );
+        }
+    }
+
+    #[test]
+    fn default_row_4_shapes_aligned() {
+        let row = DEFAULT_ROW.to_vec();
+        let rects = capture_row_rects(&row);
+        assert_cards_h_uniform(&rects, "default 4-shape row");
+        assert_top_aligned(&rects, "default 4-shape row");
+    }
+
+    #[test]
+    fn row_with_120cell_aligned() {
+        let mut row = DEFAULT_ROW.to_vec();
+        row.push(parse_shape_name("120-cell").unwrap());
+        let rects = capture_row_rects(&row);
+        assert_cards_h_uniform(&rects, "default + 120-cell");
+        assert_top_aligned(&rects, "default + 120-cell");
+    }
+
+    #[test]
+    fn row_with_120cell_and_600cell_aligned() {
+        let mut row = DEFAULT_ROW.to_vec();
+        row.push(parse_shape_name("120-cell").unwrap());
+        row.push(parse_shape_name("600-cell").unwrap());
+        let rects = capture_row_rects(&row);
+        assert_cards_h_uniform(&rects, "default + 120-cell + 600-cell");
+        assert_top_aligned(&rects, "default + 120-cell + 600-cell");
+    }
 }

@@ -14,6 +14,11 @@
 //! - [`world_to_screen`]: project a world-space point to screen pixel
 //!   coordinates via a camera + viewport. The cheap pattern for
 //!   "egui label that follows a 3D object."
+//! - [`BottomOverlay`]: floating bottom-anchored overlay panel with
+//!   flicker-free animated size transitions. Solves the single-frame
+//!   jump that egui's [`Area`](egui::Area) produces when content size
+//!   changes drastically. The widget you reach for when building a
+//!   game HUD that grows/shrinks with state.
 //!
 //! [egui]: https://github.com/emilk/egui
 //!
@@ -52,13 +57,17 @@
 //!   for current use cases; the screen-space-with-world-anchoring
 //!   pattern via [`world_to_screen`] covers labels and HUDs that
 //!   follow 3D objects.
-//! - **Custom widget set on top of egui.** egui's defaults are fine
-//!   for v0; theme tweaks live in the app, not here.
+//! - **A full custom widget set on top of egui.** egui's defaults
+//!   cover most needs; this crate only adds widgets that work
+//!   around concrete egui limitations (currently:
+//!   [`BottomOverlay`] for flicker-free anchored HUDs).
 
 mod integration;
+mod overlay;
 mod world;
 
 pub use integration::UiIntegration;
+pub use overlay::BottomOverlay;
 pub use world::world_to_screen;
 
 // Re-export egui so apps depend on `rye-egui` only and the version
