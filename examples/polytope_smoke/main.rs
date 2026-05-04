@@ -454,6 +454,25 @@ struct PolytopeSmokeApp {
     /// bivector addition is commutative.
     rotation_mode: RotationMode,
 
+    /// Mode change requested this frame by the mode tabs. Applied
+    /// after the overlay finishes rendering so that the body that
+    /// renders this frame still sees `rotation_mode` (the OLD
+    /// value), and only the next frame swaps to the new mode.
+    /// Without this deferral, clicking a tab would change
+    /// `rotation_mode` mid-pass — the visible pass would render
+    /// the new mode's body while `BottomOverlay`'s measure pass
+    /// already captured the old mode's natural height, producing
+    /// a one-frame layout mismatch the user perceives as flicker.
+    pending_mode: Option<RotationMode>,
+
+    /// Composer-mode actions deferred to end-of-frame for the same
+    /// reason as `pending_mode`: any mutation that grows or shrinks
+    /// the overlay's body height (adding a draft plane, committing
+    /// a term, clearing the draft) must apply *after* both
+    /// `BottomOverlay` passes have rendered, otherwise pass 1 sees
+    /// the OLD body height and pass 2 the NEW one — flicker.
+    pending_actions: Vec<DeferredAction>,
+
     /// Sequence of [`RotorTerm`]s the user is building in the panel.
     /// Apply composes them onto `rot_state` left-to-right via rotor
     /// multiplication.
@@ -519,6 +538,23 @@ enum RotationMode {
     Composer,
 }
 
+/// State mutations queued during overlay rendering and applied
+/// AFTER the overlay's measure + visible passes finish. Any
+/// mutation that changes the overlay's natural content height
+/// must go through this — applying mid-frame would make the two
+/// `BottomOverlay` passes disagree on body height and the user
+/// would see a one-frame layout mismatch as flicker.
+#[derive(Clone, Debug)]
+enum DeferredAction {
+    /// `+xy` etc. button on the plane row: append to draft.
+    DraftPush(Plane),
+    /// `Add` button on the draft preview: commit current draft as a
+    /// new RotorTerm in seq, clear draft.
+    SeqCommitDraft,
+    /// `×` button on the draft preview: discard the draft.
+    DraftClear,
+}
+
 /// Drag-and-drop payload for the rotor sequence UI. Terms (whole
 /// cards) and plane entries (pills inside cards) both ride this
 /// single enum so a term card can be a single drop zone that
@@ -538,66 +574,53 @@ enum DragPayload {
 /// the user can see where drops are accepted; the gap currently
 /// under the cursor is painted brighter (the "live target") to
 /// match the convention used by Trello / Notion / Linear etc.
-fn drop_pipe(ui: &mut egui::Ui, height: f32) -> Option<DragPayload> {
-    let ctx = ui.ctx().clone();
-    let dragging = egui::DragAndDrop::payload::<DragPayload>(&ctx).is_some();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, height), egui::Sense::hover());
-    // Hit area extends ±40pt above and below the row so a card
-    // dragged a bit too high or too low still snaps to a drop
-    // target. Without this, dragging slightly outside the row's
-    // vertical extent canceled the drop. Using `contains_pointer`
-    // on the original rect alone (without expansion) was the
-    // cause of "card too high → no drop" returns.
-    let hit = rect.expand2(egui::vec2(0.0, 40.0));
-    let cursor = ctx.input(|i| i.pointer.hover_pos());
-    let hovered = dragging && cursor.is_some_and(|p| hit.contains(p));
-    if hovered {
-        // Visible line is TALLER than the row (50pt total) so it
-        // sticks out above and below the dragged card's floating
-        // preview — the drop indicator stays visible even with
-        // the card directly under the cursor obscuring most of
-        // the gap.
-        let line_half_h = 25.0;
-        let cy = rect.center().y;
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.center().x, cy - line_half_h),
-                egui::pos2(rect.center().x, cy + line_half_h),
-            ],
-            egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 200, 60)),
-        );
+/// Animated "make room" insertion gap at one slot of a horizontal
+/// row. The slot whose `is_target` is `true` expands to `open_width`
+/// over ~120 ms; others stay at zero width. Cards on either side
+/// slide outward as the gap opens, giving a clear drop preview
+/// without a separate marker line. The gap collapses back to zero
+/// when the drag ends. Returns `true` if a pointer release occurred
+/// on the targeted gap this frame — the caller takes whatever
+/// payload it expects from `DragAndDrop` and applies the move.
+fn make_room_gap(
+    ui: &mut egui::Ui,
+    is_target: bool,
+    slot_id: egui::Id,
+    height: f32,
+    open_width: f32,
+) -> bool {
+    let target_w = if is_target { open_width } else { 0.0 };
+    let smooth_w = ui.ctx().animate_value_with_time(slot_id, target_w, 0.12);
+    if smooth_w >= 0.5 {
+        let _ = ui.allocate_exact_size(egui::vec2(smooth_w, height), egui::Sense::hover());
     }
-    if hovered && ctx.input(|i| i.pointer.any_released()) {
-        return egui::DragAndDrop::take_payload::<DragPayload>(&ctx).map(|arc| *arc);
-    }
-    None
+    is_target && ui.ctx().input(|i| i.pointer.any_released())
 }
 
-/// Same as [`drop_pipe`] for the shape row; payload is the shape
-/// source index so it doesn't collide with the rotor seq's
-/// `DragPayload`.
-fn shape_drop_pipe(ui: &mut egui::Ui, height: f32) -> Option<usize> {
-    let ctx = ui.ctx().clone();
-    let dragging = egui::DragAndDrop::payload::<usize>(&ctx).is_some();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, height), egui::Sense::hover());
-    let hit = rect.expand2(egui::vec2(0.0, 40.0));
-    let cursor = ctx.input(|i| i.pointer.hover_pos());
-    let hovered = dragging && cursor.is_some_and(|p| hit.contains(p));
-    if hovered {
-        let line_half_h = 25.0;
-        let cy = rect.center().y;
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.center().x, cy - line_half_h),
-                egui::pos2(rect.center().x, cy + line_half_h),
-            ],
-            egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 200, 60)),
-        );
+/// Map cursor x-position over a row's bounding `row_rect` to a
+/// 0-based insertion slot index in `0..=item_count`. Returns
+/// `None` when no drag is active (`is_dragging` is `false`) or
+/// the cursor isn't over the row band. Hit band extends ±40 pt
+/// vertically so a card dragged a bit above or below the row
+/// still snaps to a slot.
+fn drop_target_idx(
+    ctx: &egui::Context,
+    is_dragging: bool,
+    row_rect: egui::Rect,
+    item_count: usize,
+) -> Option<usize> {
+    if !is_dragging {
+        return None;
     }
-    if hovered && ctx.input(|i| i.pointer.any_released()) {
-        return egui::DragAndDrop::take_payload::<usize>(&ctx).map(|arc| *arc);
+    let cursor = ctx.input(|i| i.pointer.hover_pos())?;
+    let band = row_rect.expand2(egui::vec2(0.0, 40.0));
+    if !band.x_range().contains(cursor.x) || !band.y_range().contains(cursor.y) {
+        return None;
     }
-    None
+    let n_slots = item_count + 1;
+    let slot_w = (row_rect.width() / n_slots as f32).max(1.0);
+    let rel = (cursor.x - row_rect.left()).max(0.0);
+    Some(((rel / slot_w) as usize).min(item_count))
 }
 
 /// Inside a `dnd_drag_source` body, force fully-opaque widget
@@ -962,16 +985,28 @@ impl PolytopeSmokeApp {
         // sub-panels swap below. The formula-display toggle sits at
         // the right of the same row — it's a viewport-level option
         // (independent of mode), not a mode setting itself.
+        // Mode change deferred via `self.pending_mode`: the body
+        // below this row reads `self.rotation_mode` (still the
+        // OLD value this frame), and `render_overlay` swaps in
+        // the new mode after `BottomOverlay::show` returns. This
+        // keeps `BottomOverlay`'s measure pass and visible pass
+        // rendering the same body height — clicking a tab shows
+        // the new mode on the *next* frame, with the height
+        // animation, but no mid-frame mismatch flicker.
+        let mut staged = self.rotation_mode;
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.rotation_mode, RotationMode::Active, "Active set")
+            ui.selectable_value(&mut staged, RotationMode::Active, "Active set")
                 .on_hover_text("Six checkbox-toggled bivectors (xy, xz, ...)");
-            ui.selectable_value(&mut self.rotation_mode, RotationMode::Composer, "Composer")
+            ui.selectable_value(&mut staged, RotationMode::Composer, "Composer")
                 .on_hover_text("Sum of bivectors from the composed sequence");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.checkbox(&mut self.show_formula, "Show formula")
                     .on_hover_text("Top-right popup with the live exp(...) form of the rotor");
             });
         });
+        if staged != self.rotation_mode {
+            self.pending_mode = Some(staged);
+        }
 
         // Mode-specific UI.
         if self.rotation_mode == RotationMode::Active {
@@ -1002,7 +1037,7 @@ impl PolytopeSmokeApp {
                     .on_hover_text("Add to the current draft term")
                     .clicked()
                 {
-                    self.draft.push(*plane);
+                    self.pending_actions.push(DeferredAction::DraftPush(*plane));
                 }
             }
         });
@@ -1036,11 +1071,7 @@ impl PolytopeSmokeApp {
                             .on_hover_text("Commit as one-shot term in sequence")
                             .clicked()
                         {
-                            self.seq.push(RotorTerm {
-                                planes: self.draft.clone(),
-                                scalar: None,
-                            });
-                            self.draft.clear();
+                            self.pending_actions.push(DeferredAction::SeqCommitDraft);
                         }
                         if ui
                             .add(
@@ -1050,7 +1081,7 @@ impl PolytopeSmokeApp {
                             .on_hover_text("Discard draft")
                             .clicked()
                         {
-                            self.draft.clear();
+                            self.pending_actions.push(DeferredAction::DraftClear);
                         }
                     });
                 });
@@ -1070,16 +1101,33 @@ impl PolytopeSmokeApp {
 
         if !self.seq.is_empty() {
             ui.label("Sequence:");
-            // Card-row height: matches `CONTROL_H` so the pipes are
-            // the same height as the term cards, keeping the row's
-            // cross-alignment stable.
-            let pipe_height = CONTROL_H;
-            ui.horizontal_wrapped(|ui| {
+            let term_h = CONTROL_H;
+            // Drop target slot index for the term row, computed
+            // from cursor position vs last frame's row geometry.
+            // Active only when a Term-variant payload is in
+            // flight; Entry-variant payloads (cross-term plane
+            // migration) drop on cards, not gaps.
+            let dragging_term = matches!(
+                egui::DragAndDrop::payload::<DragPayload>(ui.ctx()).as_deref(),
+                Some(DragPayload::Term(_))
+            );
+            let term_row_rect_id = ui.make_persistent_id("term-row-rect");
+            let last_term_row_rect: Option<egui::Rect> =
+                ui.ctx().memory(|m| m.data.get_temp(term_row_rect_id));
+            let term_drop_idx = last_term_row_rect
+                .and_then(|rect| drop_target_idx(ui.ctx(), dragging_term, rect, self.seq.len()));
+            let term_row_resp = ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
                 for term_idx in 0..self.seq.len() {
-                    // Insertion pipe before this term (insert-at = term_idx).
-                    if let Some(DragPayload::Term(from)) = drop_pipe(ui, pipe_height) {
-                        if from != term_idx {
-                            term_moves.push((from, term_idx));
+                    let gap_id = ui.make_persistent_id(("term-gap", term_idx));
+                    if make_room_gap(ui, term_drop_idx == Some(term_idx), gap_id, term_h, 72.0) {
+                        if let Some(arc) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx())
+                        {
+                            if let DragPayload::Term(from) = *arc {
+                                if from != term_idx {
+                                    term_moves.push((from, term_idx));
+                                }
+                            }
                         }
                     }
                     if term_idx > 0 {
@@ -1215,10 +1263,25 @@ impl PolytopeSmokeApp {
                         }
                     }
                 }
-                // Trailing pipe: drop after the last term.
-                if let Some(DragPayload::Term(from)) = drop_pipe(ui, pipe_height) {
-                    term_moves.push((from, self.seq.len()));
+                // Trailing insertion gap: drop after the last term.
+                let trailing_id = ui.make_persistent_id(("term-gap", self.seq.len()));
+                if make_room_gap(
+                    ui,
+                    term_drop_idx == Some(self.seq.len()),
+                    trailing_id,
+                    term_h,
+                    72.0,
+                ) {
+                    if let Some(arc) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx()) {
+                        if let DragPayload::Term(from) = *arc {
+                            term_moves.push((from, self.seq.len()));
+                        }
+                    }
                 }
+            });
+            ui.ctx().memory_mut(|m| {
+                m.data
+                    .insert_temp(term_row_rect_id, term_row_resp.response.rect)
             });
         }
 
@@ -1287,7 +1350,6 @@ impl PolytopeSmokeApp {
     /// Apply/Clear in `Composer`).
     fn render_shapes_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        ui.label("Shapes (drop a card onto another to insert there)");
         let has_heavy = self
             .row
             .iter()
@@ -1301,162 +1363,146 @@ impl PolytopeSmokeApp {
         let mut row_changed = false;
 
         // Cards in a horizontally scrolling area: never wraps, so
-        // resizing the panel doesn't reflow the row. Drag-and-drop
-        // works the same; insertion pipes between cards mark drop
-        // points.
+        // resizing the panel doesn't reflow the row. Drop is via
+        // an animated "make room" gap that opens at the cursor's
+        // insertion slot during drag — no separate marker line
+        // needed; the gap itself is the indicator.
         let mut remove_idx: Option<usize> = None;
         let mut shape_moves: Vec<(usize, usize)> = Vec::new();
         let row_len = self.row.len();
-        let pipe_height = CONTROL_H;
-        egui::ScrollArea::horizontal()
+        let row_h = CONTROL_H;
+        // Slot index where the drop should land. Computed once
+        // from cursor position and last-frame's row geometry, so
+        // every slot agrees on which one is "the target."
+        let row_rect_id = ui.make_persistent_id("shape-row-rect");
+        let last_row_rect: Option<egui::Rect> = ui.ctx().memory(|m| m.data.get_temp(row_rect_id));
+        let dragging_shape = egui::DragAndDrop::payload::<usize>(ui.ctx()).is_some();
+        let drop_idx =
+            last_row_rect.and_then(|rect| drop_target_idx(ui.ctx(), dragging_shape, rect, row_len));
+        let row_rect = egui::ScrollArea::horizontal()
             .auto_shrink([false, true])
             .id_salt("polytope-smoke-shapes-scroll")
             .show(ui, |ui| {
-                // Top-align the row's cross axis (`Align::Min`).
-                // egui's Center alignment for horizontal layouts
-                // sizes each widget's frame as `max(child, avail)`
-                // and recenters within it — when widget heights
-                // vary, this produces a converging-staircase pattern
-                // (each subsequent widget pulled halfway toward the
-                // accumulating avail center). Top-align skips that
-                // step entirely: every widget lands with its top at
-                // the row's top edge. The alignment fix is verified
-                // by `alignment_tests::*` below; the regression we
-                // saw 14 → 18.5 → 20.75 → 21.88 collapses to a flat
-                // 8 → 8 → 8 → 8 once Top-align is in place.
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                    for (i, entry) in self.row.iter().enumerate() {
-                        if let Some(from) = shape_drop_pipe(ui, pipe_height) {
-                            if from != i {
-                                shape_moves.push((from, i));
-                            }
-                        }
-                        let drag_id = ui.make_persistent_id(("shape-card", i));
-                        let pickup_t = drag_pickup_t(ui.ctx(), drag_id);
-                        // Card fill = saturated body color so the
-                        // mapping card → polytope is unambiguous at a
-                        // glance. Full alpha (no premultiply tricks)
-                        // because earlier the underdriven values just
-                        // looked gray.
-                        let [r, g, b] = entry.color;
-                        let card_fill = egui::Color32::from_rgb(
-                            (r * 200.0).min(255.0) as u8,
-                            (g * 200.0).min(255.0) as u8,
-                            (b * 200.0).min(255.0) as u8,
-                        );
-                        let stroke_color = if pickup_t > 0.0 {
-                            egui::Color32::from_rgb(255, 200, 60)
-                        } else {
-                            egui::Color32::from_rgb(
-                                (r * 255.0).min(255.0) as u8,
-                                (g * 255.0).min(255.0) as u8,
-                                (b * 255.0).min(255.0) as u8,
-                            )
-                        };
-                        let stroke = egui::Stroke::new(1.0 + pickup_t * 1.5, stroke_color);
-                        // Frame is rendered INSIDE the drag-source's
-                        // body so the entire card (background +
-                        // stroke + label) follows the cursor when
-                        // dragged. Previously the Frame was the
-                        // dnd_drop_zone's frame argument, which kept
-                        // the Frame at the original position while
-                        // only the inner label floated to the cursor
-                        // — a "ghost text" effect rather than a card
-                        // pickup. Drop detection is also done
-                        // manually here: the auto-highlight that
-                        // dnd_drop_zone applies to its frame would
-                        // light up every card during drag (the
-                        // "every position is a drop target" look the
-                        // user already objected to); the pipes
-                        // between cards handle the visual indicator.
-                        let card_id = drag_id;
-                        let drag_resp = ui.dnd_drag_source(card_id, i, |ui| {
-                            if ui.ctx().is_being_dragged(card_id) {
-                                force_opaque_active(ui);
-                            }
-                            egui::Frame::default()
-                                .fill(card_fill)
-                                .stroke(stroke)
-                                .inner_margin(egui::Margin::symmetric(4, 6))
-                                .corner_radius(egui::CornerRadius::same(3))
-                                .show(ui, |ui| {
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(SHAPE_CARD_WIDTH, 0.0),
-                                        egui::Layout::top_down(egui::Align::Center),
-                                        |ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(entry.label)
-                                                        .strong()
-                                                        .color(egui::Color32::WHITE),
-                                                )
-                                                .selectable(false)
-                                                .wrap_mode(egui::TextWrapMode::Extend),
-                                            );
-                                        },
-                                    );
-                                });
-                        });
-                        // Manual drop detection on the card's rect.
-                        // Hit area extends ±40pt vertically so drops
-                        // a bit above or below the row still register
-                        // — matches the pipes' extended hit zone, so
-                        // the user can't accidentally cancel a drop
-                        // by drifting slightly outside the row's
-                        // exact y-band.
-                        let card_rect = drag_resp.response.rect;
-                        let card_hit = card_rect.expand2(egui::vec2(0.0, 40.0));
-                        let dragging = egui::DragAndDrop::payload::<usize>(ui.ctx()).is_some();
-                        let cursor = ui.ctx().input(|i| i.pointer.hover_pos());
-                        let card_hovered = dragging && cursor.is_some_and(|p| card_hit.contains(p));
-                        if card_hovered && ui.ctx().input(|i| i.pointer.any_released()) {
-                            if let Some(arc) = egui::DragAndDrop::take_payload::<usize>(ui.ctx()) {
-                                let from = *arc;
-                                if from != i {
-                                    shape_moves.push((from, i));
+                let row_response =
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        // Tighter inter-card spacing — the make-
+                        // room gap takes over from item_spacing as
+                        // the visual room-maker.
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for (i, entry) in self.row.iter().enumerate() {
+                            // Animated insertion gap before card i.
+                            let gap_id = ui.make_persistent_id(("shape-gap", i));
+                            if make_room_gap(
+                                ui,
+                                drop_idx == Some(i),
+                                gap_id,
+                                row_h,
+                                SHAPE_CARD_WIDTH + 16.0,
+                            ) {
+                                if let Some(arc) =
+                                    egui::DragAndDrop::take_payload::<usize>(ui.ctx())
+                                {
+                                    let from = *arc;
+                                    if from != i {
+                                        shape_moves.push((from, i));
+                                    }
                                 }
                             }
+                            let drag_id = ui.make_persistent_id(("shape-card", i));
+                            let pickup_t = drag_pickup_t(ui.ctx(), drag_id);
+                            // Uniform gray cards. egui's noninteractive
+                            // bg_fill matches surrounding panel chrome so
+                            // the cards read as a "list of equally-
+                            // weighted items" rather than a categorical
+                            // color legend.
+                            let card_fill = ui.visuals().widgets.noninteractive.bg_fill;
+                            let stroke_color = if pickup_t > 0.0 {
+                                egui::Color32::from_rgb(255, 200, 60)
+                            } else {
+                                ui.visuals().widgets.noninteractive.bg_stroke.color
+                            };
+                            let stroke = egui::Stroke::new(1.0 + pickup_t * 1.5, stroke_color);
+                            let card_id = drag_id;
+                            let drag_resp = ui.dnd_drag_source(card_id, i, |ui| {
+                                if ui.ctx().is_being_dragged(card_id) {
+                                    force_opaque_active(ui);
+                                }
+                                egui::Frame::default()
+                                    .fill(card_fill)
+                                    .stroke(stroke)
+                                    .inner_margin(egui::Margin::symmetric(4, 6))
+                                    .corner_radius(egui::CornerRadius::same(3))
+                                    .show(ui, |ui| {
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(SHAPE_CARD_WIDTH, 0.0),
+                                            egui::Layout::top_down(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(entry.label).strong(),
+                                                    )
+                                                    .selectable(false)
+                                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                                );
+                                            },
+                                        );
+                                    });
+                            });
+                            drag_resp
+                                .response
+                                .on_hover_cursor(egui::CursorIcon::Grab)
+                                .on_hover_text(entry.long_name)
+                                .interact(egui::Sense::click())
+                                .context_menu(|ui| {
+                                    if row_len > 1 && ui.button("Remove from row").clicked() {
+                                        remove_idx = Some(i);
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
+                                });
                         }
-                        drag_resp
-                            .response
-                            .on_hover_cursor(egui::CursorIcon::Grab)
-                            .on_hover_text(entry.long_name)
-                            .interact(egui::Sense::click())
-                            .context_menu(|ui| {
-                                if row_len > 1 && ui.button("Remove from row").clicked() {
-                                    remove_idx = Some(i);
-                                    ui.close_kind(egui::UiKind::Menu);
+                        // Trailing insertion gap — drop after the
+                        // last card.
+                        let trailing_id = ui.make_persistent_id(("shape-gap", row_len));
+                        if make_room_gap(
+                            ui,
+                            drop_idx == Some(row_len),
+                            trailing_id,
+                            row_h,
+                            SHAPE_CARD_WIDTH + 16.0,
+                        ) {
+                            if let Some(arc) = egui::DragAndDrop::take_payload::<usize>(ui.ctx()) {
+                                shape_moves.push((*arc, row_len));
+                            }
+                        }
+                        // "+" trigger inline with the shape cards.
+                        // Custom-painted plus on a 28×24 button rect so
+                        // the height matches the cards exactly and the
+                        // visual vocabulary matches the play / rate /
+                        // chevron buttons (no font-glyph dependency).
+                        if self.row.len() < MAX_ROW_LEN {
+                            let plus_resp = add_button(ui).on_hover_text("Add a shape to the row");
+                            egui::Popup::menu(&plus_resp).show(|ui| {
+                                ui.set_min_width(80.0);
+                                for shape_name in [
+                                    "5-cell", "8-cell", "16-cell", "24-cell", "120-cell",
+                                    "600-cell",
+                                ] {
+                                    if ui.button(shape_name).clicked() {
+                                        if let Ok(entry) = parse_shape_name(shape_name) {
+                                            self.row.push(entry);
+                                            row_changed = true;
+                                        }
+                                        ui.close_kind(egui::UiKind::Menu);
+                                    }
                                 }
                             });
-                    }
-                    // Trailing pipe: drop at end of row.
-                    if let Some(from) = shape_drop_pipe(ui, pipe_height) {
-                        shape_moves.push((from, self.row.len()));
-                    }
-                    // "+" trigger inline with the shape cards.
-                    // Custom-painted plus on a 28×24 button rect so
-                    // the height matches the cards exactly and the
-                    // visual vocabulary matches the play / rate /
-                    // chevron buttons (no font-glyph dependency).
-                    if self.row.len() < MAX_ROW_LEN {
-                        let plus_resp = add_button(ui).on_hover_text("Add a shape to the row");
-                        egui::Popup::menu(&plus_resp).show(|ui| {
-                            ui.set_min_width(80.0);
-                            for shape_name in [
-                                "5-cell", "8-cell", "16-cell", "24-cell", "120-cell", "600-cell",
-                            ] {
-                                if ui.button(shape_name).clicked() {
-                                    if let Ok(entry) = parse_shape_name(shape_name) {
-                                        self.row.push(entry);
-                                        row_changed = true;
-                                    }
-                                    ui.close_kind(egui::UiKind::Menu);
-                                }
-                            }
-                        });
-                    }
-                });
-            });
+                        }
+                    });
+                row_response.response.rect
+            })
+            .inner;
+        ui.ctx()
+            .memory_mut(|m| m.data.insert_temp(row_rect_id, row_rect));
         if let Some(i) = remove_idx {
             self.row.remove(i);
             row_changed = true;
@@ -1611,6 +1657,29 @@ impl PolytopeSmokeApp {
                 self.render_slider_strip(ui, area_w);
                 self.render_rate_row(ui);
             });
+
+        // Apply any deferred state changes AFTER the overlay
+        // finishes rendering, so both BottomOverlay passes saw
+        // the same content this frame. Effective on the next
+        // frame.
+        if let Some(new_mode) = self.pending_mode.take() {
+            self.rotation_mode = new_mode;
+        }
+        for action in std::mem::take(&mut self.pending_actions) {
+            match action {
+                DeferredAction::DraftPush(plane) => self.draft.push(plane),
+                DeferredAction::SeqCommitDraft => {
+                    if !self.draft.is_empty() {
+                        self.seq.push(RotorTerm {
+                            planes: self.draft.clone(),
+                            scalar: None,
+                        });
+                        self.draft.clear();
+                    }
+                }
+                DeferredAction::DraftClear => self.draft.clear(),
+            }
+        }
     }
 
     /// Two big sliders (w, t) with fixed-width monospace value
@@ -1924,6 +1993,8 @@ impl App for PolytopeSmokeApp {
             show_help: false,
             show_formula: false,
             rotation_mode: RotationMode::Active,
+            pending_mode: None,
+            pending_actions: Vec::new(),
             seq: Vec::new(),
             draft: Vec::new(),
         })

@@ -208,6 +208,12 @@ impl BottomOverlay {
         Area::new(self.id)
             .fixed_pos(Pos2::new(area_x, area_y))
             .constrain(false)
+            // Don't let the user drag the panel by clicking its
+            // background — its position is fully derived from
+            // `screen.bottom() - margin_y - smooth_h` each frame
+            // and any drag offset would be overwritten next frame
+            // anyway, producing a "pickup-then-snap-back" jitter.
+            .movable(false)
             .show(ctx, |ui| {
                 ui.set_min_width(self.width);
                 ui.set_max_width(self.width);
