@@ -18,6 +18,7 @@ wgpu.workspace = true
 winit.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
+rye-math    = { path = "../rye-math" }
 rye-physics = { path = "../rye-physics" }
 
 [dev-dependencies]

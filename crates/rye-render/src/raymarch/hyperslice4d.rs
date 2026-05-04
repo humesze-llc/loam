@@ -49,6 +49,7 @@
 
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
+use rye_math::Rotor4;
 use wgpu::*;
 
 use crate::device::RenderDevice;
@@ -170,8 +171,11 @@ impl BodyUniform {
     /// Build a polytope body. `shape_index` references the kernel's
     /// shape table (0 = pentatope, 1 = tesseract, ...). `size` is
     /// the polytope's circumradius in world coords. `rotor` is the
-    /// body's Rotor4 orientation as `[s, b_xy, b_xz, b_xw, b_yz,
-    /// b_yw, b_zw, ps]`.
+    /// body's Rotor4 orientation packed as
+    /// `[s, b_xy, b_xz, b_xw, b_yz, b_yw, b_zw, ps]` — the same
+    /// order produced by `<[f32; 8]>::from(Rotor4)`. Prefer
+    /// [`Self::polytope_with_rotor`] when the caller already has a
+    /// [`Rotor4`].
     pub fn polytope(
         position: [f32; 4],
         shape_index: u32,
@@ -188,6 +192,20 @@ impl BodyUniform {
             rotor,
             ..Self::default()
         }
+    }
+
+    /// Same as [`Self::polytope`] but takes a [`Rotor4`] directly,
+    /// using rye-math's canonical `[f32; 8]` packing. Use this from
+    /// app / example code so the GPU rotor field order isn't spelled
+    /// out by hand at the call site.
+    pub fn polytope_with_rotor(
+        position: [f32; 4],
+        shape_index: u32,
+        size: f32,
+        rotor: Rotor4,
+        color: [f32; 3],
+    ) -> Self {
+        Self::polytope(position, shape_index, size, rotor.into(), color)
     }
 }
 
@@ -1298,6 +1316,39 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         // 24-cell: 1/sqrt(2) and sqrt(2) literals.
         assert!(HYPERSLICE_KERNEL_WGSL.contains("0.70710678"));
         assert!(HYPERSLICE_KERNEL_WGSL.contains("1.41421356"));
+    }
+
+    /// `polytope_with_rotor` must produce the same uniform bytes as
+    /// `polytope` when the latter is fed the canonical `[f32; 8]`
+    /// packing of the same `Rotor4`. Catches a future drift where
+    /// either side reorders the rotor fields without the other.
+    #[test]
+    fn polytope_with_rotor_matches_manual_packing() {
+        let rotor = Rotor4 {
+            s: 0.5,
+            xy: 0.1,
+            xz: 0.2,
+            xw: 0.3,
+            yz: 0.4,
+            yw: 0.6,
+            zw: 0.7,
+            xyzw: 0.8,
+        };
+        let manual = BodyUniform::polytope(
+            [1.0, 2.0, 3.0, 4.0],
+            SHAPE_24CELL,
+            0.7,
+            rotor.into(),
+            [0.9, 0.4, 0.1],
+        );
+        let helper = BodyUniform::polytope_with_rotor(
+            [1.0, 2.0, 3.0, 4.0],
+            SHAPE_24CELL,
+            0.7,
+            rotor,
+            [0.9, 0.4, 0.1],
+        );
+        assert_eq!(bytemuck::bytes_of(&manual), bytemuck::bytes_of(&helper));
     }
 
     /// `BodyUniform::polytope(shape_index, ..)` writes the same numeric
