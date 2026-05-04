@@ -85,7 +85,7 @@ const MAX_ROW_LEN: usize = 8;
 
 /// Uniform width for shape cards in the row. Wide enough to fit
 /// the longest label ("120-cell" / "600-cell") in bold without the
-/// label wrapping — wrapping would make those cards taller than
+/// label wrapping; wrapping would make those cards taller than
 /// the others, which egui's horizontal cross-alignment then turns
 /// into a descending staircase as the row's running max-height
 /// grows past earlier (now lower-aligned) cards. Labels also use
@@ -93,13 +93,14 @@ const MAX_ROW_LEN: usize = 8;
 const SHAPE_CARD_WIDTH: f32 = 64.0;
 
 /// Unified height for every interactive widget in the bottom
-/// overlay: rate / play / chevron / + / ↻ buttons, drop pipes, and
-/// shape cards (via their Frame's inner_margin). Sized to match
-/// the cards' natural rendered height — strong-styled body text in
-/// egui's default font measures ~17 pt, plus the cards' 6-pt
-/// vertical inner_margin = 29 pt. Keeping all controls at this
-/// same height removes the height mismatch that previously made
-/// the + button appear higher than the cards.
+/// overlay: rate, play, chevron, plus, and refresh buttons,
+/// make-room drag gaps, and shape cards (via their Frame's
+/// inner_margin). Sized to match the cards' natural rendered
+/// height; strong-styled body text in egui's default font measures
+/// ~17 pt, plus the cards' 6-pt vertical inner_margin = 29 pt.
+/// Keeping all controls at this same height removes the height
+/// mismatch that would otherwise make the + button appear higher
+/// than the cards.
 const CONTROL_H: f32 = 29.0;
 
 const W_SCRUB_RATE: f32 = 0.5;
@@ -121,10 +122,10 @@ const BODY_Y: f32 = 0.9;
 
 /// One polytope's metadata: shape index in the kernel's table,
 /// per-body fragment color (driven into `BodyUniform.color` on the
-/// GPU side, NOT the panel's card color — those are uniformly grey
+/// GPU side, NOT the panel's card color; those are uniformly grey
 /// in the redesigned UI), short display label, and long
 /// mathematical name shown in card tooltips. The long name uses
-/// the `pentatope` / `tesseract` / `hexadecachoron` family — the
+/// the `pentatope` / `tesseract` / `hexadecachoron` family; the
 /// `*-plex` aliases (pentaplex, dodecaplex, ...) are deliberately
 /// avoided since "plex" is dimension-generalized rather than
 /// being the actual 4D name.
@@ -138,7 +139,7 @@ struct ShapeEntry {
 
 /// Default row when no `--shapes` argument is given. Ordered to put
 /// the 24-cell first (most "4D-distinct" cross-section), then the
-/// pentatope / 16-cell / tesseract triple — visually contrasting
+/// pentatope / 16-cell / tesseract triple; visually contrasting
 /// shapes left-to-right.
 const DEFAULT_ROW: &[ShapeEntry] = &[
     ShapeEntry {
@@ -248,7 +249,7 @@ fn body_position(slot: usize, n: usize) -> [f32; 4] {
 // drives angular velocity by summing `Plane4::unit_bivector()`
 // values for the toggled planes. Sum-of-bivectors composition is
 // **commutative** (vector-space addition), so toggle order doesn't
-// matter — only the active *set* does. The three w-involving
+// matter; only the active *set* does. The three w-involving
 // planes pull visible axes into the hidden dimension and drive the
 // slice-shape changes the viewer was built to show; the three
 // pure-3D planes act as ordinary 3D rotations on the cross-section.
@@ -382,7 +383,7 @@ struct PolytopeSmokeApp {
     show_help: bool,
 
     /// Whether the top-right rotation-formula popup is rendered.
-    /// Off by default — the formula is dense for newcomers; the
+    /// Off by default; the formula is dense for newcomers; the
     /// expanded section has a checkbox to turn it on for users who
     /// want to see exactly which bivectors and scalars compose into
     /// the current orientation.
@@ -394,7 +395,7 @@ struct PolytopeSmokeApp {
     /// scale and time slider; switching mode re-points the omega
     /// derivation. The composer mode collapses the seq's terms into
     /// a single bivector velocity (sum of `scalar * planes` per
-    /// term) — order doesn't matter for continuous-mode since
+    /// term); order doesn't matter for continuous-mode since
     /// bivector addition is commutative.
     rotation_mode: RotationMode,
 
@@ -403,7 +404,7 @@ struct PolytopeSmokeApp {
     /// renders this frame still sees `rotation_mode` (the OLD
     /// value), and only the next frame swaps to the new mode.
     /// Without this deferral, clicking a tab would change
-    /// `rotation_mode` mid-pass — the visible pass would render
+    /// `rotation_mode` mid-pass; the visible pass would render
     /// the new mode's body while `BottomOverlay`'s measure pass
     /// already captured the old mode's natural height, producing
     /// a one-frame layout mismatch the user perceives as flicker.
@@ -414,7 +415,7 @@ struct PolytopeSmokeApp {
     /// the overlay's body height (adding a draft plane, committing
     /// a term, clearing the draft) must apply *after* both
     /// `BottomOverlay` passes have rendered, otherwise pass 1 sees
-    /// the OLD body height and pass 2 the NEW one — flicker.
+    /// the OLD body height and pass 2 the NEW one; flicker.
     pending_actions: Vec<DeferredAction>,
 
     /// Sequence of [`RotorTerm`]s the user is building in the panel.
@@ -423,7 +424,7 @@ struct PolytopeSmokeApp {
     seq: Vec<RotorTerm>,
     /// In-progress draft for the next term. Plane buttons append
     /// here; "Add" commits this list as a new term in `seq` and
-    /// clears the draft. Bivector planes only — the optional
+    /// clears the draft. Bivector planes only; the optional
     /// scalar attaches to a committed term, not to the draft.
     draft: Vec<Plane4>,
 }
@@ -485,7 +486,7 @@ enum RotationMode {
 /// State mutations queued during overlay rendering and applied
 /// AFTER the overlay's measure + visible passes finish. Any
 /// mutation that changes the overlay's natural content height
-/// must go through this — applying mid-frame would make the two
+/// must go through this; applying mid-frame would make the two
 /// `BottomOverlay` passes disagree on body height and the user
 /// would see a one-frame layout mismatch as flicker.
 #[derive(Clone, Debug)]
@@ -517,7 +518,7 @@ enum DragPayload {
 /// dragged item out of the parent layout entirely while the drag
 /// is in flight. The body paints into a Tooltip layer that follows
 /// the cursor (egui's standard drag preview); the parent layout
-/// allocates **zero space** for the dragged item — neighbouring
+/// allocates **zero space** for the dragged item; neighbouring
 /// widgets fill its old slot instantly, and the make-room gap at
 /// the drop target is the slot the item will eventually occupy on
 /// drop.
@@ -527,9 +528,9 @@ enum DragPayload {
 /// horizontal layout shift on the frame the item slot is replaced
 /// with the actual card.
 ///
-/// `egui::Ui::dnd_drag_source`'s dragged path uses `scope_builder`
-/// which advances the parent cursor by the body's natural width —
-/// that's why egui's stock helper leaves the original slot
+/// `egui::Ui::dnd_drag_source`'s dragged path uses `scope_builder`,
+/// which advances the parent cursor by the body's natural width.
+/// That's why egui's stock helper leaves the original slot
 /// allocated. We bypass `scope_builder` via `Ui::new_child`, which
 /// does NOT advance the parent cursor.
 fn dnd_drag_source_collapsing<P>(
@@ -569,7 +570,7 @@ where
 /// slide outward as the gap opens, giving a clear drop preview
 /// without a separate marker line. The gap collapses back to zero
 /// when the drag ends. Returns `true` if a pointer release occurred
-/// on the targeted gap this frame — the caller takes whatever
+/// on the targeted gap this frame; the caller takes whatever
 /// payload it expects from `DragAndDrop` and applies the move.
 fn make_room_gap(
     ui: &mut egui::Ui,
@@ -586,9 +587,9 @@ fn make_room_gap(
     let dropped = is_target && ui.ctx().input(|i| i.pointer.any_released());
     if dropped {
         // Snap the gap closed instantly on drop. Without this, the
-        // gap animates from `open_width` → 0 over the next ~120 ms
+        // gap animates from `open_width` -> 0 over the next ~120 ms
         // while the row's right side rubberbands leftward as the
-        // gap closes — a visible "settle" the user reads as jank.
+        // gap closes; a visible "settle" the user reads as jank.
         let _ = ui.ctx().animate_value_with_time(slot_id, 0.0, 0.0);
     }
     dropped
@@ -624,18 +625,9 @@ fn drop_target_idx(
 /// visuals on the current ui when the source is being dragged.
 /// egui paints the body to a Tooltip layer when dragged, where
 /// widgets never register hover and therefore default to the
-/// dimmed `inactive` style; this override lifts inactive +
+/// dimmed `inactive` style; this override lifts inactive and
 /// noninteractive fills/strokes to match `active` so the floating
 /// ghost reads as a solid card.
-///
-/// (Earlier we tried routing the dragged source through an
-/// off-screen `Area` to also collapse the original layout slot;
-/// egui's `Area::constrain` clamps fixed-pos to the screen rect by
-/// default and the constraint, combined with Tooltip-layer
-/// translation, ended up painting a stale rectangle anchored at
-/// `(0, 0)`. Going back to the standard dnd_drag_source path keeps
-/// the original slot allocated but visible-as-empty during drag,
-/// which is the egui-native behavior; we accept that for now.)
 fn force_opaque_active(ui: &mut egui::Ui) {
     let active = ui.visuals().widgets.active;
     let v = ui.visuals_mut();
@@ -648,7 +640,7 @@ fn force_opaque_active(ui: &mut egui::Ui) {
 }
 
 /// "Pickup" pulse intensity in `[0.0, 1.0]` for the card identified
-/// by `drag_id`. Animates from 0 → 1 in 120 ms when the source
+/// by `drag_id`. Animates from 0 to 1 in 120 ms when the source
 /// starts being dragged, and back to 0 over the same time when the
 /// drag ends. Use it to interpolate stroke width / color / scale on
 /// the dragged frame so the card visibly "lifts" on pickup.
@@ -661,8 +653,8 @@ fn drag_pickup_t(ctx: &egui::Context, drag_id: egui::Id) -> f32 {
     ctx.animate_value_with_time(drag_id.with("pickup"), target, 0.12)
 }
 
-/// Rate "skip" button drawn as one or two solid triangles —
-/// matches the play/pause button's media-player vocabulary so the
+/// Rate "skip" button drawn as one or two solid triangles.
+/// Matches the play/pause button's media-player vocabulary so the
 /// whole row reads as a single set of media controls. Highlights
 /// when `*rate == value`; clicking when already selected resets
 /// `rate = 1.0` (lets the user step out of a non-default rate
@@ -741,7 +733,7 @@ fn rate_toggle(
 fn add_button(ui: &mut egui::Ui) -> egui::Response {
     // Slightly shorter than `CONTROL_H` because the cards' tinted
     // backgrounds carry more visual weight than this neutral
-    // button's outline — equal heights made the + read as
+    // button's outline; equal heights made the + read as
     // visually taller than the cards next to it.
     let size = egui::vec2(28.0, CONTROL_H - 2.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -959,14 +951,14 @@ impl PolytopeSmokeApp {
     fn render_expanded_body(&mut self, ui: &mut egui::Ui) {
         // Mode tab: which source drives the continuous spin. Two
         // sub-panels swap below. The formula-display toggle sits at
-        // the right of the same row — it's a viewport-level option
+        // the right of the same row; it's a viewport-level option
         // (independent of mode), not a mode setting itself.
         // Mode change deferred via `self.pending_mode`: the body
         // below this row reads `self.rotation_mode` (still the
         // OLD value this frame), and `render_overlay` swaps in
         // the new mode after `BottomOverlay::show` returns. This
         // keeps `BottomOverlay`'s measure pass and visible pass
-        // rendering the same body height — clicking a tab shows
+        // rendering the same body height; clicking a tab shows
         // the new mode on the *next* frame, with the height
         // animation, but no mid-frame mismatch flicker.
         let mut staged = self.rotation_mode;
@@ -991,7 +983,7 @@ impl PolytopeSmokeApp {
                     ui.checkbox(active, plane.label());
                 }
                 // Combo name (e.g., "isoclinic xw+yz") inline on the
-                // same row as the checkboxes — saves a row of
+                // same row as the checkboxes; saves a row of
                 // vertical space and the name reads as a label
                 // applied to the active set right next to it.
                 if let Some(name) = combo_name(&self.active) {
@@ -1020,7 +1012,7 @@ impl PolytopeSmokeApp {
 
         // Draft preview rendered as a card matching the committed-
         // term style. Add commits to seq; Discard scraps the draft.
-        // No "make continuous" action here — the mode tab governs
+        // No "make continuous" action here; the mode tab governs
         // continuous rotation now, the seq drives it directly.
         if !self.draft.is_empty() {
             egui::Frame::group(ui.style())
@@ -1064,8 +1056,8 @@ impl PolytopeSmokeApp {
         }
 
         // Sequence: each term is a single-row card. Whole card is
-        // its own drag source (no separate ⠿ handle); the card body
-        // is also a drop zone that branches on payload variant —
+        // its own drag source (no separate handle); the card body
+        // is also a drop zone that branches on payload variant.
         // Term payloads reorder, Entry payloads migrate a plane in.
         // Insertion pipes between cards give precise drop indication
         // for the Term-reorder path.
@@ -1095,7 +1087,7 @@ impl PolytopeSmokeApp {
             // Width of the currently-dragged term card, captured
             // last frame. Used as the gap's open width so the
             // gap matches the slot the card will eventually
-            // occupy — without this, gap-vs-card width mismatch
+            // occupy; without this, gap-vs-card width mismatch
             // produces a one-frame horizontal layout shift on
             // drop. Falls back to a sensible default.
             let dragged_term_idx =
@@ -1145,7 +1137,7 @@ impl PolytopeSmokeApp {
                     // expression) follows the cursor as the tooltip
                     // when dragged. Drop detection for cross-term
                     // plane migration (`DragPayload::Entry`) is done
-                    // manually on the card's rect — `dnd_drop_zone`
+                    // manually on the card's rect; `dnd_drop_zone`
                     // would have to wrap the source, which forces
                     // the frame outside the source body.
                     let card_resp = dnd_drag_source_collapsing(
@@ -1224,7 +1216,7 @@ impl PolytopeSmokeApp {
                     // Manual Entry drop detection on the card's rect.
                     // Skipped for the dragged card itself (its
                     // response rect is the placeholder, not the
-                    // card body — and dropping a plane onto your own
+                    // card body; and dropping a plane onto your own
                     // term is a no-op anyway).
                     let is_self_dragged = ui.ctx().is_being_dragged(card_id);
                     if !is_self_dragged {
@@ -1299,7 +1291,7 @@ impl PolytopeSmokeApp {
                     }
                 }
                 // Reset per-index term animation state when a
-                // mutation will fire — same reasoning as the
+                // mutation will fire; same reasoning as the
                 // shape-row reset: ids resolve correctly only
                 // inside this ui scope.
                 if !term_moves.is_empty() || !entry_moves.is_empty() || remove_term.is_some() {
@@ -1397,7 +1389,7 @@ impl PolytopeSmokeApp {
         // Cards in a horizontally scrolling area: never wraps, so
         // resizing the panel doesn't reflow the row. Drop is via
         // an animated "make room" gap that opens at the cursor's
-        // insertion slot during drag — no separate marker line
+        // insertion slot during drag; no separate marker line
         // needed; the gap itself is the indicator.
         let mut remove_idx: Option<usize> = None;
         let mut shape_moves: Vec<(usize, usize)> = Vec::new();
@@ -1417,7 +1409,7 @@ impl PolytopeSmokeApp {
             .show(ui, |ui| {
                 let row_response =
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                        // Tighter inter-card spacing — the make-
+                        // Tighter inter-card spacing; the make-
                         // room gap takes over from item_spacing as
                         // the visual room-maker.
                         ui.spacing_mut().item_spacing.x = 4.0;
@@ -1499,7 +1491,7 @@ impl PolytopeSmokeApp {
                                     }
                                 });
                         }
-                        // Trailing insertion gap — drop after the
+                        // Trailing insertion gap; drop after the
                         // last card.
                         let trailing_id = ui.make_persistent_id(("shape-gap", row_len));
                         if make_room_gap(
@@ -1543,7 +1535,7 @@ impl PolytopeSmokeApp {
                         // previous occupants' `pickup_t = 1.0` and
                         // ghost-fade. Snap defaults here, while the
                         // ui scope still resolves to the same ids
-                        // we used during rendering — outside this
+                        // we used during rendering; outside this
                         // closure, `ui.make_persistent_id(...)`
                         // would resolve to *different* ids.
                         if !shape_moves.is_empty() || remove_idx.is_some() {
@@ -1579,7 +1571,7 @@ impl PolytopeSmokeApp {
         }
     }
 
-    /// Modal help window — shown when `self.show_help` is `true`.
+    /// Modal help window; shown when `self.show_help` is `true`.
     /// Closes via the window's title-bar X (egui's
     /// `Window::open(&mut bool)` flips the bool).
     fn render_help_window(&mut self, ctx: &egui::Context) {
@@ -1600,7 +1592,7 @@ impl PolytopeSmokeApp {
                         "You're looking at the 3D cross-sections of a row of \
                          four-dimensional polytopes. As they rotate through 4D \
                          space, their cross-sections morph in characteristic ways \
-                         — that's the whole point of the demo: to make 4D shape \
+                        ; that's the whole point of the demo: to make 4D shape \
                          intuition reachable for someone in 3D.",
                     );
                     ui.add_space(8.0);
@@ -1618,25 +1610,25 @@ impl PolytopeSmokeApp {
                          passing through 3D space gives a 3D shape at every \
                          instant. The hidden 4th axis is conventionally called \
                          w. As w changes, the polytope's 3D cross-section morphs \
-                         — that is what the w slider scrubs through.",
+                        ; that is what the w slider scrubs through.",
                     );
                     ui.add_space(8.0);
 
                     ui.heading("The shapes");
                     ui.label("All six convex regular 4-polytopes (\"polychora\") ship:");
-                    ui.label("• 5-cell (pentatope) — 5 tetrahedra; the 4D simplex.");
-                    ui.label("• 8-cell (tesseract) — 8 cubes; the 4D cube.");
+                    ui.label("• 5-cell (pentatope); 5 tetrahedra; the 4D simplex.");
+                    ui.label("• 8-cell (tesseract); 8 cubes; the 4D cube.");
                     ui.label(
-                        "• 16-cell (hexadecachoron) — 16 tetrahedra; \
+                        "• 16-cell (hexadecachoron); 16 tetrahedra; \
                          the 4D analog of the octahedron.",
                     );
                     ui.label(
-                        "• 24-cell (icositetrachoron) — 24 octahedra; \
+                        "• 24-cell (icositetrachoron); 24 octahedra; \
                          uniquely 4-dimensional, no 3D analog.",
                     );
-                    ui.label("• 120-cell (hecatonicosachoron) — 120 dodecahedra.");
+                    ui.label("• 120-cell (hecatonicosachoron); 120 dodecahedra.");
                     ui.label(
-                        "• 600-cell (hexacosichoron) — 600 tetrahedra; \
+                        "• 600-cell (hexacosichoron); 600 tetrahedra; \
                          the 4D analog of the icosahedron.",
                     );
                     ui.add_space(8.0);
@@ -1657,7 +1649,7 @@ impl PolytopeSmokeApp {
                          angular velocity is the sum of the active unit \
                          bivectors. Composer mode: build a sequence of terms \
                          (each term is a sum of planes, optionally scaled by a \
-                         scalar φ) — the seq sums into the angular velocity.",
+                         scalar φ); the seq sums into the angular velocity.",
                     );
                     ui.add_space(8.0);
 
@@ -1681,7 +1673,7 @@ impl PolytopeSmokeApp {
     /// section (mode tabs, mode-specific UI, shape row) appears
     /// when `self.expanded`; the slider strip + rate row are always
     /// visible. The whole overlay is a single translucent popup
-    /// painted over the full-window scene — there's no side panel
+    /// painted over the full-window scene; there's no side panel
     /// anymore, and the scene fills the entire viewport.
     fn render_overlay(&mut self, ctx: &egui::Context) {
         let screen = ctx.content_rect();
@@ -1747,11 +1739,11 @@ impl PolytopeSmokeApp {
         // Sliders use `show_value(false)` + a separately-allocated
         // fixed-width monospace label per row, so the slider's
         // bounding rect width never changes as the value's char
-        // count does (e.g., "0.5" → "0.50" → "12.34"). Without this
+        // count does (e.g., "0.5" -> "0.50" -> "12.34"). Without this
         // stabilization, the popup Frame's painted rect oscillates
         // each frame as the spin advances `rot_time`, and the
         // entire overlay visibly jitters.
-        // No leading axis-name cell — the axis is folded into the
+        // No leading axis-name cell; the axis is folded into the
         // trailing value (e.g. "w +0.000", "t  8.70s"), so the
         // slider hugs the frame's left edge with no dead space.
         // Trailing cell is fixed-width monospace so the value's
@@ -1907,7 +1899,7 @@ impl PolytopeSmokeApp {
     /// composed sequence (each term parenthesized when it's a sum).
     /// Empty string when nothing is contributing.
     fn formula_string(&self) -> String {
-        // The rotation source is exclusive — only one mode drives
+        // The rotation source is exclusive; only one mode drives
         // the spin at a time. The formula popup must reflect THAT
         // mode's expression, not concatenate both, otherwise the
         // user reads it as "we're applying both" when in fact the
@@ -1964,7 +1956,7 @@ impl PolytopeSmokeApp {
     }
 
     /// Full reset: pause spin, slice, rate, active set, orientation,
-    /// time, draft. Reset implies "stop", so `rotate` flips off too —
+    /// time, draft. Reset implies "stop", so `rotate` flips off too;
     /// otherwise the next frame's `update()` would immediately start
     /// spinning the freshly-reset state, which the user almost never
     /// wants.
@@ -2055,7 +2047,7 @@ impl App for PolytopeSmokeApp {
             rot_state: Rotor4::IDENTITY,
             // Default: xw spin enabled (active[2] = Plane4::Xw). A
             // first-time user who hits "Spin" before toggling any
-            // checkbox now sees motion immediately — the most
+            // checkbox now sees motion immediately; the most
             // characteristic 4D rotation, pulling the visible x-axis
             // through the hidden w-axis.
             active: [false, false, true, false, false, false],
@@ -2169,7 +2161,7 @@ impl App for PolytopeSmokeApp {
         if self.show_formula {
             let formula = self.formula_string();
             // Combo name ("isoclinic xw+yz" etc.) is an Active-mode
-            // label — it describes the active-set bivector, not the
+            // label; it describes the active-set bivector, not the
             // composer's seq. Suppress it in Composer mode so the
             // popup reads as the seq's expression alone.
             let name = if self.rotation_mode == RotationMode::Active {
@@ -2248,7 +2240,7 @@ impl App for PolytopeSmokeApp {
 
     fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
         // Scene renders to the full window. The bottom controls
-        // overlay floats on top — `BottomOverlay` is an Area, not
+        // overlay floats on top; `BottomOverlay` is an Area, not
         // a docked panel, so the scene viewport doesn't need to
         // skip a bottom strip.
         let cfg = &rd.surface_bundle.config;
@@ -2292,7 +2284,7 @@ fn main() -> Result<()> {
 // regression where adding a long-label shape (120/600-cell) caused
 // label-wrapping to grow that card's frame, which in turn pushed
 // egui's horizontal Center cross-alignment to recompute against a
-// new max-height — leaving earlier cards aligned to the old (lower)
+// new max-height; leaving earlier cards aligned to the old (lower)
 // center while the new card centered higher.
 //
 // `egui::Context` works fine without a renderer for layout-only
@@ -2315,8 +2307,8 @@ mod alignment_tests {
                 // each widget at the row's top edge, skipping the
                 // `frame_size.y = max(child, avail)` recursion that
                 // Center alignment uses (and that recursion is what
-                // produced the converging staircase tops 14 → 18.5
-                // → 20.75 → 21.88 — each card pulled halfway toward
+                // produced the converging staircase tops 14 -> 18.5
+                // -> 20.75 -> 21.88; each card pulled halfway toward
                 // the avail.center as `avail` grew with placed
                 // widgets).
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
@@ -2374,7 +2366,7 @@ mod alignment_tests {
     }
 
     /// All widgets must share a top y. With Top-align cross-axis,
-    /// this is the meaningful invariant — heights may vary (the +
+    /// this is the meaningful invariant; heights may vary (the +
     /// button is intentionally 2pt shorter than the cards) but
     /// tops align.
     fn assert_top_aligned(rects: &[egui::Rect], context: &str) {
@@ -2450,7 +2442,7 @@ mod alignment_tests {
 ///      `egui::Id::new` accidentally broke detection (this exists
 ///      to verify the helper works with both kinds of id).
 ///   2. Wrapping the body in a `Frame` (so the whole card follows
-///      the cursor) must not eat the drag's hit-test rect — the
+///      the cursor) must not eat the drag's hit-test rect; the
 ///      drag rect is the body's rect, which equals the Frame's
 ///      outer rect after `Frame::show`.
 #[cfg(test)]
@@ -2466,7 +2458,7 @@ mod drag_tests {
     /// between frames, every press is "still within click window"
     /// and `is_decidedly_dragging` returns false, even with
     /// movement. We thread a monotonic clock so each frame's input
-    /// has `time = N * 50ms` — well past the default click duration.
+    /// has `time = N * 50ms`; well past the default click duration.
     fn pointer_press(time: f64, pos: egui::Pos2) -> egui::RawInput {
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(screen());
@@ -2597,8 +2589,8 @@ mod drag_tests {
     ///    different layers does NOT trigger the debug-assert when
     ///    ids are scoped per-ui (`make_persistent_id`).
     /// 2. The IDs actually ARE distinct between the two passes.
-    /// The first part — running this test without panic in debug
-    /// — is what catches a regression to globally-stable ids.
+    /// The first part; running this test without panic in debug
+    ///; is what catches a regression to globally-stable ids.
     #[test]
     fn make_persistent_id_per_pass_avoids_layer_collision() {
         let ctx = egui::Context::default();
@@ -2696,11 +2688,11 @@ mod drag_tests {
 
     /// Simulates dragging a card from one slot to another and
     /// verifies that the row's total width is INVARIANT through
-    /// the drag → drop transition. If the dragged card takes some
+    /// the drag -> drop transition. If the dragged card takes some
     /// space during drag and a different amount after drop, OR if
     /// the make-room gap's width doesn't match the dropped card's
-    /// slot width, the OTHER cards shift horizontally on drop —
-    /// the rubberband the user sees.
+    /// slot width, the OTHER cards shift horizontally on drop.
+    /// That's the rubberband the user sees.
     ///
     /// Render N "cards" with stable widths via the same helper
     /// (`dnd_drag_source_collapsing` + `make_room_gap`) the live
@@ -2805,7 +2797,7 @@ mod drag_tests {
         let drift = (drag_total - post_drop_total).abs();
         assert!(
             drift < 1.0,
-            "row total width must stay constant from drag → drop, otherwise \
+            "row total width must stay constant from drag -> drop, otherwise \
              cards rubberband horizontally on release. drag={drag_total:.1}, \
              post_drop={post_drop_total:.1}, drift={drift:.1}"
         );
@@ -2844,7 +2836,7 @@ mod drag_tests {
         let _ = ctx.run(warmup_input(0.05), render);
     }
 
-    /// `ui.make_persistent_id(...)` keys must also work — protect
+    /// `ui.make_persistent_id(...)` keys must also work; protect
     /// against a future regression that hard-codes one id flavour.
     #[test]
     fn make_persistent_id_starts_drag() {

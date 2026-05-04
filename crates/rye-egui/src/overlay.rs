@@ -5,13 +5,13 @@
 //!
 //! egui's [`Area`](egui::Area) recomputes its position from
 //! content size each frame. When content size changes drastically
-//! between frames — typically because some app state toggled and a
-//! big chunk of UI appeared or disappeared — the area's pivot
-//! recomputes in a single frame, and the in-between rendering
-//! reads as the overlay "flickering" or "disappearing" briefly.
+//! between frames (an app state toggle adding or removing a big
+//! chunk of UI), the area's pivot recomputes in a single frame and
+//! the in-between rendering reads as the overlay "flickering" or
+//! "disappearing" briefly.
 //!
-//! For floating bottom HUDs in games, this happens whenever the
-//! HUD expands a panel, switches modes, opens an inventory, etc.
+//! For floating bottom HUDs in games this happens whenever the HUD
+//! expands a panel, switches modes, opens an inventory, etc.
 //! Single-frame jumps are unacceptable polish-wise.
 //!
 //! ## How this widget fixes it
@@ -20,38 +20,37 @@
 //! (the conventional spot, [`margin_y`](Self::margin_y) above
 //! `screen.bottom()`). The TOP edge animates over a configurable
 //! duration via [`Context::animate_value_with_time`] toward the
-//! panel's target height — by default, the natural content size
-//! (so the panel hugs its content with no dead space, and grows
-//! / shrinks smoothly when content changes between frames). A
-//! caller can override with [`target_h`](Self::target_h) to pin
-//! a fixed height (HUDs that scroll internally rather than
+//! panel's target height. By default that target is the natural
+//! content size, so the panel hugs its content with no dead space
+//! and grows or shrinks smoothly when content changes between
+//! frames. A caller can override with [`target_h`](Self::target_h)
+//! to pin a fixed height (HUDs that scroll internally rather than
 //! resize).
 //!
 //! The natural content size is measured by rendering the user's
 //! content closure **twice per frame**: once invisibly via
 //! [`Ui::set_invisible`] to capture this frame's height, then
-//! again for real at the correctly-anchored position. Two
-//! passes are what let the bottom edge stay rock-solid on the
-//! very frame content size changes — a single-pass design with
-//! stale-measurement positioning always lags by one frame at
-//! transitions and the user perceives the lag as flicker. The
-//! measure pass disables widgets so interaction-gated side
-//! effects (clicks, drags, slider edits) only fire in the
-//! visible pass.
+//! again for real at the correctly-anchored position. Two passes
+//! are what let the bottom edge stay rock-solid on the very frame
+//! content size changes; a single-pass design with stale-
+//! measurement positioning always lags by one frame at transitions
+//! and the user perceives the lag as flicker. The measure pass
+//! disables widgets, so interaction-gated side effects (clicks,
+//! drags, slider edits) only fire in the visible pass.
 //!
 //! Content is rendered inside an internal
-//! [`ScrollArea`](egui::ScrollArea) so that mid-transition,
-//! when the animated height is transiently smaller than the
-//! natural content, the TOP scrolls out of view while the
-//! bottom (always-visible footer) stays on screen.
+//! [`ScrollArea`](egui::ScrollArea) so that mid-transition, when
+//! the animated height is transiently smaller than the natural
+//! content, the TOP scrolls out of view while the bottom
+//! (always-visible footer) stays on screen.
 //!
-//! Render content in normal top-down order — the ScrollArea's
+//! Render content in normal top-down order. The ScrollArea's
 //! bottom-anchored offset handles clip-from-top, no layout
 //! reversal needed.
 //!
 //! ## Why not [`TopBottomPanel`](egui::TopBottomPanel)?
 //!
-//! `TopBottomPanel::bottom` is docked — it carves a strip out of
+//! `TopBottomPanel::bottom` is docked: it carves a strip out of
 //! the central area, which forces the scene viewport to skip that
 //! strip. For games that render the scene full-window with a
 //! floating HUD on top, that's the wrong shape; the HUD should
@@ -152,31 +151,30 @@ impl BottomOverlay {
     /// rendered late (the footer) stay in view.
     ///
     /// `content` is called *twice per frame*: once invisibly to
-    /// measure this frame's natural content height, then again
-    /// for the actual paint at the correctly-anchored position.
-    /// The measure pass uses [`Ui::set_invisible`], which
-    /// disables widgets and skips painting, so interaction-gated
-    /// side effects (button clicks, drag drops, slider edits)
-    /// only fire in the visible pass. The two-pass shape is what
-    /// lets the bottom edge stay anchored on the very frame
-    /// content size changes — a single-pass design with
-    /// stale-measurement positioning always lags by one frame at
-    /// transitions and the user perceives the lag as flicker.
+    /// measure this frame's natural content height, then again for
+    /// the actual paint at the correctly-anchored position. The
+    /// measure pass uses [`Ui::set_invisible`], which disables
+    /// widgets and skips painting, so interaction-gated side
+    /// effects (button clicks, drag drops, slider edits) only fire
+    /// in the visible pass. The two-pass shape is what lets the
+    /// bottom edge stay anchored on the very frame content size
+    /// changes; a single-pass design with stale-measurement
+    /// positioning always lags by one frame at transitions and the
+    /// user perceives the lag as flicker.
     pub fn show<R>(self, ctx: &Context, mut content: impl FnMut(&mut Ui) -> R) -> InnerResponse<R> {
         let screen = ctx.content_rect();
         let frame = self.frame.unwrap_or_default();
-        let frame_margin = frame.inner_margin.top as f32 + frame.inner_margin.bottom as f32;
 
-        // Pass 1: measure pass. Render content invisibly off-
-        // screen to capture this frame's natural content height.
-        // `Ui::set_invisible` disables widgets (no interaction)
-        // and skips painting; widgets still allocate space, so
+        // Pass 1: measure pass. Render content invisibly off-screen
+        // to capture this frame's natural content height.
+        // `Ui::set_invisible` disables widgets (no interaction) and
+        // skips painting; widgets still allocate space, so
         // `min_rect` reflects the natural laid-out size.
         let measure_id = self.id.with("measure-area");
         let measure_resp = Area::new(measure_id)
             .order(egui::Order::Background)
             .interactable(false)
-            .fixed_pos(Pos2::new(-99_999.0, -99_999.0))
+            .fixed_pos(MEASURE_PASS_POS)
             .show(ctx, |ui| {
                 ui.set_invisible();
                 ui.set_min_width(self.width);
@@ -187,9 +185,9 @@ impl BottomOverlay {
             });
         let natural_h = measure_resp.response.rect.height();
 
-        // Animate the displayed height toward the target. Auto-
-        // size mode uses this frame's natural height; pinned
-        // mode uses caller-supplied target_h.
+        // Animate the displayed height toward the target. Auto-size
+        // mode uses this frame's natural height; pinned mode uses
+        // the caller-supplied target_h.
         let target = self.target_h.unwrap_or(natural_h);
         let smooth_h =
             ctx.animate_value_with_time(self.id.with("smooth_h"), target, self.transition_secs);
@@ -203,13 +201,13 @@ impl BottomOverlay {
         // Pass 2: visible paint at the correct anchored position.
         // Inner ScrollArea's offset is computed from THIS frame's
         // natural_h so the content's bottom always sits at the
-        // viewport's bottom — even on the very frame content
-        // size changes.
+        // viewport's bottom, even on the very frame content size
+        // changes.
         Area::new(self.id)
             .fixed_pos(Pos2::new(area_x, area_y))
             .constrain(false)
             // Don't let the user drag the panel by clicking its
-            // background — its position is fully derived from
+            // background; its position is fully derived from
             // `screen.bottom() - margin_y - smooth_h` each frame
             // and any drag offset would be overwritten next frame
             // anyway, producing a "pickup-then-snap-back" jitter.
@@ -219,15 +217,19 @@ impl BottomOverlay {
                 ui.set_max_width(self.width);
                 // Pin outer ui height to the animated value.
                 // Without this, egui's `Area` keeps `state.size`
-                // sticky and the inner ScrollArea's available
-                // space round-trips through itself, never growing
-                // past the initial value.
+                // sticky and the inner ScrollArea's available space
+                // round-trips through itself, never growing past
+                // the initial value.
                 ui.set_min_height(smooth_h);
                 ui.set_max_height(smooth_h);
                 frame
                     .show(ui, |ui| {
-                        let scroll_offset =
-                            (natural_h - frame_margin - (smooth_h - frame_margin)).max(0.0);
+                        // Scroll offset = how far past the visible
+                        // viewport the natural content is. Frame
+                        // inner_margin contributes to both `natural_h`
+                        // and the outer pinned height equally, so
+                        // it cancels out of `(natural_h - smooth_h)`.
+                        let scroll_offset = (natural_h - smooth_h).max(0.0);
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .vertical_scroll_offset(scroll_offset)
@@ -242,6 +244,15 @@ impl BottomOverlay {
             })
     }
 }
+
+/// Fixed-position anchor for the measure-pass `Area`. We place it
+/// far enough off-screen that egui's clipping treats it as fully
+/// outside the viewport and skips painting; the value just needs
+/// to be safely below any plausible `screen_rect.min`. The measure
+/// pass's `set_invisible` already prevents painting, but the
+/// off-screen position also prevents the area from ever
+/// participating in cursor hit-tests.
+const MEASURE_PASS_POS: Pos2 = Pos2::new(-99_999.0, -99_999.0);
 
 #[cfg(test)]
 mod tests {
@@ -272,7 +283,7 @@ mod tests {
 
     /// `show()`'s response rect should be at least `target_h` tall
     /// once animation has settled. If it's not, animation isn't
-    /// driving the panel size at all — the regression where
+    /// driving the panel size at all; the regression where
     /// expanding produces no visible change.
     #[test]
     fn response_height_reaches_target_h() {
@@ -304,7 +315,7 @@ mod tests {
     /// visible pass), so over N frames it should be invoked
     /// exactly 2 * N times. The measure pass is what lets the
     /// overlay anchor its bottom on a growth frame, so this
-    /// double-invocation is by design — callers should keep
+    /// double-invocation is by design; callers should keep
     /// non-interaction side effects idempotent / cheap.
     #[test]
     fn content_closure_runs_twice_per_frame() {
@@ -353,7 +364,7 @@ mod tests {
         assert!(
             overlay_rect.intersects(last_widget_rect),
             "the last widget's rect ({last_widget_rect:?}) should intersect the \
-             overlay's rect ({overlay_rect:?}) — i.e., the widget is visible \
+             overlay's rect ({overlay_rect:?}); i.e., the widget is visible \
              inside the panel"
         );
     }
@@ -392,13 +403,13 @@ mod tests {
     /// `target_h` is small + body conditionally hidden (collapsed),
     /// then `target_h` grows + body conditionally rendered
     /// (expanded). After settling in the expanded state, the body's
-    /// widget rects MUST intersect the overlay's rect — i.e., the
+    /// widget rects MUST intersect the overlay's rect; i.e., the
     /// body actually shows up to the user, not just renders into
     /// some clipped void.
     ///
     /// This is the test for the regression where expanding a
     /// `BottomOverlay` produces a visibly larger panel but with
-    /// the same content as the collapsed state — body widgets get
+    /// the same content as the collapsed state; body widgets get
     /// rendered (the closure runs) but are clipped out of view.
     #[test]
     fn expand_toggle_makes_body_visible() {
@@ -464,7 +475,7 @@ mod tests {
         assert!(
             expanded_overlay.intersects(expanded_body_rect),
             "expanded body rect ({expanded_body_rect:?}) should intersect overlay \
-             rect ({expanded_overlay:?}) — i.e., the body is visible inside the panel"
+             rect ({expanded_overlay:?}); i.e., the body is visible inside the panel"
         );
     }
 
@@ -504,8 +515,8 @@ mod tests {
         );
     }
 
-    /// Auto-size with state-driven content change: collapse →
-    /// expand should grow the panel; expand → collapse should
+    /// Auto-size with state-driven content change: collapse to
+    /// expand should grow the panel; expand to collapse should
     /// shrink it. Both transitions converge to a panel that hugs
     /// the new content (no dead space at rest).
     #[test]
@@ -552,7 +563,7 @@ mod tests {
     /// content), then on the next frame suddenly render expanded
     /// content (body + footer). On THAT first frame, the footer's
     /// rendered rect must still be inside the overlay's visible rect
-    /// — not scrolled off the bottom because the inner ScrollArea
+    ///; not scrolled off the bottom because the inner ScrollArea
     /// was still using last frame's offset.
     #[test]
     fn footer_stays_visible_on_first_growth_frame() {
@@ -568,7 +579,7 @@ mod tests {
                     });
             });
         }
-        // Phase 2: ONE frame with sudden growth — body added on top.
+        // Phase 2: ONE frame with sudden growth; body added on top.
         let mut footer_rect = egui::Rect::NOTHING;
         let mut overlay_rect = egui::Rect::NOTHING;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -587,7 +598,7 @@ mod tests {
         assert!(
             overlay_rect.intersects(footer_rect),
             "on the first frame after content grew, footer rect ({footer_rect:?}) \
-             must still intersect overlay rect ({overlay_rect:?}) — otherwise the \
+             must still intersect overlay rect ({overlay_rect:?}); otherwise the \
              ScrollArea's stale offset is showing the top of the new content where \
              the footer should be"
         );
@@ -598,7 +609,7 @@ mod tests {
     /// `ScrollArea`), then sliders, then a footer. Verifies that
     /// when the overlay is at a `target_h` smaller than the natural
     /// content height, the FOOTER widgets (rendered last) stay
-    /// inside the overlay rect — which is what the
+    /// inside the overlay rect; which is what the
     /// stick_to_bottom-anchored ScrollArea is supposed to guarantee.
     #[test]
     fn polytope_like_pattern_keeps_footer_visible_under_overflow() {
@@ -641,7 +652,7 @@ mod tests {
                         // Sliders (mid)
                         ui.label("w slider");
                         ui.label("t slider");
-                        // Footer (LAST → must stay visible)
+                        // Footer (LAST, must stay visible)
                         footer_rect = ui.label("rate row").rect;
                     });
                 overlay_rect = resp.response.rect;
@@ -650,7 +661,7 @@ mod tests {
         assert!(
             overlay_rect.intersects(footer_rect),
             "footer rect ({footer_rect:?}) should intersect overlay rect \
-             ({overlay_rect:?}) — stick_to_bottom should keep the last widget \
+             ({overlay_rect:?}); stick_to_bottom should keep the last widget \
              on screen even when content overflows the viewport"
         );
     }

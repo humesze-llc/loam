@@ -853,7 +853,7 @@ pub fn cell600_face_planes() -> (Vec<Vec4>, f32) {
 /// onto the intersection of all active planes via Lagrange multipliers
 /// (`λ = G⁻¹ b`, where `G` is the active normals' Gram matrix and `b`
 /// holds their plane distances at `p`). Terminates when no further
-/// violations remain or after 4 iterations (|S|=4 ⇒ 0-face).
+/// violations remain or after 4 iterations (|S|=4 => 0-face).
 ///
 /// The result is the exact Euclidean distance: |S|=1 lands on a face
 /// interior, |S|=2 on an edge interior, |S|=3 on a 2-face edge, |S|=4

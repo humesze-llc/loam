@@ -172,7 +172,7 @@ impl BodyUniform {
     /// shape table (0 = pentatope, 1 = tesseract, ...). `size` is
     /// the polytope's circumradius in world coords. `rotor` is the
     /// body's Rotor4 orientation packed as
-    /// `[s, b_xy, b_xz, b_xw, b_yz, b_yw, b_zw, ps]` — the same
+    /// `[s, b_xy, b_xz, b_xw, b_yz, b_yw, b_zw, ps]`; the same
     /// order produced by `<[f32; 8]>::from(Rotor4)`. Prefer
     /// [`Self::polytope_with_rotor`] when the caller already has a
     /// [`Rotor4`].
@@ -1490,7 +1490,7 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
     }
 
     /// Shallow ray with clear path to floor converges within budget.
-    /// Pins the iteration-cap fix (192 → 384).
+    /// Pins the iteration-cap fix (192 -> 384).
     #[test]
     fn cpu_march_converges_on_shallow_ray_to_floor() {
         let ro = Vec3::new(0.0, 2.5, 5.0);

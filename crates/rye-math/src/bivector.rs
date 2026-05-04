@@ -501,7 +501,7 @@ impl Bivector4 {
     }
 }
 
-/// One of the six elementary 4D rotation planes — a basis bivector
+/// One of the six elementary 4D rotation planes; a basis bivector
 /// of [`Bivector4`]. Indices and label match `Bivector4`'s field
 /// order: `0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw`.
 ///
@@ -733,10 +733,10 @@ impl Rotor4 {
     };
 
     /// Identity rotor packed into the `[s, xy, xz, xw, yz, yw, zw,
-    /// xyzw]` slot order used by GPU uniform buffers (matches the
-    /// `From<Rotor4> for [f32; 8]` packing). Convenience for
-    /// initializing `BodyUniform.rotor` etc. without having to spell
-    /// out the eight-tuple at every call site.
+    /// xyzw]` slot order used by `From<Rotor4> for [f32; 8]`.
+    /// Convenience for initializing GPU uniform-buffer rotor fields
+    /// without having to spell out the eight-tuple at every call
+    /// site.
     pub const IDENTITY_SLOT: [f32; 8] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
     /// Squared norm under the reverse: `<R̃·R>_0`. For a proper rotor
@@ -993,7 +993,7 @@ impl Rotor for Rotor4 {
 
         // Simple (single-plane) case: `δ ≈ 0`, i.e. `t₂ ≈ 0`.
         if delta_target.abs() < 1e-6 * s_target.max(1.0) {
-            // `R = cos(θ/2) + sin(θ/2)·B̂` ⇒ θ = 2·atan2(|B_r|, c).
+            // `R = cos(θ/2) + sin(θ/2)·B̂` => θ = 2·atan2(|B_r|, c).
             let theta = 2.0 * br_mag_sq.sqrt().atan2(c);
             let k = theta / br_mag_sq.sqrt();
             return br * k;
@@ -1777,7 +1777,7 @@ mod tests {
     }
 
     /// `Plane4::ALL[i].unit_bivector()` must equal `Bivector4::basis(i)`,
-    /// and both must agree with `Bivector4`'s field ordering — index
+    /// and both must agree with `Bivector4`'s field ordering; index
     /// `i` sets exactly the i-th field to 1.
     #[test]
     fn plane4_unit_bivector_matches_bivector4_field_order() {
