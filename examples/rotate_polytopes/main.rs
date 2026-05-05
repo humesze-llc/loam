@@ -2146,14 +2146,21 @@ impl RotatePolytopesApp {
                             .map(|p| p.label())
                             .collect::<Vec<_>>()
                             .join(" + ");
-                        let bivec = if term.planes.len() > 1 {
-                            format!("({plane_str})")
-                        } else {
-                            plane_str
-                        };
+                        // Inner parens around the bivector are only
+                        // needed to bind it to the scalar before the
+                        // outer `exp()` parens take over. With no
+                        // scalar, `exp(xy + xz)` is unambiguous and
+                        // the inner wrap reads as a doubled paren.
                         let body = match term.scalar {
-                            Some(phi) => format!("{:.0}° · {}", phi.to_degrees(), bivec),
-                            None => bivec,
+                            Some(phi) => {
+                                let bivec = if term.planes.len() > 1 {
+                                    format!("({plane_str})")
+                                } else {
+                                    plane_str
+                                };
+                                format!("{:.0}° · {}", phi.to_degrees(), bivec)
+                            }
+                            None => plane_str,
                         };
                         format!("exp({body})")
                     })
