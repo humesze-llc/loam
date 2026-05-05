@@ -1106,6 +1106,7 @@ impl RotatePolytopesApp {
         let mut remove_term: Option<usize> = None;
         let mut remove_scalar: Option<usize> = None;
         let mut add_scalar: Option<usize> = None;
+        let mut edit_scalar: Option<(usize, f32)> = None;
 
         if !self.seq.is_empty() {
             ui.label("Sequence:");
@@ -1195,29 +1196,29 @@ impl RotatePolytopesApp {
                                 .corner_radius(egui::CornerRadius::same(3))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        let term = &mut self.seq[term_idx];
-                                        if let Some(phi) = term.scalar.as_mut() {
-                                            let mut deg = phi.to_degrees();
+                                        let term = &self.seq[term_idx];
+                                        if let Some(phi) = term.scalar {
                                             let phi_color = egui::Color32::from_rgb(255, 150, 150);
-                                            ui.scope(|ui| {
-                                                let v = ui.visuals_mut();
-                                                v.widgets.inactive.fg_stroke.color = phi_color;
-                                                v.widgets.hovered.fg_stroke.color = phi_color;
-                                                v.widgets.active.fg_stroke.color = phi_color;
-                                                v.override_text_color = Some(phi_color);
-                                                if ui
-                                                    .add(
-                                                        egui::DragValue::new(&mut deg)
-                                                            .speed(0.0)
-                                                            .suffix("°")
-                                                            .range(-720.0..=720.0),
-                                                    )
-                                                    .on_hover_text("Click to type a new angle")
-                                                    .changed()
-                                                {
-                                                    *phi = deg.to_radians();
-                                                }
-                                            });
+                                            // Read-only label; the term card's drag source
+                                            // captures pointer-down events at this rect, so
+                                            // the previous editable DragValue couldn't reach
+                                            // text-edit mode reliably. Editing now happens
+                                            // through the right-click context menu, which
+                                            // lives in its own popup layer.
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!(
+                                                        "{:.2}°",
+                                                        phi.to_degrees()
+                                                    ))
+                                                    .monospace()
+                                                    .color(phi_color),
+                                                )
+                                                .selectable(false),
+                                            )
+                                            .on_hover_text(
+                                                "Right-click the term to edit or remove",
+                                            );
                                             ui.monospace("·");
                                         }
                                         let n_planes = self.seq[term_idx].planes.len();
@@ -1290,22 +1291,37 @@ impl RotatePolytopesApp {
                         let w = card_resp.rect.width();
                         ui.ctx().memory_mut(|m| m.data.insert_temp(width_key, w));
                     }
-                    let has_scalar = self.seq[term_idx].scalar.is_some();
+                    let scalar_now = self.seq[term_idx].scalar;
                     let menu_resp = card_resp.interact(egui::Sense::click());
                     menu_resp.context_menu(|ui| {
-                        if ui
-                            .button(if has_scalar {
-                                "Remove scalar (φ)"
-                            } else {
-                                "Add scalar (φ = 90°)"
-                            })
-                            .clicked()
-                        {
-                            if has_scalar {
+                        if let Some(phi) = scalar_now {
+                            let current_deg = phi.to_degrees();
+                            ui.menu_button(format!("Edit scalar ({current_deg:.2}°)"), |ui| {
+                                let mut deg = current_deg;
+                                // DragValue lives inside this menu's
+                                // popup layer, separate from the term
+                                // card's drag source, so click-to-type
+                                // and drag-to-scrub both work without
+                                // the outer drag intercepting.
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut deg)
+                                            .suffix("°")
+                                            .speed(1.0)
+                                            .fixed_decimals(2)
+                                            .range(-720.0..=720.0),
+                                    )
+                                    .changed()
+                                {
+                                    edit_scalar = Some((term_idx, deg.to_radians()));
+                                }
+                            });
+                            if ui.button("Remove scalar (φ)").clicked() {
                                 remove_scalar = Some(term_idx);
-                            } else {
-                                add_scalar = Some(term_idx);
+                                ui.close_kind(egui::UiKind::Menu);
                             }
+                        } else if ui.button("Add scalar (φ = 90°)").clicked() {
+                            add_scalar = Some(term_idx);
                             ui.close_kind(egui::UiKind::Menu);
                         }
                         ui.separator();
@@ -1358,6 +1374,13 @@ impl RotatePolytopesApp {
         if let Some(i) = remove_scalar {
             if let Some(t) = self.seq.get_mut(i) {
                 t.scalar = None;
+            }
+        }
+        if let Some((i, new_phi)) = edit_scalar {
+            if let Some(t) = self.seq.get_mut(i) {
+                if t.scalar.is_some() {
+                    t.scalar = Some(new_phi);
+                }
             }
         }
         // Cross-term entry migrations. Sort by (source term, plane idx
