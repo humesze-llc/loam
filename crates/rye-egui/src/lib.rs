@@ -23,10 +23,6 @@
 //!   where a value sits in a 1D parameter range. Useful for "where
 //!   am I in this parameter" debug HUDs (the `w` slice plane in a
 //!   4D viewer, current frame in a recorded sequence, etc.).
-//! - [`RotorVisualizer`]: renders a [`rye_math::Bivector4`] as one
-//!   or two labeled circular arcs via the SO(4) plane decomposition,
-//!   exposing the double-rotation structure for debugging compound
-//!   rotors.
 //!
 //! [egui]: https://github.com/emilk/egui
 //!
@@ -73,13 +69,11 @@
 mod integration;
 mod linear_indicator;
 mod overlay;
-mod rotor_visualizer;
 mod world;
 
 pub use integration::UiIntegration;
 pub use linear_indicator::LinearIndicator;
 pub use overlay::BottomOverlay;
-pub use rotor_visualizer::RotorVisualizer;
 pub use world::world_to_screen;
 
 // Re-export egui so apps depend on `rye-egui` only and the version

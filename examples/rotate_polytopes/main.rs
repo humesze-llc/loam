@@ -56,8 +56,8 @@
 use anyhow::{anyhow, Result};
 use glam::{Vec3, Vec4};
 use rye_app::{
-    egui, run_with_config, App, BottomOverlay, Camera, FrameCtx, OrbitController, RotorVisualizer,
-    RunConfig, SetupCtx,
+    egui, run_with_config, App, BottomOverlay, Camera, FrameCtx, OrbitController, RunConfig,
+    SetupCtx,
 };
 use rye_math::{Bivector, Bivector4, EuclideanR3, Plane4, Rotor4};
 use rye_render::{
@@ -396,10 +396,6 @@ struct RotatePolytopesApp {
     /// Index into `row` of the polytope shown in each filmstrip
     /// cell. Clamped to `row.len() - 1` when the row shrinks.
     strip_subject: usize,
-    /// Show the `rye_egui::RotorVisualizer` overlay (top-right)
-    /// decomposing the angular-velocity bivector into one or two
-    /// rotation planes.
-    show_rotor_viz: bool,
 
     /// Which rotation source drives the continuous spin: the
     /// six-checkbox active set (`Active`), or the composed
@@ -980,8 +976,6 @@ impl RotatePolytopesApp {
             ui.selectable_value(&mut staged, RotationMode::Composer, "Composer")
                 .on_hover_text("Sum of bivectors from the composed sequence");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut self.show_rotor_viz, "Rotor viz")
-                    .on_hover_text("Top-right SO(4) plane decomposition of the angular velocity");
                 ui.checkbox(&mut self.show_formula, "Show formula")
                     .on_hover_text("Top-right popup with the live exp(...) form of the rotor");
             });
@@ -2105,7 +2099,6 @@ impl App for RotatePolytopesApp {
             strip_view: false,
             strip_count: 11,
             strip_subject: 0,
-            show_rotor_viz: true,
             rotation_mode: RotationMode::Active,
             pending_mode: None,
             pending_actions: Vec::new(),
@@ -2241,30 +2234,6 @@ impl App for RotatePolytopesApp {
                             });
                     });
             }
-        }
-
-        // Top-right under the formula popup: SO(4) rotation
-        // visualizer. The omega bivector for the active rotation
-        // source decomposes into one or two simple rotation planes.
-        if self.show_rotor_viz {
-            let omega = match self.rotation_mode {
-                RotationMode::Active => angular_velocity(&self.active, self.rate_scale),
-                RotationMode::Composer => angular_velocity_from_seq(&self.seq, self.rate_scale),
-            };
-            // Stack below the formula popup if it's open. The
-            // formula's typical height is ~50pt; the rotor viz is
-            // ~52pt tall, so a 80pt stagger keeps them from
-            // overlapping when both are shown.
-            let y_offset = if self.show_formula { 80.0 } else { 16.0 };
-            egui::Area::new(egui::Id::new("rotate-polytopes-rotor-viz"))
-                .anchor(egui::Align2::RIGHT_TOP, [-16.0, y_offset])
-                .show(ctx, |ui| {
-                    egui::Frame::popup(&ctx.style())
-                        .inner_margin(6.0)
-                        .show(ui, |ui| {
-                            RotorVisualizer::new(omega, "rotation").show(ui);
-                        });
-                });
         }
 
         // Bottom-anchored unified controls overlay. Sliders + rate
