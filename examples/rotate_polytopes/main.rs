@@ -397,6 +397,27 @@ struct RotatePolytopesApp {
     /// cell. Clamped to `row.len() - 1` when the row shrinks.
     strip_subject: usize,
 
+    /// Whether the floating "Manual rotation" window is open.
+    /// While open AND `rotate == false`, `rot_state` each frame is
+    /// computed as `manual_omega.exp() * manual_checkpoint`, so the
+    /// six basis-plane sliders plus the seq-direction slider drive
+    /// the orientation directly. Sliders use sum-of-bivectors
+    /// semantics (same model as Active spin), so each acts cleanly
+    /// in isolation and multiple non-zero sliders compose into one
+    /// compound rotor.
+    manual_window_open: bool,
+    /// Per-basis-plane manual angles in degrees, ordered by
+    /// [`Plane4::ALL`]: xy, xz, xw, yz, yw, zw. Range -360..=360.
+    manual_basis_angles: [f32; 6],
+    /// Manual angle in degrees applied along the seq's net-bivector
+    /// unit direction. Disabled when `seq` is empty.
+    manual_seq_angle: f32,
+    /// Rotor at the moment the manual window was opened. Manual
+    /// sliders represent rotation FROM this checkpoint, so closing
+    /// the window with all sliders at zero leaves the orientation
+    /// unchanged. Captured fresh on every open.
+    manual_checkpoint: Rotor4,
+
     /// Which rotation source drives the continuous spin: the
     /// six-checkbox active set (`Active`), or the composed
     /// sequence's bivector sum (`Composer`). Both share the rate
@@ -935,6 +956,35 @@ fn chevron_button(ui: &mut egui::Ui, up: bool, hover: &str) -> egui::Response {
 }
 
 impl RotatePolytopesApp {
+    /// Sum the manual sliders' contributions into one bivector.
+    /// Each basis-plane slider contributes `angle_rad · e_i`; the
+    /// seq slider contributes `angle_rad · seq_unit_bivector`. With
+    /// all sliders at zero this returns `Bivector4::ZERO`, so a
+    /// caller that opened the manual window without scrubbing sees
+    /// the polytope held at the checkpoint orientation.
+    fn manual_omega(&self) -> Bivector4 {
+        let mut omega = Bivector4::ZERO;
+        for (i, &deg) in self.manual_basis_angles.iter().enumerate() {
+            if deg != 0.0 {
+                omega = omega + Plane4::ALL[i].unit_bivector() * deg.to_radians();
+            }
+        }
+        if self.manual_seq_angle != 0.0 {
+            let seq_omega = angular_velocity_from_seq(&self.seq, 1.0);
+            let mag = seq_omega.magnitude();
+            // Use the seq's NET direction as the unit bivector and
+            // the slider value as the absolute angle along it.
+            // `BASE_ROTATION_RATE * 1.0` was already baked into
+            // `angular_velocity_from_seq`, so divide it out before
+            // normalizing the direction.
+            if mag > 1e-6 {
+                let unit = seq_omega * (1.0 / mag);
+                omega = omega + unit * self.manual_seq_angle.to_radians();
+            }
+        }
+        omega
+    }
+
     /// Drive every body in the row with the same rotor, lets the
     /// user directly compare slice signatures under identical 4D motion.
     fn write_all(&mut self, rotor: Rotor4) {
@@ -976,6 +1026,11 @@ impl RotatePolytopesApp {
             ui.selectable_value(&mut staged, RotationMode::Composer, "Composer")
                 .on_hover_text("Sum of bivectors from the composed sequence");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut self.manual_window_open, "Manual rotation")
+                    .on_hover_text(
+                        "Floating window with 360° sliders per basis plane plus a seq-direction \
+                         slider; pause spin, drag to scrub the orientation",
+                    );
                 ui.checkbox(&mut self.show_formula, "Show formula")
                     .on_hover_text("Top-right popup with the live exp(...) form of the rotor");
             });
@@ -1637,6 +1692,96 @@ impl RotatePolytopesApp {
     /// Modal help window; shown when `self.show_help` is `true`.
     /// Closes via the window's title-bar X (egui's
     /// `Window::open(&mut bool)` flips the bool).
+    /// Floating "Manual rotation" window. Six 0..360 angle sliders
+    /// (one per basis plane) plus a seventh for the composer's net
+    /// bivector direction. Sliders sum into one omega bivector each
+    /// frame; the rotor is `omega.exp() * checkpoint`, where
+    /// `checkpoint` is the orientation at the moment the window was
+    /// opened. Closing the window leaves the orientation at its
+    /// last value; reopening captures a new checkpoint and resets
+    /// sliders to zero.
+    ///
+    /// Manual driving requires `rotate == false` (paused), which
+    /// the window header indicates. The user can hit play
+    /// (Space / T) without closing the window; spin will resume
+    /// from the current orientation, and the manual sliders go
+    /// inert until paused again.
+    fn render_manual_rotation_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.manual_window_open;
+        let was_open = open;
+        let seq_disabled = self.seq.is_empty();
+        egui::Window::new("Manual rotation")
+            .open(&mut open)
+            .resizable(true)
+            .default_pos([24.0, 160.0])
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                if self.rotate {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 60),
+                        "Spin is on; pause to drive sliders manually.",
+                    );
+                    ui.add_space(4.0);
+                }
+                if ui.button("Reset all").clicked() {
+                    self.manual_basis_angles = [0.0; 6];
+                    self.manual_seq_angle = 0.0;
+                }
+                ui.separator();
+                for (i, plane) in Plane4::ALL.iter().enumerate() {
+                    Self::manual_slider_row(
+                        ui,
+                        plane.label(),
+                        &mut self.manual_basis_angles[i],
+                        false,
+                    );
+                }
+                ui.separator();
+                Self::manual_slider_row(ui, "seq", &mut self.manual_seq_angle, seq_disabled);
+                if seq_disabled {
+                    ui.colored_label(
+                        ui.visuals().weak_text_color(),
+                        "(empty composer; seq slider disabled)",
+                    );
+                }
+            });
+        // On open: capture a fresh checkpoint and zero the sliders
+        // so the polytope holds at the current orientation.
+        if open && !was_open {
+            self.manual_checkpoint = self.rot_state;
+            self.manual_basis_angles = [0.0; 6];
+            self.manual_seq_angle = 0.0;
+        }
+        self.manual_window_open = open;
+    }
+
+    /// One row of the manual rotation window: label, 360-degree
+    /// slider, and a per-row reset button. Disabled rows render
+    /// greyed out and ignore drag input.
+    fn manual_slider_row(ui: &mut egui::Ui, label: &str, value: &mut f32, disabled: bool) {
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!disabled, |ui| {
+                ui.add_sized(
+                    [28.0, 18.0],
+                    egui::Label::new(egui::RichText::new(label).monospace()),
+                );
+                ui.add(
+                    egui::Slider::new(value, -360.0..=360.0)
+                        .suffix("°")
+                        .fixed_decimals(1)
+                        .clamping(egui::SliderClamping::Always),
+                );
+                if ui
+                    .add(egui::Button::new("×").min_size(egui::vec2(20.0, 18.0)))
+                    .on_hover_text("Reset this slider to 0°")
+                    .clicked()
+                {
+                    *value = 0.0;
+                }
+            });
+        });
+    }
+
     fn render_help_window(&mut self, ctx: &egui::Context) {
         if !self.show_help {
             return;
@@ -2122,6 +2267,10 @@ impl App for RotatePolytopesApp {
             strip_view: false,
             strip_count: 11,
             strip_subject: 0,
+            manual_window_open: false,
+            manual_basis_angles: [0.0; 6],
+            manual_seq_angle: 0.0,
+            manual_checkpoint: Rotor4::IDENTITY,
             rotation_mode: RotationMode::Active,
             pending_mode: None,
             pending_actions: Vec::new(),
@@ -2161,6 +2310,20 @@ impl App for RotatePolytopesApp {
                 self.rot_state = (delta * self.rot_state).normalize();
                 self.write_all(self.rot_state);
             }
+        } else if self.manual_window_open {
+            // Manual scrub: compute the omega bivector from the
+            // basis-plane sliders + (when seq is non-empty) the seq-
+            // direction slider, then apply against the checkpoint
+            // rotor captured when the window opened. Sliders all-zero
+            // means rotor stays at the checkpoint.
+            let omega = self.manual_omega();
+            let rotor = if omega.magnitude_squared() > 0.0 {
+                (omega.exp() * self.manual_checkpoint).normalize()
+            } else {
+                self.manual_checkpoint
+            };
+            self.rot_state = rotor;
+            self.write_all(self.rot_state);
         }
 
         // Camera. Gate the orbit on `!ui_has_focus` so dragging the
@@ -2262,6 +2425,9 @@ impl App for RotatePolytopesApp {
         // Bottom-anchored unified controls overlay. Sliders + rate
         // row always visible; the rest expands above on chevron/H.
         self.render_overlay(ctx);
+
+        // Floating manual-rotation window (toggled from the panel).
+        self.render_manual_rotation_window(ctx);
 
         // Modal help window (opened by the `?` button).
         self.render_help_window(ctx);
