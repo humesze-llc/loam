@@ -2337,6 +2337,15 @@ impl App for RotatePolytopesApp {
             );
             self.node.set_bodies(&[subject_body]);
 
+            // The polytopes have circumradius 1 in body-local
+            // canonical form, scaled by `BODY_SIZE` in world space.
+            // Rotations preserve the bounding sphere, so the
+            // world w-extent of the rotated polytope is at most
+            // `BODY_SIZE`. Use that as the strip's half-extent so
+            // every cell shows part of the shape instead of two
+            // thirds of the cells rendering empty space (which is
+            // what the slider's `W_RANGE = 1.5` band would do).
+            let strip_w_max = BODY_SIZE;
             let cells = viewport.split_horizontal(self.strip_count as u32);
             let n = cells.len().max(1);
             let strip: Vec<(Viewport, f32)> = cells
@@ -2348,7 +2357,7 @@ impl App for RotatePolytopesApp {
                     } else {
                         i as f32 / (n - 1) as f32
                     };
-                    let w = -W_RANGE + t * (2.0 * W_RANGE);
+                    let w = -strip_w_max + t * (2.0 * strip_w_max);
                     (vp, w)
                 })
                 .collect();
