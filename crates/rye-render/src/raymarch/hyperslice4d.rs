@@ -982,12 +982,18 @@ impl Hyperslice4DNode {
         &mut self,
         rd: &RenderDevice,
         view: &wgpu::TextureView,
-        cells: &[(crate::Viewport, f32)],
+        cells: &[(crate::Viewport, f32, BodyUniform)],
     ) -> Result<()> {
-        for (cell_idx, (viewport, w_slice)) in cells.iter().enumerate() {
+        for (cell_idx, (viewport, w_slice, body)) in cells.iter().enumerate() {
             if viewport.width == 0 || viewport.height == 0 {
                 continue;
             }
+            // Per-cell body lets the caller swap in a different
+            // rotor (or shape, color, position) per cell. The
+            // 2D w/t grid uses this to render different rotors
+            // along the t axis: `body.rotor_*` carries
+            // `exp(omega * t_cell)`.
+            self.set_bodies(&[*body]);
             // Update per-cell uniforms: w_slice + the resolution
             // for this cell so the kernel's UV math (camera aspect,
             // viewport-origin subtraction) lands inside the cell.

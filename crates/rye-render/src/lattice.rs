@@ -89,6 +89,28 @@ impl Viewport {
             })
             .collect()
     }
+
+    /// Split this viewport into `n` evenly-spaced vertical cells.
+    /// Companion to [`Self::split_horizontal`]; same trailing-cell
+    /// remainder rule, so the strip covers `self` without seams.
+    pub fn split_vertical(&self, n: u32) -> Vec<Viewport> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let cell_h = self.height / n;
+        let remainder = self.height - cell_h * n;
+        (0..n)
+            .map(|i| {
+                let extra = if i == n - 1 { remainder } else { 0 };
+                Viewport {
+                    x: self.x,
+                    y: self.y + i * cell_h,
+                    width: self.width,
+                    height: cell_h + extra,
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
