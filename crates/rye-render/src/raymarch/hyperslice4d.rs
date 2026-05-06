@@ -73,6 +73,10 @@ pub const SHAPE_16CELL: u32 = 2;
 pub const SHAPE_24CELL: u32 = 3;
 pub const SHAPE_120CELL: u32 = 4;
 pub const SHAPE_600CELL: u32 = 5;
+pub const SHAPE_3SPHERE: u32 = 6;
+pub const SHAPE_DUOCYLINDER: u32 = 7;
+pub const SHAPE_CLIFFORD_TORUS: u32 = 8;
+pub const SHAPE_SPHERINDER: u32 = 9;
 
 /// One dynamic-body slot. Discriminated record covering both
 /// hypersphere and polytope cases, `kind` selects which fields
@@ -292,6 +296,10 @@ const SHAPE_16CELL: u32 = 2u;
 const SHAPE_24CELL: u32 = 3u;
 const SHAPE_120CELL: u32 = 4u;
 const SHAPE_600CELL: u32 = 5u;
+const SHAPE_3SPHERE: u32 = 6u;
+const SHAPE_DUOCYLINDER: u32 = 7u;
+const SHAPE_CLIFFORD_TORUS: u32 = 8u;
+const SHAPE_SPHERINDER: u32 = 9u;
 // Mirrors `BodyKind::Invalid` (CPU). Intentionally absent from the
 // dispatch chain in `rye_dynamic_bodies_sdf` and `rye_total_sdf` below:
 // neither the sphere nor the polytope branch matches, so the SDF
@@ -477,6 +485,62 @@ fn cell24_sdf_local(p: vec4<f32>) -> f32 {
     return max(tess, cross);
 }
 
+// 3-sphere (the 4-ball) at unit circumradius. The SDF that
+// returns 0 on the surface and negative inside is just
+// `|p| - 1`. Rotation-invariant: every 4D rotation leaves the
+// shape unchanged, so the cross-section is always a 2-sphere
+// of radius `sqrt(1 - w_slice²)` (or empty when |w_slice| > 1).
+// Useful as a control: when the user spins a 3-sphere and the
+// cross-section doesn't morph, that's the rotation-invariance
+// of S³ on display.
+fn sphere3_sdf_local(p: vec4<f32>) -> f32 {
+    return length(p) - 1.0;
+}
+
+// Duocylinder (D² × D²) at unit circumradius. The Cartesian
+// product of two 2-discs in orthogonal 2-planes (xy and zw),
+// each of radius 1/sqrt(2) so the bounding 4-ball has radius 1.
+// SDF uses the same outside/inside split as the box SDF: the
+// outside leg is the 2-D Euclidean distance to the disc-pair
+// (correct, not an underestimate).
+fn duocylinder_sdf_local(p: vec4<f32>) -> f32 {
+    let r = 0.7071068;
+    let dxy = length(p.xy) - r;
+    let dzw = length(p.zw) - r;
+    let outside = length(vec2<f32>(max(dxy, 0.0), max(dzw, 0.0)));
+    let inside = min(max(dxy, dzw), 0.0);
+    return outside + inside;
+}
+
+// Clifford torus, "filled" as a 4-D tube of radius `tube`
+// around the 2-D torus surface `length(p.xy) = r1, length(p.zw)
+// = r2`. The center curve is codimension 2, so the SDF takes a
+// vec2 length in the (q1, q2) normal plane and subtracts the
+// tube radius. Numbers chosen so the bounding 4-ball is unit.
+fn clifford_torus_sdf_local(p: vec4<f32>) -> f32 {
+    let r1 = 0.5;
+    let r2 = 0.5;
+    let tube = 0.2;
+    let q1 = length(p.xy) - r1;
+    let q2 = length(p.zw) - r2;
+    return length(vec2<f32>(q1, q2)) - tube;
+}
+
+// Spherinder (B³ × [-h, h]) at unit circumradius. A 3-ball
+// extruded along the w-axis. Cross-sections at |w_slice| <= h
+// are 3-spheres of radius `r`; outside the extent, empty.
+// Box-style SDF combining the radial distance from the w-axis
+// (length of p.xyz) and the slab distance along w.
+fn spherinder_sdf_local(p: vec4<f32>) -> f32 {
+    let r = 0.7071068;
+    let h = 0.7071068;
+    let dxyz = length(p.xyz) - r;
+    let dw = abs(p.w) - h;
+    let outside = length(vec2<f32>(max(dxyz, 0.0), max(dw, 0.0)));
+    let inside = min(max(dxyz, dw), 0.0);
+    return outside + inside;
+}
+
 // Dispatcher: world-space `p4` against polytope body `b`. Translates
 // to body origin, applies the inverse rotor (world -> body local),
 // scales by 1/size to evaluate the unit-circumradius shape, then
@@ -512,6 +576,14 @@ fn body_polytope_sdf_4d(p4: vec4<f32>, b: BodyUniform) -> f32 {
         d = cell120_sdf_local(unit_p);
     } else if (shape == SHAPE_600CELL) {
         d = cell600_sdf_local(unit_p);
+    } else if (shape == SHAPE_3SPHERE) {
+        d = sphere3_sdf_local(unit_p);
+    } else if (shape == SHAPE_DUOCYLINDER) {
+        d = duocylinder_sdf_local(unit_p);
+    } else if (shape == SHAPE_CLIFFORD_TORUS) {
+        d = clifford_torus_sdf_local(unit_p);
+    } else if (shape == SHAPE_SPHERINDER) {
+        d = spherinder_sdf_local(unit_p);
     }
     return d * size;
 }
@@ -1029,6 +1101,10 @@ mod tests {
         assert!(HYPERSLICE_KERNEL_WGSL.contains("cell24_sdf_local"));
         assert!(HYPERSLICE_KERNEL_WGSL.contains("cell120_sdf_local"));
         assert!(HYPERSLICE_KERNEL_WGSL.contains("cell600_sdf_local"));
+        assert!(HYPERSLICE_KERNEL_WGSL.contains("sphere3_sdf_local"));
+        assert!(HYPERSLICE_KERNEL_WGSL.contains("duocylinder_sdf_local"));
+        assert!(HYPERSLICE_KERNEL_WGSL.contains("clifford_torus_sdf_local"));
+        assert!(HYPERSLICE_KERNEL_WGSL.contains("spherinder_sdf_local"));
         assert!(HYPERSLICE_KERNEL_WGSL.contains("rotor4_inverse_apply"));
         // Per-body SDF for normal sampling (issue #17).
         assert!(HYPERSLICE_KERNEL_WGSL.contains("rye_body_sdf_at"));
@@ -1431,6 +1507,13 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
             (SHAPE_24CELL, "const SHAPE_24CELL: u32 = 3u;"),
             (SHAPE_120CELL, "const SHAPE_120CELL: u32 = 4u;"),
             (SHAPE_600CELL, "const SHAPE_600CELL: u32 = 5u;"),
+            (SHAPE_3SPHERE, "const SHAPE_3SPHERE: u32 = 6u;"),
+            (SHAPE_DUOCYLINDER, "const SHAPE_DUOCYLINDER: u32 = 7u;"),
+            (
+                SHAPE_CLIFFORD_TORUS,
+                "const SHAPE_CLIFFORD_TORUS: u32 = 8u;",
+            ),
+            (SHAPE_SPHERINDER, "const SHAPE_SPHERINDER: u32 = 9u;"),
         ] {
             assert!(
                 HYPERSLICE_KERNEL_WGSL.contains(wgsl_decl),
