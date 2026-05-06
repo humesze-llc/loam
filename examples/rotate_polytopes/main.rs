@@ -31,8 +31,8 @@
 //!
 //! - **Mouse left-drag**: orbit camera.
 //! - **Up / Down arrows**: scrub `w`-slice (0.5 u/s).
-//! - **T**: toggle 4D rotation (pause/resume freezes orientation
-//!   in place, does NOT snap back to identity).
+//! - **Space / T**: toggle 4D rotation (pause/resume freezes
+//!   orientation in place, does NOT snap back to identity).
 //! - **1..6**: toggle the corresponding rotation plane on/off.
 //!   The mapping is `1=xy, 2=xz, 3=xw, 4=yz, 5=yw, 6=zw`. Active
 //!   planes' bivectors sum into the angular velocity. Famous
@@ -40,9 +40,9 @@
 //!   isoclinic xw+yz; `3+5+6` = three w-planes drift through
 //!   SO(4). Pure-3D combinations (`1+2+4`) just rotate the
 //!   cross-section as a rigid 3D shape.
-//! - **+ / -**: adjust the global rotation rate.
 //! - **R**: full reset, slice, rate, all toggles off, AND
 //!   orientation back to canonical pose.
+//! - **H**: toggle the bottom-overlay expanded section.
 //! - **Esc**: exit.
 //!
 //! ## CLI
@@ -55,16 +55,24 @@
 
 use anyhow::{anyhow, Result};
 use glam::{Vec3, Vec4};
-use rye_app::{
-    egui, run_with_config, App, BottomOverlay, Camera, FrameCtx, OrbitController, RunConfig,
-    SetupCtx,
+use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use rye_egui::{
+    dnd::{
+        apply_drop_pre_pass as dnd_apply_drop_pre_pass,
+        drag_source_collapsing as dnd_drag_source_collapsing, drop_target_idx, force_opaque_active,
+        make_room_gap, pickup_t as drag_pickup_t,
+    },
+    media::{add_button, chevron_button, play_pause_button, rate_toggle, refresh_button},
+    slider_with_edit,
 };
-use rye_math::{Bivector, Bivector4, EuclideanR3, Plane4, Rotor4};
+use rye_math::{Bivector, Bivector4, EuclideanR3, Plane4, Rotor, Rotor4};
 use rye_render::{
     device::RenderDevice,
     raymarch::{
         polytope_extended_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL,
-        SHAPE_120CELL, SHAPE_16CELL, SHAPE_24CELL, SHAPE_600CELL, SHAPE_PENTATOPE, SHAPE_TESSERACT,
+        SHAPE_120CELL, SHAPE_16CELL, SHAPE_24CELL, SHAPE_3SPHERE, SHAPE_600CELL,
+        SHAPE_CLIFFORD_TORUS, SHAPE_DUOCYLINDER, SHAPE_PENTATOPE, SHAPE_SPHERINDER,
+        SHAPE_TESSERACT,
     },
     Viewport,
 };
@@ -96,12 +104,40 @@ const SHAPE_CARD_WIDTH: f32 = 64.0;
 /// mismatch that would otherwise make the + button appear higher
 /// than the cards.
 const CONTROL_H: f32 = 29.0;
+/// Standard width for square control buttons in the overlay's
+/// rate row and shape row (`<<`, `<`, `>`, `>>`, refresh, the per-
+/// shape `×`). Matches the visual cadence of the row without each
+/// callsite hardcoding the same `28.0`. The play/pause button is
+/// deliberately wider (see [`PLAY_PAUSE_W`]) and the smaller help
+/// / close glyphs use [`MINI_BUTTON_W`].
+const CONTROL_W: f32 = 28.0;
+/// Wider central play/pause control. Asymmetry signals the primary
+/// action in the rate cluster.
+const PLAY_PAUSE_W: f32 = 36.0;
+/// Compact close / help glyphs (`×`, `?`). Smaller than the rate-
+/// cluster controls so they read as utility chrome, not primary
+/// actions.
+const MINI_BUTTON_W: f32 = 22.0;
+/// Horizontal spacing between adjacent cards in the term and shape
+/// rows. The make-room gap animates open to a card's width *plus*
+/// this gap, so the value is shared and can't desync.
+const CARD_ITEM_SPACING_X: f32 = 4.0;
 
 const W_SCRUB_RATE: f32 = 0.5;
 const W_RANGE: f32 = 1.5;
 
+/// Initial maximum value for the t slider's range. Chosen so the
+/// per-pixel scrub precision matches the w slider's: w spans
+/// `2 × W_RANGE = 3.0` over the same slider track, so starting t
+/// at 3.0 means dragging t feels just as smooth as dragging w.
+/// The runaway guard in `update()` doubles this as the spin
+/// pushes `rot_time` past it; precision halves with each
+/// doubling but the user keeps the high precision early on when
+/// fine scrubbing matters most.
+const T_SLIDER_INITIAL: f32 = 3.0;
+
 /// Base rotation angular rate (rad/s). Scaled by `rate_scale` per
-/// frame so +/- can speed it up or slow it down.
+/// frame so the rate buttons can speed it up or slow it down.
 const BASE_ROTATION_RATE: f32 = std::f32::consts::TAU * 0.3;
 
 /// Spacing between body centers along x. Slightly larger than
@@ -119,11 +155,11 @@ const BODY_Y: f32 = 0.9;
 /// GPU side, NOT the panel's card color; those are uniformly grey
 /// in the redesigned UI), short display label, and long
 /// mathematical name shown in card tooltips. The long name uses
-/// the `pentatope` / `tesseract` / `hexadecachoron` family; the
+/// the `pentachoron` / `tesseract` / `hexadecachoron` family; the
 /// `*-plex` aliases (pentaplex, dodecaplex, ...) are deliberately
 /// avoided since "plex" is dimension-generalized rather than
 /// being the actual 4D name.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 struct ShapeEntry {
     shape: u32,
     body_color: [f32; 3],
@@ -133,7 +169,7 @@ struct ShapeEntry {
 
 /// Default row when no `--shapes` argument is given. Ordered to put
 /// the 24-cell first (most "4D-distinct" cross-section), then the
-/// pentatope / 16-cell / tesseract triple; visually contrasting
+/// pentachoron / 16-cell / tesseract triple; visually contrasting
 /// shapes left-to-right.
 const DEFAULT_ROW: &[ShapeEntry] = &[
     ShapeEntry {
@@ -146,7 +182,7 @@ const DEFAULT_ROW: &[ShapeEntry] = &[
         shape: SHAPE_PENTATOPE,
         body_color: [0.95, 0.55, 0.30],
         label: "5-cell",
-        long_name: "pentatope",
+        long_name: "pentachoron",
     },
     ShapeEntry {
         shape: SHAPE_16CELL,
@@ -162,55 +198,155 @@ const DEFAULT_ROW: &[ShapeEntry] = &[
     },
 ];
 
+/// Catalog of every shipped 4D shape: the six convex regular
+/// polychora plus four non-polychoral SDF-trivial shapes
+/// (3-sphere, duocylinder, Clifford torus, spherinder). Used by
+/// the filmstrip subject picker and the `+` shape menu. Colours
+/// are RGB float channels passed straight to the WGSL kernel
+/// (engine doesn't constrain the colour space).
+const SHAPE_CATALOG: &[ShapeEntry] = &[
+    ShapeEntry {
+        shape: SHAPE_PENTATOPE,
+        body_color: [0.95, 0.55, 0.30],
+        label: "5-cell",
+        long_name: "pentachoron",
+    },
+    ShapeEntry {
+        shape: SHAPE_TESSERACT,
+        body_color: [0.30, 0.55, 0.95],
+        label: "8-cell",
+        long_name: "tesseract",
+    },
+    ShapeEntry {
+        shape: SHAPE_16CELL,
+        body_color: [0.55, 0.95, 0.40],
+        label: "16-cell",
+        long_name: "hexadecachoron",
+    },
+    ShapeEntry {
+        shape: SHAPE_24CELL,
+        body_color: [0.95, 0.45, 0.85],
+        label: "24-cell",
+        long_name: "icositetrachoron",
+    },
+    ShapeEntry {
+        shape: SHAPE_120CELL,
+        body_color: [0.40, 0.85, 0.85],
+        label: "120-cell",
+        long_name: "hecatonicosachoron",
+    },
+    ShapeEntry {
+        shape: SHAPE_600CELL,
+        body_color: [0.95, 0.85, 0.40],
+        label: "600-cell",
+        long_name: "hexacosichoron",
+    },
+    ShapeEntry {
+        shape: SHAPE_3SPHERE,
+        body_color: [0.85, 0.40, 0.40],
+        label: "3-sphere",
+        long_name: "hypersphere (4-ball)",
+    },
+    ShapeEntry {
+        shape: SHAPE_DUOCYLINDER,
+        body_color: [0.60, 0.45, 0.90],
+        label: "duocyl",
+        long_name: "duocylinder (D² × D²)",
+    },
+    ShapeEntry {
+        shape: SHAPE_CLIFFORD_TORUS,
+        body_color: [0.70, 0.85, 0.35],
+        label: "clifford",
+        long_name: "Clifford torus tube",
+    },
+    ShapeEntry {
+        shape: SHAPE_SPHERINDER,
+        body_color: [0.85, 0.55, 0.75],
+        label: "spherinder",
+        long_name: "spherinder (B³ × interval)",
+    },
+];
+
+/// Render a category-grouped shape menu into the current ui.
+/// Both call sites (the `+` shape menu and the filmstrip
+/// subject combo) use this so the layout stays consistent: top
+/// level lists the [`SHAPE_CATEGORIES`] entries, each opens a
+/// nested submenu of the shapes in that category, every entry
+/// carries a `long_name` hover tooltip. `on_select` fires when
+/// the user clicks an entry; the helper closes the menu.
+fn render_shape_catalog_menu(ui: &mut egui::Ui, mut on_select: impl FnMut(ShapeEntry)) {
+    for cat in SHAPE_CATEGORIES {
+        ui.menu_button(cat.name, |ui| {
+            for entry in &SHAPE_CATALOG[cat.start..cat.end] {
+                if ui
+                    .button(entry.label)
+                    .on_hover_text(entry.long_name)
+                    .clicked()
+                {
+                    on_select(*entry);
+                    ui.close_kind(egui::UiKind::Menu);
+                }
+            }
+        });
+    }
+}
+
+/// Subcategories of [`SHAPE_CATALOG`], expressed as half-open
+/// index ranges into the catalog. Used by the shape menus
+/// (`+` button and filmstrip subject combo) to group entries
+/// with a header label and separator. Keeping the categories as
+/// ranges (rather than nested slices) lets `parse_shape_name`
+/// and direct `SHAPE_CATALOG[i]` lookups stay flat.
+struct ShapeCategory {
+    name: &'static str,
+    start: usize,
+    end: usize,
+}
+
+const SHAPE_CATEGORIES: &[ShapeCategory] = &[
+    ShapeCategory {
+        name: "Regular polychora",
+        start: 0,
+        end: 6,
+    },
+    ShapeCategory {
+        name: "Smooth solids",
+        start: 6,
+        end: 10,
+    },
+];
+
 /// Catalog of named shapes. Both common math-name aliases (the
 /// `n-cell` form) and Platonic-slice aliases (the `tetrahedron` /
 /// `cube` / etc. form) resolve to the same shape index.
 fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
     let n = name.to_lowercase();
-    Ok(match n.as_str() {
-        "5-cell" | "5cell" | "pentatope" | "pentachoron" | "tetrahedron" => ShapeEntry {
-            shape: SHAPE_PENTATOPE,
-            body_color: [0.95, 0.55, 0.30],
-            label: "5-cell",
-            long_name: "pentatope",
-        },
-        "8-cell" | "8cell" | "tesseract" | "hypercube" | "cube" => ShapeEntry {
-            shape: SHAPE_TESSERACT,
-            body_color: [0.30, 0.55, 0.95],
-            label: "8-cell",
-            long_name: "tesseract",
-        },
-        "16-cell" | "16cell" | "hexadecachoron" | "octahedron" => ShapeEntry {
-            shape: SHAPE_16CELL,
-            body_color: [0.55, 0.95, 0.40],
-            label: "16-cell",
-            long_name: "hexadecachoron",
-        },
-        "24-cell" | "24cell" | "icositetrachoron" | "cuboctahedron" => ShapeEntry {
-            shape: SHAPE_24CELL,
-            body_color: [0.95, 0.45, 0.85],
-            label: "24-cell",
-            long_name: "icositetrachoron",
-        },
-        "120-cell" | "120cell" | "hecatonicosachoron" | "dodecahedron" => ShapeEntry {
-            shape: SHAPE_120CELL,
-            body_color: [0.40, 0.85, 0.85],
-            label: "120-cell",
-            long_name: "hecatonicosachoron",
-        },
-        "600-cell" | "600cell" | "hexacosichoron" | "icosahedron" => ShapeEntry {
-            shape: SHAPE_600CELL,
-            body_color: [0.95, 0.85, 0.40],
-            label: "600-cell",
-            long_name: "hexacosichoron",
-        },
+    let needle: &str = n.as_str();
+    for entry in SHAPE_CATALOG {
+        if needle == entry.label.to_lowercase() || needle == entry.long_name.to_lowercase() {
+            return Ok(*entry);
+        }
+    }
+    // Common aliases not in the catalog's `label` / `long_name`.
+    Ok(match needle {
+        "5cell" | "pentatope" | "tetrahedron" => SHAPE_CATALOG[0],
+        "8cell" | "hypercube" | "cube" => SHAPE_CATALOG[1],
+        "16cell" | "octahedron" => SHAPE_CATALOG[2],
+        "24cell" | "cuboctahedron" => SHAPE_CATALOG[3],
+        "120cell" | "dodecahedron" => SHAPE_CATALOG[4],
+        "600cell" | "icosahedron" => SHAPE_CATALOG[5],
+        "hypersphere" | "3sphere" | "s3" | "4-ball" => SHAPE_CATALOG[6],
+        "duocylinder" => SHAPE_CATALOG[7],
+        "clifford" | "clifford-torus" | "torus" => SHAPE_CATALOG[8],
+        "spherinder" => SHAPE_CATALOG[9],
         _ => {
             return Err(anyhow!(
-                "unknown shape name {name:?}; valid names: 5-cell, \
-                 tesseract, 16-cell, 24-cell, 120-cell, 600-cell \
-                 (or Platonic aliases: tetrahedron, cube, octahedron, \
-                 cuboctahedron, dodecahedron, icosahedron)"
-            ))
+                "unknown shape name {name:?}; valid: 5-cell, 8-cell, \
+                 16-cell, 24-cell, 120-cell, 600-cell, 3-sphere, \
+                 duocyl, clifford, spherinder (plus Platonic aliases: \
+                 tetrahedron, cube, octahedron, cuboctahedron, \
+                 dodecahedron, icosahedron)"
+            ));
         }
     })
 }
@@ -248,23 +384,17 @@ fn body_position(slot: usize, n: usize) -> [f32; 4] {
 // slice-shape changes the viewer was built to show; the three
 // pure-3D planes act as ordinary 3D rotations on the cross-section.
 
-/// Angular velocity from the active set: sum of unit bivectors of
-/// active planes, scaled by base rate × rate_scale.
-fn angular_velocity(active: &[bool; 6], rate_scale: f32) -> Bivector4 {
-    let mut omega = Bivector4::ZERO;
-    for (i, &on) in active.iter().enumerate() {
-        if on {
-            omega = omega + Plane4::ALL[i].unit_bivector();
-        }
-    }
-    omega * (BASE_ROTATION_RATE * rate_scale)
-}
-
 /// Angular velocity from a composed seq: sum over terms of
 /// `scalar * sum_of_unit_bivectors_in_term`, scaled by rate_scale.
 /// Bivector addition is commutative, so term order is irrelevant
 /// in this continuous mode (it matters for the multiplicative
 /// `Apply` action, but that's a separate one-shot path).
+///
+/// The Active-mode angular velocity is structurally a special case:
+/// each active plane is one unit term with `scalar = None`. The
+/// app-level `omega_per_sec` dispatcher inlines that walk over the
+/// `[bool; 6]` directly to avoid allocating a transient seq each
+/// frame.
 fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> Bivector4 {
     let mut omega = Bivector4::ZERO;
     for term in seq {
@@ -274,6 +404,63 @@ fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> Bivector4 {
         }
     }
     omega * (BASE_ROTATION_RATE * rate_scale)
+}
+
+/// Render the 4x4 antisymmetric bivector matrix view: rows
+/// and columns labeled `x y z w`, the upper triangle filled
+/// with the bivector's component for that pair (in degrees),
+/// the lower triangle the negation, the diagonal zero. Pure
+/// presentation; reads `b` once and writes a Grid of labels.
+///
+/// Useful in the formula popup as a more structured view of
+/// the rotor's decomposition than the inline `exp(B · t)`
+/// summary, which only lists non-zero terms. The matrix shows
+/// the full 6-component bivector at a glance.
+fn render_bivector_matrix(ui: &mut egui::Ui, b: &Bivector4) {
+    const AXIS: [&str; 4] = ["x", "y", "z", "w"];
+    // Upper-triangle entries indexed by (row, col) with row < col,
+    // mapped to bivector components. e_i ∧ e_j convention: xy at
+    // (0, 1), xz at (0, 2), xw at (0, 3), yz at (1, 2), yw at
+    // (1, 3), zw at (2, 3).
+    let pair = |row: usize, col: usize| -> f32 {
+        match (row, col) {
+            (0, 1) => b.xy,
+            (0, 2) => b.xz,
+            (0, 3) => b.xw,
+            (1, 2) => b.yz,
+            (1, 3) => b.yw,
+            (2, 3) => b.zw,
+            _ => unreachable!(),
+        }
+    };
+    egui::Grid::new("bivec-matrix")
+        .num_columns(5)
+        .spacing([8.0, 2.0])
+        .show(ui, |ui| {
+            ui.label("");
+            for axis in AXIS {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(axis).monospace().weak(),
+                ));
+            }
+            ui.end_row();
+            for (row, row_axis) in AXIS.iter().enumerate() {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(*row_axis).monospace().weak(),
+                ));
+                for col in 0..4 {
+                    let text = if row == col {
+                        "0".to_string()
+                    } else if row < col {
+                        format!("{:>+5.1}", pair(row, col).to_degrees())
+                    } else {
+                        format!("{:>+5.1}", -pair(col, row).to_degrees())
+                    };
+                    ui.add(egui::Label::new(egui::RichText::new(text).monospace()));
+                }
+                ui.end_row();
+            }
+        });
 }
 
 /// Name a recognizable combination of active planes. Indices match
@@ -329,10 +516,6 @@ fn combo_name(active: &[bool; 6]) -> Option<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
-// Font discovery (portable system-font fallback)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // RotatePolytopesApp
 // ---------------------------------------------------------------------------
 
@@ -361,6 +544,12 @@ struct RotatePolytopesApp {
     /// `rotate == true`; resets on **R**). Useful for spotting
     /// periodicities in compound-bivector animations.
     rot_time: f32,
+    /// Upper bound on the `t` slider's range. Doubles every time
+    /// the spin's accumulated `rot_time` exceeds the current
+    /// bound, so the slider's handle stays meaningful at long
+    /// elapsed times instead of pinning at the right edge.
+    /// Reset to the initial bound on `R`.
+    t_slider_max: f32,
 
     /// Whether the bottom controls overlay is expanded. When
     /// `false` only the always-on slider strip + rate row is shown
@@ -376,12 +565,63 @@ struct RotatePolytopesApp {
     /// bar X (egui's `Window::open(&mut bool)` flips it).
     show_help: bool,
 
+    /// Cached natural overlay width on first frame. Used as the
+    /// fixed width of the overlay regardless of the current
+    /// window size, so resizing the demo window doesn't stretch
+    /// the controls. Set lazily on first render.
+    overlay_pinned_width: Option<f32>,
+
     /// Whether the top-right rotation-formula popup is rendered.
     /// Off by default; the formula is dense for newcomers; the
     /// expanded section has a checkbox to turn it on for users who
     /// want to see exactly which bivectors and scalars compose into
     /// the current orientation.
     show_formula: bool,
+
+    /// Whether the bottom controls overlay is rendered. On by
+    /// default so first-time users see all the demo's state at
+    /// once; toggle off via `View > Rotation controls` or the
+    /// `H` key for an unobstructed scene (e.g., for screenshots
+    /// or focused viewing).
+    show_controls: bool,
+
+    /// Top-level visualisation mode. `Shapes` shows `self.row`
+    /// side-by-side at one `w_slice`; `Filmstrip` shows one
+    /// polytope (`self.strip_subject`) sampled across an axis
+    /// of w, an axis of t, or both at once (a 2D grid).
+    view_mode: ViewMode,
+    /// Filmstrip-axis toggles. At least one MUST be active when
+    /// `view_mode == Filmstrip` (UI prevents both being off);
+    /// when only `strip_w` is on the panel renders a horizontal
+    /// row of cells across the w slider's value, when only
+    /// `strip_t` is on it renders a vertical column across the
+    /// rotation animation's `rot_time`, and when both are on it
+    /// renders a 2D grid (w on one axis, t on the other; default
+    /// orientation has w on columns and t on rows, swappable via
+    /// `strip_swap_axes`).
+    strip_w: bool,
+    strip_t: bool,
+    /// When both `strip_w` and `strip_t` are active, swap the
+    /// default axis assignment (w-on-columns / t-on-rows becomes
+    /// t-on-columns / w-on-rows).
+    strip_swap_axes: bool,
+    /// Cell counts along each filmstrip axis. Range 3..=21.
+    strip_count_w: usize,
+    strip_count_t: usize,
+    /// Forward extent of the t-axis fan in animation seconds.
+    /// The first cell is at the current `rot_time` (offset 0)
+    /// and the last is at `rot_time + strip_t_extent`. Cells
+    /// are evenly spaced in between; you read each cell as
+    /// "the rotor at this absolute t in the future." Negative
+    /// offsets aren't shown (no looking back). Default is
+    /// roughly one rotation period at the base rate.
+    strip_t_extent: f32,
+    /// Polytope rendered in each filmstrip cell. Independent of
+    /// `self.row`: filmstrip's single-shape view is decoupled
+    /// from the multi-shape row so the user can pick any of the
+    /// shipped polytopes regardless of what's been added to the
+    /// row.
+    strip_subject: ShapeEntry,
 
     /// Which rotation source drives the continuous spin: the
     /// six-checkbox active set (`Active`), or the composed
@@ -404,6 +644,14 @@ struct RotatePolytopesApp {
     /// a one-frame layout mismatch the user perceives as flicker.
     pending_mode: Option<RotationMode>,
 
+    /// View change requested this frame by the view tab row.
+    /// Same deferred-write rationale as `pending_mode`: switching
+    /// Shapes <-> Filmstrip changes the body's natural height
+    /// significantly (shape row vs subject combo), so the
+    /// `BottomOverlay` two-pass shape would mismatch on the
+    /// transition frame and flicker.
+    pending_view_mode: Option<ViewMode>,
+
     /// Composer-mode actions deferred to end-of-frame for the same
     /// reason as `pending_mode`: any mutation that grows or shrinks
     /// the overlay's body height (adding a draft plane, committing
@@ -421,6 +669,15 @@ struct RotatePolytopesApp {
     /// clears the draft. Bivector planes only; the optional
     /// scalar attaches to a committed term, not to the draft.
     draft: Vec<Plane4>,
+
+    /// Typed-formula input for the Composer's text bar. Single
+    /// expression per submit (Enter); pushes a RotorTerm into seq
+    /// and clears. The chip row remains the fast path for single-
+    /// plane terms.
+    formula_input: String,
+    /// Last parse error from the formula bar, rendered under the
+    /// input until cleared by a successful submit.
+    formula_error: Option<String>,
 }
 
 /// One term in the rotor-composition sequence: a sum of unit
@@ -444,27 +701,156 @@ struct RotorTerm {
     planes: Vec<Plane4>,
     /// Optional scalar prefix `phi` in radians. `None` means the
     /// raw bivector sum (unit magnitude); `Some(phi)` scales the
-    /// whole sum before `exp()`. Default `Some(FRAC_PI_2)` when
-    /// the user adds a scalar via the panel.
+    /// whole sum before `exp()`. The panel's "Add scalar" action
+    /// initialises this to `FRAC_PI_2`; `Default::default()` is
+    /// `None` so an empty draft commits as a unit-magnitude term.
     scalar: Option<f32>,
 }
 
-impl RotorTerm {
-    /// Compose this term as a delta rotor.
-    fn delta(&self) -> Rotor4 {
-        let mut sum = Bivector4::ZERO;
-        for plane in &self.planes {
-            sum = sum + plane.unit_bivector();
+/// Render `(p_0 + p_1 + ...)` (with parens iff multi-plane) into
+/// the current ui. Each plane goes through `render_plane`, which
+/// decides whether it's an interactive drag pill (term card),
+/// plain monospace (draft card), or anything else. The paren
+/// logic and `+` separators are shared so the visual reading of
+/// a bivector sum stays identical across all callsites.
+fn render_plane_sum(
+    ui: &mut egui::Ui,
+    planes: &[Plane4],
+    mut render_plane: impl FnMut(&mut egui::Ui, usize, Plane4),
+) {
+    let multi = planes.len() > 1;
+    if multi {
+        ui.monospace("(");
+    }
+    for (i, plane) in planes.iter().enumerate() {
+        if i > 0 {
+            ui.monospace("+");
         }
-        let phi = self.scalar.unwrap_or(1.0);
-        (sum * phi).exp()
+        render_plane(ui, i, *plane);
+    }
+    if multi {
+        ui.monospace(")");
+    }
+}
+
+/// Render a single [`RotorTerm`] as the `scalar · bivec` form
+/// that appears inside `exp(...)`. Multi-plane terms get inner
+/// parens; the lone scalar prefix is dropped when absent. Pure
+/// presentation, no math.
+fn render_term(term: &RotorTerm) -> String {
+    let plane_str = term
+        .planes
+        .iter()
+        .map(|p| p.label())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let bivec = if term.planes.len() > 1 {
+        format!("({plane_str})")
+    } else {
+        plane_str
+    };
+    match term.scalar {
+        Some(phi) => format!("{:.0}° · {}", phi.to_degrees(), bivec),
+        None => bivec,
+    }
+}
+
+/// Wrap a list of bivector-expression parts into a single bivector
+/// expression (paren-grouped when there's more than one part). None
+/// when the list is empty so the caller can return early.
+fn render_bivector_sum(parts: &[String]) -> Option<String> {
+    match parts {
+        [] => None,
+        [only] => Some(only.clone()),
+        many => Some(format!("({})", many.join(" + "))),
+    }
+}
+
+/// Parse a single term written like `90° (xy + zw)`, `xy + xz`,
+/// `90 xy`, `0.5 rad xy`, into a [`RotorTerm`]. Degrees are the
+/// default unit for the scalar; `rad` suffix overrides. The `*`
+/// or `·` between scalar and bivector is optional. Outer parens
+/// around the bivector sum are optional.
+///
+/// Single expression per call: chained terms (`exp(A) * exp(B)`)
+/// are not parsed here, since the user submits each term separately
+/// via the input bar; rotor multiplication lives in the seq.
+fn parse_formula_term(input: &str) -> Result<RotorTerm, String> {
+    let normalized = input.trim().replace('·', "*").replace('°', "deg ");
+    let s = normalized.trim();
+    if s.is_empty() {
+        return Err("empty input".into());
+    }
+    let (scalar, rest) = peel_scalar(s)?;
+    let bivec_str = rest.trim();
+    let inner = if bivec_str.starts_with('(') && bivec_str.ends_with(')') {
+        bivec_str[1..bivec_str.len() - 1].trim()
+    } else {
+        bivec_str
+    };
+    if inner.is_empty() {
+        return Err("missing bivector after scalar".into());
+    }
+    let mut planes = Vec::new();
+    for part in inner.split('+') {
+        let p = part.trim();
+        if p.is_empty() {
+            return Err("empty plane between '+'".into());
+        }
+        planes.push(parse_plane(p)?);
+    }
+    Ok(RotorTerm { planes, scalar })
+}
+
+fn peel_scalar(s: &str) -> Result<(Option<f32>, &str), String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let digits_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        i += 1;
+    }
+    if i == digits_start {
+        return Ok((None, s));
+    }
+    let num_str = &s[..i];
+    let value: f32 = num_str
+        .parse()
+        .map_err(|_| format!("not a number: `{num_str}`"))?;
+    let mut tail = s[i..].trim_start();
+    let radians = if let Some(rest) = tail.strip_prefix("rad") {
+        tail = rest.trim_start();
+        value
+    } else if let Some(rest) = tail.strip_prefix("deg") {
+        tail = rest.trim_start();
+        value.to_radians()
+    } else {
+        value.to_radians()
+    };
+    if let Some(rest) = tail.strip_prefix('*') {
+        tail = rest.trim_start();
+    }
+    Ok((Some(radians), tail))
+}
+
+fn parse_plane(s: &str) -> Result<Plane4, String> {
+    match s {
+        "xy" => Ok(Plane4::Xy),
+        "xz" => Ok(Plane4::Xz),
+        "xw" => Ok(Plane4::Xw),
+        "yz" => Ok(Plane4::Yz),
+        "yw" => Ok(Plane4::Yw),
+        "zw" => Ok(Plane4::Zw),
+        _ => Err(format!("unknown plane `{s}` (expected xy/xz/xw/yz/yw/zw)")),
     }
 }
 
 /// Continuous-rotation source. Two distinct UIs (active-set
 /// checkboxes vs composed sequence) populate the angular velocity
 /// independently; the user picks which one drives `omega` for the
-/// spin animation via a tab at the top of the rotation section.
+/// spin animation via a tab in the rotation tab row.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum RotationMode {
     /// Sum of unit bivectors of planes whose checkboxes are on.
@@ -475,6 +861,25 @@ enum RotationMode {
     /// Apply (one-shot rotor multiplication) is still available in
     /// this mode and is independent of the spin animation.
     Composer,
+}
+
+/// Visualisation mode. Orthogonal to [`RotationMode`]: rotation
+/// configures *how* the rotor evolves, view configures *what* the
+/// scene shows. Two distinct visual demos live here, picked by a
+/// top-level tab row above the rotation tabs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ViewMode {
+    /// Multi-shape comparison: `self.row` of [`ShapeEntry`]s
+    /// rendered side-by-side at one common `w_slice`. Shape order
+    /// in the row is meaningful; drag-and-drop rearranges the
+    /// scene's left-to-right layout.
+    Shapes,
+    /// Single-shape filmstrip: one [`ShapeEntry`] (independent of
+    /// the row) rendered N times across evenly-spaced `w_slice`
+    /// values around the slider's current `w`. Order of the
+    /// scene's row is irrelevant in this mode; the row UI is
+    /// hidden entirely.
+    Filmstrip,
 }
 
 /// State mutations queued during overlay rendering and applied
@@ -492,6 +897,8 @@ enum DeferredAction {
     SeqCommitDraft,
     /// `×` button on the draft preview: discard the draft.
     DraftClear,
+    /// Typed-formula bar: push a fully-formed term to seq.
+    SeqPushTerm(RotorTerm),
 }
 
 /// Drag-and-drop payload for the rotor sequence UI. Terms (whole
@@ -508,419 +915,51 @@ enum DragPayload {
     Entry(usize, usize),
 }
 
-/// Drop-in replacement for `Ui::dnd_drag_source` that takes the
-/// dragged item out of the parent layout entirely while the drag
-/// is in flight. The body paints into a Tooltip layer that follows
-/// the cursor (egui's standard drag preview); the parent layout
-/// allocates **zero space** for the dragged item; neighbouring
-/// widgets fill its old slot instantly, and the make-room gap at
-/// the drop target is the slot the item will eventually occupy on
-/// drop.
-///
-/// This matches `egui_dnd`'s shape and keeps the row's total width
-/// constant from drag through drop, so dropping doesn't trigger a
-/// horizontal layout shift on the frame the item slot is replaced
-/// with the actual card.
-///
-/// `egui::Ui::dnd_drag_source`'s dragged path uses `scope_builder`,
-/// which advances the parent cursor by the body's natural width.
-/// That's why egui's stock helper leaves the original slot
-/// allocated. We bypass `scope_builder` via `Ui::new_child`, which
-/// does NOT advance the parent cursor.
-fn dnd_drag_source_collapsing<P>(
-    ui: &mut egui::Ui,
-    id: egui::Id,
-    payload: P,
-    body: impl FnOnce(&mut egui::Ui),
-) -> egui::Response
-where
-    P: 'static + Send + Sync,
-{
-    let ctx = ui.ctx().clone();
-    let is_dragged = ctx.is_being_dragged(id);
-    if !is_dragged {
-        return ui.dnd_drag_source(id, payload, body).response;
-    }
-    egui::DragAndDrop::set_payload(&ctx, payload);
-    let layer_id = egui::LayerId::new(egui::Order::Tooltip, id);
-    let mut child = ui.new_child(egui::UiBuilder::new().layer_id(layer_id));
-    body(&mut child);
-    let body_rect = child.min_rect();
-    if let Some(pos) = ctx.pointer_interact_pos() {
-        let delta = pos - body_rect.center();
-        ctx.transform_layer_shapes(layer_id, egui::emath::TSTransform::from_translation(delta));
-    }
-    // Register a hit-rect at the body's natural position so callers
-    // (context menus, hover text) still get a usable response, but
-    // do NOT allocate space in the parent layout. This is the
-    // whole point: the dragged card occupies zero width in the
-    // row while the drag is in flight.
-    ui.interact(body_rect, id, egui::Sense::hover())
-}
-
-/// Animated "make room" insertion gap at one slot of a horizontal
-/// row. The slot whose `is_target` is `true` expands to `open_width`
-/// over ~120 ms; others stay at zero width. Cards on either side
-/// slide outward as the gap opens, giving a clear drop preview
-/// without a separate marker line. The gap collapses back to zero
-/// when the drag ends. Returns `true` if a pointer release occurred
-/// on the targeted gap this frame; the caller takes whatever
-/// payload it expects from `DragAndDrop` and applies the move.
-fn make_room_gap(
-    ui: &mut egui::Ui,
-    is_target: bool,
-    slot_id: egui::Id,
-    height: f32,
-    open_width: f32,
-) -> bool {
-    let target_w = if is_target { open_width } else { 0.0 };
-    let smooth_w = ui.ctx().animate_value_with_time(slot_id, target_w, 0.12);
-    if smooth_w >= 0.5 {
-        let _ = ui.allocate_exact_size(egui::vec2(smooth_w, height), egui::Sense::hover());
-    }
-    let dropped = is_target && ui.ctx().input(|i| i.pointer.any_released());
-    if dropped {
-        // Snap the gap closed instantly on drop. Without this, the
-        // gap animates from `open_width` -> 0 over the next ~120 ms
-        // while the row's right side rubberbands leftward as the
-        // gap closes; a visible "settle" the user reads as jank.
-        let _ = ui.ctx().animate_value_with_time(slot_id, 0.0, 0.0);
-    }
-    dropped
-}
-
-/// Map cursor x-position over a row's bounding `row_rect` to a
-/// 0-based insertion slot index in `0..=item_count`. Returns
-/// `None` when no drag is active (`is_dragging` is `false`) or
-/// the cursor isn't over the row band. Hit band extends ±40 pt
-/// vertically so a card dragged a bit above or below the row
-/// still snaps to a slot.
-fn drop_target_idx(
-    ctx: &egui::Context,
-    is_dragging: bool,
-    row_rect: egui::Rect,
-    item_count: usize,
-) -> Option<usize> {
-    if !is_dragging {
-        return None;
-    }
-    let cursor = ctx.input(|i| i.pointer.hover_pos())?;
-    let band = row_rect.expand2(egui::vec2(0.0, 40.0));
-    if !band.x_range().contains(cursor.x) || !band.y_range().contains(cursor.y) {
-        return None;
-    }
-    let n_slots = item_count + 1;
-    let slot_w = (row_rect.width() / n_slots as f32).max(1.0);
-    let rel = (cursor.x - row_rect.left()).max(0.0);
-    Some(((rel / slot_w) as usize).min(item_count))
-}
-
-/// Inside a `dnd_drag_source` body, force fully-opaque widget
-/// visuals on the current ui when the source is being dragged.
-/// egui paints the body to a Tooltip layer when dragged, where
-/// widgets never register hover and therefore default to the
-/// dimmed `inactive` style; this override lifts inactive and
-/// noninteractive fills/strokes to match `active` so the floating
-/// ghost reads as a solid card.
-fn force_opaque_active(ui: &mut egui::Ui) {
-    let active = ui.visuals().widgets.active;
-    let v = ui.visuals_mut();
-    v.widgets.inactive.bg_fill = active.bg_fill;
-    v.widgets.inactive.weak_bg_fill = active.weak_bg_fill;
-    v.widgets.inactive.fg_stroke = active.fg_stroke;
-    v.widgets.inactive.bg_stroke = active.bg_stroke;
-    v.widgets.noninteractive.bg_fill = active.bg_fill;
-    v.widgets.noninteractive.weak_bg_fill = active.weak_bg_fill;
-}
-
-/// "Pickup" pulse intensity in `[0.0, 1.0]` for the card identified
-/// by `drag_id`. Animates from 0 to 1 in 120 ms when the source
-/// starts being dragged, and back to 0 over the same time when the
-/// drag ends. Use it to interpolate stroke width / color / scale on
-/// the dragged frame so the card visibly "lifts" on pickup.
-fn drag_pickup_t(ctx: &egui::Context, drag_id: egui::Id) -> f32 {
-    let target = if ctx.is_being_dragged(drag_id) {
-        1.0
-    } else {
-        0.0
-    };
-    ctx.animate_value_with_time(drag_id.with("pickup"), target, 0.12)
-}
-
-/// Rate "skip" button drawn as one or two solid triangles.
-/// Matches the play/pause button's media-player vocabulary so the
-/// whole row reads as a single set of media controls. Highlights
-/// when `*rate == value`; clicking when already selected resets
-/// `rate = 1.0` (lets the user step out of a non-default rate
-/// without the global Reset).
-///
-/// `double = true` paints two adjacent triangles (`<<` / `>>`),
-/// `false` paints one (`<` / `>`). `forward = true` points right.
-fn rate_toggle(
-    ui: &mut egui::Ui,
-    rate: &mut f32,
-    value: f32,
-    double: bool,
-    forward: bool,
-) -> egui::Response {
-    let selected = (*rate - value).abs() < 1e-6;
-    let size = egui::vec2(28.0, CONTROL_H);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let style = ui.style().interact_selectable(&response, selected);
-    ui.painter().rect(
-        rect,
-        egui::CornerRadius::same(2),
-        style.bg_fill,
-        style.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    let color = style.fg_stroke.color;
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let r_w = 4.5_f32;
-    let r_h = 5.5_f32;
-    let triangle_at = |tip_x: f32| -> Vec<egui::Pos2> {
-        if forward {
-            vec![
-                egui::pos2(tip_x - r_w * 0.5, cy - r_h),
-                egui::pos2(tip_x - r_w * 0.5, cy + r_h),
-                egui::pos2(tip_x + r_w * 0.7, cy),
-            ]
-        } else {
-            vec![
-                egui::pos2(tip_x + r_w * 0.5, cy - r_h),
-                egui::pos2(tip_x + r_w * 0.5, cy + r_h),
-                egui::pos2(tip_x - r_w * 0.7, cy),
-            ]
-        }
-    };
-    if double {
-        let offset = 4.0;
-        ui.painter().add(egui::Shape::convex_polygon(
-            triangle_at(cx - offset),
-            color,
-            egui::Stroke::NONE,
-        ));
-        ui.painter().add(egui::Shape::convex_polygon(
-            triangle_at(cx + offset),
-            color,
-            egui::Stroke::NONE,
-        ));
-    } else {
-        ui.painter().add(egui::Shape::convex_polygon(
-            triangle_at(cx),
-            color,
-            egui::Stroke::NONE,
-        ));
-    }
-    if response.clicked() {
-        *rate = if selected { 1.0 } else { value };
-    }
-    response.on_hover_text(format!("Set rate to ×{value} (click again to reset to ×1)"))
-}
-
-/// `+` button painted as two crossed bars on a button-styled rect.
-/// Same primitive-shape vocabulary as the play / rate / chevron
-/// buttons so the row reads as one consistent set of custom-painted
-/// controls (avoids the `menu_button`'s default-padding height
-/// mismatch with the shape cards).
-fn add_button(ui: &mut egui::Ui) -> egui::Response {
-    // Slightly shorter than `CONTROL_H` because the cards' tinted
-    // backgrounds carry more visual weight than this neutral
-    // button's outline; equal heights made the + read as
-    // visually taller than the cards next to it.
-    let size = egui::vec2(28.0, CONTROL_H - 2.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let style = ui.style().interact(&response);
-    ui.painter().rect(
-        rect,
-        egui::CornerRadius::same(2),
-        style.bg_fill,
-        style.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let arm = 5.5_f32;
-    let thick = 2.0_f32;
-    let color = style.fg_stroke.color;
-    ui.painter().rect_filled(
-        egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(arm * 2.0, thick)),
-        egui::CornerRadius::ZERO,
-        color,
-    );
-    ui.painter().rect_filled(
-        egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(thick, arm * 2.0)),
-        egui::CornerRadius::ZERO,
-        color,
-    );
-    response
-}
-
-/// `R` retry button: a clockwise arc with an arrowhead, painted
-/// from primitives. Replaces a font glyph (egui's default font has
-/// patchy coverage of the Mathematical Operators block where
-/// circular-arrow code points live).
-fn refresh_button(ui: &mut egui::Ui) -> egui::Response {
-    let size = egui::vec2(28.0, CONTROL_H);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let style = ui.style().interact(&response);
-    ui.painter().rect(
-        rect,
-        egui::CornerRadius::same(2),
-        style.bg_fill,
-        style.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let radius = 6.5_f32;
-    let stroke = egui::Stroke::new(1.6, style.fg_stroke.color);
-    use std::f32::consts::PI;
-    // Clockwise arc starting just past the top, sweeping ~280°.
-    // egui's y-axis points down, so positive angles sweep clockwise
-    // visually.
-    let start_angle: f32 = -PI / 2.0 + 0.45;
-    let sweep: f32 = PI * 1.55;
-    let n = 16;
-    let points: Vec<egui::Pos2> = (0..=n)
-        .map(|i| {
-            let t = i as f32 / n as f32;
-            let angle = start_angle + t * sweep;
-            egui::pos2(cx + radius * angle.cos(), cy + radius * angle.sin())
-        })
-        .collect();
-    ui.painter().add(egui::Shape::line(points, stroke));
-    // Arrowhead at the START of the arc (the top-right gap), pointing
-    // in the direction the arc would continue if it kept going CW.
-    let arrow_size = 3.5_f32;
-    let anchor = egui::pos2(
-        cx + radius * start_angle.cos(),
-        cy + radius * start_angle.sin(),
-    );
-    let tan = start_angle - PI / 2.0;
-    let perp = tan + PI / 2.0;
-    let tip = egui::pos2(
-        anchor.x + arrow_size * tan.cos(),
-        anchor.y + arrow_size * tan.sin(),
-    );
-    let base_l = egui::pos2(
-        anchor.x + arrow_size * 0.8 * perp.cos(),
-        anchor.y + arrow_size * 0.8 * perp.sin(),
-    );
-    let base_r = egui::pos2(
-        anchor.x - arrow_size * 0.8 * perp.cos(),
-        anchor.y - arrow_size * 0.8 * perp.sin(),
-    );
-    ui.painter().add(egui::Shape::convex_polygon(
-        vec![tip, base_l, base_r],
-        style.fg_stroke.color,
-        egui::Stroke::NONE,
-    ));
-    response
-}
-
-/// Single button that toggles between a play triangle (when
-/// `playing == false`) and a pause symbol (two bars, when
-/// `playing == true`). Painted as primitive shapes so it's
-/// font-independent and reads as a media-player control on every
-/// platform. Returns the response so the caller reads `.clicked()`.
-fn play_pause_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
-    let size = egui::vec2(36.0, CONTROL_H);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let style = ui.style().interact(&response);
-    ui.painter().rect(
-        rect,
-        egui::CornerRadius::same(3),
-        style.bg_fill,
-        style.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    let color = style.fg_stroke.color;
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    if playing {
-        // Pause: two vertical bars.
-        let bar_w = 4.0;
-        let bar_h = 12.0;
-        let gap = 3.0;
-        let half_gap = gap / 2.0;
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(
-                egui::pos2(cx - half_gap - bar_w, cy - bar_h / 2.0),
-                egui::vec2(bar_w, bar_h),
-            ),
-            egui::CornerRadius::ZERO,
-            color,
-        );
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(
-                egui::pos2(cx + half_gap, cy - bar_h / 2.0),
-                egui::vec2(bar_w, bar_h),
-            ),
-            egui::CornerRadius::ZERO,
-            color,
-        );
-    } else {
-        // Play: filled rightward triangle.
-        let r_h = 7.0;
-        let r_w = 8.0;
-        let p1 = egui::pos2(cx - r_w * 0.4, cy - r_h);
-        let p2 = egui::pos2(cx - r_w * 0.4, cy + r_h);
-        let p3 = egui::pos2(cx + r_w * 0.7, cy);
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![p1, p2, p3],
-            color,
-            egui::Stroke::NONE,
-        ));
-    }
-    response
-}
-
-/// Allocate a clickable button with a custom-painted up- or down-
-/// chevron (`^` / `v`, drawn as two stroked line segments). Used
-/// instead of a font glyph so it doesn't depend on the egui font
-/// having Mathematical Operators (∧/∨) coverage. Returns the
-/// response so the caller can read `.clicked()`.
-fn chevron_button(ui: &mut egui::Ui, up: bool, hover: &str) -> egui::Response {
-    let size = egui::vec2(28.0, CONTROL_H);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let style = ui.style().interact(&response);
-    ui.painter().rect(
-        rect,
-        egui::CornerRadius::same(2),
-        style.bg_fill,
-        style.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let dx = 6.0;
-    let dy = 4.0;
-    let stroke = egui::Stroke::new(2.0, style.fg_stroke.color);
-    if up {
-        ui.painter().line_segment(
-            [egui::pos2(cx - dx, cy + dy), egui::pos2(cx, cy - dy)],
-            stroke,
-        );
-        ui.painter().line_segment(
-            [egui::pos2(cx + dx, cy + dy), egui::pos2(cx, cy - dy)],
-            stroke,
-        );
-    } else {
-        ui.painter().line_segment(
-            [egui::pos2(cx - dx, cy - dy), egui::pos2(cx, cy + dy)],
-            stroke,
-        );
-        ui.painter().line_segment(
-            [egui::pos2(cx + dx, cy - dy), egui::pos2(cx, cy + dy)],
-            stroke,
-        );
-    }
-    response.on_hover_text(hover)
-}
-
 impl RotatePolytopesApp {
+    /// Per-animation-second angular velocity (the bivector
+    /// that, integrated over animation time, produces
+    /// `rot_state`). Independent of `rate_scale`. Active mode
+    /// sums the toggled basis bivectors; Composer mode delegates
+    /// to the seq walker. The rate buttons advance animation
+    /// time faster or slower (see [`Self::dt_animation`]); they
+    /// don't change this velocity.
+    ///
+    /// This factoring lets `rot_time` be displayed as
+    /// "animation time" and still give consistent
+    /// `rot_state = exp(omega_animation * rot_time)` semantics
+    /// across rate changes.
+    /// The composer seq's net bivector direction (no rate or
+    /// base-rate scaling). This is the "function" the seq
+    /// describes: sum over terms of `scalar * sum_planes`. The
+    /// scrub slider uses this as its rotation axis-bivector;
+    /// the projection of `log(rot_state)` onto this direction is
+    /// the slider's value.
+    fn compose_omega(&self) -> Bivector4 {
+        let mut omega = Bivector4::ZERO;
+        for term in &self.seq {
+            let phi = term.scalar.unwrap_or(1.0);
+            for plane in &term.planes {
+                omega = omega + plane.unit_bivector() * phi;
+            }
+        }
+        omega
+    }
+
+    fn omega_animation(&self) -> Bivector4 {
+        match self.rotation_mode {
+            RotationMode::Active => {
+                let mut omega = Bivector4::ZERO;
+                for (i, &on) in self.active.iter().enumerate() {
+                    if on {
+                        omega = omega + Plane4::ALL[i].unit_bivector();
+                    }
+                }
+                omega * BASE_ROTATION_RATE
+            }
+            RotationMode::Composer => angular_velocity_from_seq(&self.seq, 1.0),
+        }
+    }
+
     /// Drive every body in the row with the same rotor, lets the
     /// user directly compare slice signatures under identical 4D motion.
     fn write_all(&mut self, rotor: Rotor4) {
@@ -937,62 +976,470 @@ impl RotatePolytopesApp {
         }
     }
 
-    /// Expanded section of the bottom overlay: rotation-mode tabs,
-    /// the active-set checkboxes (Active mode) or the composer
-    /// (Composer mode), and the shape row. Always-visible controls
-    /// (Spin/Pause, rate buttons, sliders) live below this in
-    /// `render_overlay` and are rendered separately.
+    /// Expanded section of the bottom overlay. Two tab rows
+    /// stacked vertically:
+    ///
+    /// 1. **View tabs** (Shapes / Filmstrip): top-level visual
+    ///    demo. Shapes shows the multi-shape row; Filmstrip
+    ///    shows one shape across N w-slices.
+    /// 2. **Rotation tabs** (Active set / Composer): how the
+    ///    rotor evolves. Independent of view mode.
+    ///
+    /// Always-visible controls (Spin/Pause, rate buttons,
+    /// sliders) live below this in `render_overlay`.
     fn render_expanded_body(&mut self, ui: &mut egui::Ui) {
-        // Mode tab: which source drives the continuous spin. Two
-        // sub-panels swap below. The formula-display toggle sits at
-        // the right of the same row; it's a viewport-level option
-        // (independent of mode), not a mode setting itself.
-        // Mode change deferred via `self.pending_mode`: the body
-        // below this row reads `self.rotation_mode` (still the
-        // OLD value this frame), and `render_overlay` swaps in
-        // the new mode after `BottomOverlay::show` returns. This
-        // keeps `BottomOverlay`'s measure pass and visible pass
-        // rendering the same body height; clicking a tab shows
-        // the new mode on the *next* frame, with the height
-        // animation, but no mid-frame mismatch flicker.
+        self.render_view_tab_row(ui);
+        match self.view_mode {
+            ViewMode::Shapes => self.render_shapes_section(ui),
+            ViewMode::Filmstrip => self.render_filmstrip_body(ui),
+        }
+        ui.separator();
+        self.render_rotation_tab_row(ui);
+        if self.rotation_mode == RotationMode::Active {
+            self.render_active_mode(ui);
+        } else {
+            self.render_composer_mode(ui);
+        }
+    }
+
+    /// Top tab row of the expanded body: visual demo selector.
+    /// Shapes (multi-shape side-by-side row) vs Filmstrip (one
+    /// shape across multiple w-slices). Tab change is staged
+    /// into `pending_view_mode` for the same `BottomOverlay`
+    /// two-pass reason as `pending_mode`: the two body shapes
+    /// have very different natural heights and an immediate
+    /// swap mid-frame would flicker.
+    fn render_view_tab_row(&mut self, ui: &mut egui::Ui) {
+        let mut staged = self.view_mode;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut staged, ViewMode::Shapes, "Shapes")
+                .on_hover_text("Side-by-side row of shapes at one w-slice");
+            ui.selectable_value(&mut staged, ViewMode::Filmstrip, "Filmstrip")
+                .on_hover_text(
+                    "One shape rendered N times across w-slices fanning out by \
+                     ±BODY_SIZE around the w slider's value",
+                );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut self.show_formula, "Show formula")
+                    .on_hover_text("Top-right popup with the live exp(...) form of the rotor");
+            });
+        });
+        if staged != self.view_mode {
+            self.pending_view_mode = Some(staged);
+        }
+    }
+
+    /// Render axis labels around the filmstrip grid. Top edge
+    /// gets w-value tags above each column (whichever axis
+    /// carries w); left edge gets t-offset tags beside each row
+    /// (whichever axis carries t). The cell whose offset along
+    /// each axis is closest to zero is highlighted in active-set
+    /// warning gold. For 1D cases the orthogonal-axis labels
+    /// are omitted (just one row or one column).
+    fn render_filmstrip_cell_labels(&mut self, ctx: &egui::Context) {
+        let (cols, rows, w_on_cols) = match (self.strip_w, self.strip_t) {
+            (true, true) => {
+                if self.strip_swap_axes {
+                    (self.strip_count_t, self.strip_count_w, false)
+                } else {
+                    (self.strip_count_w, self.strip_count_t, true)
+                }
+            }
+            (true, false) => (self.strip_count_w, 1, true),
+            (false, true) => (1, self.strip_count_t, false),
+            (false, false) => return,
+        };
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let screen = ctx.content_rect();
+        let cell_w_px = screen.width() / cols as f32;
+        let cell_h_px = screen.height() / rows as f32;
+        let strip_w_extent = BODY_SIZE;
+
+        let label_color = |is_center: bool| {
+            if is_center {
+                egui::Color32::from_rgb(255, 217, 140)
+            } else {
+                egui::Color32::from_gray(220)
+            }
+        };
+        let label_frame = egui::Frame::default()
+            .fill(egui::Color32::from_black_alpha(160))
+            .inner_margin(egui::Margin::symmetric(6, 2))
+            .corner_radius(3);
+
+        // Per-axis cell label + center-cell flag. `axis_label`
+        // computes the (text, is_current) pair: w cells fan
+        // symmetrically around the slider so the center index
+        // is "current"; t cells fan FORWARD from the current
+        // `rot_time`, so index 0 is "current" and the rest are
+        // future predictions.
+        let w_axis_label = |i: usize, n: usize| -> (String, bool) {
+            let off = if n <= 1 {
+                0.0
+            } else {
+                let t = i as f32 / (n - 1) as f32;
+                -strip_w_extent + t * (2.0 * strip_w_extent)
+            };
+            let mid = if n == 0 { 0 } else { n / 2 };
+            (format!("w={:>+.3}", self.w_slice + off), i == mid)
+        };
+        let t_axis_label = |i: usize, n: usize| -> (String, bool) {
+            let off = if n <= 1 {
+                0.0
+            } else {
+                let t = i as f32 / (n - 1) as f32;
+                t * self.strip_t_extent
+            };
+            (format!("t={:.2}s", self.rot_time + off), i == 0)
+        };
+
+        // Top edge: column labels.
+        for i in 0..cols {
+            let center_x = screen.left() + (i as f32 + 0.5) * cell_w_px;
+            let (text, is_center) = if w_on_cols {
+                w_axis_label(i, cols)
+            } else {
+                t_axis_label(i, cols)
+            };
+            let pos = egui::pos2(center_x, screen.top() + 96.0);
+            egui::Area::new(egui::Id::new(("strip-col-label", i)))
+                .fixed_pos(pos)
+                .pivot(egui::Align2::CENTER_TOP)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    label_frame.show(ui, |ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(text)
+                                .color(label_color(is_center))
+                                .monospace()
+                                .size(12.0),
+                        ));
+                    });
+                });
+        }
+        // Left edge: row labels (only when > 1 row).
+        if rows > 1 {
+            for j in 0..rows {
+                let center_y = screen.top() + (j as f32 + 0.5) * cell_h_px;
+                let (text, is_center) = if w_on_cols {
+                    t_axis_label(j, rows)
+                } else {
+                    w_axis_label(j, rows)
+                };
+                let pos = egui::pos2(screen.left() + 16.0, center_y);
+                egui::Area::new(egui::Id::new(("strip-row-label", j)))
+                    .fixed_pos(pos)
+                    .pivot(egui::Align2::LEFT_CENTER)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        label_frame.show(ui, |ui| {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(text)
+                                    .color(label_color(is_center))
+                                    .monospace()
+                                    .size(12.0),
+                            ));
+                        });
+                    });
+            }
+        }
+    }
+
+    /// Filmstrip body: subject combo (over [`SHAPE_CATALOG`], so
+    /// the user can pick any of the six known polytopes
+    /// independent of `self.row`) plus a cells DragValue. Heavy-
+    /// shape warning surfaces here when the subject is 120/600-
+    /// cell since `render_shapes_section` (where the warning
+    /// otherwise lives) is hidden in this view.
+    fn render_filmstrip_body(&mut self, ui: &mut egui::Ui) {
+        let heavy =
+            self.strip_subject.shape == SHAPE_120CELL || self.strip_subject.shape == SHAPE_600CELL;
+        if heavy {
+            ui.colored_label(
+                egui::Color32::from_rgb(242, 130, 70),
+                "120/600-cell SDFs are heavy; expect <60 fps.",
+            );
+        }
+        // Row 1: axis toggles + (when both are on) the swap.
+        // Invariant: at least one of `strip_w` / `strip_t` must
+        // be on. Clicking the on-toggle while the other is off
+        // is a no-op (visual checkbox stays checked).
+        ui.horizontal(|ui| {
+            let mut w_on = self.strip_w;
+            let mut t_on = self.strip_t;
+            if ui
+                .checkbox(&mut w_on, "w cells")
+                .on_hover_text("Sample across w around the slider's value")
+                .changed()
+                && (w_on || self.strip_t)
+            {
+                self.strip_w = w_on;
+            }
+            if ui
+                .checkbox(&mut t_on, "t cells")
+                .on_hover_text(
+                    "Sample across animation time around the t slider; \
+                     fans by ±strip_t_extent seconds",
+                )
+                .changed()
+                && (t_on || self.strip_w)
+            {
+                self.strip_t = t_on;
+            }
+            if self.strip_w && self.strip_t {
+                ui.checkbox(&mut self.strip_swap_axes, "swap axes")
+                    .on_hover_text(
+                        "Default puts w on columns, t on rows. \
+                         Swap to put t on columns, w on rows.",
+                    );
+            }
+        });
+        // Row 2: counts + t-extent + subject combo.
+        ui.horizontal(|ui| {
+            if self.strip_w {
+                ui.add(
+                    egui::DragValue::new(&mut self.strip_count_w)
+                        .range(3..=21)
+                        .speed(0.2)
+                        .prefix("w: "),
+                );
+            }
+            if self.strip_t {
+                ui.add(
+                    egui::DragValue::new(&mut self.strip_count_t)
+                        .range(3..=21)
+                        .speed(0.2)
+                        .prefix("t: "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.strip_t_extent)
+                        .range(0.1..=10.0)
+                        .speed(0.02)
+                        .fixed_decimals(2)
+                        .suffix("s")
+                        .prefix("Δt: "),
+                )
+                .on_hover_text(
+                    "Forward extent of the t fan; cells span \
+                     [t, t+Δt] seconds of animation time",
+                );
+            }
+            // Same Popup::menu pattern as the `+` shape menu in
+            // the shape row, so the subject picker has identical
+            // visuals (nested category submenus) instead of
+            // egui's ComboBox styling, which renders the menu
+            // entries with combo-dropdown chrome that doesn't
+            // match the rest of the demo's menus.
+            let subject_button = ui
+                .button(format!("subject: {}", self.strip_subject.label))
+                .on_hover_text("Pick the polytope rendered in each filmstrip cell");
+            egui::Popup::menu(&subject_button).show(|ui| {
+                ui.set_min_width(140.0);
+                render_shape_catalog_menu(ui, |entry| {
+                    self.strip_subject = entry;
+                });
+            });
+        });
+    }
+
+    /// Rotation-mode tabs: which source drives `omega`. The tab
+    /// change is staged into `self.pending_mode` rather than
+    /// applied directly so `BottomOverlay`'s two-pass measure-
+    /// then-render captures the same body height in both passes;
+    /// clicking a tab swaps modes on the *next* frame, with the
+    /// height animation, but no mid-frame mismatch flicker.
+    fn render_rotation_tab_row(&mut self, ui: &mut egui::Ui) {
         let mut staged = self.rotation_mode;
         ui.horizontal(|ui| {
             ui.selectable_value(&mut staged, RotationMode::Active, "Active set")
                 .on_hover_text("Six checkbox-toggled bivectors (xy, xz, ...)");
             ui.selectable_value(&mut staged, RotationMode::Composer, "Composer")
                 .on_hover_text("Sum of bivectors from the composed sequence");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut self.show_formula, "Show formula")
-                    .on_hover_text("Top-right popup with the live exp(...) form of the rotor");
-            });
         });
         if staged != self.rotation_mode {
             self.pending_mode = Some(staged);
         }
+    }
 
-        // Mode-specific UI.
-        if self.rotation_mode == RotationMode::Active {
+    /// Active-set body: six plane cells laid out as a 3x2 grid.
+    /// Pure-3D planes (xy, xz, yz) on the top row, w-involving
+    /// planes (xw, yw, zw) on the bottom row. Each cell is
+    /// `[checkbox][label][slider][value]`:
+    ///
+    /// - Checkbox = "include this plane in continuous spin omega"
+    ///   (the classic Active mode toggle).
+    /// - Label = plane name (xy / xz / ...).
+    /// - Slider = the log decomposition of `rot_state` in that
+    ///   basis bivector, in degrees, range -180..=180. Dragging
+    ///   sets that component of `log(rot_state)` and rebuilds
+    ///   `rot_state` via exp. No separate manual-angle state, so
+    ///   the slider is a true window onto the current rotor.
+    /// - Value = right-click-editable label.
+    ///
+    /// All sub-component widths are pinned via constants (not
+    /// derived from `available_width` per row) so the columns
+    /// align EXACTLY across rows; the previous diagonal drift
+    /// came from per-cell `slider_width = available - n` reading
+    /// slightly different `available` values each row as cell
+    /// content + spacing accumulated.
+    ///
+    /// Combo name ("isoclinic xw+yz" etc.) is dropped from this
+    /// body; it lives only in the formula popup now.
+    /// Active body: 3-per-row 2-row grid of
+    /// `[checkbox][label][slider][value]`. Pinned widths so
+    /// columns align across rows (see issue-history note about
+    /// the previous staircase). Each value cell is right-click
+    /// editable via the shared `slider_with_edit` helper.
+    fn render_active_mode(&mut self, ui: &mut egui::Ui) {
+        const TOP_ROW: [usize; 3] = [0, 1, 3]; // xy, xz, yz
+        const BOTTOM_ROW: [usize; 3] = [2, 4, 5]; // xw, yw, zw
+
+        const CELL_INNER_SPACING: f32 = 4.0;
+        const CHECKBOX_W: f32 = 18.0;
+        const LABEL_W: f32 = 22.0;
+        const VALUE_W: f32 = 56.0;
+        const ROW_GAP: f32 = 6.0;
+
+        let total_w = ui.available_width();
+        let cell_w = ((total_w - 2.0 * ROW_GAP) / 3.0).floor();
+        let slider_w =
+            (cell_w - CHECKBOX_W - LABEL_W - VALUE_W - 3.0 * CELL_INNER_SPACING).max(40.0);
+
+        for plane_indices in [TOP_ROW, BOTTOM_ROW] {
             ui.horizontal(|ui| {
-                for (active, plane) in self.active.iter_mut().zip(Plane4::ALL.iter()) {
-                    ui.checkbox(active, plane.label());
-                }
-                // Combo name (e.g., "isoclinic xw+yz") inline on the
-                // same row as the checkboxes; saves a row of
-                // vertical space and the name reads as a label
-                // applied to the active set right next to it.
-                if let Some(name) = combo_name(&self.active) {
-                    ui.add_space(8.0);
-                    ui.colored_label(egui::Color32::from_rgb(255, 217, 140), name);
+                ui.spacing_mut().item_spacing.x = ROW_GAP;
+                for &i in &plane_indices {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(cell_w, CONTROL_H),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = CELL_INNER_SPACING;
+                            ui.spacing_mut().slider_width = slider_w;
+                            self.render_plane_slider_cell(
+                                ui, i, CHECKBOX_W, LABEL_W, slider_w, VALUE_W,
+                            );
+                        },
+                    );
                 }
             });
-            return self.render_shapes_section(ui);
         }
+    }
 
-        // Composer mode below.
+    /// One plane cell. All component widths pinned by the caller
+    /// so the cell renders identically regardless of which row
+    /// or column it's in.
+    fn render_plane_slider_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        plane_idx: usize,
+        checkbox_w: f32,
+        label_w: f32,
+        slider_w: f32,
+        value_w: f32,
+    ) {
+        let plane = Plane4::ALL[plane_idx];
+        let bivec = self.rot_state.log();
+        let current_rad = bivec.component(plane);
+        // Slider range matches the rotor's actual period.
+        // `Rotor4` lives in Spin(4), the double cover of SO(4):
+        // a 360° physical rotation maps to the rotor `-1`, and
+        // 720° brings the rotor back to `+1`. So the natural
+        // period of any single-plane rotor parameter is 720°,
+        // and `Rotor4::log` returns values across [-360, 360].
+        // Showing the full ±360° range exposes the double-cover
+        // structure honestly; a previous [-180, 180] wrap hid
+        // it but pinned the slider during the rotor's "second
+        // half" or jumped twice per cycle.
+        let mut deg = current_rad.to_degrees();
+        ui.add_sized(
+            [checkbox_w, 18.0],
+            egui::Checkbox::new(&mut self.active[plane_idx], ""),
+        );
+        ui.add_sized(
+            [label_w, 18.0],
+            egui::Label::new(egui::RichText::new(plane.label()).monospace()),
+        );
+        let slider = egui::Slider::new(&mut deg, -360.0..=360.0)
+            .show_value(false)
+            .smart_aim(false)
+            .clamping(egui::SliderClamping::Always);
+        let slider_resp = ui.add_sized([slider_w, 18.0], slider);
+        let formatted = format!("{deg:>+6.1}°");
+        let mut popup_changed = false;
+        ui.allocate_ui_with_layout(
+            egui::vec2(value_w, 18.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let label_resp = ui.add(
+                    egui::Button::new(egui::RichText::new(formatted).monospace())
+                        .frame(false)
+                        .small(),
+                );
+                label_resp
+                    .on_hover_cursor(egui::CursorIcon::ContextMenu)
+                    .on_hover_text("Right-click to edit value")
+                    .context_menu(|ui| {
+                        let drag_resp = ui.add(
+                            egui::DragValue::new(&mut deg)
+                                .range(-360.0..=360.0)
+                                .suffix("°")
+                                .fixed_decimals(1),
+                        );
+                        if drag_resp.changed() {
+                            popup_changed = true;
+                        }
+                    });
+            },
+        );
+        if slider_resp.changed() || popup_changed {
+            let mut new_bivec = bivec;
+            new_bivec.set_component(plane, deg.to_radians());
+            self.rot_state = new_bivec.exp();
+            self.write_all(self.rot_state);
+        }
+    }
+
+    /// Composer-mode body: typed-formula bar, single-plane chip
+    /// row, draft preview card, drag-and-drop term sequence,
+    /// Apply / Clear actions. The state-mutation collectors
+    /// (`term_moves`, `entry_moves`, `remove_term`, etc.) are
+    /// gathered during card rendering and applied at the end of
+    /// this function so that the `BottomOverlay`'s measure-then-
+    /// render two-pass shape sees the same seq in both passes.
+    fn render_composer_mode(&mut self, ui: &mut egui::Ui) {
         ui.separator();
 
-        // Plane buttons append into the draft.
+        // Typed-formula bar + single-plane chip row on the same
+        // line. Layout: `f: [text input] [Add] [+xy] ... [+zw]`.
+        // The chips append to the draft (fast path for single-
+        // plane terms); the text input takes a full expression.
         ui.horizontal_wrapped(|ui| {
+            ui.label("f:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.formula_input)
+                    .hint_text("e.g. 90° (xy + zw)")
+                    .desired_width(180.0),
+            );
+            let submitted = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let add_clicked = ui.small_button("Add").clicked();
+            if submitted || add_clicked {
+                match parse_formula_term(&self.formula_input) {
+                    Ok(term) => {
+                        self.pending_actions.push(DeferredAction::SeqPushTerm(term));
+                        self.formula_input.clear();
+                        self.formula_error = None;
+                        if submitted {
+                            resp.request_focus();
+                        }
+                    }
+                    Err(e) => self.formula_error = Some(e),
+                }
+            } else if self.formula_input.is_empty() {
+                self.formula_error = None;
+            }
+            ui.separator();
             for plane in Plane4::ALL.iter() {
                 if ui
                     .small_button(format!("+{}", plane.label()))
@@ -1002,7 +1449,23 @@ impl RotatePolytopesApp {
                     self.pending_actions.push(DeferredAction::DraftPush(*plane));
                 }
             }
+            // Clear at the right end of the chips row.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!self.seq.is_empty(), egui::Button::new("Clear"))
+                    .on_hover_text("Remove all terms from the sequence")
+                    .clicked()
+                {
+                    self.seq.clear();
+                }
+            });
         });
+        if let Some(err) = &self.formula_error {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 120, 120),
+                format!("parse error: {err}"),
+            );
+        }
 
         // Draft preview rendered as a card matching the committed-
         // term style. Add commits to seq; Discard scraps the draft.
@@ -1014,19 +1477,9 @@ impl RotatePolytopesApp {
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new("draft").small().weak());
-                        let multi = self.draft.len() > 1;
-                        if multi {
-                            ui.monospace("(");
-                        }
-                        for (k, plane) in self.draft.iter().enumerate() {
-                            if k > 0 {
-                                ui.monospace("+");
-                            }
+                        render_plane_sum(ui, &self.draft, |ui, _, plane| {
                             ui.monospace(plane.label());
-                        }
-                        if multi {
-                            ui.monospace(")");
-                        }
+                        });
                         ui.add_space(8.0);
                         if ui
                             .small_button("Add")
@@ -1038,7 +1491,7 @@ impl RotatePolytopesApp {
                         if ui
                             .add(
                                 egui::Button::new(egui::RichText::new("×").size(14.0))
-                                    .min_size(egui::vec2(22.0, 22.0)),
+                                    .min_size(egui::vec2(MINI_BUTTON_W, MINI_BUTTON_W)),
                             )
                             .on_hover_text("Discard draft")
                             .clicked()
@@ -1049,17 +1502,84 @@ impl RotatePolytopesApp {
                 });
         }
 
-        // Sequence: each term is a single-row card. Whole card is
-        // its own drag source (no separate handle); the card body
-        // is also a drop zone that branches on payload variant.
-        // Term payloads reorder, Entry payloads migrate a plane in.
-        // Insertion pipes between cards give precise drop indication
-        // for the Term-reorder path.
-        let mut term_moves: Vec<(usize, usize)> = Vec::new();
+        self.render_composer_seq_cards(ui);
+        self.render_composer_scrub_slider(ui);
+    }
+
+    /// "Slide-to-rotate" slider for the composer: a full-width
+    /// row sized like the w/t sliders. Drives a rotation along
+    /// the seq's net bivector direction.
+    ///
+    /// Math: let `D = compose_omega() / |compose_omega()|` (the
+    /// seq's unit-bivector direction). The slider value is the
+    /// projection of `log(rot_state)` onto `D`, in degrees. On
+    /// drag, the projection is updated; the perpendicular
+    /// component of `log(rot_state)` is preserved, so adjusting
+    /// the slider rotates ALONG the seq's direction without
+    /// disturbing other rotations. Hidden when the seq is empty
+    /// or its net bivector is zero (terms cancel out).
+    fn render_composer_scrub_slider(&mut self, ui: &mut egui::Ui) {
+        let omega = self.compose_omega();
+        let mag_sq = omega.magnitude_squared();
+        if mag_sq < 1e-12 {
+            return;
+        }
+        let unit = omega * (1.0 / mag_sq.sqrt());
+        let bivec = self.rot_state.log();
+        let proj_rad = bivec.dot(unit);
+        let mut proj_deg = proj_rad.to_degrees();
+
+        const VALUE_CELL_W: f32 = 86.0;
+        let avail = ui.available_width();
+        let spacing = ui.spacing().item_spacing.x;
+        let slider_w = (avail - VALUE_CELL_W - spacing).max(140.0);
+        ui.spacing_mut().slider_width = slider_w;
+        let row_size = egui::vec2(avail, CONTROL_H);
+        let row_layout = egui::Layout::left_to_right(egui::Align::Center);
+
+        // Same -360..360 range as the per-plane sliders, for the
+        // same Spin(4) double-cover reason: a 360° projection
+        // along the seq's direction lands at the negative-rotor
+        // -1, and 720° returns to identity. Showing the full
+        // range honestly exposes the rotor's period.
+        let formatted = format!("f {proj_deg:>+6.1}°");
+        ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
+            let changed = slider_with_edit(
+                ui,
+                &mut proj_deg,
+                -360.0..=360.0,
+                &formatted,
+                "°",
+                1,
+                VALUE_CELL_W,
+            );
+            if changed {
+                let new_proj = proj_deg.to_radians();
+                let old_proj = bivec.dot(unit);
+                let new_b = bivec + unit * (new_proj - old_proj);
+                self.rot_state = new_b.exp();
+                self.write_all(self.rot_state);
+            }
+        });
+    }
+
+    /// Composer's seq-card row: each [`RotorTerm`] renders as a
+    /// single-row card. The whole card is its own drag source
+    /// (Term payload, reorders the seq) and also a drop zone for
+    /// `Entry` payloads (cross-term plane migration). Insertion-
+    /// pipe gaps between cards give precise drop indication for
+    /// the Term-reorder path. State mutations gathered during
+    /// card rendering (`term_moves`, `entry_moves`,
+    /// `remove_term`, `remove_scalar`, `add_scalar`,
+    /// `edit_scalar`) are all applied at the end of this
+    /// function so the card-rendering loop can borrow `self.seq`
+    /// immutably while in flight.
+    fn render_composer_seq_cards(&mut self, ui: &mut egui::Ui) {
         let mut entry_moves: Vec<(usize, usize, usize)> = Vec::new();
         let mut remove_term: Option<usize> = None;
         let mut remove_scalar: Option<usize> = None;
         let mut add_scalar: Option<usize> = None;
+        let mut edit_scalar: Option<(usize, f32)> = None;
 
         if !self.seq.is_empty() {
             ui.label("Sequence:");
@@ -1094,25 +1614,55 @@ impl RotatePolytopesApp {
                 .and_then(|key| ui.ctx().memory(|m| m.data.get_temp::<f32>(key)))
                 .unwrap_or(72.0);
             let term_row_resp = ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = CARD_ITEM_SPACING_X;
+                // Term-reorder pre-pass: apply the reorder NOW
+                // so the render loop sees the new order and the
+                // gap is closed. Issue-#54 fix; shared via
+                // `dnd_apply_drop_pre_pass`. Filters to the
+                // `Term(_)` payload variant only; `Entry(_, _)`
+                // payloads (cross-term plane migration) drop on
+                // cards, not gaps.
+                //
+                // Critical: the pre-pass MUST run inside this
+                // `horizontal_wrapped` closure, not on the outer
+                // `ui`. `make_persistent_id` resolves through
+                // the parent chain, so snapping animations on
+                // the outer scope targets DIFFERENT ids than the
+                // card render loop reads inside the inner
+                // scope; the snap silently misses, and the
+                // dragged card's pickup glow leaks onto the
+                // card now sitting at the dragged card's old
+                // index for one frame.
+                let _ = dnd_apply_drop_pre_pass::<RotorTerm, DragPayload>(
+                    ui,
+                    &mut self.seq,
+                    term_drop_idx,
+                    |p| match p {
+                        DragPayload::Term(i) => Some(*i),
+                        _ => None,
+                    },
+                    "term-gap",
+                    "term-card",
+                    32,
+                );
+                let still_dragging_term = matches!(
+                    egui::DragAndDrop::payload::<DragPayload>(ui.ctx()).as_deref(),
+                    Some(DragPayload::Term(_))
+                );
+                let render_term_drop_idx = if still_dragging_term {
+                    term_drop_idx
+                } else {
+                    None
+                };
                 for term_idx in 0..self.seq.len() {
                     let gap_id = ui.make_persistent_id(("term-gap", term_idx));
-                    if make_room_gap(
+                    let _ = make_room_gap(
                         ui,
-                        term_drop_idx == Some(term_idx),
+                        render_term_drop_idx == Some(term_idx),
                         gap_id,
                         term_h,
                         dragged_term_width,
-                    ) {
-                        if let Some(arc) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx())
-                        {
-                            if let DragPayload::Term(from) = *arc {
-                                if from != term_idx {
-                                    term_moves.push((from, term_idx));
-                                }
-                            }
-                        }
-                    }
+                    );
                     if term_idx > 0 {
                         ui.label(egui::RichText::new("·").size(16.0).strong());
                     }
@@ -1149,60 +1699,48 @@ impl RotatePolytopesApp {
                                 .corner_radius(egui::CornerRadius::same(3))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        let term = &mut self.seq[term_idx];
-                                        if let Some(phi) = term.scalar.as_mut() {
-                                            let mut deg = phi.to_degrees();
+                                        let term = &self.seq[term_idx];
+                                        if let Some(phi) = term.scalar {
                                             let phi_color = egui::Color32::from_rgb(255, 150, 150);
-                                            ui.scope(|ui| {
-                                                let v = ui.visuals_mut();
-                                                v.widgets.inactive.fg_stroke.color = phi_color;
-                                                v.widgets.hovered.fg_stroke.color = phi_color;
-                                                v.widgets.active.fg_stroke.color = phi_color;
-                                                v.override_text_color = Some(phi_color);
-                                                if ui
-                                                    .add(
-                                                        egui::DragValue::new(&mut deg)
-                                                            .speed(0.0)
-                                                            .suffix("°")
-                                                            .range(-720.0..=720.0),
-                                                    )
-                                                    .on_hover_text("Click to type a new angle")
-                                                    .changed()
-                                                {
-                                                    *phi = deg.to_radians();
-                                                }
-                                            });
+                                            // Read-only label; the term card's drag source
+                                            // captures pointer-down events at this rect, so
+                                            // the previous editable DragValue couldn't reach
+                                            // text-edit mode reliably. Editing now happens
+                                            // through the right-click context menu, which
+                                            // lives in its own popup layer.
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!(
+                                                        "{:.2}°",
+                                                        phi.to_degrees()
+                                                    ))
+                                                    .monospace()
+                                                    .color(phi_color),
+                                                )
+                                                .selectable(false),
+                                            )
+                                            .on_hover_text(
+                                                "Right-click the term to edit or remove",
+                                            );
                                             ui.monospace("·");
                                         }
-                                        let n_planes = self.seq[term_idx].planes.len();
-                                        let need_parens = n_planes > 1;
-                                        if need_parens {
-                                            ui.monospace("(");
-                                        }
-                                        for plane_idx in 0..n_planes {
-                                            if plane_idx > 0 {
-                                                ui.monospace("+");
-                                            }
+                                        let planes = self.seq[term_idx].planes.clone();
+                                        render_plane_sum(ui, &planes, |ui, plane_idx, plane| {
                                             let pill_id = ui.make_persistent_id((
                                                 "plane-pill",
                                                 term_idx,
                                                 plane_idx,
                                             ));
-                                            let plane_label =
-                                                self.seq[term_idx].planes[plane_idx].label();
                                             ui.dnd_drag_source(
                                                 pill_id,
                                                 DragPayload::Entry(term_idx, plane_idx),
                                                 |ui| {
-                                                    ui.monospace(plane_label);
+                                                    ui.monospace(plane.label());
                                                 },
                                             )
                                             .response
                                             .on_hover_cursor(egui::CursorIcon::Grab);
-                                        }
-                                        if need_parens {
-                                            ui.monospace(")");
-                                        }
+                                        });
                                     });
                                 });
                         },
@@ -1244,22 +1782,37 @@ impl RotatePolytopesApp {
                         let w = card_resp.rect.width();
                         ui.ctx().memory_mut(|m| m.data.insert_temp(width_key, w));
                     }
-                    let has_scalar = self.seq[term_idx].scalar.is_some();
+                    let scalar_now = self.seq[term_idx].scalar;
                     let menu_resp = card_resp.interact(egui::Sense::click());
                     menu_resp.context_menu(|ui| {
-                        if ui
-                            .button(if has_scalar {
-                                "Remove scalar (φ)"
-                            } else {
-                                "Add scalar (φ = 90°)"
-                            })
-                            .clicked()
-                        {
-                            if has_scalar {
+                        if let Some(phi) = scalar_now {
+                            let current_deg = phi.to_degrees();
+                            ui.menu_button(format!("Edit scalar ({current_deg:.2}°)"), |ui| {
+                                let mut deg = current_deg;
+                                // DragValue lives inside this menu's
+                                // popup layer, separate from the term
+                                // card's drag source, so click-to-type
+                                // and drag-to-scrub both work without
+                                // the outer drag intercepting.
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut deg)
+                                            .suffix("°")
+                                            .speed(1.0)
+                                            .fixed_decimals(2)
+                                            .range(-720.0..=720.0),
+                                    )
+                                    .changed()
+                                {
+                                    edit_scalar = Some((term_idx, deg.to_radians()));
+                                }
+                            });
+                            if ui.button("Remove scalar (φ)").clicked() {
                                 remove_scalar = Some(term_idx);
-                            } else {
-                                add_scalar = Some(term_idx);
+                                ui.close_kind(egui::UiKind::Menu);
                             }
+                        } else if ui.button("Add scalar (φ = 90°)").clicked() {
+                            add_scalar = Some(term_idx);
                             ui.close_kind(egui::UiKind::Menu);
                         }
                         ui.separator();
@@ -1269,31 +1822,26 @@ impl RotatePolytopesApp {
                         }
                     });
                 }
-                // Trailing insertion gap: drop after the last term.
+                // Trailing insertion gap: pre-pass already handled
+                // any drop here; render with `is_target=false` so
+                // the gap stays closed.
                 let trailing_id = ui.make_persistent_id(("term-gap", self.seq.len()));
-                if make_room_gap(
+                let _ = make_room_gap(
                     ui,
-                    term_drop_idx == Some(self.seq.len()),
+                    render_term_drop_idx == Some(self.seq.len()),
                     trailing_id,
                     term_h,
                     dragged_term_width,
-                ) {
-                    if let Some(arc) = egui::DragAndDrop::take_payload::<DragPayload>(ui.ctx()) {
-                        if let DragPayload::Term(from) = *arc {
-                            term_moves.push((from, self.seq.len()));
-                        }
-                    }
-                }
+                );
                 // Reset per-index term animation state when a
                 // mutation will fire; same reasoning as the
                 // shape-row reset: ids resolve correctly only
                 // inside this ui scope.
-                if !term_moves.is_empty() || !entry_moves.is_empty() || remove_term.is_some() {
+                if !entry_moves.is_empty() || remove_term.is_some() {
                     let ctx = ui.ctx();
                     for i in 0..32 {
                         let card_id = ui.make_persistent_id(("term-card", i));
                         let _ = ctx.animate_value_with_time(card_id.with("pickup"), 0.0, 0.0);
-                        let _ = ctx.animate_value_with_time(card_id.with("collapse"), 1.0, 0.0);
                     }
                 }
             });
@@ -1314,6 +1862,13 @@ impl RotatePolytopesApp {
                 t.scalar = None;
             }
         }
+        if let Some((i, new_phi)) = edit_scalar {
+            if let Some(t) = self.seq.get_mut(i) {
+                if t.scalar.is_some() {
+                    t.scalar = Some(new_phi);
+                }
+            }
+        }
         // Cross-term entry migrations. Sort by (source term, plane idx
         // descending) so removals don't shift earlier indices.
         entry_moves.sort_by_key(|(from, idx, _)| (*from, std::cmp::Reverse(*idx)));
@@ -1329,37 +1884,11 @@ impl RotatePolytopesApp {
         }
         // Drop emptied terms (after entry moves).
         self.seq.retain(|t| !t.planes.is_empty());
-        for (from, to) in term_moves {
-            if from < self.seq.len() {
-                let item = self.seq.remove(from);
-                let dest = if to > from { to - 1 } else { to };
-                self.seq.insert(dest.min(self.seq.len()), item);
-            }
-        }
         if let Some(i) = remove_term {
             if i < self.seq.len() {
                 self.seq.remove(i);
             }
         }
-
-        ui.horizontal(|ui| {
-            let apply = ui
-                .add_enabled(!self.seq.is_empty(), egui::Button::new("Apply"))
-                .on_hover_text("Compose seq onto rot_state (one-shot)")
-                .clicked();
-            if apply {
-                let terms = self.seq.clone();
-                for term in &terms {
-                    self.rot_state = (term.delta() * self.rot_state).normalize();
-                }
-                self.write_all(self.rot_state);
-            }
-            if ui.button("Clear").clicked() {
-                self.seq.clear();
-            }
-        });
-
-        self.render_shapes_section(ui);
     }
 
     /// Shape row + add-menu + drag-and-drop reorder. Extracted as a
@@ -1386,7 +1915,6 @@ impl RotatePolytopesApp {
         // insertion slot during drag; no separate marker line
         // needed; the gap itself is the indicator.
         let mut remove_idx: Option<usize> = None;
-        let mut shape_moves: Vec<(usize, usize)> = Vec::new();
         let row_len = self.row.len();
         let row_h = CONTROL_H;
         // Slot index where the drop should land. Computed once
@@ -1406,120 +1934,66 @@ impl RotatePolytopesApp {
                         // Tighter inter-card spacing; the make-
                         // room gap takes over from item_spacing as
                         // the visual room-maker.
-                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.spacing_mut().item_spacing.x = CARD_ITEM_SPACING_X;
+
+                        // Drop pre-pass: apply the reorder NOW so the
+                        // render loop sees the new order and gaps
+                        // are closed. See `dnd_apply_drop_pre_pass`
+                        // for the issue-#54 rationale.
+                        if dnd_apply_drop_pre_pass::<ShapeEntry, usize>(
+                            ui,
+                            &mut self.row,
+                            drop_idx,
+                            |p| Some(*p),
+                            "shape-gap",
+                            "shape-card",
+                            MAX_ROW_LEN,
+                        ) {
+                            row_changed = true;
+                        }
+                        // After the pre-pass the payload is gone, so
+                        // `is_target` evaluates false in every gap
+                        // and the render loop reflects the new
+                        // ordering with all gaps closed.
+                        let still_dragging =
+                            egui::DragAndDrop::payload::<usize>(ui.ctx()).is_some();
+                        let render_drop_idx = if still_dragging { drop_idx } else { None };
+                        let row_len = self.row.len();
                         for (i, entry) in self.row.iter().enumerate() {
-                            // Animated insertion gap before card i.
-                            // `ui.make_persistent_id` (NOT `Id::new`)
-                            // is load-bearing: `BottomOverlay` runs
-                            // its content closure twice per frame
-                            // (measure pass off-screen + visible
-                            // pass), and same-id-in-different-layer
-                            // breaks egui's hit-testing. Per-pass
-                            // ui scope makes the same source resolve
-                            // to different ids between passes.
                             let gap_id = ui.make_persistent_id(("shape-gap", i));
-                            if make_room_gap(
+                            let _ = make_room_gap(
                                 ui,
-                                drop_idx == Some(i),
+                                render_drop_idx == Some(i),
                                 gap_id,
                                 row_h,
                                 SHAPE_CARD_WIDTH + 8.0,
-                            ) {
-                                if let Some(arc) =
-                                    egui::DragAndDrop::take_payload::<usize>(ui.ctx())
-                                {
-                                    let from = *arc;
-                                    if from != i {
-                                        shape_moves.push((from, i));
-                                    }
-                                }
+                            );
+                            if Self::render_shape_card(ui, i, entry, row_len) {
+                                remove_idx = Some(i);
                             }
-                            let drag_id = ui.make_persistent_id(("shape-card", i));
-                            let pickup_t = drag_pickup_t(ui.ctx(), drag_id);
-                            // Uniform gray cards. egui's noninteractive
-                            // bg_fill matches surrounding panel chrome so
-                            // the cards read as a "list of equally-
-                            // weighted items" rather than a categorical
-                            // color legend.
-                            let card_fill = ui.visuals().widgets.noninteractive.bg_fill;
-                            let stroke_color = if pickup_t > 0.0 {
-                                egui::Color32::from_rgb(255, 200, 60)
-                            } else {
-                                ui.visuals().widgets.noninteractive.bg_stroke.color
-                            };
-                            let stroke = egui::Stroke::new(1.0 + pickup_t * 1.5, stroke_color);
-                            let card_id = drag_id;
-                            let drag_resp = dnd_drag_source_collapsing(ui, card_id, i, |ui| {
-                                if ui.ctx().is_being_dragged(card_id) {
-                                    force_opaque_active(ui);
-                                }
-                                egui::Frame::default()
-                                    .fill(card_fill)
-                                    .stroke(stroke)
-                                    .inner_margin(egui::Margin::symmetric(4, 6))
-                                    .corner_radius(egui::CornerRadius::same(3))
-                                    .show(ui, |ui| {
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(SHAPE_CARD_WIDTH, 0.0),
-                                            egui::Layout::top_down(egui::Align::Center),
-                                            |ui| {
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(entry.label).strong(),
-                                                    )
-                                                    .selectable(false)
-                                                    .wrap_mode(egui::TextWrapMode::Extend),
-                                                );
-                                            },
-                                        );
-                                    });
-                            });
-                            drag_resp
-                                .on_hover_cursor(egui::CursorIcon::Grab)
-                                .on_hover_text(entry.long_name)
-                                .interact(egui::Sense::click())
-                                .context_menu(|ui| {
-                                    if row_len > 1 && ui.button("Remove from row").clicked() {
-                                        remove_idx = Some(i);
-                                        ui.close_kind(egui::UiKind::Menu);
-                                    }
-                                });
                         }
-                        // Trailing insertion gap; drop after the
-                        // last card.
                         let trailing_id = ui.make_persistent_id(("shape-gap", row_len));
-                        if make_room_gap(
+                        let _ = make_room_gap(
                             ui,
-                            drop_idx == Some(row_len),
+                            render_drop_idx == Some(row_len),
                             trailing_id,
                             row_h,
                             SHAPE_CARD_WIDTH + 16.0,
-                        ) {
-                            if let Some(arc) = egui::DragAndDrop::take_payload::<usize>(ui.ctx()) {
-                                shape_moves.push((*arc, row_len));
-                            }
-                        }
+                        );
                         // "+" trigger inline with the shape cards.
                         // Custom-painted plus on a 28×24 button rect so
                         // the height matches the cards exactly and the
                         // visual vocabulary matches the play / rate /
                         // chevron buttons (no font-glyph dependency).
                         if self.row.len() < MAX_ROW_LEN {
-                            let plus_resp = add_button(ui).on_hover_text("Add a shape to the row");
+                            let plus_resp = add_button(ui, egui::vec2(CONTROL_W, CONTROL_H - 2.0))
+                                .on_hover_text("Add a shape to the row");
                             egui::Popup::menu(&plus_resp).show(|ui| {
-                                ui.set_min_width(80.0);
-                                for shape_name in [
-                                    "5-cell", "8-cell", "16-cell", "24-cell", "120-cell",
-                                    "600-cell",
-                                ] {
-                                    if ui.button(shape_name).clicked() {
-                                        if let Ok(entry) = parse_shape_name(shape_name) {
-                                            self.row.push(entry);
-                                            row_changed = true;
-                                        }
-                                        ui.close_kind(egui::UiKind::Menu);
-                                    }
-                                }
+                                ui.set_min_width(140.0);
+                                render_shape_catalog_menu(ui, |entry| {
+                                    self.row.push(entry);
+                                    row_changed = true;
+                                });
                             });
                         }
                         // Per-index animation state is keyed by ids
@@ -1532,14 +2006,12 @@ impl RotatePolytopesApp {
                         // we used during rendering; outside this
                         // closure, `ui.make_persistent_id(...)`
                         // would resolve to *different* ids.
-                        if !shape_moves.is_empty() || remove_idx.is_some() {
+                        if remove_idx.is_some() {
                             let ctx = ui.ctx();
                             for i in 0..=MAX_ROW_LEN {
                                 let card_id = ui.make_persistent_id(("shape-card", i));
                                 let _ =
                                     ctx.animate_value_with_time(card_id.with("pickup"), 0.0, 0.0);
-                                let _ =
-                                    ctx.animate_value_with_time(card_id.with("collapse"), 1.0, 0.0);
                             }
                         }
                     });
@@ -1552,22 +2024,105 @@ impl RotatePolytopesApp {
             self.row.remove(i);
             row_changed = true;
         }
-        for (from, to) in shape_moves {
-            if from < self.row.len() {
-                let item = self.row.remove(from);
-                let dest = if to > from { to - 1 } else { to };
-                self.row.insert(dest.min(self.row.len()), item);
-                row_changed = true;
-            }
-        }
         if row_changed {
             self.rebuild_bodies();
         }
     }
 
-    /// Modal help window; shown when `self.show_help` is `true`.
-    /// Closes via the window's title-bar X (egui's
-    /// `Window::open(&mut bool)` flips the bool).
+    /// One shape card: drag source for reorder, hover-name
+    /// tooltip, right-click "Remove from row" context menu.
+    /// Returns `true` when the user clicked Remove this frame so
+    /// the caller can record the index for end-of-frame removal
+    /// (in-flight removal would invalidate the row's iteration).
+    /// Card chrome (stroke colour, drag pickup glow, opaque-while-
+    /// dragged frame) all lives here so the row-rendering loop
+    /// reads as `gap, card, gap, card, ...` without each card
+    /// inlining ~50 LOC of frame setup.
+    fn render_shape_card(ui: &mut egui::Ui, i: usize, entry: &ShapeEntry, row_len: usize) -> bool {
+        let card_id = ui.make_persistent_id(("shape-card", i));
+        let pickup_t = drag_pickup_t(ui.ctx(), card_id);
+        let card_fill = ui.visuals().widgets.noninteractive.bg_fill;
+        let stroke_color = if pickup_t > 0.0 {
+            egui::Color32::from_rgb(255, 200, 60)
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        };
+        let stroke = egui::Stroke::new(1.0 + pickup_t * 1.5, stroke_color);
+        let drag_resp = dnd_drag_source_collapsing(ui, card_id, i, |ui| {
+            if ui.ctx().is_being_dragged(card_id) {
+                force_opaque_active(ui);
+            }
+            egui::Frame::default()
+                .fill(card_fill)
+                .stroke(stroke)
+                .inner_margin(egui::Margin::symmetric(4, 6))
+                .corner_radius(egui::CornerRadius::same(3))
+                .show(ui, |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(SHAPE_CARD_WIDTH, 0.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(entry.label).strong())
+                                    .selectable(false)
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        },
+                    );
+                });
+        });
+        let mut removed = false;
+        drag_resp
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text(entry.long_name)
+            .interact(egui::Sense::click())
+            .context_menu(|ui| {
+                if row_len > 1 && ui.button("Remove from row").clicked() {
+                    removed = true;
+                    ui.close_kind(egui::UiKind::Menu);
+                }
+            });
+        removed
+    }
+
+    /// Top menu bar: Edit / View. Always visible.
+    ///
+    /// The File menu (New / Open / Save / Quit) is intentionally
+    /// absent until those items are wired: project-settings
+    /// persistence is a follow-up, and `Quit` via
+    /// `ViewportCommand::Close` doesn't reliably close the root
+    /// viewport in the current `rye-app` runner. Adding the
+    /// menu back is a one-block edit once items are functional.
+    fn render_menu_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("rotate-polytopes-menu-bar").show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Reset orientation").clicked() {
+                        self.rot_state = Rotor4::IDENTITY;
+                        self.write_all(self.rot_state);
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
+                    if ui
+                        .add(egui::Button::new("Reset all").shortcut_text("R"))
+                        .clicked()
+                    {
+                        self.reset();
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.show_controls, "Rotation controls (H)");
+                    ui.checkbox(&mut self.show_formula, "Formula popup");
+                    ui.separator();
+                    if ui.button("About this program").clicked() {
+                        self.show_help = true;
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
+                });
+            });
+        });
+    }
+
     fn render_help_window(&mut self, ctx: &egui::Context) {
         if !self.show_help {
             return;
@@ -1577,17 +2132,17 @@ impl RotatePolytopesApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
+            .movable(true)
             .default_size(egui::vec2(560.0, 460.0))
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_pos(egui::pos2(80.0, 80.0))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("What this program shows");
                     ui.label(
-                        "You're looking at the 3D cross-sections of a row of \
-                         four-dimensional polytopes. As they rotate through 4D \
-                         space, their cross-sections morph in characteristic ways \
-                        ; that's the whole point of the demo: to make 4D shape \
-                         intuition reachable for someone in 3D.",
+                        "You're looking at 3D cross-sections of four-dimensional \
+                         polytopes. As they rotate through 4D space their cross-\
+                         sections morph in characteristic ways; the point of the \
+                         demo is to make 4D shape intuition reachable from 3D.",
                     );
                     ui.add_space(8.0);
 
@@ -1595,90 +2150,98 @@ impl RotatePolytopesApp {
                     ui.label(
                         "A cross-section is what you get when a higher-\
                          dimensional object passes through a lower-dimensional \
-                         space. A 3D apple intersecting a 2D table at any moment \
-                         gives a 2D shape (a circle, an oval, a curve), and the \
-                         shape changes as the apple moves.",
-                    );
-                    ui.label(
-                        "The same idea works one dimension up: a 4D polytope \
-                         passing through 3D space gives a 3D shape at every \
-                         instant. The hidden 4th axis is conventionally called \
-                         w. As w changes, the polytope's 3D cross-section morphs \
-                        ; that is what the w slider scrubs through.",
+                         space. A 3D apple intersecting a 2D table gives a 2D \
+                         shape (a circle, an oval) that changes as the apple \
+                         moves. One dimension up: a 4D polytope passing through \
+                         3D gives a 3D shape that changes with the slicing w. \
+                         That's what the w slider scrubs.",
                     );
                     ui.add_space(8.0);
 
                     ui.heading("The shapes");
                     ui.label("All six convex regular 4-polytopes (\"polychora\") ship:");
-                    ui.label("• 5-cell (pentatope); 5 tetrahedra; the 4D simplex.");
+                    ui.label("• 5-cell (pentachoron); 5 tetrahedra; the 4D simplex.");
                     ui.label("• 8-cell (tesseract); 8 cubes; the 4D cube.");
                     ui.label(
-                        "• 16-cell (hexadecachoron); 16 tetrahedra; \
-                         the 4D analog of the octahedron.",
+                        "• 16-cell (hexadecachoron); 16 tetrahedra; the 4D analog \
+                         of the octahedron.",
                     );
                     ui.label(
-                        "• 24-cell (icositetrachoron); 24 octahedra; \
-                         uniquely 4-dimensional, no 3D analog.",
+                        "• 24-cell (icositetrachoron); 24 octahedra; uniquely 4D, \
+                         no 3D analog.",
                     );
                     ui.label("• 120-cell (hecatonicosachoron); 120 dodecahedra.");
                     ui.label(
-                        "• 600-cell (hexacosichoron); 600 tetrahedra; \
-                         the 4D analog of the icosahedron.",
+                        "• 600-cell (hexacosichoron); 600 tetrahedra; the 4D \
+                         analog of the icosahedron.",
                     );
                     ui.add_space(8.0);
 
                     ui.heading("Rotation");
                     ui.label(
-                        "4D space has six independent rotation planes, not three: \
-                         xy, xz, xw, yz, yw, zw. In 3D you spin around an axis; \
-                         in 4D you spin in a plane (the bivector picture). The \
-                         three planes that include w (xw, yw, zw) pull a visible \
+                        "4D rotations are generated by bivectors (2-planes), not \
+                         axes. There are six independent planes: xy, xz, xw, yz, \
+                         yw, zw. The three w-involving planes pull a visible \
                          axis through the hidden 4th dimension and produce the \
-                         interesting cross-section morphs. The three pure-3D \
-                         planes (xy, xz, yz) just rotate the cross-section as a \
-                         rigid 3D shape.",
+                         interesting cross-section morphs; the three pure-3D \
+                         planes rotate the cross-section as a rigid 3D shape.",
                     );
                     ui.label(
-                        "Active set mode: toggle which planes contribute. The \
-                         angular velocity is the sum of the active unit \
-                         bivectors. Composer mode: build a sequence of terms \
-                         (each term is a sum of planes, optionally scaled by a \
-                         scalar φ); the seq sums into the angular velocity.",
+                        "Active-set mode: each plane has a checkbox (include in \
+                         spin) and a -180..=180° slider (the rotor's component \
+                         in that plane). Composer mode: build a sequence of \
+                         exp(scalar · planes) terms via chips or the typed \
+                         formula bar.",
                     );
                     ui.add_space(8.0);
 
-                    ui.heading("Controls");
-                    ui.label("• w slider: scrub the slicing hyperplane along the 4th axis.");
-                    ui.label("• t slider: scrub the rotation animation by absolute time.");
-                    ui.label("• Play / Pause: start or pause the spin.");
-                    ui.label("• << < > >>: set the rate to ×0.25 / ×0.5 / ×2 / ×4.");
-                    ui.label("• Reset (R): zero everything.");
-                    ui.label("• ^ / v (H): expand or collapse the controls overlay.");
-                    ui.label("• 1..6: toggle a plane in the active set.");
-                    ui.label("• T: toggle spin.");
-                    ui.label("• Up / Down arrows: scrub the w-slice with the keyboard.");
-                    ui.label("• Drag in the viewport: orbit the camera.");
+                    ui.heading("Views");
+                    ui.label(
+                        "Shapes view: a row of polytopes side-by-side at one \
+                         w-slice. Drag-and-drop to reorder. Filmstrip view: one \
+                         polytope rendered N times across w-slices fanning out \
+                         by ±BODY_SIZE around the slider's value, so the centre \
+                         cell tracks w.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("Keyboard");
+                    ui.label("• Space / T: toggle continuous spin.");
+                    ui.label("• Up / Down arrows: scrub w with the keyboard.");
+                    ui.label("• 1..6: toggle a plane in the Active set.");
+                    ui.label("• H: expand / collapse the controls panel.");
+                    ui.label("• R: full reset.");
+                    ui.label("• Esc: exit.");
+                    ui.add_space(8.0);
+
+                    ui.heading("Mouse");
+                    ui.label("• Drag in the viewport: orbit camera.");
+                    ui.label(
+                        "• Right-click on any value label (w, t, plane angle, \
+                         scalar): typed-edit popup.",
+                    );
+                    ui.label(
+                        "• Drag the controls panel by its frame to move it; \
+                         drag the formula popup the same way.",
+                    );
                 });
             });
         self.show_help = open;
     }
 
-    /// Unified bottom-of-window controls overlay. The expanded
-    /// section (mode tabs, mode-specific UI, shape row) appears
-    /// when `self.expanded`; the slider strip + rate row are always
-    /// visible. The whole overlay is a single translucent popup
-    /// painted over the full-window scene; there's no side panel
-    /// anymore, and the scene fills the entire viewport.
+    /// Unified controls overlay. `egui::Window` with
+    /// `pivot(CENTER_BOTTOM)` so the bottom edge is the anchor
+    /// and the panel grows upward when the expanded body is
+    /// shown. Always draggable. On first frame the default
+    /// position is bottom-centre of the viewport; subsequent
+    /// frames remember whatever position the user dragged it to.
     fn render_overlay(&mut self, ctx: &egui::Context) {
         let screen = ctx.content_rect();
         let pad = 16.0;
-        let area_w = (screen.width() - 2.0 * pad).max(280.0);
+        let natural_w = (screen.width() - 2.0 * pad).max(280.0);
+        let pinned = *self.overlay_pinned_width.get_or_insert(natural_w);
+        let area_w = pinned.min(natural_w).max(280.0);
 
-        // `BottomOverlay` auto-sizes to its content and animates
-        // height transitions smoothly, so when the user toggles
-        // expand or switches rotation modes the panel grows /
-        // shrinks to exactly fit the new content with no dead
-        // space and no flicker.
         let visuals = &ctx.style().visuals;
         let frame = egui::Frame::default()
             .fill(visuals.window_fill)
@@ -1686,15 +2249,30 @@ impl RotatePolytopesApp {
             .corner_radius(visuals.window_corner_radius)
             .inner_margin(10.0);
 
-        BottomOverlay::new("rotate-polytopes-overlay")
-            .width(area_w)
-            .margin_y(pad)
+        let default_bottom_centre = egui::pos2(screen.center().x, screen.bottom() - pad);
+
+        egui::Window::new("rotate-polytopes-overlay")
+            .id(egui::Id::new("rotate-polytopes-overlay"))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .movable(true)
+            // `auto_sized()` forces the Window to recompute its
+            // outer rect from current content every frame.
+            // Without it the saved rect from the previous frame
+            // is reused, which on an expand-toggle one-frame
+            // glitches: the new content is shorter/taller than
+            // the saved rect, the Window briefly clips or
+            // mispositions before egui catches up. The user-
+            // visible effect was a one-frame disappear of the
+            // panel after toggling `^` / `v`.
+            .auto_sized()
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .default_pos(default_bottom_centre)
+            .default_width(area_w)
             .frame(frame)
             .show(ctx, |ui| {
-                // Render top-down: body at top, sliders, rate row at
-                // bottom. `BottomOverlay`'s internal ScrollArea
-                // anchors the bottom, so the rate row stays visible
-                // throughout collapse animations.
+                ui.set_width(area_w);
                 if self.expanded {
                     self.render_expanded_body(ui);
                     ui.separator();
@@ -1710,6 +2288,9 @@ impl RotatePolytopesApp {
         if let Some(new_mode) = self.pending_mode.take() {
             self.rotation_mode = new_mode;
         }
+        if let Some(new_view) = self.pending_view_mode.take() {
+            self.view_mode = new_view;
+        }
         for action in std::mem::take(&mut self.pending_actions) {
             match action {
                 DeferredAction::DraftPush(plane) => self.draft.push(plane),
@@ -1723,74 +2304,129 @@ impl RotatePolytopesApp {
                     }
                 }
                 DeferredAction::DraftClear => self.draft.clear(),
+                DeferredAction::SeqPushTerm(term) => self.seq.push(term),
             }
         }
     }
 
     /// Two big sliders (w, t) with fixed-width monospace value
-    /// labels. `area_w` is the parent's content width in points.
-    fn render_slider_strip(&mut self, ui: &mut egui::Ui, area_w: f32) {
-        // Sliders use `show_value(false)` + a separately-allocated
-        // fixed-width monospace label per row, so the slider's
-        // bounding rect width never changes as the value's char
-        // count does (e.g., "0.5" -> "0.50" -> "12.34"). Without this
-        // stabilization, the popup Frame's painted rect oscillates
-        // each frame as the spin advances `rot_time`, and the
-        // entire overlay visibly jitters.
-        // No leading axis-name cell; the axis is folded into the
-        // trailing value (e.g. "w +0.000", "t  8.70s"), so the
-        // slider hugs the frame's left edge with no dead space.
-        // Trailing cell is fixed-width monospace so the value's
-        // char count never makes the slider rect oscillate as the
-        // spin advances `rot_time`.
+    /// labels.
+    fn render_slider_strip(&mut self, ui: &mut egui::Ui, _area_w: f32) {
+        // Sliders use the shared `slider_with_edit` helper, which
+        // hides the in-slider value display (so click-on-value
+        // can't accidentally drag) and renders the value in a
+        // fixed-width side-Label cell. The fixed cell width keeps
+        // the slider's right edge stable as the value's char
+        // count varies (`0.5` -> `12.34`); without it the entire
+        // overlay frame would oscillate each frame as the spin
+        // advances `rot_time`. Right-click on the value cell
+        // opens an Edit popup with a real DragValue.
+        //
+        // Slider width is computed from the row's actual
+        // `available_width()` (post inner-margin), not the
+        // outer `area_w`, so there's no dead space at the right
+        // edge when the Window's frame margin shrinks the
+        // usable width below `area_w`.
         const VALUE_CELL_W: f32 = 86.0;
-        let slider_w = (area_w - VALUE_CELL_W - 16.0).max(140.0);
+        let avail = ui.available_width();
+        let spacing = ui.spacing().item_spacing.x;
+        let slider_w = (avail - VALUE_CELL_W - spacing).max(140.0);
         ui.spacing_mut().slider_width = slider_w;
-        let value_layout = egui::Layout::left_to_right(egui::Align::Center);
 
-        ui.horizontal(|ui| {
-            ui.add(egui::Slider::new(&mut self.w_slice, -W_RANGE..=W_RANGE).show_value(false));
-            ui.allocate_ui_with_layout(egui::vec2(VALUE_CELL_W, 14.0), value_layout, |ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(format!("w {:>+.3}", self.w_slice)).monospace(),
-                ));
-            });
+        // w / t rows allocate `CONTROL_H` tall so the vertical
+        // pitch matches the rotor-plane sliders above (which
+        // pin each cell to `CONTROL_H` via
+        // `allocate_ui_with_layout`). Without this the w/t
+        // rows are ~22 px tall and the rotor rows are 29 px,
+        // giving the strip a noticeably looser feel mid-panel.
+        let row_size = egui::vec2(avail, CONTROL_H);
+        let row_layout = egui::Layout::left_to_right(egui::Align::Center);
+        ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
+            let formatted = format!("w {:>+.3}", self.w_slice);
+            slider_with_edit(
+                ui,
+                &mut self.w_slice,
+                -W_RANGE..=W_RANGE,
+                &formatted,
+                "",
+                3,
+                VALUE_CELL_W,
+            );
         });
+        // Gate the scrub-from-zero recomputation on the slider
+        // *being dragged* so it ONLY fires while the user is
+        // actively scrubbing. Using `.changed()` would misfire
+        // every frame the spin's `rot_time += dt_secs`
+        // accumulator advanced the value, producing a snap when
+        // toggling active checkboxes (omega would shift, and
+        // re-deriving `exp(omega_new * t)` from an accumulated
+        // `t` is a discontinuous jump rather than the smooth
+        // integrated path). The Edit-popup path doesn't share
+        // this hazard since its DragValue only fires on user
+        // input; the `t_dragged` gate is intentionally
+        // slider-only.
+        // `t_slider_max` is grown by `update()` when the spin
+        // pushes `rot_time` past the current bound; we don't
+        // grow it here because (a) the slider clamps user
+        // input to its current range so dragging can't push
+        // `rot_time` past it without the spin's help, and
+        // (b) growing here while the user is actively
+        // dragging at the right edge causes a feedback loop
+        // (drag clamps to t_max, spin adds dt, t_max doubles,
+        // drag's screen-x re-maps to the new t_max value,
+        // repeat).
+        let t_max = self.t_slider_max;
         let mut t_dragged = false;
-        ui.horizontal(|ui| {
-            let resp = ui.add(egui::Slider::new(&mut self.rot_time, 0.0..=30.0).show_value(false));
-            ui.allocate_ui_with_layout(egui::vec2(VALUE_CELL_W, 14.0), value_layout, |ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(format!("t {:>5.2}s", self.rot_time)).monospace(),
-                ));
-            });
-            t_dragged = resp.dragged();
+        ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
+            let formatted = format!("t {:>5.2}s", self.rot_time);
+            let slider_resp = ui.add(
+                egui::Slider::new(&mut self.rot_time, 0.0..=t_max)
+                    .show_value(false)
+                    .smart_aim(false)
+                    .clamping(egui::SliderClamping::Always),
+            );
+            t_dragged = slider_resp.dragged();
+            ui.allocate_ui_with_layout(
+                egui::vec2(VALUE_CELL_W, 14.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let label_resp = ui.add(
+                        egui::Button::new(egui::RichText::new(formatted).monospace())
+                            .frame(false)
+                            .small(),
+                    );
+                    label_resp
+                        .on_hover_cursor(egui::CursorIcon::ContextMenu)
+                        .on_hover_text("Right-click to edit value")
+                        .context_menu(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.rot_time)
+                                    .range(0.0..=f32::INFINITY)
+                                    .suffix("s")
+                                    .fixed_decimals(2),
+                            );
+                        });
+                },
+            );
         });
-        // Gate the scrub-from-zero recomputation on `.dragged()` so
-        // it ONLY fires while the user is actively scrubbing the
-        // slider. Using `.changed()` here misfired every frame the
-        // spin's `rot_time += dt_secs` accumulator advanced the
-        // value, producing the snap the user reported when toggling
-        // active checkboxes (omega would shift, and re-deriving
-        // `exp(omega_new * t)` from an accumulated `t` is a
-        // discontinuous jump rather than the smooth integrated path).
         if t_dragged {
-            let omega = match self.rotation_mode {
-                RotationMode::Active => angular_velocity(&self.active, self.rate_scale),
-                RotationMode::Composer => angular_velocity_from_seq(&self.seq, self.rate_scale),
-            };
+            // Scrub uses the rate-independent
+            // `omega_animation`; `rot_time` is animation time
+            // (already rate-scaled at integration), so
+            // `exp(omega_animation * rot_time)` equals what the
+            // continuous-spin path would have integrated.
+            let omega = self.omega_animation();
             self.rot_state = (omega * self.rot_time).exp().normalize();
             self.write_all(self.rot_state);
         }
     }
 
     /// Always-visible single row directly under the sliders.
-    /// Center-justified play/rate cluster with the right-aligned
-    /// utility cluster on the same line:
+    /// Center-justified play / rate / refresh cluster with the
+    /// right-aligned utility cluster on the same line:
     ///
     /// ```text
-    ///                  [<<] [<] [play/pause] [>] [>>]      [Reset] [?] [^]
-    ///                            ×1.00
+    ///                  [<<] [<] [play/pause] [>] [>>] [refresh]    [?] [^]
     /// ```
     ///
     /// Rate buttons toggle: clicking a highlighted preset clears it
@@ -1813,17 +2449,19 @@ impl RotatePolytopesApp {
             let leading = ((total_w - PLAY_GROUP_W) / 2.0).max(8.0);
 
             ui.add_space(leading);
-            rate_toggle(ui, &mut self.rate_scale, 0.25, true, false);
-            rate_toggle(ui, &mut self.rate_scale, 0.5, false, false);
-            if play_pause_button(ui, self.rotate)
+            let ctrl_size = egui::vec2(CONTROL_W, CONTROL_H);
+            let play_size = egui::vec2(PLAY_PAUSE_W, CONTROL_H);
+            rate_toggle(ui, ctrl_size, &mut self.rate_scale, 0.25, true, false);
+            rate_toggle(ui, ctrl_size, &mut self.rate_scale, 0.5, false, false);
+            if play_pause_button(ui, play_size, self.rotate)
                 .on_hover_text("Toggle continuous rotation (Space)")
                 .clicked()
             {
                 self.rotate = !self.rotate;
             }
-            rate_toggle(ui, &mut self.rate_scale, 2.0, false, true);
-            rate_toggle(ui, &mut self.rate_scale, 4.0, true, true);
-            if refresh_button(ui)
+            rate_toggle(ui, ctrl_size, &mut self.rate_scale, 2.0, false, true);
+            rate_toggle(ui, ctrl_size, &mut self.rate_scale, 4.0, true, true);
+            if refresh_button(ui, ctrl_size)
                 .on_hover_text("Reset slice, rate, active set, orientation, time (R)")
                 .clicked()
             {
@@ -1838,6 +2476,7 @@ impl RotatePolytopesApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if chevron_button(
                     ui,
+                    egui::vec2(CONTROL_W, CONTROL_H),
                     !self.expanded,
                     if self.expanded {
                         "Collapse (H)"
@@ -1852,7 +2491,7 @@ impl RotatePolytopesApp {
                 if ui
                     .add(
                         egui::Button::new(egui::RichText::new("?").strong())
-                            .min_size(egui::vec2(22.0, 22.0)),
+                            .min_size(egui::vec2(MINI_BUTTON_W, MINI_BUTTON_W)),
                     )
                     .on_hover_text("About this program")
                     .clicked()
@@ -1887,65 +2526,29 @@ impl RotatePolytopesApp {
         self.node.set_bodies(&bodies);
     }
 
-    /// Render a compact formula for what's currently driving the
-    /// rotor: the continuous active-set bivector (multiplied by the
-    /// rate and time, when nonzero) followed by the multiplicative
-    /// composed sequence (each term parenthesized when it's a sum).
-    /// Empty string when nothing is contributing.
+    /// Render a compact `exp(B · 0.30·t)` form for whichever mode
+    /// drives the spin. `B` is the bivector velocity expression: a
+    /// sum of plane terms (Active mode: each enabled plane is one
+    /// unit-bivector term; Composer mode: each seq entry is its
+    /// scalar-weighted bivector). Empty string when nothing is
+    /// contributing.
     fn formula_string(&self) -> String {
-        // The rotation source is exclusive; only one mode drives
-        // the spin at a time. The formula popup must reflect THAT
-        // mode's expression, not concatenate both, otherwise the
-        // user reads it as "we're applying both" when in fact the
-        // off-mode's terms aren't contributing to omega.
-        match self.rotation_mode {
-            RotationMode::Active => {
-                let active_planes: Vec<&'static str> = Plane4::ALL
-                    .iter()
-                    .zip(self.active.iter())
-                    .filter(|(_, on)| **on)
-                    .map(|(p, _)| p.label())
-                    .collect();
-                if active_planes.is_empty() {
-                    return String::new();
-                }
-                let bivec = if active_planes.len() == 1 {
-                    active_planes[0].to_string()
-                } else {
-                    format!("({})", active_planes.join(" + "))
-                };
-                format!(
-                    "exp({} · {:.2}·t)",
-                    bivec,
-                    self.rate_scale * BASE_ROTATION_RATE / std::f32::consts::TAU
-                )
-            }
-            RotationMode::Composer => {
-                let parts: Vec<String> = self
-                    .seq
-                    .iter()
-                    .filter(|t| !t.planes.is_empty())
-                    .map(|term| {
-                        let plane_str = term
-                            .planes
-                            .iter()
-                            .map(|p| p.label())
-                            .collect::<Vec<_>>()
-                            .join(" + ");
-                        let bivec = if term.planes.len() > 1 {
-                            format!("({plane_str})")
-                        } else {
-                            plane_str
-                        };
-                        let body = match term.scalar {
-                            Some(phi) => format!("{:.0}° · {}", phi.to_degrees(), bivec),
-                            None => bivec,
-                        };
-                        format!("exp({body})")
-                    })
-                    .collect();
-                parts.join(" · ")
-            }
+        let parts: Vec<String> = match self.rotation_mode {
+            RotationMode::Active => Plane4::ALL
+                .iter()
+                .zip(self.active.iter())
+                .filter(|(_, on)| **on)
+                .map(|(p, _)| p.label().to_string())
+                .collect(),
+            RotationMode::Composer => self.seq.iter().map(render_term).collect(),
+        };
+        match render_bivector_sum(&parts) {
+            Some(bivec) => format!(
+                "exp({} · {:.2}·t)",
+                bivec,
+                BASE_ROTATION_RATE / std::f32::consts::TAU
+            ),
+            None => String::new(),
         }
     }
 
@@ -1963,6 +2566,7 @@ impl RotatePolytopesApp {
         self.active = [false, false, true, false, false, false];
         self.rot_state = Rotor4::IDENTITY;
         self.rot_time = 0.0;
+        self.t_slider_max = T_SLIDER_INITIAL;
         self.draft.clear();
         self.write_all(Rotor4::IDENTITY);
     }
@@ -2047,14 +2651,32 @@ impl App for RotatePolytopesApp {
             active: [false, false, true, false, false, false],
             rate_scale: 1.0,
             rot_time: 0.0,
+            t_slider_max: T_SLIDER_INITIAL,
             expanded: false,
             show_help: false,
+            overlay_pinned_width: None,
             show_formula: false,
+            show_controls: true,
+            view_mode: ViewMode::Shapes,
+            strip_w: true,
+            strip_t: false,
+            strip_swap_axes: false,
+            strip_count_w: 11,
+            strip_count_t: 5,
+            // Match the t slider's initial range
+            // (`T_SLIDER_INITIAL`) so a row of t cells covers the
+            // same animation interval the t slider can scrub
+            // through at high precision.
+            strip_t_extent: T_SLIDER_INITIAL,
+            strip_subject: SHAPE_CATALOG[3],
             rotation_mode: RotationMode::Active,
             pending_mode: None,
+            pending_view_mode: None,
             pending_actions: Vec::new(),
             seq: Vec::new(),
             draft: Vec::new(),
+            formula_input: String::new(),
+            formula_error: None,
         })
     }
 
@@ -2073,26 +2695,58 @@ impl App for RotatePolytopesApp {
 
         // 4D rotation animation. Both bodies share the same rotor
         // so the user can directly compare their slice signatures
-        // under identical 4D motion. Rotor accumulates per-frame
-        // (delta = exp(ω · dt)) so pause naturally freezes
-        // orientation in place, see KeyT handler.
+        // under identical 4D motion. `rot_state` is the spin
+        // baseline; the manual-rotation window's sliders ride on
+        // top as a transient display offset (composed at write_all
+        // time), so the user can scrub orientation while the spin
+        // is running without disturbing the spin itself.
         if self.rotate {
-            self.rot_time += dt_secs;
-            let omega_per_sec = match self.rotation_mode {
-                RotationMode::Active => angular_velocity(&self.active, self.rate_scale),
-                RotationMode::Composer => angular_velocity_from_seq(&self.seq, self.rate_scale),
-            };
-            let omega = omega_per_sec * dt_secs;
-            // No-op when no planes are active; skip the exp+mul.
+            // Animation time advances by `dt_real * rate_scale`
+            // so the rate buttons make `t` count faster/slower
+            // (per-real-second). The integrated rotation is
+            // `exp(omega_animation * dt_animation)` per frame,
+            // which = `exp(omega_animation * rate_scale * dt_real)`.
+            // This way `rot_state` and `rot_time` stay in sync:
+            // dragging `t` to N reproduces what the spin would
+            // have integrated to at animation time N, regardless
+            // of how the rate varied along the way.
+            let dt_animation = dt_secs * self.rate_scale;
+            self.rot_time += dt_animation;
+            // Grow the t-slider's max range when the spin has
+            // pushed `rot_time` past it, capped so the value
+            // can't run away if (e.g.) `rate_scale` is huge or
+            // the demo is left running for days. 1e6 seconds
+            // (~12 days at ×1) is past any realistic use; if
+            // we hit it, `rot_time` clamps to the cap.
+            const T_SLIDER_CAP: f32 = 1.0e6;
+            if self.rot_time > self.t_slider_max {
+                let new_max = (self.rot_time * 2.0).min(T_SLIDER_CAP);
+                self.t_slider_max = new_max;
+                if self.rot_time > T_SLIDER_CAP {
+                    self.rot_time = T_SLIDER_CAP;
+                }
+            }
+            let omega = self.omega_animation() * dt_animation;
             if omega.magnitude_squared() > 0.0 {
                 let delta = omega.exp();
                 self.rot_state = (delta * self.rot_state).normalize();
-                self.write_all(self.rot_state);
             }
         }
+        self.write_all(self.rot_state);
 
         // Camera. Gate the orbit on `!ui_has_focus` so dragging the
         // egui w-slice slider doesn't also rotate the camera.
+        //
+        // In 2D grid filmstrip mode the body sits low in each
+        // cell because the orbit target is at y = 0 (origin)
+        // while the body is at y = BODY_Y; that puts the body
+        // near the horizon and crowds the polytope at the
+        // bottom of every cell. Lifting the orbit target up to
+        // body height re-centres the polytope vertically in
+        // each cell so the grid reads as a tidy matrix instead
+        // of a row of horizon shots.
+        let lift_orbit = self.view_mode == ViewMode::Filmstrip && self.strip_w && self.strip_t;
+        self.orbit.target.y = if lift_orbit { BODY_Y } else { 0.0 };
         use rye_camera::CameraController;
         if !ctx.ui_has_focus {
             self.orbit
@@ -2126,14 +2780,24 @@ impl App for RotatePolytopesApp {
         // supports mouse-wheel orbit-zoom.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
+        // Menu bar always visible at the top. Renders before
+        // every other UI so its docked space is reserved (and
+        // `ctx.content_rect()` reflects the area below it for
+        // subsequent positioning calculations).
+        self.render_menu_bar(ctx);
+
         // Top-left: title + fps + framebuffer size. Replaces the old
         // panel header now that the side panel is gone. Larger
         // typography so the title reads as the program's nameplate
         // rather than just another label.
         let cfg = &frame.rd.surface_bundle.config;
         let (fb_w, fb_h) = (cfg.width, cfg.height);
+        // y offset clears the menu bar (~24-28px depending on
+        // font) plus a small visual margin. egui::Area's anchor
+        // is screen-relative, not content-rect-relative, so the
+        // offset must include the menu bar height manually.
         egui::Area::new(egui::Id::new("rotate-polytopes-title"))
-            .anchor(egui::Align2::LEFT_TOP, [20.0, 18.0])
+            .anchor(egui::Align2::LEFT_TOP, [20.0, 50.0])
             .show(ctx, |ui| {
                 ui.add(egui::Label::new(
                     egui::RichText::new("4D Polytope Rotation")
@@ -2148,48 +2812,64 @@ impl App for RotatePolytopesApp {
                 ));
             });
 
-        // Top-right: live rotation formula and the combo name. Off
-        // by default (the math notation is dense for newcomers);
-        // toggled by the "Show formula" checkbox in the expanded
-        // section.
+        // Live rotation formula popup, plus combo name (Active
+        // mode) and the rotor's bivector decomposition matrix.
+        // Defaults to top-right; freely draggable. Off by
+        // default; toggled by the "Show formula" checkbox.
         if self.show_formula {
             let formula = self.formula_string();
-            // Combo name ("isoclinic xw+yz" etc.) is an Active-mode
-            // label; it describes the active-set bivector, not the
-            // composer's seq. Suppress it in Composer mode so the
-            // popup reads as the seq's expression alone.
             let name = if self.rotation_mode == RotationMode::Active {
                 combo_name(&self.active)
             } else {
                 None
             };
-            if !formula.is_empty() || name.is_some() {
-                egui::Area::new(egui::Id::new("rotate-polytopes-formula"))
-                    .anchor(egui::Align2::RIGHT_TOP, [-16.0, 16.0])
-                    .show(ctx, |ui| {
-                        egui::Frame::popup(&ctx.style())
-                            .inner_margin(8.0)
-                            .show(ui, |ui| {
-                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                                if !formula.is_empty() {
-                                    ui.add(egui::Label::new(
-                                        egui::RichText::new(&formula).monospace(),
-                                    ));
-                                }
-                                if let Some(n) = name {
-                                    ui.add(egui::Label::new(
-                                        egui::RichText::new(n)
-                                            .color(egui::Color32::from_rgb(255, 217, 140)),
-                                    ));
-                                }
-                            });
-                    });
-            }
+            let bivec = self.rot_state.log();
+            let screen = ctx.content_rect();
+            let default_pos = egui::pos2(screen.right() - 280.0, screen.top() + 16.0);
+            let popup_frame = egui::Frame::popup(&ctx.style()).inner_margin(8.0);
+            // Cap width so a long formula or term sum doesn't
+            // make the popup expand off-screen. The matrix's
+            // intrinsic width sets the lower bound (~280 px);
+            // formula and combo-name labels wrap inside.
+            const FORMULA_POPUP_W: f32 = 320.0;
+            egui::Window::new("formula")
+                .id(egui::Id::new("rotate-polytopes-formula"))
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .movable(true)
+                .default_pos(default_pos)
+                .default_width(FORMULA_POPUP_W)
+                .max_width(FORMULA_POPUP_W)
+                .frame(popup_frame)
+                .show(ctx, |ui| {
+                    ui.set_max_width(FORMULA_POPUP_W);
+                    if !formula.is_empty() {
+                        ui.add(egui::Label::new(egui::RichText::new(&formula).monospace()).wrap());
+                    }
+                    if let Some(n) = name {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(n).color(egui::Color32::from_rgb(255, 217, 140)),
+                        ));
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("log(R) bivector").small().weak());
+                    render_bivector_matrix(ui, &bivec);
+                });
         }
 
-        // Bottom-anchored unified controls overlay. Sliders + rate
-        // row always visible; the rest expands above on chevron/H.
-        self.render_overlay(ctx);
+        // Filmstrip cell labels: per-cell `w` annotation overlaid
+        // on top of the rendered scene so users can see which cell
+        // tracks the slider and read the cell-by-cell w sweep.
+        if self.view_mode == ViewMode::Filmstrip {
+            self.render_filmstrip_cell_labels(ctx);
+        }
+
+        // Bottom-anchored unified controls overlay. Hidden by
+        // default; toggle via `View > Rotation controls` or `H`.
+        if self.show_controls {
+            self.render_overlay(ctx);
+        }
 
         // Modal help window (opened by the `?` button).
         self.render_help_window(ctx);
@@ -2209,7 +2889,7 @@ impl App for RotatePolytopesApp {
             KeyCode::ArrowUp => self.slider_up_held = pressed,
             KeyCode::ArrowDown => self.slider_down_held = pressed,
             KeyCode::KeyR if pressed => self.reset(),
-            KeyCode::KeyH if pressed => self.expanded = !self.expanded,
+            KeyCode::KeyH if pressed => self.show_controls = !self.show_controls,
             KeyCode::KeyT | KeyCode::Space if pressed => {
                 // Pause / resume only, DO NOT touch rot_state. The
                 // bodies keep their current orientation when paused
@@ -2239,13 +2919,102 @@ impl App for RotatePolytopesApp {
         // skip a bottom strip.
         let cfg = &rd.surface_bundle.config;
         let viewport = Viewport::full([cfg.width, cfg.height]);
-        {
-            let u = self.node.uniforms_mut();
-            u.resolution = viewport.resolution_f32();
-            u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+        if self.view_mode == ViewMode::Filmstrip {
+            // Filmstrip: each cell shows the `strip_subject`
+            // polytope (independent of `self.row`) at a different
+            // `w_slice`. We swap the GPU body list to just the
+            // subject for the duration of this render, then
+            // restore via `rebuild_bodies` so the Shapes view and
+            // any subsequent state read sees the full row.
+            let entry = self.strip_subject;
+            // 2D filmstrip rendering. cols is the column count
+            // (horizontal axis), rows is the row count (vertical).
+            // Default axis assignment: w on columns, t on rows;
+            // `strip_swap_axes` flips it.
+            //
+            // Per-cell rendering: viewport (cell rect), w_slice
+            // (cell's w), and body (cell's rotor for that t).
+            // The base rotor `self.rot_state` is offset along
+            // omega_animation by `(t_offset)` to give the cell's
+            // rotor: `exp(omega_animation * t_offset) * rot_state`.
+            // For the w-only and t-only 1D cases, the second
+            // axis collapses to a single cell with offset=0.
+            let strip_w_extent = BODY_SIZE;
+            let (cols, rows, w_on_cols) = match (self.strip_w, self.strip_t) {
+                (true, true) => {
+                    if self.strip_swap_axes {
+                        (self.strip_count_t, self.strip_count_w, false)
+                    } else {
+                        (self.strip_count_w, self.strip_count_t, true)
+                    }
+                }
+                (true, false) => (self.strip_count_w, 1, true),
+                (false, true) => (1, self.strip_count_t, false),
+                // UI invariant prevents both being off; defensive.
+                (false, false) => (1, 1, true),
+            };
+            let col_vps = viewport.split_horizontal(cols as u32);
+            let omega = self.omega_animation();
+            let mut grid_cells: Vec<(Viewport, f32, BodyUniform)> = Vec::with_capacity(cols * rows);
+            for (col_idx, col_vp) in col_vps.into_iter().enumerate() {
+                let row_vps = col_vp.split_vertical(rows as u32);
+                for (row_idx, cell_vp) in row_vps.into_iter().enumerate() {
+                    // Decide what (w_offset, t_offset) this cell
+                    // corresponds to based on which axis carries
+                    // which dimension.
+                    let (w_idx, w_n, t_idx, t_n) = if w_on_cols {
+                        (col_idx, cols, row_idx, rows)
+                    } else {
+                        (row_idx, rows, col_idx, cols)
+                    };
+                    let w_t = if w_n <= 1 {
+                        0.5
+                    } else {
+                        w_idx as f32 / (w_n - 1) as f32
+                    };
+                    let w_offset = -strip_w_extent + w_t * (2.0 * strip_w_extent);
+                    let cell_w_slice = self.w_slice + w_offset;
+                    let t_offset = if !self.strip_t || t_n <= 1 {
+                        0.0
+                    } else {
+                        // Fan FORWARD only: cell 0 = now, cell
+                        // last = rot_time + strip_t_extent. Reads
+                        // as "what the rotor will look like at
+                        // this future time."
+                        let t_norm = t_idx as f32 / (t_n - 1) as f32;
+                        t_norm * self.strip_t_extent
+                    };
+                    // Cell's rotor: spin from `rot_state` by
+                    // `omega * t_offset` (animation-time offset).
+                    let cell_rotor = if t_offset == 0.0 {
+                        self.rot_state
+                    } else {
+                        ((omega * t_offset).exp() * self.rot_state).normalize()
+                    };
+                    let body = BodyUniform::polytope_with_rotor(
+                        [0.0, BODY_Y, 0.0, 0.0],
+                        entry.shape,
+                        BODY_SIZE,
+                        cell_rotor,
+                        entry.body_color,
+                    );
+                    grid_cells.push((cell_vp, cell_w_slice, body));
+                }
+            }
+            let result = self.node.execute_strip(rd, view, &grid_cells);
+            // Restore the full row of bodies for any non-strip
+            // consumer (state save, mode switch, etc.).
+            self.rebuild_bodies();
+            result
+        } else {
+            {
+                let u = self.node.uniforms_mut();
+                u.resolution = viewport.resolution_f32();
+                u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+            }
+            self.node.flush_uniforms(&rd.queue);
+            self.node.execute_in_viewport(rd, view, viewport)
         }
-        self.node.flush_uniforms(&rd.queue);
-        self.node.execute_in_viewport(rd, view, viewport)
     }
 
     fn title(&self, _fps: f32) -> std::borrow::Cow<'static, str> {
@@ -2334,7 +3103,7 @@ mod alignment_tests {
                         });
                         rects.push(inner_resp.response.rect);
                     }
-                    let plus = add_button(ui);
+                    let plus = add_button(ui, egui::vec2(CONTROL_W, CONTROL_H - 2.0));
                     rects.push(plus.rect);
                 });
             });

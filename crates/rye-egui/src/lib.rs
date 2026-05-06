@@ -19,6 +19,10 @@
 //!   jump that egui's [`Area`](egui::Area) produces when content size
 //!   changes drastically. The widget you reach for when building a
 //!   game HUD that grows/shrinks with state.
+//! - [`LinearIndicator`]: read-only horizontal scrub bar showing
+//!   where a value sits in a 1D parameter range. Useful for "where
+//!   am I in this parameter" debug HUDs (the `w` slice plane in a
+//!   4D viewer, current frame in a recorded sequence, etc.).
 //!
 //! [egui]: https://github.com/emilk/egui
 //!
@@ -62,12 +66,18 @@
 //!   around concrete egui limitations (currently:
 //!   [`BottomOverlay`] for flicker-free anchored HUDs).
 
+pub mod dnd;
 mod integration;
+mod linear_indicator;
+pub mod media;
 mod overlay;
+mod slider_edit;
 mod world;
 
 pub use integration::UiIntegration;
+pub use linear_indicator::LinearIndicator;
 pub use overlay::BottomOverlay;
+pub use slider_edit::slider_with_edit;
 pub use world::world_to_screen;
 
 // Re-export egui so apps depend on `rye-egui` only and the version

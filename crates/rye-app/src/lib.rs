@@ -93,7 +93,7 @@ pub use rye_camera::{
 pub use rye_input::FrameInput as Input;
 // Re-export the egui surface so apps that override `App::ui` depend on
 // `rye-app` only and the version pin lives in `rye-egui`.
-pub use rye_egui::{egui, world_to_screen, BottomOverlay};
+pub use rye_egui::{egui, world_to_screen, BottomOverlay, LinearIndicator};
 
 // ---------------------------------------------------------------------------
 // App trait

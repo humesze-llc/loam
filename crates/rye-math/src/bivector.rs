@@ -436,6 +436,53 @@ impl Bivector4 {
         self.magnitude_squared().sqrt()
     }
 
+    /// Read the coefficient of a basis plane. The 6 basis
+    /// bivectors form an orthonormal basis of the bivector
+    /// space; this returns the bivector's component along the
+    /// given basis direction.
+    pub fn component(self, plane: Plane4) -> f32 {
+        match plane {
+            Plane4::Xy => self.xy,
+            Plane4::Xz => self.xz,
+            Plane4::Xw => self.xw,
+            Plane4::Yz => self.yz,
+            Plane4::Yw => self.yw,
+            Plane4::Zw => self.zw,
+        }
+    }
+
+    /// Set the coefficient of a basis plane in place. Mirror of
+    /// [`Self::component`].
+    pub fn set_component(&mut self, plane: Plane4, value: f32) {
+        match plane {
+            Plane4::Xy => self.xy = value,
+            Plane4::Xz => self.xz = value,
+            Plane4::Xw => self.xw = value,
+            Plane4::Yz => self.yz = value,
+            Plane4::Yw => self.yw = value,
+            Plane4::Zw => self.zw = value,
+        }
+    }
+
+    /// Inner product treating both bivectors as 6-component
+    /// vectors over the orthonormal basis `{xy, xz, xw, yz, yw,
+    /// zw}`. Equivalent to `-(A * B).scalar_part()` for the
+    /// Clifford product when `A * B` is computed in G(4, 0),
+    /// since the basis bivectors satisfy `e_ij · e_ij = -1`;
+    /// the convention used here is the *Euclidean* inner
+    /// product on the coefficient vector, which is positive
+    /// definite. Used to project one bivector onto another's
+    /// direction (e.g., the angle a rotor has accumulated along
+    /// a fixed bivector axis).
+    pub fn dot(self, other: Self) -> f32 {
+        self.xy * other.xy
+            + self.xz * other.xz
+            + self.xw * other.xw
+            + self.yz * other.yz
+            + self.yw * other.yw
+            + self.zw * other.zw
+    }
+
     /// Coefficient of the pseudoscalar `I = e1∧e2∧e3∧e4` in the wedge
     /// product `B ∧ B`. Computed from the three complementary-plane
     /// pairings: `xy·zw − xz·yw + xw·yz`, times 2. For a simple
@@ -1313,6 +1360,43 @@ mod tests {
     fn bivector4_zero_exp_is_identity() {
         let r = Bivector4::ZERO.exp();
         assert_eq!(r, Rotor4::IDENTITY);
+    }
+
+    /// `component(plane)` reads the plane's coefficient;
+    /// `set_component` writes it; round-trip is the identity.
+    #[test]
+    fn bivector4_component_round_trip() {
+        let b = Bivector4::new(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
+        assert_eq!(b.component(Plane4::Xy), 1.0);
+        assert_eq!(b.component(Plane4::Xz), 2.0);
+        assert_eq!(b.component(Plane4::Xw), 3.0);
+        assert_eq!(b.component(Plane4::Yz), 4.0);
+        assert_eq!(b.component(Plane4::Yw), 5.0);
+        assert_eq!(b.component(Plane4::Zw), 6.0);
+        let mut c = Bivector4::ZERO;
+        for plane in Plane4::ALL {
+            c.set_component(plane, b.component(plane));
+        }
+        assert_eq!(c, b);
+    }
+
+    /// `dot` is the Euclidean inner product on the 6-coefficient
+    /// vector. Sanity checks: orthogonal basis bivectors give 0;
+    /// a basis bivector dotted with itself gives 1; bilinearity
+    /// holds.
+    #[test]
+    fn bivector4_dot_inner_product_invariants() {
+        let xy = Plane4::Xy.unit_bivector();
+        let zw = Plane4::Zw.unit_bivector();
+        let xw = Plane4::Xw.unit_bivector();
+        assert_eq!(xy.dot(xy), 1.0);
+        assert_eq!(xy.dot(zw), 0.0);
+        assert_eq!(xy.dot(xw), 0.0);
+        // Bilinearity: dot(a, b + c) = dot(a, b) + dot(a, c).
+        let a = Bivector4::new(1.0, 0.5, -0.25, 0.75, -1.0, 2.0);
+        let b = xy * 3.0;
+        let c = xw * 4.0;
+        assert!((a.dot(b + c) - (a.dot(b) + a.dot(c))).abs() < 1e-6);
     }
 
     #[test]
