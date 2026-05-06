@@ -76,3 +76,4 @@ tracing-subscriber = { workspace = true }
 glam = { workspace = true }
 png = "0.17"
 gif = "0.13"
+rye-egui = { path = "crates/rye-egui" }

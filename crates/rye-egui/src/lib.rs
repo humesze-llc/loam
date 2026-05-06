@@ -66,14 +66,18 @@
 //!   around concrete egui limitations (currently:
 //!   [`BottomOverlay`] for flicker-free anchored HUDs).
 
+pub mod dnd;
 mod integration;
 mod linear_indicator;
+pub mod media;
 mod overlay;
+mod slider_edit;
 mod world;
 
 pub use integration::UiIntegration;
 pub use linear_indicator::LinearIndicator;
 pub use overlay::BottomOverlay;
+pub use slider_edit::slider_with_edit;
 pub use world::world_to_screen;
 
 // Re-export egui so apps depend on `rye-egui` only and the version
