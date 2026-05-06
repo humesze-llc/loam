@@ -64,7 +64,9 @@ use rye_render::{
     device::RenderDevice,
     raymarch::{
         polytope_extended_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL,
-        SHAPE_120CELL, SHAPE_16CELL, SHAPE_24CELL, SHAPE_600CELL, SHAPE_PENTATOPE, SHAPE_TESSERACT,
+        SHAPE_120CELL, SHAPE_16CELL, SHAPE_24CELL, SHAPE_3SPHERE, SHAPE_600CELL,
+        SHAPE_CLIFFORD_TORUS, SHAPE_DUOCYLINDER, SHAPE_PENTATOPE, SHAPE_SPHERINDER,
+        SHAPE_TESSERACT,
     },
     Viewport,
 };
@@ -233,29 +235,83 @@ const SHAPE_CATALOG: &[ShapeEntry] = &[
         label: "600-cell",
         long_name: "hexacosichoron",
     },
+    ShapeEntry {
+        shape: SHAPE_3SPHERE,
+        body_color: [0.85, 0.40, 0.40],
+        label: "3-sphere",
+        long_name: "hypersphere (4-ball)",
+    },
+    ShapeEntry {
+        shape: SHAPE_DUOCYLINDER,
+        body_color: [0.60, 0.45, 0.90],
+        label: "duocyl",
+        long_name: "duocylinder (D² × D²)",
+    },
+    ShapeEntry {
+        shape: SHAPE_CLIFFORD_TORUS,
+        body_color: [0.70, 0.85, 0.35],
+        label: "clifford",
+        long_name: "Clifford torus tube",
+    },
+    ShapeEntry {
+        shape: SHAPE_SPHERINDER,
+        body_color: [0.85, 0.55, 0.75],
+        label: "spherinder",
+        long_name: "spherinder (B³ × interval)",
+    },
 ];
 
-/// Render a flat shape menu into the current ui. Both call
-/// sites (the `+` shape menu and the filmstrip subject combo)
-/// use this so the layout stays consistent: each entry shows
-/// its `label` with a `long_name` hover tooltip. `on_select`
-/// fires when the user clicks an entry; the helper closes the
-/// menu.
+/// Render a category-grouped shape menu into the current ui.
+/// Both call sites (the `+` shape menu and the filmstrip
+/// subject combo) use this so the layout stays consistent: top
+/// level lists the [`SHAPE_CATEGORIES`] entries, each opens a
+/// nested submenu of the shapes in that category, every entry
+/// carries a `long_name` hover tooltip. `on_select` fires when
+/// the user clicks an entry; the helper closes the menu.
 fn render_shape_catalog_menu(
     ui: &mut egui::Ui,
     mut on_select: impl FnMut(ShapeEntry),
 ) {
-    for entry in SHAPE_CATALOG {
-        if ui
-            .button(entry.label)
-            .on_hover_text(entry.long_name)
-            .clicked()
-        {
-            on_select(*entry);
-            ui.close_kind(egui::UiKind::Menu);
-        }
+    for cat in SHAPE_CATEGORIES {
+        ui.menu_button(cat.name, |ui| {
+            for entry in &SHAPE_CATALOG[cat.start..cat.end] {
+                if ui
+                    .button(entry.label)
+                    .on_hover_text(entry.long_name)
+                    .clicked()
+                {
+                    on_select(*entry);
+                    ui.close_kind(egui::UiKind::Menu);
+                }
+            }
+        });
     }
 }
+
+/// Subcategories of [`SHAPE_CATALOG`], expressed as half-open
+/// index ranges into the catalog. Used by the shape menus
+/// (`+` button and filmstrip subject combo) to group entries
+/// with a header label and separator. Keeping the categories as
+/// ranges (rather than nested slices) lets `parse_shape_name`
+/// and direct `SHAPE_CATALOG[i]` lookups stay flat.
+struct ShapeCategory {
+    name: &'static str,
+    start: usize,
+    end: usize,
+}
+
+const SHAPE_CATEGORIES: &[ShapeCategory] = &[
+    ShapeCategory {
+        name: "Regular polychora",
+        start: 0,
+        end: 6,
+    },
+    ShapeCategory {
+        name: "Smooth solids",
+        start: 6,
+        end: 10,
+    },
+];
 
 /// Catalog of named shapes. Both common math-name aliases (the
 /// `n-cell` form) and Platonic-slice aliases (the `tetrahedron` /
@@ -278,11 +334,16 @@ fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
         "24cell" | "cuboctahedron" => SHAPE_CATALOG[3],
         "120cell" | "dodecahedron" => SHAPE_CATALOG[4],
         "600cell" | "icosahedron" => SHAPE_CATALOG[5],
+        "hypersphere" | "3sphere" | "s3" | "4-ball" => SHAPE_CATALOG[6],
+        "duocylinder" => SHAPE_CATALOG[7],
+        "clifford" | "clifford-torus" | "torus" => SHAPE_CATALOG[8],
+        "spherinder" => SHAPE_CATALOG[9],
         _ => {
             return Err(anyhow!(
                 "unknown shape name {name:?}; valid: 5-cell, 8-cell, \
-                 16-cell, 24-cell, 120-cell, 600-cell (plus Platonic \
-                 aliases: tetrahedron, cube, octahedron, cuboctahedron, \
+                 16-cell, 24-cell, 120-cell, 600-cell, 3-sphere, \
+                 duocyl, clifford, spherinder (plus Platonic aliases: \
+                 tetrahedron, cube, octahedron, cuboctahedron, \
                  dodecahedron, icosahedron)"
             ));
         }
