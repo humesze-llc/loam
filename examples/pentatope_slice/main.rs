@@ -140,7 +140,12 @@ struct SliceNode {
 }
 
 impl SliceNode {
-    fn new(device: &Device, surface_format: TextureFormat, shader: &ShaderModule) -> Self {
+    fn new(
+        device: &Device,
+        surface_format: TextureFormat,
+        shader: &ShaderModule,
+        sample_count: u32,
+    ) -> Self {
         let uniforms = SliceUniforms::default();
         let uniform_buf = device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("pentatope_slice uniforms"),
@@ -197,7 +202,10 @@ impl SliceNode {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: MultisampleState::default(),
+            multisample: MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -410,6 +418,7 @@ impl App for PentatopeApp {
             &rd.device,
             rd.surface_bundle.config.format,
             ctx.shader_db.module(shader_id),
+            rd.sample_count(),
         );
 
         if let Some(watcher) = ctx.watcher.as_mut() {
@@ -505,6 +514,7 @@ impl App for PentatopeApp {
                 &ctx.rd.device,
                 ctx.rd.surface_bundle.config.format,
                 ctx.shader_db.module(self.shader_id),
+                ctx.rd.sample_count(),
             );
         }
     }

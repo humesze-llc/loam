@@ -20,7 +20,7 @@
 //! let scene_wgsl = scene.to_hyperslice_wgsl("u.w_slice");
 //! let source = format!("{kernel}\n{scene_wgsl}");
 //! let module = device.create_shader_module(...);
-//! let node = Hyperslice4DNode::new(device, format, &module);
+//! let node = Hyperslice4DNode::new(device, format, &module, sample_count);
 //! ```
 //!
 //! ## What it renders
@@ -799,7 +799,16 @@ impl Hyperslice4DNode {
     /// caller is responsible for producing it from the kernel
     /// ([`HYPERSLICE_KERNEL_WGSL`]) + their scene's hyperslice
     /// WGSL emit. See the module-level docs for an example.
-    pub fn new(device: &Device, surface_format: TextureFormat, module: &ShaderModule) -> Self {
+    /// Construct the hyperslice4d pipeline. `sample_count` must match
+    /// the color attachment's sample count at draw time
+    /// (use [`crate::device::RenderDevice::sample_count`] in app
+    /// code; pass 1 in tests / headless contexts).
+    pub fn new(
+        device: &Device,
+        surface_format: TextureFormat,
+        module: &ShaderModule,
+        sample_count: u32,
+    ) -> Self {
         let uniform_buf = device.create_buffer(&BufferDescriptor {
             label: Some("hyperslice4d uniforms"),
             size: std::mem::size_of::<Hyperslice4DUniforms>() as u64,
@@ -860,7 +869,10 @@ impl Hyperslice4DNode {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: MultisampleState::default(),
+            multisample: MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });

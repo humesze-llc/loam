@@ -141,9 +141,10 @@ impl App for LatticeApp {
         let mod_h3 = make_module(&HyperbolicH3.wgsl_impl(), &scene_h3)?;
         let mod_s3 = make_module(&SphericalS3.wgsl_impl(), &scene_s3)?;
 
-        let node_e3 = GeodesicRayMarchNode::from_module(&rd.device, fmt, &mod_e3);
-        let node_h3 = GeodesicRayMarchNode::from_module(&rd.device, fmt, &mod_h3);
-        let node_s3 = GeodesicRayMarchNode::from_module(&rd.device, fmt, &mod_s3);
+        let samples = rd.sample_count();
+        let node_e3 = GeodesicRayMarchNode::from_module(&rd.device, fmt, &mod_e3, samples);
+        let node_h3 = GeodesicRayMarchNode::from_module(&rd.device, fmt, &mod_h3, samples);
+        let node_s3 = GeodesicRayMarchNode::from_module(&rd.device, fmt, &mod_s3, samples);
 
         let rotate = std::env::args().any(|a| a == "--rotate");
         let camera = OrbitCamera::default();

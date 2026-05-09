@@ -17,12 +17,20 @@ pub struct GeodesicRayMarchNode(RayMarchNode);
 
 impl GeodesicRayMarchNode {
     /// Construct from a pre-compiled geodesic shader module.
+    /// `sample_count` must match the render target's sample count;
+    /// use [`crate::device::RenderDevice::sample_count`] in app code.
     pub fn from_module(
         device: &Device,
         surface_format: TextureFormat,
         module: &ShaderModule,
+        sample_count: u32,
     ) -> Self {
-        Self(RayMarchNode::new(device, surface_format, module))
+        Self(RayMarchNode::new(
+            device,
+            surface_format,
+            module,
+            sample_count,
+        ))
     }
 
     pub fn uniforms(&self) -> &RayMarchUniforms {

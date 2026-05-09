@@ -287,6 +287,15 @@ pub struct RunConfig {
     /// `Result` instead of looping forever on a wedged GPU. Reset to
     /// zero on any successful frame. `0` disables the budget.
     pub render_error_budget: u32,
+    /// MSAA sample count requested for the scene + UI render target.
+    /// `1` disables MSAA. `4` is the conventional default (good
+    /// quality / cost tradeoff, supported on every consumer GPU).
+    /// Higher counts (8, 16) cost more and yield diminishing returns
+    /// on edge antialiasing. The runtime negotiates with the
+    /// adapter; if the requested count isn't supported on the chosen
+    /// surface format, [`RenderDevice`] falls back to the highest
+    /// supported lower count and logs a warning.
+    pub msaa_samples: u32,
 }
 
 impl Default for RunConfig {
@@ -300,6 +309,7 @@ impl Default for RunConfig {
             log_filter: None,
             esc_exits: true,
             render_error_budget: 8,
+            msaa_samples: 1,
         }
     }
 }
@@ -424,7 +434,8 @@ impl<A: App> ApplicationHandler for Runner<A> {
             }
         };
 
-        let rd = match pollster::block_on(RenderDevice::new(win.clone())) {
+        let rd = match pollster::block_on(RenderDevice::new(win.clone(), self.config.msaa_samples))
+        {
             Ok(r) => r,
             Err(e) => {
                 self.deferred_error = Some(anyhow::anyhow!("RenderDevice::new: {e:#}"));
@@ -432,6 +443,8 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 return;
             }
         };
+        // for debugging negotiated MSAA count; the actual count is in `rd.sample_count()`
+        // tracing::info!("scale_factor: {}, msaa: {}x", win.scale_factor(), rd.sample_count());
 
         let mut shader_db = ShaderDb::new(rd.device.clone());
 
@@ -460,12 +473,17 @@ impl<A: App> ApplicationHandler for Runner<A> {
             }
         };
 
-        // 1 sample = no MSAA on the egui pass. Tracks the surface's
-        // own sample count, which is also 1 today (Rye doesn't
-        // configure MSAA on the swapchain). If a future render path
-        // enables MSAA on the main scene, this needs to bump in
-        // lockstep so egui paints into the same multisample target.
-        let ui = UiIntegration::new(&rd.device, &win, rd.surface_bundle.config.format, 1);
+        // egui pipelines must be built with the same sample count as
+        // the multisampled scene attachment, since both passes write
+        // into the same color attachment and the deferred MSAA
+        // resolve happens at the end of the egui paint pass. See
+        // [`UiIntegration::paint`]'s `resolve_target` parameter.
+        let ui = UiIntegration::new(
+            &rd.device,
+            &win,
+            rd.surface_bundle.config.format,
+            rd.sample_count(),
+        );
 
         self.window = Some(win.clone());
         self.rd = Some(rd);
@@ -661,18 +679,24 @@ impl<A: App> Runner<A> {
         }
 
         // 5. Render: scene (App::render) then UI overlay.
+        //
+        // When MSAA is enabled, both passes write into the
+        // multisampled color attachment (`rd.msaa_view()`) and the
+        // egui pass attaches the swapchain view as `resolve_target`
+        // so the deferred MSAA resolve happens at the end of the
+        // egui pass. When MSAA is disabled, both passes write
+        // directly into the swapchain view and `resolve_target` is
+        // `None`.
         match rd.begin_frame() {
-            Ok((frame, view)) => {
+            Ok((frame, swap_view)) => {
                 let mut last_err: Option<anyhow::Error> = None;
+                let render_view = rd.msaa_view().unwrap_or(&swap_view);
                 if let Some(app) = self.app.as_mut() {
-                    if let Err(e) = app.render(rd, &view) {
+                    if let Err(e) = app.render(rd, render_view) {
                         tracing::error!("App::render error: {e:#}");
                         last_err = Some(e);
                     }
                 }
-                // Paint egui on top of whatever the app rendered.
-                // Uses `LoadOp::Load` internally so the scene shows
-                // through where no widgets cover it.
                 if let Some(ui) = self.ui.as_mut() {
                     let mut encoder =
                         rd.device
@@ -680,11 +704,13 @@ impl<A: App> Runner<A> {
                                 label: Some("rye-app::ui-paint"),
                             });
                     let viewport = (rd.surface_bundle.size.width, rd.surface_bundle.size.height);
+                    let resolve_target = (rd.sample_count() > 1).then_some(&swap_view);
                     ui.paint(
                         &rd.device,
                         &rd.queue,
                         &mut encoder,
-                        &view,
+                        render_view,
+                        resolve_target,
                         win.as_ref(),
                         viewport,
                     );

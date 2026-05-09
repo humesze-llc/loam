@@ -105,12 +105,22 @@ impl UiIntegration {
     /// `viewport` is `(width_px, height_px)`. Caller is responsible for
     /// having already cleared and rendered the main scene; this paint
     /// overlays with `LoadOp::Load`.
+    ///
+    /// `resolve_target`, when `Some`, is the single-sample target the
+    /// MSAA render attachment is resolved into at the end of this
+    /// pass. Pass `Some(swapchain_view)` when MSAA is enabled (`view`
+    /// being the multisampled color attachment) so the deferred MSAA
+    /// resolve happens here rather than requiring a separate resolve
+    /// pass. Pass `None` when MSAA is disabled (`view` is the
+    /// swapchain view).
+    #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
+        resolve_target: Option<&wgpu::TextureView>,
         window: &Window,
         viewport: (u32, u32),
     ) {
@@ -145,7 +155,7 @@ impl UiIntegration {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,

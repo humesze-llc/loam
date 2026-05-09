@@ -86,7 +86,16 @@ pub struct RayMarchNode {
 }
 
 impl RayMarchNode {
-    pub fn new(device: &Device, surface_format: TextureFormat, shader: &ShaderModule) -> Self {
+    /// Construct a fullscreen-triangle raymarch pipeline. `sample_count`
+    /// must match the color attachment's sample count at draw time
+    /// (use [`crate::device::RenderDevice::sample_count`] in app
+    /// code; pass 1 in tests / headless contexts).
+    pub fn new(
+        device: &Device,
+        surface_format: TextureFormat,
+        shader: &ShaderModule,
+        sample_count: u32,
+    ) -> Self {
         let uniform_buf = device.create_buffer(&BufferDescriptor {
             label: Some("raymarch uniforms"),
             size: std::mem::size_of::<RayMarchUniforms>() as u64,
@@ -147,7 +156,10 @@ impl RayMarchNode {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: MultisampleState::default(),
+            multisample: MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
