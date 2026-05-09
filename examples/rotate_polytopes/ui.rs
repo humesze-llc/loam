@@ -1,0 +1,428 @@
+//! Cross-cutting overlay UI: top menu bar, help window, the
+//! `BottomOverlay` (rotation tabs, mode-specific body dispatcher,
+//! always-visible w/t sliders, rate row), and the deferred-mutation
+//! drain that fires after the overlay's two-pass measure-then-render
+//! finishes.
+//!
+//! The mode-specific bodies (active / composer / filmstrip / shapes)
+//! and the formula popup live in their own modules; this file owns the
+//! chrome that wraps them.
+
+use rye_app::egui;
+use rye_egui::{
+    media::{chevron_button, play_pause_button, rate_toggle, refresh_button},
+    slider_with_edit,
+};
+use rye_math::{Bivector, Rotor4};
+
+use crate::consts::{CONTROL_H, CONTROL_W, MINI_BUTTON_W, PLAY_PAUSE_W, W_RANGE};
+use crate::state::{DeferredAction, RotatePolytopesApp, RotationMode, RotorTerm, ViewMode};
+
+impl RotatePolytopesApp {
+    /// Expanded section of the bottom overlay. Two tab rows
+    /// stacked vertically:
+    ///
+    /// 1. **View tabs** (Shapes / Filmstrip): top-level visual
+    ///    demo. Shapes shows the multi-shape row; Filmstrip
+    ///    shows one shape across N w-slices.
+    /// 2. **Rotation tabs** (Active set / Composer): how the
+    ///    rotor evolves. Independent of view mode.
+    ///
+    /// Always-visible controls (Spin/Pause, rate buttons,
+    /// sliders) live below this in `render_overlay`.
+    pub(crate) fn render_expanded_body(&mut self, ui: &mut egui::Ui) {
+        self.render_view_tab_row(ui);
+        match self.view_mode {
+            ViewMode::Shapes => self.render_shapes_section(ui),
+            ViewMode::Filmstrip => self.render_filmstrip_body(ui),
+        }
+        ui.separator();
+        self.render_rotation_tab_row(ui);
+        if self.rotation_mode == RotationMode::Active {
+            self.render_active_mode(ui);
+        } else {
+            self.render_composer_mode(ui);
+        }
+    }
+
+    /// Top tab row of the expanded body: visual demo selector.
+    /// Shapes (multi-shape side-by-side row) vs Filmstrip (one
+    /// shape across multiple w-slices). Tab change is staged
+    /// into `pending_view_mode` for the same `BottomOverlay`
+    /// two-pass reason as `pending_mode`.
+    pub(crate) fn render_view_tab_row(&mut self, ui: &mut egui::Ui) {
+        let mut staged = self.view_mode;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut staged, ViewMode::Shapes, "Shapes")
+                .on_hover_text("Side-by-side row of shapes at one w-slice");
+            ui.selectable_value(&mut staged, ViewMode::Filmstrip, "Filmstrip")
+                .on_hover_text(
+                    "One shape rendered N times across w-slices fanning out by \
+                     ±BODY_SIZE around the w slider's value",
+                );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut self.show_formula, "Show formula")
+                    .on_hover_text("Top-right popup with the live exp(...) form of the rotor");
+            });
+        });
+        if staged != self.view_mode {
+            self.pending_view_mode = Some(staged);
+        }
+    }
+
+    /// Rotation-mode tabs: which source drives `omega`. The tab
+    /// change is staged into `self.pending_mode` rather than
+    /// applied directly so `BottomOverlay`'s two-pass measure-
+    /// then-render captures the same body height in both passes.
+    pub(crate) fn render_rotation_tab_row(&mut self, ui: &mut egui::Ui) {
+        let mut staged = self.rotation_mode;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut staged, RotationMode::Active, "Active set")
+                .on_hover_text("Six checkbox-toggled bivectors (xy, xz, ...)");
+            ui.selectable_value(&mut staged, RotationMode::Composer, "Composer")
+                .on_hover_text("Sum of bivectors from the composed sequence");
+        });
+        if staged != self.rotation_mode {
+            self.pending_mode = Some(staged);
+        }
+    }
+
+    /// Top menu bar: Edit / View. Always visible.
+    ///
+    /// The File menu is intentionally absent until persistence
+    /// and `Quit` via `ViewportCommand::Close` are wired.
+    pub(crate) fn render_menu_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("rotate-polytopes-menu-bar").show(ctx, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Reset orientation").clicked() {
+                        self.rot_state = Rotor4::IDENTITY;
+                        self.write_all(self.rot_state);
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
+                    if ui
+                        .add(egui::Button::new("Reset all").shortcut_text("R"))
+                        .clicked()
+                    {
+                        self.reset();
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.show_controls, "Rotation controls (H)");
+                    ui.checkbox(&mut self.show_formula, "Formula popup");
+                    ui.separator();
+                    if ui.button("About this program").clicked() {
+                        self.show_help = true;
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
+                });
+            });
+        });
+    }
+
+    pub(crate) fn render_help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let mut open = self.show_help;
+        egui::Window::new("About 4D Polytope Rotation")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .movable(true)
+            .default_size(egui::vec2(560.0, 460.0))
+            .default_pos(egui::pos2(80.0, 80.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("What this program shows");
+                    ui.label(
+                        "You're looking at 3D cross-sections of four-dimensional \
+                         polytopes. As they rotate through 4D space their cross-\
+                         sections morph in characteristic ways; the point of the \
+                         demo is to make 4D shape intuition reachable from 3D.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("3D cross-sections, briefly");
+                    ui.label(
+                        "A cross-section is what you get when a higher-\
+                         dimensional object passes through a lower-dimensional \
+                         space. A 3D apple intersecting a 2D table gives a 2D \
+                         shape (a circle, an oval) that changes as the apple \
+                         moves. One dimension up: a 4D polytope passing through \
+                         3D gives a 3D shape that changes with the slicing w. \
+                         That's what the w slider scrubs.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("The shapes");
+                    ui.label("All six convex regular 4-polytopes (\"polychora\") ship:");
+                    ui.label("• 5-cell (pentachoron); 5 tetrahedra; the 4D simplex.");
+                    ui.label("• 8-cell (tesseract); 8 cubes; the 4D cube.");
+                    ui.label(
+                        "• 16-cell (hexadecachoron); 16 tetrahedra; the 4D analog \
+                         of the octahedron.",
+                    );
+                    ui.label(
+                        "• 24-cell (icositetrachoron); 24 octahedra; uniquely 4D, \
+                         no 3D analog.",
+                    );
+                    ui.label("• 120-cell (hecatonicosachoron); 120 dodecahedra.");
+                    ui.label(
+                        "• 600-cell (hexacosichoron); 600 tetrahedra; the 4D \
+                         analog of the icosahedron.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("Rotation");
+                    ui.label(
+                        "4D rotations are generated by bivectors (2-planes), not \
+                         axes. There are six independent planes: xy, xz, xw, yz, \
+                         yw, zw. The three w-involving planes pull a visible \
+                         axis through the hidden 4th dimension and produce the \
+                         interesting cross-section morphs; the three pure-3D \
+                         planes rotate the cross-section as a rigid 3D shape.",
+                    );
+                    ui.label(
+                        "Active-set mode: each plane has a checkbox (include in \
+                         spin) and a -180..=180° slider (the rotor's component \
+                         in that plane). Composer mode: build a sequence of \
+                         exp(scalar · planes) terms via chips or the typed \
+                         formula bar.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("Views");
+                    ui.label(
+                        "Shapes view: a row of polytopes side-by-side at one \
+                         w-slice. Drag-and-drop to reorder. Filmstrip view: one \
+                         polytope rendered N times across w-slices fanning out \
+                         by ±BODY_SIZE around the slider's value, so the centre \
+                         cell tracks w.",
+                    );
+                    ui.add_space(8.0);
+
+                    ui.heading("Keyboard");
+                    ui.label("• Space / T: toggle continuous spin.");
+                    ui.label("• Up / Down arrows: scrub w with the keyboard.");
+                    ui.label("• 1..6: toggle a plane in the Active set.");
+                    ui.label("• H: expand / collapse the controls panel.");
+                    ui.label("• R: full reset.");
+                    ui.label("• Esc: exit.");
+                    ui.add_space(8.0);
+
+                    ui.heading("Mouse");
+                    ui.label("• Drag in the viewport: orbit camera.");
+                    ui.label(
+                        "• Right-click on any value label (w, t, plane angle, \
+                         scalar): typed-edit popup.",
+                    );
+                    ui.label(
+                        "• Drag the controls panel by its frame to move it; \
+                         drag the formula popup the same way.",
+                    );
+                });
+            });
+        self.show_help = open;
+    }
+
+    /// Unified controls overlay. `egui::Window` with
+    /// `pivot(CENTER_BOTTOM)` so the bottom edge is the anchor
+    /// and the panel grows upward when the expanded body is
+    /// shown. Always draggable.
+    pub(crate) fn render_overlay(&mut self, ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        let pad = 16.0;
+        let natural_w = (screen.width() - 2.0 * pad).max(280.0);
+        let pinned = *self.overlay_pinned_width.get_or_insert(natural_w);
+        let area_w = pinned.min(natural_w).max(280.0);
+
+        let visuals = &ctx.style().visuals;
+        let frame = egui::Frame::default()
+            .fill(visuals.window_fill)
+            .stroke(visuals.window_stroke)
+            .corner_radius(visuals.window_corner_radius)
+            .inner_margin(10.0);
+
+        let default_bottom_centre = egui::pos2(screen.center().x, screen.bottom() - pad);
+
+        egui::Window::new("rotate-polytopes-overlay")
+            .id(egui::Id::new("rotate-polytopes-overlay"))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .movable(true)
+            .auto_sized()
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .default_pos(default_bottom_centre)
+            .default_width(area_w)
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(area_w);
+                if self.expanded {
+                    self.render_expanded_body(ui);
+                    ui.separator();
+                }
+                self.render_slider_strip(ui, area_w);
+                self.render_rate_row(ui);
+            });
+
+        // Apply any deferred state changes AFTER the overlay
+        // finishes rendering, so both BottomOverlay passes saw
+        // the same content this frame.
+        if let Some(new_mode) = self.pending_mode.take() {
+            self.rotation_mode = new_mode;
+        }
+        if let Some(new_view) = self.pending_view_mode.take() {
+            self.view_mode = new_view;
+        }
+        for action in std::mem::take(&mut self.pending_actions) {
+            match action {
+                DeferredAction::DraftPush(plane) => self.draft.push(plane),
+                DeferredAction::SeqCommitDraft => {
+                    if !self.draft.is_empty() {
+                        self.seq.push(RotorTerm {
+                            planes: self.draft.clone(),
+                            scalar: None,
+                        });
+                        self.draft.clear();
+                    }
+                }
+                DeferredAction::DraftClear => self.draft.clear(),
+                DeferredAction::SeqPushTerm(term) => self.seq.push(term),
+            }
+        }
+    }
+
+    /// Two big sliders (w, t) with fixed-width monospace value
+    /// labels.
+    pub(crate) fn render_slider_strip(&mut self, ui: &mut egui::Ui, _area_w: f32) {
+        const VALUE_CELL_W: f32 = 86.0;
+        let avail = ui.available_width();
+        let spacing = ui.spacing().item_spacing.x;
+        let slider_w = (avail - VALUE_CELL_W - spacing).max(140.0);
+        ui.spacing_mut().slider_width = slider_w;
+
+        let row_size = egui::vec2(avail, CONTROL_H);
+        let row_layout = egui::Layout::left_to_right(egui::Align::Center);
+        ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
+            let formatted = format!("w {:>+.3}", self.w_slice);
+            slider_with_edit(
+                ui,
+                &mut self.w_slice,
+                -W_RANGE..=W_RANGE,
+                &formatted,
+                "",
+                3,
+                VALUE_CELL_W,
+            );
+        });
+        let t_max = self.t_slider_max;
+        let mut t_dragged = false;
+        ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
+            let formatted = format!("t {:>5.2}s", self.rot_time);
+            let slider_resp = ui.add(
+                egui::Slider::new(&mut self.rot_time, 0.0..=t_max)
+                    .show_value(false)
+                    .smart_aim(false)
+                    .clamping(egui::SliderClamping::Always),
+            );
+            t_dragged = slider_resp.dragged();
+            ui.allocate_ui_with_layout(
+                egui::vec2(VALUE_CELL_W, 14.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let label_resp = ui.add(
+                        egui::Button::new(egui::RichText::new(formatted).monospace())
+                            .frame(false)
+                            .small(),
+                    );
+                    label_resp
+                        .on_hover_cursor(egui::CursorIcon::ContextMenu)
+                        .on_hover_text("Right-click to edit value")
+                        .context_menu(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.rot_time)
+                                    .range(0.0..=f32::INFINITY)
+                                    .suffix("s")
+                                    .fixed_decimals(2),
+                            );
+                        });
+                },
+            );
+        });
+        if t_dragged {
+            // Scrub uses the rate-independent `omega_animation`;
+            // `rot_time` is animation time (already rate-scaled at
+            // integration), so `exp(omega_animation * rot_time)`
+            // equals what the continuous-spin path would have
+            // integrated.
+            let omega = self.omega_animation();
+            self.rot_state = (omega * self.rot_time).exp().normalize();
+            self.write_all(self.rot_state);
+        }
+    }
+
+    /// Always-visible single row directly under the sliders.
+    /// Center-justified play / rate / refresh cluster with the
+    /// right-aligned utility cluster on the same line:
+    ///
+    /// ```text
+    ///                  [<<] [<] [play/pause] [>] [>>] [refresh]    [?] [^]
+    /// ```
+    pub(crate) fn render_rate_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            const PLAY_GROUP_W: f32 = 215.0;
+            let total_w = ui.available_width();
+            let leading = ((total_w - PLAY_GROUP_W) / 2.0).max(8.0);
+
+            ui.add_space(leading);
+            let ctrl_size = egui::vec2(CONTROL_W, CONTROL_H);
+            let play_size = egui::vec2(PLAY_PAUSE_W, CONTROL_H);
+            rate_toggle(ui, ctrl_size, &mut self.rate_scale, 0.25, true, false);
+            rate_toggle(ui, ctrl_size, &mut self.rate_scale, 0.5, false, false);
+            if play_pause_button(ui, play_size, self.rotate)
+                .on_hover_text("Toggle continuous rotation (Space)")
+                .clicked()
+            {
+                self.rotate = !self.rotate;
+            }
+            rate_toggle(ui, ctrl_size, &mut self.rate_scale, 2.0, false, true);
+            rate_toggle(ui, ctrl_size, &mut self.rate_scale, 4.0, true, true);
+            if refresh_button(ui, ctrl_size)
+                .on_hover_text("Reset slice, rate, active set, orientation, time (R)")
+                .clicked()
+            {
+                self.reset();
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if chevron_button(
+                    ui,
+                    egui::vec2(CONTROL_W, CONTROL_H),
+                    !self.expanded,
+                    if self.expanded {
+                        "Collapse (H)"
+                    } else {
+                        "Expand controls (H)"
+                    },
+                )
+                .clicked()
+                {
+                    self.expanded = !self.expanded;
+                }
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("?").strong())
+                            .min_size(egui::vec2(MINI_BUTTON_W, MINI_BUTTON_W)),
+                    )
+                    .on_hover_text("About this program")
+                    .clicked()
+                {
+                    self.show_help = true;
+                }
+            });
+        });
+    }
+}

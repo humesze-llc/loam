@@ -138,10 +138,7 @@ pub(crate) const SHAPE_CATALOG: &[ShapeEntry] = &[
 /// nested submenu of the shapes in that category, every entry
 /// carries a `long_name` hover tooltip. `on_select` fires when
 /// the user clicks an entry; the helper closes the menu.
-pub(crate) fn render_shape_catalog_menu(
-    ui: &mut egui::Ui,
-    mut on_select: impl FnMut(ShapeEntry),
-) {
+pub(crate) fn render_shape_catalog_menu(ui: &mut egui::Ui, mut on_select: impl FnMut(ShapeEntry)) {
     for cat in SHAPE_CATEGORIES {
         ui.menu_button(cat.name, |ui| {
             for entry in &SHAPE_CATALOG[cat.start..cat.end] {
