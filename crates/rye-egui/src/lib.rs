@@ -70,6 +70,7 @@
 //!   around concrete egui limitations (currently:
 //!   [`BottomOverlay`] for flicker-free anchored HUDs).
 
+mod bivector_matrix;
 pub mod console;
 pub mod dnd;
 mod integration;
@@ -79,6 +80,7 @@ mod overlay;
 mod slider_edit;
 mod world;
 
+pub use bivector_matrix::{bivector_matrix, cell_text as bivector_matrix_cell_text};
 pub use console::{cmd, Command, Console, ConsoleWriter, HistoryLine, LineKind};
 pub use integration::UiIntegration;
 pub use linear_indicator::LinearIndicator;

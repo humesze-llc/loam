@@ -20,6 +20,7 @@ egui-wgpu = { version = "0.33", default-features = false, features = ["winit"] }
 egui-winit = { version = "0.33", default-features = false, features = ["clipboard", "links"] }
 
 rye-camera = { path = "../rye-camera" }
+rye-math   = { path = "../rye-math" }
 
 [dev-dependencies]
 glam = { workspace = true }
