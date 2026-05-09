@@ -23,6 +23,10 @@
 //!   where a value sits in a 1D parameter range. Useful for "where
 //!   am I in this parameter" debug HUDs (the `w` slice plane in a
 //!   4D viewer, current frame in a recorded sequence, etc.).
+//! - [`Console`]: Quake-style developer console (drop-down overlay,
+//!   command registry, scrollback, hotkey binds, tab autocomplete).
+//!   Generic over a `Ctx` type so consuming crates choose what state
+//!   commands operate on.
 //!
 //! [egui]: https://github.com/emilk/egui
 //!
@@ -66,6 +70,7 @@
 //!   around concrete egui limitations (currently:
 //!   [`BottomOverlay`] for flicker-free anchored HUDs).
 
+pub mod console;
 pub mod dnd;
 mod integration;
 mod linear_indicator;
@@ -74,6 +79,7 @@ mod overlay;
 mod slider_edit;
 mod world;
 
+pub use console::{cmd, Command, Console, ConsoleWriter, HistoryLine, LineKind};
 pub use integration::UiIntegration;
 pub use linear_indicator::LinearIndicator;
 pub use overlay::BottomOverlay;

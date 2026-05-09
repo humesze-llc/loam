@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Rye + egui integration: ApplicationHandler glue, wgpu paint pass, world-anchored label helper. Wraps egui rather than abstracting over UI frameworks; the name reflects that."
 
 [dependencies]
+anyhow.workspace = true
 glam.workspace = true
 wgpu.workspace = true
 winit.workspace = true
