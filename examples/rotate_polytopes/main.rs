@@ -70,301 +70,24 @@ use rye_render::{
     device::RenderDevice,
     raymarch::{
         polytope_extended_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL,
-        SHAPE_120CELL, SHAPE_16CELL, SHAPE_24CELL, SHAPE_3SPHERE, SHAPE_600CELL,
-        SHAPE_CLIFFORD_TORUS, SHAPE_DUOCYLINDER, SHAPE_PENTATOPE, SHAPE_SPHERINDER,
-        SHAPE_TESSERACT,
+        SHAPE_120CELL, SHAPE_600CELL,
     },
     Viewport,
 };
 use rye_sdf::{Scene4, SceneNode4};
 use winit::window::WindowAttributes;
 
-/// Cap on shapes per row from the runtime "Add" buttons. Keeps the
-/// scene visible without scroll-zoom and bounds the per-frame body
-/// loop. The CLI `--shapes` argument can still spawn up to
-/// `MAX_BODIES` (32) at startup.
-const MAX_ROW_LEN: usize = 8;
+mod catalog;
+mod consts;
 
-/// Uniform width for shape cards in the row. Wide enough to fit
-/// the longest label ("120-cell" / "600-cell") in bold without the
-/// label wrapping; wrapping would make those cards taller than
-/// the others, which egui's horizontal cross-alignment then turns
-/// into a descending staircase as the row's running max-height
-/// grows past earlier (now lower-aligned) cards. Labels also use
-/// `WrapMode::Extend` as a belt-and-suspenders check.
-const SHAPE_CARD_WIDTH: f32 = 64.0;
-
-/// Unified height for every interactive widget in the bottom
-/// overlay: rate, play, chevron, plus, and refresh buttons,
-/// make-room drag gaps, and shape cards (via their Frame's
-/// inner_margin). Sized to match the cards' natural rendered
-/// height; strong-styled body text in egui's default font measures
-/// ~17 pt, plus the cards' 6-pt vertical inner_margin = 29 pt.
-/// Keeping all controls at this same height removes the height
-/// mismatch that would otherwise make the + button appear higher
-/// than the cards.
-const CONTROL_H: f32 = 29.0;
-/// Standard width for square control buttons in the overlay's
-/// rate row and shape row (`<<`, `<`, `>`, `>>`, refresh, the per-
-/// shape `×`). Matches the visual cadence of the row without each
-/// callsite hardcoding the same `28.0`. The play/pause button is
-/// deliberately wider (see [`PLAY_PAUSE_W`]) and the smaller help
-/// / close glyphs use [`MINI_BUTTON_W`].
-const CONTROL_W: f32 = 28.0;
-/// Wider central play/pause control. Asymmetry signals the primary
-/// action in the rate cluster.
-const PLAY_PAUSE_W: f32 = 36.0;
-/// Compact close / help glyphs (`×`, `?`). Smaller than the rate-
-/// cluster controls so they read as utility chrome, not primary
-/// actions.
-const MINI_BUTTON_W: f32 = 22.0;
-/// Horizontal spacing between adjacent cards in the term and shape
-/// rows. The make-room gap animates open to a card's width *plus*
-/// this gap, so the value is shared and can't desync.
-const CARD_ITEM_SPACING_X: f32 = 4.0;
-
-const W_SCRUB_RATE: f32 = 0.5;
-const W_RANGE: f32 = 1.5;
-
-/// Initial maximum value for the t slider's range. Chosen so the
-/// per-pixel scrub precision matches the w slider's: w spans
-/// `2 × W_RANGE = 3.0` over the same slider track, so starting t
-/// at 3.0 means dragging t feels just as smooth as dragging w.
-/// The runaway guard in `update()` doubles this as the spin
-/// pushes `rot_time` past it; precision halves with each
-/// doubling but the user keeps the high precision early on when
-/// fine scrubbing matters most.
-const T_SLIDER_INITIAL: f32 = 3.0;
-
-/// Base rotation angular rate (rad/s). Scaled by `rate_scale` per
-/// frame so the rate buttons can speed it up or slow it down.
-const BASE_ROTATION_RATE: f32 = std::f32::consts::TAU * 0.3;
-
-/// Spacing between body centers along x. Slightly larger than
-/// `BODY_SIZE * 2` so rotated bodies can stretch into a neighbor's
-/// column without overlap during animation.
-const BODY_X_SPACING: f32 = 1.8;
-/// Per-body circumradius. Smaller than the `[-2, +2]` first row of
-/// shapes was at, letting four shapes fit in view at once.
-const BODY_SIZE: f32 = 0.7;
-/// Center-y for all bodies; floor is at y=0.
-const BODY_Y: f32 = 0.9;
-
-/// One polytope's metadata: shape index in the kernel's table,
-/// per-body fragment color (driven into `BodyUniform.color` on the
-/// GPU side, NOT the panel's card color; those are uniformly grey
-/// in the redesigned UI), short display label, and long
-/// mathematical name shown in card tooltips. The long name uses
-/// the `pentachoron` / `tesseract` / `hexadecachoron` family; the
-/// `*-plex` aliases (pentaplex, dodecaplex, ...) are deliberately
-/// avoided since "plex" is dimension-generalized rather than
-/// being the actual 4D name.
-#[derive(Copy, Clone, PartialEq)]
-struct ShapeEntry {
-    shape: u32,
-    body_color: [f32; 3],
-    label: &'static str,
-    long_name: &'static str,
-}
-
-/// Default row when no `--shapes` argument is given. Ordered to put
-/// the 24-cell first (most "4D-distinct" cross-section), then the
-/// pentachoron / 16-cell / tesseract triple; visually contrasting
-/// shapes left-to-right.
-const DEFAULT_ROW: &[ShapeEntry] = &[
-    ShapeEntry {
-        shape: SHAPE_24CELL,
-        body_color: [0.95, 0.45, 0.85],
-        label: "24-cell",
-        long_name: "icositetrachoron",
-    },
-    ShapeEntry {
-        shape: SHAPE_PENTATOPE,
-        body_color: [0.95, 0.55, 0.30],
-        label: "5-cell",
-        long_name: "pentachoron",
-    },
-    ShapeEntry {
-        shape: SHAPE_16CELL,
-        body_color: [0.55, 0.95, 0.40],
-        label: "16-cell",
-        long_name: "hexadecachoron",
-    },
-    ShapeEntry {
-        shape: SHAPE_TESSERACT,
-        body_color: [0.30, 0.55, 0.95],
-        label: "8-cell",
-        long_name: "tesseract",
-    },
-];
-
-/// Catalog of every shipped 4D shape: the six convex regular
-/// polychora plus four non-polychoral SDF-trivial shapes
-/// (3-sphere, duocylinder, Clifford torus, spherinder). Used by
-/// the filmstrip subject picker and the `+` shape menu. Colours
-/// are RGB float channels passed straight to the WGSL kernel
-/// (engine doesn't constrain the colour space).
-const SHAPE_CATALOG: &[ShapeEntry] = &[
-    ShapeEntry {
-        shape: SHAPE_PENTATOPE,
-        body_color: [0.95, 0.55, 0.30],
-        label: "5-cell",
-        long_name: "pentachoron",
-    },
-    ShapeEntry {
-        shape: SHAPE_TESSERACT,
-        body_color: [0.30, 0.55, 0.95],
-        label: "8-cell",
-        long_name: "tesseract",
-    },
-    ShapeEntry {
-        shape: SHAPE_16CELL,
-        body_color: [0.55, 0.95, 0.40],
-        label: "16-cell",
-        long_name: "hexadecachoron",
-    },
-    ShapeEntry {
-        shape: SHAPE_24CELL,
-        body_color: [0.95, 0.45, 0.85],
-        label: "24-cell",
-        long_name: "icositetrachoron",
-    },
-    ShapeEntry {
-        shape: SHAPE_120CELL,
-        body_color: [0.40, 0.85, 0.85],
-        label: "120-cell",
-        long_name: "hecatonicosachoron",
-    },
-    ShapeEntry {
-        shape: SHAPE_600CELL,
-        body_color: [0.95, 0.85, 0.40],
-        label: "600-cell",
-        long_name: "hexacosichoron",
-    },
-    ShapeEntry {
-        shape: SHAPE_3SPHERE,
-        body_color: [0.85, 0.40, 0.40],
-        label: "3-sphere",
-        long_name: "hypersphere (4-ball)",
-    },
-    ShapeEntry {
-        shape: SHAPE_DUOCYLINDER,
-        body_color: [0.60, 0.45, 0.90],
-        label: "duocyl",
-        long_name: "duocylinder (D² × D²)",
-    },
-    ShapeEntry {
-        shape: SHAPE_CLIFFORD_TORUS,
-        body_color: [0.70, 0.85, 0.35],
-        label: "clifford",
-        long_name: "Clifford torus tube",
-    },
-    ShapeEntry {
-        shape: SHAPE_SPHERINDER,
-        body_color: [0.85, 0.55, 0.75],
-        label: "spherinder",
-        long_name: "spherinder (B³ × interval)",
-    },
-];
-
-/// Render a category-grouped shape menu into the current ui.
-/// Both call sites (the `+` shape menu and the filmstrip
-/// subject combo) use this so the layout stays consistent: top
-/// level lists the [`SHAPE_CATEGORIES`] entries, each opens a
-/// nested submenu of the shapes in that category, every entry
-/// carries a `long_name` hover tooltip. `on_select` fires when
-/// the user clicks an entry; the helper closes the menu.
-fn render_shape_catalog_menu(ui: &mut egui::Ui, mut on_select: impl FnMut(ShapeEntry)) {
-    for cat in SHAPE_CATEGORIES {
-        ui.menu_button(cat.name, |ui| {
-            for entry in &SHAPE_CATALOG[cat.start..cat.end] {
-                if ui
-                    .button(entry.label)
-                    .on_hover_text(entry.long_name)
-                    .clicked()
-                {
-                    on_select(*entry);
-                    ui.close_kind(egui::UiKind::Menu);
-                }
-            }
-        });
-    }
-}
-
-/// Subcategories of [`SHAPE_CATALOG`], expressed as half-open
-/// index ranges into the catalog. Used by the shape menus
-/// (`+` button and filmstrip subject combo) to group entries
-/// with a header label and separator. Keeping the categories as
-/// ranges (rather than nested slices) lets `parse_shape_name`
-/// and direct `SHAPE_CATALOG[i]` lookups stay flat.
-struct ShapeCategory {
-    name: &'static str,
-    start: usize,
-    end: usize,
-}
-
-const SHAPE_CATEGORIES: &[ShapeCategory] = &[
-    ShapeCategory {
-        name: "Regular polychora",
-        start: 0,
-        end: 6,
-    },
-    ShapeCategory {
-        name: "Smooth solids",
-        start: 6,
-        end: 10,
-    },
-];
-
-/// Catalog of named shapes. Both common math-name aliases (the
-/// `n-cell` form) and Platonic-slice aliases (the `tetrahedron` /
-/// `cube` / etc. form) resolve to the same shape index.
-fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
-    let n = name.to_lowercase();
-    let needle: &str = n.as_str();
-    for entry in SHAPE_CATALOG {
-        if needle == entry.label.to_lowercase() || needle == entry.long_name.to_lowercase() {
-            return Ok(*entry);
-        }
-    }
-    // Common aliases not in the catalog's `label` / `long_name`.
-    Ok(match needle {
-        "5cell" | "pentatope" | "tetrahedron" => SHAPE_CATALOG[0],
-        "8cell" | "hypercube" | "cube" => SHAPE_CATALOG[1],
-        "16cell" | "octahedron" => SHAPE_CATALOG[2],
-        "24cell" | "cuboctahedron" => SHAPE_CATALOG[3],
-        "120cell" | "dodecahedron" => SHAPE_CATALOG[4],
-        "600cell" | "icosahedron" => SHAPE_CATALOG[5],
-        "hypersphere" | "3sphere" | "s3" | "4-ball" => SHAPE_CATALOG[6],
-        "duocylinder" => SHAPE_CATALOG[7],
-        "clifford" | "clifford-torus" | "torus" => SHAPE_CATALOG[8],
-        "spherinder" => SHAPE_CATALOG[9],
-        _ => {
-            return Err(anyhow!(
-                "unknown shape name {name:?}; valid: 5-cell, 8-cell, \
-                 16-cell, 24-cell, 120-cell, 600-cell, 3-sphere, \
-                 duocyl, clifford, spherinder (plus Platonic aliases: \
-                 tetrahedron, cube, octahedron, cuboctahedron, \
-                 dodecahedron, icosahedron)"
-            ));
-        }
-    })
-}
-
-/// Parse the row from CLI arguments. Looks for `--shapes name1 name2 ...`
-/// (consumes everything after the flag). Returns `DEFAULT_ROW` if
-/// the flag isn't present.
-fn parse_row_from_args() -> Result<Vec<ShapeEntry>> {
-    let args: Vec<String> = std::env::args().collect();
-    let Some(idx) = args.iter().position(|a| a == "--shapes") else {
-        return Ok(DEFAULT_ROW.to_vec());
-    };
-    let names = &args[idx + 1..];
-    if names.is_empty() {
-        return Err(anyhow!("--shapes flag passed but no shape names followed"));
-    }
-    names.iter().map(|n| parse_shape_name(n)).collect()
-}
+use catalog::{
+    parse_row_from_args, render_shape_catalog_menu, ShapeEntry, SHAPE_CATALOG,
+};
+use consts::{
+    BASE_ROTATION_RATE, BODY_SIZE, BODY_X_SPACING, BODY_Y, CARD_ITEM_SPACING_X, CONTROL_H,
+    CONTROL_W, MAX_ROW_LEN, MINI_BUTTON_W, PLAY_PAUSE_W, SHAPE_CARD_WIDTH, T_SLIDER_INITIAL,
+    W_RANGE, W_SCRUB_RATE,
+};
 
 fn body_position(slot: usize, n: usize) -> [f32; 4] {
     let x = (slot as f32 - (n as f32 - 1.0) * 0.5) * BODY_X_SPACING;
@@ -404,63 +127,6 @@ fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> Bivector4 {
         }
     }
     omega * (BASE_ROTATION_RATE * rate_scale)
-}
-
-/// Render the 4x4 antisymmetric bivector matrix view: rows
-/// and columns labeled `x y z w`, the upper triangle filled
-/// with the bivector's component for that pair (in degrees),
-/// the lower triangle the negation, the diagonal zero. Pure
-/// presentation; reads `b` once and writes a Grid of labels.
-///
-/// Useful in the formula popup as a more structured view of
-/// the rotor's decomposition than the inline `exp(B · t)`
-/// summary, which only lists non-zero terms. The matrix shows
-/// the full 6-component bivector at a glance.
-fn render_bivector_matrix(ui: &mut egui::Ui, b: &Bivector4) {
-    const AXIS: [&str; 4] = ["x", "y", "z", "w"];
-    // Upper-triangle entries indexed by (row, col) with row < col,
-    // mapped to bivector components. e_i ∧ e_j convention: xy at
-    // (0, 1), xz at (0, 2), xw at (0, 3), yz at (1, 2), yw at
-    // (1, 3), zw at (2, 3).
-    let pair = |row: usize, col: usize| -> f32 {
-        match (row, col) {
-            (0, 1) => b.xy,
-            (0, 2) => b.xz,
-            (0, 3) => b.xw,
-            (1, 2) => b.yz,
-            (1, 3) => b.yw,
-            (2, 3) => b.zw,
-            _ => unreachable!(),
-        }
-    };
-    egui::Grid::new("bivec-matrix")
-        .num_columns(5)
-        .spacing([8.0, 2.0])
-        .show(ui, |ui| {
-            ui.label("");
-            for axis in AXIS {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(axis).monospace().weak(),
-                ));
-            }
-            ui.end_row();
-            for (row, row_axis) in AXIS.iter().enumerate() {
-                ui.add(egui::Label::new(
-                    egui::RichText::new(*row_axis).monospace().weak(),
-                ));
-                for col in 0..4 {
-                    let text = if row == col {
-                        "0".to_string()
-                    } else if row < col {
-                        format!("{:>+5.1}", pair(row, col).to_degrees())
-                    } else {
-                        format!("{:>+5.1}", -pair(col, row).to_degrees())
-                    };
-                    ui.add(egui::Label::new(egui::RichText::new(text).monospace()));
-                }
-                ui.end_row();
-            }
-        });
 }
 
 /// Name a recognizable combination of active planes. Indices match
@@ -2599,8 +2265,12 @@ impl App for RotatePolytopesApp {
                 label: Some("rotate_polytopes shader"),
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
-        let mut node =
-            Hyperslice4DNode::new(&ctx.rd.device, ctx.rd.surface_bundle.config.format, &module);
+        let mut node = Hyperslice4DNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            &module,
+            ctx.rd.sample_count(),
+        );
 
         let n = row.len();
         let bodies: Vec<BodyUniform> = row
@@ -2854,7 +2524,7 @@ impl App for RotatePolytopesApp {
                     }
                     ui.separator();
                     ui.label(egui::RichText::new("log(R) bivector").small().weak());
-                    render_bivector_matrix(ui, &bivec);
+                    rye_egui::bivector_matrix(ui, &bivec);
                 });
         }
 
