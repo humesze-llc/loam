@@ -247,6 +247,18 @@ pub struct Console<Ctx> {
     /// Right-aligned text in the title row. Host fills with anything
     /// useful (fps, recording state, current scene); empty by default.
     status: String,
+    /// `false` for the half-screen drop-down (default Quake-style),
+    /// `true` for a draggable / resizable egui Window. Detached mode
+    /// lets the user click outside the console to give keyboard
+    /// focus back to the app, since the docked console
+    /// permanently captures keyboard while open.
+    detached: bool,
+    /// Set in docked mode when the user clicks outside the panel
+    /// rect; suppresses the input row's per-frame focus re-request
+    /// so mouse + keyboard go back to the app while the console
+    /// stays visible. Cleared by clicking back inside the panel
+    /// or by reopening the console.
+    user_defocused: bool,
 }
 
 struct TabState {
@@ -276,6 +288,8 @@ impl<Ctx: 'static> Console<Ctx> {
             open: false,
             pending_focus: false,
             status: String::new(),
+            detached: false,
+            user_defocused: false,
         }
     }
 
@@ -315,6 +329,9 @@ impl<Ctx: 'static> Console<Ctx> {
         if !self.open {
             self.open = true;
             self.pending_focus = true;
+            // Reopening clears any prior click-outside defocus so
+            // typing lands in the input again.
+            self.user_defocused = false;
         }
     }
 
@@ -337,6 +354,24 @@ impl<Ctx: 'static> Console<Ctx> {
         self.open
     }
 
+    /// Switch to detached mode: console renders as a draggable /
+    /// resizable [`egui::Window`] instead of the half-screen drop-
+    /// down. Idempotent.
+    pub fn detach(&mut self) {
+        self.detached = true;
+    }
+
+    /// Switch to docked mode: half-screen drop-down (the default).
+    /// Idempotent.
+    pub fn dock(&mut self) {
+        self.detached = false;
+    }
+
+    /// Detached or docked?
+    pub fn is_detached(&self) -> bool {
+        self.detached
+    }
+
     /// Append a line to the scrollback. Useful for system messages
     /// generated outside command execution (e.g., a background
     /// recording finishing).
@@ -355,9 +390,21 @@ impl<Ctx: 'static> Console<Ctx> {
     /// closed), in-panel keys (when open), animation, and panel
     /// rendering. Call once per frame from the host's egui pass.
     pub fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut Ctx) {
-        // 1. Toggle key always active.
-        let toggle_pressed =
-            egui_ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, self.toggle_key));
+        // 1. Toggle key always active. `consume_key` strips the Key
+        // event, but printable keys (Backtick, etc.) also produce a
+        // Text event that TextEdit reads independently; strip that
+        // too or it leaks into the input box on the second press.
+        let toggle_text = key_text(self.toggle_key);
+        let toggle_pressed = egui_ctx.input_mut(|i| {
+            let pressed = i.consume_key(egui::Modifiers::NONE, self.toggle_key);
+            if pressed {
+                if let Some(t) = toggle_text {
+                    i.events
+                        .retain(|e| !matches!(e, egui::Event::Text(s) if s == t));
+                }
+            }
+            pressed
+        });
         if toggle_pressed {
             self.toggle();
         }
@@ -385,7 +432,11 @@ impl<Ctx: 'static> Console<Ctx> {
             self.handle_panel_keys(egui_ctx);
         }
 
-        // 4. Animate panel height.
+        // 4. Animate panel height (docked only). Detached mode
+        // shows/hides instantly: the egui Window has its own
+        // appearance, so animating a slide value would only
+        // produce dead frames where `open=false` is still being
+        // drawn.
         let target = if self.open { 1.0 } else { 0.0 };
         let progress = egui_ctx.animate_value_with_time(
             egui::Id::new("rye_console_open_progress"),
@@ -393,7 +444,12 @@ impl<Ctx: 'static> Console<Ctx> {
             ANIM_DURATION_SECS,
         );
 
-        if progress > 0.0 {
+        let visible = if self.detached {
+            self.open
+        } else {
+            progress > 0.0
+        };
+        if visible {
             panel::draw(self, egui_ctx, ctx, progress);
         }
     }
@@ -491,6 +547,8 @@ impl<Ctx: 'static> Console<Ctx> {
         let mut names: Vec<String> = self.commands.keys().cloned().collect();
         names.push("help".into());
         names.push("clear".into());
+        names.push("detach".into());
+        names.push("dock".into());
         names.sort();
         names
     }
@@ -528,6 +586,16 @@ impl<Ctx: 'static> Console<Ctx> {
             self.history.clear();
             return;
         }
+        if name == "detach" {
+            self.detached = true;
+            self.push_history(HistoryLine::system("console detached"));
+            return;
+        }
+        if name == "dock" {
+            self.detached = false;
+            self.push_history(HistoryLine::system("console docked"));
+            return;
+        }
 
         if !self.commands.contains_key(&name) {
             self.push_history(HistoryLine::error(format!(
@@ -560,6 +628,16 @@ impl<Ctx: 'static> Console<Ctx> {
             Some("clear") => {
                 self.push_history(HistoryLine::output("clear: clear the scrollback buffer"));
             }
+            Some("detach") => {
+                self.push_history(HistoryLine::output(
+                    "detach: render console as a draggable window",
+                ));
+            }
+            Some("dock") => {
+                self.push_history(HistoryLine::output(
+                    "dock: render console as a half-screen drop-down (default)",
+                ));
+            }
             Some(name) => match self.commands.get(name) {
                 Some(c) => {
                     let line = format!("{}: {}", c.name(), c.help());
@@ -576,6 +654,8 @@ impl<Ctx: 'static> Console<Ctx> {
                     .collect();
                 entries.push(("help".into(), "list commands or describe one".into()));
                 entries.push(("clear".into(), "clear the scrollback buffer".into()));
+                entries.push(("detach".into(), "render as a draggable window".into()));
+                entries.push(("dock".into(), "render as a half-screen drop-down".into()));
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 for (name, help) in entries {
                     self.push_history(HistoryLine::output(format!("  {name:16} {help}")));
@@ -588,6 +668,24 @@ impl<Ctx: 'static> Console<Ctx> {
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
+
+/// Printable text the OS produces for a key, when one exists. Used
+/// to strip the corresponding `egui::Event::Text` after consuming
+/// the key event for the toggle: without this, pressing Backtick
+/// to toggle the console open and pressing it again to toggle closed
+/// also types `` ` `` into the input box (the Key event is consumed
+/// but the Text event isn't).
+///
+/// Only the keys that plausibly serve as a console-toggle are
+/// covered (Backtick is the default; Tilde is the natural alternate
+/// on US layouts). Other keys return `None`; their Text events stay
+/// untouched.
+fn key_text(key: egui::Key) -> Option<&'static str> {
+    match key {
+        egui::Key::Backtick => Some("`"),
+        _ => None,
+    }
+}
 
 /// Whitespace-split parser. Returns `(command_name, args)` or `None`
 /// for an empty/whitespace-only line. No quoting in v0; commands that
@@ -817,6 +915,54 @@ mod tests {
         );
         c.unbind(egui::Key::F9);
         assert!(!c.binds.contains_key(&egui::Key::F9));
+    }
+
+    #[test]
+    fn detach_and_dock_methods_flip_state() {
+        let mut c = Console::<Ctx>::new();
+        assert!(!c.is_detached());
+        c.detach();
+        assert!(c.is_detached());
+        c.detach(); // idempotent
+        assert!(c.is_detached());
+        c.dock();
+        assert!(!c.is_detached());
+        c.dock(); // idempotent
+        assert!(!c.is_detached());
+    }
+
+    #[test]
+    fn builtin_detach_command_flips_state_and_emits_system_line() {
+        let mut c = Console::<Ctx>::new();
+        let mut ctx: Ctx = 0;
+        c.execute("detach", &mut ctx);
+        assert!(c.is_detached());
+        let last = c.history.back().unwrap();
+        assert_eq!(last.kind, LineKind::System);
+        assert!(last.text.contains("detached"));
+        c.execute("dock", &mut ctx);
+        assert!(!c.is_detached());
+        let last = c.history.back().unwrap();
+        assert_eq!(last.kind, LineKind::System);
+        assert!(last.text.contains("docked"));
+    }
+
+    #[test]
+    fn builtin_help_lists_detach_and_dock() {
+        let mut c = Console::<Ctx>::new();
+        let mut ctx: Ctx = 0;
+        c.execute("help", &mut ctx);
+        let texts: Vec<&str> = c.history.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.iter().any(|t| t.contains("detach")));
+        assert!(texts.iter().any(|t| t.contains("dock")));
+    }
+
+    #[test]
+    fn tab_complete_includes_detach_and_dock() {
+        let mut c = Console::<Ctx>::new();
+        c.input.clone_from(&"de".to_string());
+        c.tab_complete();
+        assert_eq!(c.input, "detach");
     }
 
     #[test]

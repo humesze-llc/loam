@@ -255,6 +255,55 @@ pub fn chevron_button(ui: &mut Ui, size: Vec2, up: bool, hover: &str) -> Respons
     response.on_hover_text(hover)
 }
 
+/// Two chevrons stacked vertically, painted as line primitives.
+/// `pointing_up = false` draws both chevrons pointing down (the
+/// "send away / collapse" direction); `true` draws them pointing
+/// up. Used as a detach / dock affordance for floating panels.
+///
+/// Drawn from primitives rather than text because no Unicode
+/// codepoint renders as two chevrons stacked vertically inside a
+/// single line of monospace; the closest options
+/// (`⇊` paired arrows, `↡` double-stem arrow) are either side-by-
+/// side or single-arrow variants. Hover and active states inherit
+/// from egui's interaction styling via `style.fg_stroke.color`, so
+/// the icon brightens on hover without per-color hardcoding.
+///
+/// `hover` is the tooltip string. Caller is expected to choose a
+/// `size` proportioned for vertical stacking (height noticeably
+/// larger than width); a 12×16 footprint is the canonical
+/// in-title-row size used by `rye-egui::console`.
+pub fn dock_chevrons(ui: &mut Ui, size: Vec2, pointing_up: bool, hover: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let style = ui.style().interact(&response);
+
+    // Chevron geometry, scaled to the icon footprint. Clamps keep
+    // the shape readable at the small (title-row icon) and large
+    // (debug overlay zoom) extremes alike.
+    let half_w = (size.x * 0.34).clamp(2.0, 6.0);
+    let half_h = (size.y * 0.16).clamp(1.5, 4.0);
+    let gap = (size.y * 0.32).clamp(3.0, 8.0);
+
+    let stroke = Stroke::new(1.4, style.fg_stroke.color);
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let chevron_centers = [cy - gap / 2.0, cy + gap / 2.0];
+
+    let painter = ui.painter();
+    for &y in &chevron_centers {
+        let (apex_y, wing_y) = if pointing_up {
+            (y - half_h, y + half_h)
+        } else {
+            (y + half_h, y - half_h)
+        };
+        painter.line_segment([pos2(cx - half_w, wing_y), pos2(cx, apex_y)], stroke);
+        painter.line_segment([pos2(cx, apex_y), pos2(cx + half_w, wing_y)], stroke);
+    }
+
+    response
+        .on_hover_text(hover)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +426,15 @@ mod tests {
         assert!(clicked);
     }
 
+    #[test]
+    fn dock_chevrons_click_fires() {
+        let clicked = click_at_centre(
+            |ui| dock_chevrons(ui, vec2(12.0, 16.0), false, "tip"),
+            |r| r.clicked(),
+        );
+        assert!(clicked);
+    }
+
     /// Allocated rect width / height match the `size` argument
     /// exactly. This is the contract callers depend on for row
     /// layout: a 5-button row with `(28, 29)` per button produces a
@@ -402,6 +460,7 @@ mod tests {
                 sizes.push(add_button(ui, vec2(28.0, 27.0)).rect.size());
                 sizes.push(refresh_button(ui, vec2(28.0, 29.0)).rect.size());
                 sizes.push(chevron_button(ui, vec2(28.0, 29.0), true, "").rect.size());
+                sizes.push(dock_chevrons(ui, vec2(12.0, 16.0), false, "").rect.size());
             });
         });
         assert_eq!(sizes[0], vec2(36.0, 29.0));
@@ -409,5 +468,6 @@ mod tests {
         assert_eq!(sizes[2], vec2(28.0, 27.0));
         assert_eq!(sizes[3], vec2(28.0, 29.0));
         assert_eq!(sizes[4], vec2(28.0, 29.0));
+        assert_eq!(sizes[5], vec2(12.0, 16.0));
     }
 }
