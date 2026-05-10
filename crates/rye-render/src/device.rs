@@ -1,14 +1,11 @@
 //! Window surface + wgpu adapter/device acquisition.
 //!
-//! [`RenderDevice::new`] picks a high-performance adapter and an sRGB
-//! surface format when available, then optionally allocates a
-//! multisampled color attachment matching the surface's size and
-//! format. Resize is handled by [`RenderDevice::resize`].
-//! [`RenderDevice::begin_frame`] returns the per-frame
-//! `(SurfaceTexture, TextureView)` pair the render graph draws into;
-//! when MSAA is enabled, [`RenderDevice::msaa_view`] is the actual
-//! render target and the swapchain view is used as the resolve target
-//! at the end of the egui paint pass.
+//! [`RenderDevice::new`] picks a high-performance adapter and an sRGB surface format when
+//! available, then optionally allocates a multisampled color attachment matching the surface's
+//! size and format. Resize is handled by [`RenderDevice::resize`]. [`RenderDevice::begin_frame`]
+//! returns the per-frame `(SurfaceTexture, TextureView)` pair the render graph draws into;
+//! when MSAA is enabled, [`RenderDevice::msaa_view`] is the actual render target and the
+//! swapchain view is used as the resolve target at the end of the egui paint pass.
 
 use anyhow::Result;
 use std::sync::Arc;

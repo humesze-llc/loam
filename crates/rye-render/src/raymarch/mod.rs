@@ -32,8 +32,8 @@ use crate::graph::RenderNode;
 
 /// Uniform buffer for [`RayMarchNode`]. Bind group 0, binding 0.
 ///
-/// Layout is `std140`-compatible (every `vec3` is padded to 16 bytes)
-/// so WGSL uniform access matches without `@align` annotations.
+/// Layout is `std140`-compatible (every `vec3` is padded to 16 bytes) so WGSL uniform access
+/// matches without `@align` annotations.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct RayMarchUniforms {
@@ -86,10 +86,10 @@ pub struct RayMarchNode {
 }
 
 impl RayMarchNode {
-    /// Construct a fullscreen-triangle raymarch pipeline. `sample_count`
-    /// must match the color attachment's sample count at draw time
-    /// (use [`crate::device::RenderDevice::sample_count`] in app
-    /// code; pass 1 in tests / headless contexts).
+    /// Construct a fullscreen-triangle raymarch pipeline. `sample_count` must match the color
+    /// attachment's sample count at draw time (use
+    /// [`crate::device::RenderDevice::sample_count`] in app code; pass 1 in tests / headless
+    /// contexts).
     pub fn new(
         device: &Device,
         surface_format: TextureFormat,
@@ -186,11 +186,11 @@ impl RayMarchNode {
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&self.uniforms));
     }
 
-    /// Flush current [`RayMarchUniforms`] to the GPU. Use after mutating
-    /// via [`RayMarchNode::uniforms_mut`].
+    /// Flush current [`RayMarchUniforms`] to the GPU. Use after mutating via
+    /// [`RayMarchNode::uniforms_mut`].
     ///
-    /// Render loops must call this (or [`set_uniforms`](Self::set_uniforms))
-    /// before the first draw; the UBO is undefined at construction time.
+    /// Render loops must call this (or [`set_uniforms`](Self::set_uniforms)) before the first
+    /// draw; the UBO is undefined at construction time.
     pub fn flush_uniforms(&self, queue: &Queue) {
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&self.uniforms));
     }
@@ -199,9 +199,9 @@ impl RayMarchNode {
 impl RayMarchNode {
     /// Execute into a sub-region of the view.
     ///
-    /// `clear` selects `LoadOp::Clear` (first panel) or `LoadOp::Load`
-    /// (subsequent panels). `scissor` is `[x, y, width, height]` in pixels;
-    /// fragments outside this rect are discarded by the GPU.
+    /// `clear` selects `LoadOp::Clear` (first panel) or `LoadOp::Load` (subsequent panels).
+    /// `scissor` is `[x, y, width, height]` in pixels; fragments outside this rect are
+    /// discarded by the GPU.
     pub fn execute_panel(
         &mut self,
         rd: &RenderDevice,

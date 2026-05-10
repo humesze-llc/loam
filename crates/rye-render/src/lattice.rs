@@ -1,17 +1,15 @@
 //! Pixel-space layout for render-pass viewports.
 //!
-//! Lets a render node draw to a sub-region of the framebuffer
-//! instead of fullscreen, for cases like an egui side-panel
-//! occluding the left strip of the window.
+//! Lets a render node draw to a sub-region of the framebuffer instead of fullscreen, for cases
+//! like an egui side-panel occluding the left strip of the window.
 //!
-//! The minimal abstraction: a [`Viewport`] is a rectangle in
-//! pixel coordinates (origin top-left, +y down). Render nodes
-//! that consume one apply `wgpu::RenderPass::set_viewport`
-//! before drawing; the kernel reads the viewport's `width` /
-//! `height` for aspect-correct projection.
+//! The minimal abstraction: a [`Viewport`] is a rectangle in pixel coordinates (origin
+//! top-left, +y down). Render nodes that consume one apply `wgpu::RenderPass::set_viewport`
+//! before drawing; the kernel reads the viewport's `width` / `height` for aspect-correct
+//! projection.
 //!
-//! Future "lattice" extensions (named regions, named layout
-//! presets, render-graph integration) layer on top.
+//! Future "lattice" extensions (named regions, named layout presets, render-graph integration)
+//! layer on top.
 
 /// A pixel rectangle within a framebuffer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -33,9 +31,8 @@ impl Viewport {
         }
     }
 
-    /// The region to the right of a left-side panel of width
-    /// `panel_width` pixels. Returns the empty viewport if the
-    /// panel covers the framebuffer (degenerate, but well-defined).
+    /// The region to the right of a left-side panel of width `panel_width` pixels. Returns the
+    /// empty viewport if the panel covers the framebuffer (degenerate, but well-defined).
     pub fn right_of_left_panel(panel_width: u32, framebuffer: [u32; 2]) -> Self {
         let panel = panel_width.min(framebuffer[0]);
         Self {
@@ -46,8 +43,8 @@ impl Viewport {
         }
     }
 
-    /// Apply this viewport to a render pass. The depth range is set
-    /// to the standard `[0.0, 1.0]`.
+    /// Apply this viewport to a render pass. The depth range is set to the standard
+    /// `[0.0, 1.0]`.
     pub fn apply(&self, rp: &mut wgpu::RenderPass<'_>) {
         rp.set_viewport(
             self.x as f32,
@@ -59,18 +56,16 @@ impl Viewport {
         );
     }
 
-    /// `[width, height]` as `[f32; 2]`, the format the hyperslice
-    /// kernel's `u.resolution` uniform expects.
+    /// `[width, height]` as `[f32; 2]`, the format the hyperslice kernel's `u.resolution`
+    /// uniform expects.
     pub fn resolution_f32(&self) -> [f32; 2] {
         [self.width as f32, self.height as f32]
     }
 
-    /// Split this viewport into `n` evenly-spaced horizontal cells.
-    /// Used by the multi-slice strip to render N small thumbnails
-    /// across one wide region. Cells are sized as `width / n` pixels
-    /// each; the trailing cell absorbs any rounding remainder so
-    /// the entire strip covers `self` without seams. Returns an
-    /// empty `Vec` when `n == 0`.
+    /// Split this viewport into `n` evenly-spaced horizontal cells. Used by the multi-slice
+    /// strip to render N small thumbnails across one wide region. Cells are sized as
+    /// `width / n` pixels each; the trailing cell absorbs any rounding remainder so the entire
+    /// strip covers `self` without seams. Returns an empty `Vec` when `n == 0`.
     pub fn split_horizontal(&self, n: u32) -> Vec<Viewport> {
         if n == 0 {
             return Vec::new();
@@ -90,9 +85,9 @@ impl Viewport {
             .collect()
     }
 
-    /// Split this viewport into `n` evenly-spaced vertical cells.
-    /// Companion to [`Self::split_horizontal`]; same trailing-cell
-    /// remainder rule, so the strip covers `self` without seams.
+    /// Split this viewport into `n` evenly-spaced vertical cells. Companion to
+    /// [`Self::split_horizontal`]; same trailing-cell remainder rule, so the strip covers
+    /// `self` without seams.
     pub fn split_vertical(&self, n: u32) -> Vec<Viewport> {
         if n == 0 {
             return Vec::new();
@@ -142,13 +137,11 @@ mod tests {
         assert_eq!(v.width, 0);
     }
 
-    /// Cells fully tile the source viewport with no gaps or overlap;
-    /// the trailing cell absorbs rounding remainder so the right
-    /// edge lines up exactly with the parent's right edge.
+    /// Cells fully tile the source viewport with no gaps or overlap; the trailing cell absorbs
+    /// rounding remainder so the right edge lines up exactly with the parent's right edge.
     #[test]
     fn split_horizontal_tiles_without_gaps() {
-        // 17 doesn't divide evenly into 5; verify remainder lands
-        // on the last cell.
+        // 17 doesn't divide evenly into 5; verify remainder lands on the last cell.
         let v = Viewport {
             x: 100,
             y: 50,
@@ -167,8 +160,7 @@ mod tests {
         for win in cells.windows(2) {
             assert_eq!(win[0].x + win[0].width, win[1].x);
         }
-        // First four cells share the floor width; last absorbs the
-        // remainder.
+        // First four cells share the floor width; last absorbs the remainder.
         assert_eq!(cells[0].width, 3);
         assert_eq!(cells[4].width, 5);
     }

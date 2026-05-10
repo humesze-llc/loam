@@ -1,13 +1,13 @@
 //! `impl PhysicsSpace for EuclideanR3`, 3D Euclidean rigid-body physics.
 //!
-//! Angular velocity is a [`Bivector3`] (3 independent rotation-plane components);
-//! inertia is the scalar moment for isotropic bodies (spheres, the regular polyhedra).
-//! Non-isotropic inertia tensors land when a game actually needs them — a full 3×3
-//! `Inertia` type is a structural change to the trait and can happen later.
+//! Angular velocity is a [`Bivector3`] (3 independent rotation-plane components); inertia is the
+//! scalar moment for isotropic bodies (spheres, the regular polyhedra). Non-isotropic inertia
+//! tensors land when a game actually needs them — a full 3×3 `Inertia` type is a structural
+//! change to the trait and can happen later.
 //!
 //! Orientation integration bridges `Bivector3` -> `Rotor3` -> `Quat` (the type stored in
-//! `Iso3`). The conversion is a fixed mapping (xy↔z, yz↔x, zx↔y) defined by how rotor
-//! sandwich matches quaternion conjugation for the three cardinal axes.
+//! `Iso3`). The conversion is a fixed mapping (xy↔z, yz↔x, zx↔y) defined by how rotor sandwich
+//! matches quaternion conjugation for the three cardinal axes.
 
 use glam::{Quat, Vec3};
 
@@ -20,16 +20,16 @@ use crate::integrator::PhysicsSpace;
 use crate::narrowphase::Narrowphase;
 use crate::response::Contact;
 
-/// Convert a [`Rotor3`] to a [`Quat`] via the mapping `(s, xy, yz, zx) ↔ (w, z, x, y)`.
-/// This is the correspondence that makes `Rotor3::apply` agree with `Quat::mul_vec3` for
-/// the three cardinal-plane rotations; verified by
-/// `rotor3_matches_glam_quat_for_axis_rotation` in `rye-math`.
+/// Convert a [`Rotor3`] to a [`Quat`] via the mapping `(s, xy, yz, zx) ↔ (w, z, x, y)`. This
+/// is the correspondence that makes `Rotor3::apply` agree with `Quat::mul_vec3` for the three
+/// cardinal-plane rotations; verified by `rotor3_matches_glam_quat_for_axis_rotation` in
+/// `rye-math`.
 fn rotor_to_quat(r: rye_math::Rotor3) -> Quat {
     Quat::from_xyzw(r.yz, r.zx, r.xy, r.s)
 }
 
-/// Velocity at body-offset `r` from the body's rotation:
-/// `v(r) = ω⌋r`. Components match `(ω as pseudovector) × r`.
+/// Velocity at body-offset `r` from the body's rotation: `v(r) = ω⌋r`. Components match
+/// `(ω as pseudovector) × r`.
 fn omega_cross_r(w: Bivector3, r: Vec3) -> Vec3 {
     Vec3::new(
         w.zx * r.z - w.xy * r.y,

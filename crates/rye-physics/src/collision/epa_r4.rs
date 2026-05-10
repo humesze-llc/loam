@@ -23,8 +23,8 @@ const EPA_MAX_ITERATIONS: u32 = 96;
 const EPA_TOLERANCE: f32 = 1e-3;
 const EPA_MAX_VERTICES: usize = 192;
 
-/// Resolved contact information in 4D. Same shape as the 3D
-/// [`super::epa::ContactInfo`] but with `Vec4` fields.
+/// Resolved contact information in 4D. Same shape as the 3D [`super::epa::ContactInfo`] but
+/// with `Vec4` fields.
 #[derive(Clone, Copy, Debug)]
 pub struct ContactInfo4 {
     pub normal: Vec4,
@@ -43,10 +43,10 @@ struct Face4 {
 struct Polytope4 {
     vertices: Vec<MinkowskiPoint4>,
     faces: Vec<Face4>,
-    /// Centroid of the seed 5-simplex. Guaranteed interior to the polytope for all
-    /// subsequent convex expansions, so it's a reliable tiebreaker when the origin itself
-    /// sits on a face plane (common for symmetric Minkowski differences, where the origin
-    /// lies on an edge of the seed simplex and multiple initial faces pass through it).
+    /// Centroid of the seed 5-simplex. Guaranteed interior to the polytope for all subsequent
+    /// convex expansions, so it's a reliable tiebreaker when the origin itself sits on a face
+    /// plane (common for symmetric Minkowski differences, where the origin lies on an edge of the
+    /// seed simplex and multiple initial faces pass through it).
     centroid: Vec4,
 }
 
@@ -87,17 +87,16 @@ impl Polytope4 {
 
     /// Face with smallest distance from origin.
     ///
-    /// Distance-0 faces are common in 4D EPA: many Minkowski-diff vertices end up coplanar
-    /// (e.g. pentatope-pentatope produces dozens of `w=0` points), which spawns
-    /// "through-origin" faces during expansion. Naively picking the smallest distance
-    /// always chases these spurious faces and never converges on the real Minkowski
-    /// boundary.
+    /// Distance-0 faces are common in 4D EPA: many Minkowski-diff vertices end up coplanar (e.g.
+    /// pentatope-pentatope produces dozens of `w=0` points), which spawns "through-origin"
+    /// faces during expansion. Naively picking the smallest distance always chases these
+    /// spurious faces and never converges on the real Minkowski boundary.
     ///
-    /// Strategy: if the polytope has any **strictly positive-distance** face, prefer the
-    /// smallest of those — they're real boundary candidates. Only fall back to a
-    /// distance-0 face when no positive face exists (the boundary genuinely touches the
-    /// origin, e.g. tangent shapes; or the seed simplex is so symmetric that every face
-    /// passes through origin and we need expansion to break the symmetry).
+    /// Strategy: if the polytope has any **strictly positive-distance** face, prefer the smallest
+    /// of those — they're real boundary candidates. Only fall back to a distance-0 face when no
+    /// positive face exists (the boundary genuinely touches the origin, e.g. tangent shapes; or
+    /// the seed simplex is so symmetric that every face passes through origin and we need
+    /// expansion to break the symmetry).
     fn closest_face(&self) -> Option<usize> {
         if let Some((idx, _)) = self
             .faces

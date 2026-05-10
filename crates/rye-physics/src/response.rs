@@ -8,18 +8,18 @@ use crate::integrator::PhysicsSpace;
 
 /// Coulomb friction coefficient applied uniformly across spaces. 0.35 reads as
 /// "moderate grip": shapes roll under gravity rather than slide indefinitely.
-/// A per-material-pair coefficient is a future extension (track on `RigidBody`
-/// and combine via geometric mean).
+/// A per-material-pair coefficient is a future extension (track on `RigidBody` and
+/// combine via geometric mean).
 pub const FRICTION_COEFF: f32 = 0.35;
 
 /// Result of narrowphase collision detection between two bodies.
 pub struct Contact<S: PhysicsSpace> {
-    /// Unit vector from body A toward body B, in A's tangent space. Points outward from
-    /// the contact; pushing along this normal separates the bodies.
+    /// Unit vector from body A toward body B, in A's tangent space. Points outward from the
+    /// contact; pushing along this normal separates the bodies.
     pub normal: S::Vector,
 
-    /// The world-space point at which the contact is applied. Needed by the solver to
-    /// compute angular response (torque = r x j).
+    /// The world-space point at which the contact is applied. Needed by the solver to compute
+    /// angular response (torque = r x j).
     pub point: S::Point,
 
     /// How far the bodies overlap. Positive when they do.

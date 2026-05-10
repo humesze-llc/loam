@@ -3,9 +3,9 @@
 //! ## The problem this solves
 //!
 //! egui's [`Area`](egui::Area) recomputes its position from content size each frame. When
-//! content size changes drastically between frames (an app state toggle adding or removing a big
-//! chunk of UI), the area's pivot recomputes in a single frame and the in-between rendering
-//! reads as the overlay "flickering" or "disappearing" briefly.
+//! content size changes drastically between frames (an app state toggle adding or removing
+//! a big chunk of UI), the area's pivot recomputes in a single frame and the in-between
+//! rendering reads as the overlay "flickering" or "disappearing" briefly.
 //!
 //! For floating bottom HUDs in games this happens whenever the HUD expands a panel, switches
 //! modes, opens an inventory, etc. Single-frame jumps are unacceptable polish-wise.
@@ -75,8 +75,8 @@ pub struct BottomOverlay {
 }
 
 impl BottomOverlay {
-    /// Construct an overlay with sensible defaults. `id_source` must be unique per-overlay across
-    /// the app.
+    /// Construct an overlay with sensible defaults. `id_source` must be unique per-overlay
+    /// across the app.
     pub fn new(id_source: impl std::hash::Hash) -> Self {
         Self {
             id: Id::new(id_source),
@@ -126,16 +126,17 @@ impl BottomOverlay {
     ///
     /// `content` should render in normal top-down order (mode header / body / footer style).
     /// The overlay sizes to its content (or to a caller-pinned `target_h`); height transitions
-    /// animate smoothly, and during shrinks the TOP is clipped via an internal `ScrollArea` so
-    /// widgets rendered late (the footer) stay in view.
+    /// animate smoothly, and during shrinks the TOP is clipped via an internal `ScrollArea`
+    /// so widgets rendered late (the footer) stay in view.
     ///
     /// `content` is called *twice per frame*: once invisibly to measure this frame's natural
-    /// content height, then again for the actual paint at the correctly-anchored position. The
-    /// measure pass uses [`Ui::set_invisible`], which disables widgets and skips painting, so
-    /// interaction-gated side effects (button clicks, drag drops, slider edits) only fire in
-    /// the visible pass. The two-pass shape is what lets the bottom edge stay anchored on the
-    /// very frame content size changes; a single-pass design with stale-measurement positioning
-    /// always lags by one frame at transitions and the user perceives the lag as flicker.
+    /// content height, then again for the actual paint at the correctly-anchored position.
+    /// The measure pass uses [`Ui::set_invisible`], which disables widgets and skips painting,
+    /// so interaction-gated side effects (button clicks, drag drops, slider edits) only fire
+    /// in the visible pass. The two-pass shape is what lets the bottom edge stay anchored on
+    /// the very frame content size changes; a single-pass design with stale-measurement
+    /// positioning always lags by one frame at transitions and the user perceives the lag as
+    /// flicker.
     pub fn show<R>(self, ctx: &Context, mut content: impl FnMut(&mut Ui) -> R) -> InnerResponse<R> {
         let screen = ctx.content_rect();
         let frame = self.frame.unwrap_or_default();
@@ -159,14 +160,14 @@ impl BottomOverlay {
             });
         let natural_h = measure_resp.response.rect.height();
 
-        // Animate the displayed height toward the target. Auto-size mode uses this frame's natural
-        // height; pinned mode uses the caller-supplied target_h.
+        // Animate the displayed height toward the target. Auto-size mode uses this frame's
+        // natural height; pinned mode uses the caller-supplied target_h.
         let target = self.target_h.unwrap_or(natural_h);
         let smooth_h =
             ctx.animate_value_with_time(self.id.with("smooth_h"), target, self.transition_secs);
 
-        // Position so the overlay's BOTTOM edge is at `screen.bottom() - margin_y` regardless of
-        // `smooth_h`. Top moves with the animation; bottom stays fixed.
+        // Position so the overlay's BOTTOM edge is at `screen.bottom() - margin_y` regardless
+        // of `smooth_h`. Top moves with the animation; bottom stays fixed.
         let area_x = screen.center().x - self.width / 2.0;
         let area_y = screen.bottom() - self.margin_y - smooth_h;
 
@@ -191,9 +192,10 @@ impl BottomOverlay {
                 ui.set_max_height(smooth_h);
                 frame
                     .show(ui, |ui| {
-                        // Scroll offset = how far past the visible viewport the natural content
-                        // is. Frame inner_margin contributes to both `natural_h` and the outer
-                        // pinned height equally, so it cancels out of `(natural_h - smooth_h)`.
+                        // Scroll offset = how far past the visible viewport the natural
+                        // content is. Frame inner_margin contributes to both `natural_h`
+                        // and the outer pinned height equally, so it cancels out of
+                        // `(natural_h - smooth_h)`.
                         let scroll_offset = (natural_h - smooth_h).max(0.0);
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
@@ -221,9 +223,9 @@ const MEASURE_PASS_POS: Pos2 = Pos2::new(-99_999.0, -99_999.0);
 mod tests {
     use super::*;
 
-    /// Run the overlay through `n` headless egui frames so animation can settle, returning the
-    /// final response rect. egui's `Context::run` advances input + animation state; 30 frames
-    /// at the default tick is plenty for a 0.18s transition to converge.
+    /// Run the overlay through `n` headless egui frames so animation can settle, returning
+    /// the final response rect. egui's `Context::run` advances input + animation state;
+    /// 30 frames at the default tick is plenty for a 0.18s transition to converge.
     fn measure(target_h: f32, content_lines: usize) -> egui::Rect {
         let ctx = egui::Context::default();
         let mut rect = egui::Rect::NOTHING;
@@ -271,10 +273,10 @@ mod tests {
         );
     }
 
-    /// The content closure runs twice per frame (measure pass + visible pass), so over N frames
-    /// it should be invoked exactly 2 * N times. The measure pass is what lets the overlay
-    /// anchor its bottom on a growth frame, so this double-invocation is by design; callers
-    /// should keep non-interaction side effects idempotent / cheap.
+    /// The content closure runs twice per frame (measure pass + visible pass), so over N
+    /// frames it should be invoked exactly 2 * N times. The measure pass is what lets the
+    /// overlay anchor its bottom on a growth frame, so this double-invocation is by design;
+    /// callers should keep non-interaction side effects idempotent / cheap.
     #[test]
     fn content_closure_runs_twice_per_frame() {
         let ctx = egui::Context::default();
@@ -297,9 +299,9 @@ mod tests {
     }
 
     /// When the overlay is at a large `target_h`, the rate-row-style widgets (rendered LAST,
-    /// conventionally at the bottom) must have a y-position that's actually inside the response
-    /// rect. Catches a regression where ScrollArea + stick_to_bottom would scroll widgets
-    /// off-screen entirely.
+    /// conventionally at the bottom) must have a y-position that's actually inside the
+    /// response rect. Catches a regression where ScrollArea + stick_to_bottom would scroll
+    /// widgets off-screen entirely.
     #[test]
     fn last_widget_visible_when_large_target_h() {
         let ctx = egui::Context::default();
@@ -355,8 +357,9 @@ mod tests {
         );
     }
 
-    /// The "chevron toggles expand/collapse" pattern: `target_h` is small + body conditionally
-    /// hidden (collapsed), then `target_h` grows + body conditionally rendered (expanded).
+    /// The "chevron toggles expand/collapse" pattern: `target_h` is small + body
+    /// conditionally hidden (collapsed), then `target_h` grows + body conditionally rendered
+    /// (expanded).
     /// After settling in the expanded state, the body's widget rects MUST intersect the
     /// overlay's rect; i.e., the body actually shows up to the user, not just renders into
     /// some clipped void.
@@ -433,8 +436,9 @@ mod tests {
     }
 
     /// Auto-size mode (no `target_h` set): the panel must hug its content with no dead space
-    /// after settling. Render N labels, settle the animation, then assert overlay height matches
-    /// natural content height to within a few points (frame margin + scroll-area padding).
+    /// after settling. Render N labels, settle the animation, then assert overlay height
+    /// matches natural content height to within a few points (frame margin + scroll-area
+    /// padding).
     #[test]
     fn auto_size_hugs_content() {
         let ctx = egui::Context::default();
@@ -508,11 +512,11 @@ mod tests {
     }
 
     /// Regression test for the "panel flickers low for one frame when content grows" bug. The
-    /// setup mimics the user-reported scenario: settle the overlay in collapsed state (footer-only
-    /// content), then on the next frame suddenly render expanded content (body + footer). On
-    /// THAT first frame, the footer's rendered rect must still be inside the overlay's visible
-    /// rect; not scrolled off the bottom because the inner ScrollArea was still using last
-    /// frame's offset.
+    /// setup mimics the user-reported scenario: settle the overlay in collapsed state
+    /// (footer-only content), then on the next frame suddenly render expanded content (body +
+    /// footer). On THAT first frame, the footer's rendered rect must still be inside the
+    /// overlay's visible rect; not scrolled off the bottom because the inner ScrollArea was
+    /// still using last frame's offset.
     #[test]
     fn footer_stays_visible_on_first_growth_frame() {
         let ctx = egui::Context::default();
@@ -562,8 +566,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut footer_rect = egui::Rect::NOTHING;
         let mut overlay_rect = egui::Rect::NOTHING;
-        // target_h (130) < natural content height (the body alone pushes past 130 once the inner
-        // row's allocated). Tests the stick_to_bottom path.
+        // target_h (130) < natural content height (the body alone pushes past 130 once the
+        // inner row's allocated). Tests the stick_to_bottom path.
         for _ in 0..30 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 let resp = BottomOverlay::new("nested-test")

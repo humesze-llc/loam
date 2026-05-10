@@ -24,11 +24,11 @@ pub enum AssetEventKind {
 
 /// Watches one or more filesystem paths and yields coalesced [`AssetEvent`]s on demand.
 ///
-/// Events arrive on a background thread managed by `notify`; [`poll`](Self::poll)
-/// drains the channel non-blockingly and deduplicates events per path within one poll
-/// cycle. That means editor saves that produce a burst of raw events (remove temp ->
-/// create target -> modify) collapse to a single `Modified` or `Created` event per
-/// file. That's the usual shape a shader cache wants.
+/// Events arrive on a background thread managed by `notify`; [`poll`](Self::poll) drains
+/// the channel non-blockingly and deduplicates events per path within one poll cycle. That
+/// means editor saves that produce a burst of raw events (remove temp -> create target ->
+/// modify) collapse to a single `Modified` or `Created` event per file. That's the usual
+/// shape a shader cache wants.
 ///
 /// Not `Sync`: own one per app. `Send` is fine.
 pub struct AssetWatcher {
@@ -37,8 +37,7 @@ pub struct AssetWatcher {
 }
 
 impl AssetWatcher {
-    /// Start a new watcher. No paths are watched until [`watch`](Self::watch)
-    /// is called.
+    /// Start a new watcher. No paths are watched until [`watch`](Self::watch) is called.
     pub fn new() -> Result<Self> {
         let (tx, rx) = channel();
         let watcher = notify::recommended_watcher(move |res| {
@@ -70,20 +69,19 @@ impl AssetWatcher {
 
     /// Drain all pending events, deduplicating per path.
     ///
-    /// When the same path produces multiple events since the last poll, they are
-    /// merged: `Created` beats `Modified` (a new file should look new, not merely
-    /// modified), otherwise the later event wins. Events that aren't create/modify/remove
-    /// (access, metadata, other) are dropped.
+    /// When the same path produces multiple events since the last poll, they are merged:
+    /// `Created` beats `Modified` (a new file should look new, not merely modified),
+    /// otherwise the later event wins. Events that aren't create/modify/remove (access,
+    /// metadata, other) are dropped.
     pub fn poll(&self) -> Vec<AssetEvent> {
         let mut latest: HashMap<PathBuf, AssetEventKind> = HashMap::new();
 
         while let Ok(res) = self.rx.try_recv() {
             let Ok(event) = res else {
-                // `warn` (not `debug`) because notify errors are usually
-                // platform-watcher failures (handle exhaustion on Windows,
-                // permission denied, dropped events) that silently degrade
-                // hot-reload. A user not seeing reloads should at least
-                // see something in stderr.
+                // `warn` (not `debug`) because notify errors are usually platform-watcher
+                // failures (handle exhaustion on Windows, permission denied, dropped events)
+                // that silently degrade hot-reload. A user not seeing reloads should at
+                // least see something in stderr.
                 tracing::warn!("notify error: {:?}", res.err());
                 continue;
             };
@@ -111,10 +109,10 @@ impl AssetWatcher {
 
 /// Merge two events for the same path within a single poll cycle.
 ///
-/// `Created` is preserved across a subsequent `Modified`, on Windows, `fs::write` on
-/// a fresh file emits Create+Modify, and downstream consumers expect "new file" to
-/// look different from "existing file changed." Otherwise the later event wins, which
-/// correctly handles save-by-atomic-replace (Remove->Create->target exists).
+/// `Created` is preserved across a subsequent `Modified`, on Windows, `fs::write` on a
+/// fresh file emits Create+Modify, and downstream consumers expect "new file" to look
+/// different from "existing file changed." Otherwise the later event wins, which correctly
+/// handles save-by-atomic-replace (Remove->Create->target exists).
 fn merge_kinds(old: AssetEventKind, new: AssetEventKind) -> AssetEventKind {
     use AssetEventKind::*;
     match (old, new) {

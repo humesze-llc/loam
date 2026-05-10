@@ -7,18 +7,17 @@ use crate::device::RenderDevice;
 use crate::graph::RenderNode;
 use crate::raymarch::{RayMarchNode, RayMarchUniforms};
 
-/// A render node that draws a fullscreen triangle using a geodesic march
-/// shader assembled from four layers:
-/// `[Space prelude] + [scene SDF] + [march kernel] + [user shading]`.
+/// A render node that draws a fullscreen triangle using a geodesic march shader assembled from
+/// four layers: `[Space prelude] + [scene SDF] + [march kernel] + [user shading]`.
 ///
-/// Build the compiled `ShaderModule` with `rye_shader::ShaderDb::load_geodesic_scene`,
-/// then pass it to [`GeodesicRayMarchNode::from_module`].
+/// Build the compiled `ShaderModule` with `rye_shader::ShaderDb::load_geodesic_scene`, then
+/// pass it to [`GeodesicRayMarchNode::from_module`].
 pub struct GeodesicRayMarchNode(RayMarchNode);
 
 impl GeodesicRayMarchNode {
-    /// Construct from a pre-compiled geodesic shader module.
-    /// `sample_count` must match the render target's sample count;
-    /// use [`crate::device::RenderDevice::sample_count`] in app code.
+    /// Construct from a pre-compiled geodesic shader module. `sample_count` must match the
+    /// render target's sample count; use [`crate::device::RenderDevice::sample_count`] in app
+    /// code.
     pub fn from_module(
         device: &Device,
         surface_format: TextureFormat,

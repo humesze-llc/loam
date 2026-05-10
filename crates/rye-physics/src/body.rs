@@ -5,12 +5,12 @@ use rye_math::Bivector;
 use crate::collider::Collider;
 use crate::integrator::PhysicsSpace;
 
-/// A rigid body in some [`PhysicsSpace`]. Public-fields struct so the solver and user
-/// code can read and write components directly, this crate doesn't hide state, it just
-/// provides the rules for advancing it.
+/// A rigid body in some [`PhysicsSpace`]. Public-fields struct so the solver and user code can
+/// read and write components directly, this crate doesn't hide state, it just provides the
+/// rules for advancing it.
 ///
-/// `inv_mass == 0.0` means a static body: gravity and impulses have no effect on its
-/// velocity, and [`crate::integrate_body`] skips it.
+/// `inv_mass == 0.0` means a static body: gravity and impulses have no effect on its velocity,
+/// and [`crate::integrate_body`] skips it.
 pub struct RigidBody<S: PhysicsSpace> {
     pub position: S::Point,
     pub velocity: S::Vector,
@@ -29,8 +29,8 @@ pub struct RigidBody<S: PhysicsSpace> {
 }
 
 impl<S: PhysicsSpace> RigidBody<S> {
-    /// Build a dynamic body at `position` with the given mass and collider. `space` is
-    /// passed so the caller can source an identity isometry without naming the space's
+    /// Build a dynamic body at `position` with the given mass and collider. `space` is passed
+    /// so the caller can source an identity isometry without naming the space's
     /// [`crate::Collider`] types directly.
     pub fn new(
         position: S::Point,
@@ -40,10 +40,10 @@ impl<S: PhysicsSpace> RigidBody<S> {
         inertia: S::Inertia,
         space: &S,
     ) -> Self {
-        // Half-spaces are infinite planes; a finite mass with infinite extent breaks
-        // the integrator's assumptions (no centre of mass, no bounded inertia).
-        // Static-only is the only sensible mode; catch the misuse in debug builds
-        // before it produces silently wrong physics in release.
+        // Half-spaces are infinite planes; a finite mass with infinite extent breaks the
+        // integrator's assumptions (no centre of mass, no bounded inertia). Static-only is the
+        // only sensible mode; catch the misuse in debug builds before it produces silently
+        // wrong physics in release.
         debug_assert!(
             !matches!(
                 collider,

@@ -1,9 +1,8 @@
 //! WGSL emission for the 120-cell and 600-cell SDFs.
 //!
-//! These two polytopes have face-hyperplane sets large enough (120 and
-//! 600 respectively) that hand-writing them as inline WGSL literals is
-//! impractical. Instead we generate the WGSL at runtime from the Rust
-//! face-plane / vertex generators in `rye_physics::euclidean_r4`.
+//! These two polytopes have face-hyperplane sets large enough (120 and 600 respectively) that
+//! hand-writing them as inline WGSL literals is impractical. Instead we generate the WGSL at
+//! runtime from the Rust face-plane / vertex generators in `rye_physics::euclidean_r4`.
 //!
 //! The emitted WGSL fragment defines:
 //!
@@ -20,8 +19,8 @@
 //! - `cell120_sdf_local(p: vec4<f32>) -> f32`: true-Euclidean SDF.
 //! - `cell600_sdf_local(p: vec4<f32>) -> f32`: true-Euclidean SDF.
 //!
-//! Both SDFs use Wolfe's greedy hyperplane projection (matching the
-//! CPU port in `rye_physics::euclidean_r4::polytope_sdf_wolfe`):
+//! Both SDFs use Wolfe's greedy hyperplane projection (matching the CPU port in
+//! `rye_physics::euclidean_r4::polytope_sdf_wolfe`):
 //!   - |S|=1: project onto closest face plane.
 //!   - |S|=2: 2x2 Lagrange-multiplier solve.
 //!   - |S|=3: 3x3 Lagrange-multiplier solve via cofactor expansion.
@@ -38,31 +37,27 @@ use rye_physics::euclidean_r4::{
     icosian_inradius_unit,
 };
 
-/// No-op stub WGSL satisfying the kernel's `cell120_sdf_local` /
-/// `cell600_sdf_local` symbol references when the scene doesn't use
-/// either polytope. Returns `+1e9` (invisible far-away surface) so the
-/// dispatch branches are inert at runtime.
+/// No-op stub WGSL satisfying the kernel's `cell120_sdf_local` / `cell600_sdf_local` symbol
+/// references when the scene doesn't use either polytope. Returns `+1e9` (invisible far-away
+/// surface) so the dispatch branches are inert at runtime.
 ///
-/// The kernel's `body_polytope_sdf_4d` always references both function
-/// names: naga rejects the WGSL otherwise: so callers must include
-/// either this stub or [`polytope_extended_sdfs_wgsl`]. The stub is
-/// tiny (~150 bytes) and adds zero register pressure; prefer it when
-/// the scene contains no 120-cell or 600-cell bodies.
+/// The kernel's `body_polytope_sdf_4d` always references both function names: naga rejects the
+/// WGSL otherwise: so callers must include either this stub or [`polytope_extended_sdfs_wgsl`].
+/// The stub is tiny (~150 bytes) and adds zero register pressure; prefer it when the scene
+/// contains no 120-cell or 600-cell bodies.
 pub fn polytope_stub_sdfs_wgsl() -> &'static str {
     "// ---- Polytope stub SDFs (no 120-cell/600-cell bodies in scene) ----\n\
      fn cell120_sdf_local(p: vec4<f32>) -> f32 { return 1.0e9; }\n\
      fn cell600_sdf_local(p: vec4<f32>) -> f32 { return 1.0e9; }\n"
 }
 
-/// Emit the full WGSL fragment for the 120-cell and 600-cell SDFs.
-/// Append this to the hyperslice4d kernel before naga validation.
+/// Emit the full WGSL fragment for the 120-cell and 600-cell SDFs. Append this to the
+/// hyperslice4d kernel before naga validation.
 ///
-/// Includes ~24 KB of `const` array data (face normals + vertex sets
-/// for both polytopes). On some GPU drivers this constant data
-/// competes with scalar registers and slows ALL pixel-shader work,
-/// even when the cell120/cell600 dispatch branches are never reached.
-/// If your scene has no 120-cell or 600-cell bodies, prefer
-/// [`polytope_stub_sdfs_wgsl`] instead.
+/// Includes ~24 KB of `const` array data (face normals + vertex sets for both polytopes). On
+/// some GPU drivers this constant data competes with scalar registers and slows ALL
+/// pixel-shader work, even when the cell120/cell600 dispatch branches are never reached. If
+/// your scene has no 120-cell or 600-cell bodies, prefer [`polytope_stub_sdfs_wgsl`] instead.
 pub fn polytope_extended_sdfs_wgsl() -> String {
     let mut s = String::with_capacity(32 * 1024);
     s.push_str("// ---- Extended polytope SDFs (120-cell, 600-cell) ----\n");
@@ -120,11 +115,10 @@ fn emit_vec4_array(out: &mut String, name: &str, data: &[Vec4]) {
     out.push_str(");\n");
 }
 
-/// Project `p` onto the intersection of `count` (1..=3) active
-/// hyperplanes (`dot(active[i], q) = inradius`) via Lagrange
-/// multipliers. Mirrors `rye_physics::euclidean_r4::project_onto_active_planes`
-/// 1:1 for the |S|=1, 2, 3 cases; |S|=4 is handled by the per-polytope
-/// SDF via vertex lookup.
+/// Project `p` onto the intersection of `count` (1..=3) active hyperplanes
+/// (`dot(active[i], q) = inradius`) via Lagrange multipliers. Mirrors
+/// `rye_physics::euclidean_r4::project_onto_active_planes` 1:1 for the |S|=1, 2, 3 cases;
+/// |S|=4 is handled by the per-polytope SDF via vertex lookup.
 const WOLFE_PROJECTION_HELPER_WGSL: &str = r#"
 fn polytope_project_active(
     p: vec4<f32>,
@@ -168,9 +162,9 @@ fn polytope_project_active(
 }
 "#;
 
-/// Generate a Wolfe-SDF function for a specific polytope. The function
-/// reads from `face_normals_name` (size `face_count`) for plane queries
-/// and `vertices_name` (size `vertex_count`) for the |S|=4 fallback.
+/// Generate a Wolfe-SDF function for a specific polytope. The function reads from
+/// `face_normals_name` (size `face_count`) for plane queries and `vertices_name` (size
+/// `vertex_count`) for the |S|=4 fallback.
 fn wolfe_sdf_function(
     fn_name: &str,
     face_normals_name: &str,
@@ -261,8 +255,8 @@ fn {fn_name}(p: vec4<f32>) -> f32 {{
 mod tests {
     use super::*;
 
-    /// The emitted WGSL fragment parses and validates against naga.
-    /// Catches any drift between the emit shape and WGSL syntax.
+    /// The emitted WGSL fragment parses and validates against naga. Catches any drift between
+    /// the emit shape and WGSL syntax.
     #[test]
     fn polytope_extended_sdfs_wgsl_validates() {
         let wgsl = polytope_extended_sdfs_wgsl();
@@ -299,8 +293,8 @@ mod tests {
         assert!(wgsl.contains("fn cell600_sdf_local"));
     }
 
-    /// The stub WGSL also parses + validates against naga, satisfying
-    /// the kernel's symbol references with no const-array overhead.
+    /// The stub WGSL also parses + validates against naga, satisfying the kernel's symbol
+    /// references with no const-array overhead.
     #[test]
     fn polytope_stub_sdfs_wgsl_validates() {
         let wgsl = polytope_stub_sdfs_wgsl();
