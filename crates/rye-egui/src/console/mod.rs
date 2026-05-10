@@ -891,8 +891,8 @@ mod tests {
         c.tab_complete();
         assert_eq!(c.input, "capture.stop");
         c.tab_complete();
-        // capture.toggle starts with "capture.t", not "capture.s" — so it isn't
-        // in the match set; cycling wraps back to start.
+        // capture.toggle starts with "capture.t", not "capture.s", so it
+        // isn't in the match set; cycling wraps back to start.
         assert_eq!(c.input, "capture.start");
     }
 

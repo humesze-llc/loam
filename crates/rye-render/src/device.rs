@@ -29,6 +29,9 @@ pub struct SurfaceBundle {
 /// the render target every scene + UI pass writes into, with the
 /// swapchain view used as the resolve target.
 pub struct MsaaTarget {
+    // Held to keep the GPU allocation alive for the lifetime of
+    // `view` (which is a borrow into this texture). Never read
+    // through the field itself.
     #[allow(dead_code)]
     texture: Texture,
     pub view: TextureView,
