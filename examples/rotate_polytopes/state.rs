@@ -1,13 +1,12 @@
-//! Demo state: the [`Demo`] struct, the mode/view/
-//! deferred-action enums, the [`RotorTerm`] data type and its display
-//! helpers, the angular-velocity derivation, body layout, and full
-//! reset.
+//! Demo state: the [`Demo`] struct, the mode/view/deferred-action enums, the
+//! [`RotorTerm`] data type and its display helpers, the angular-velocity
+//! derivation, body layout, and full reset.
 //!
 //! This module owns the data model. Per-mode UI rendering lives in
-//! `modes/{active,composer,filmstrip,shapes}.rs` as additional `impl
-//! Demo` blocks; cross-cutting overlay UI lives in
-//! `ui.rs`. All struct fields are `pub(crate)` so those sibling impls
-//! can access them directly without per-field accessors.
+//! `modes/{active,composer,filmstrip,shapes}.rs` as additional `impl Demo`
+//! blocks; cross-cutting overlay UI lives in `ui.rs`. All struct fields are
+//! `pub(crate)` so those sibling impls can access them directly without
+//! per-field accessors.
 
 use rye_app::{Camera, OrbitController};
 use rye_math::{Bivector4, EuclideanR3, Plane4, Rotor4};
@@ -20,38 +19,36 @@ use crate::consts::{BASE_ROTATION_RATE, BODY_SIZE, BODY_X_SPACING, BODY_Y, T_SLI
 // Mode + view enums
 // ---------------------------------------------------------------------------
 
-/// Continuous-rotation source. Two distinct UIs (active-set
-/// checkboxes vs composed sequence) populate the angular velocity
-/// independently; the user picks which one drives `omega` for the
-/// spin animation via a tab in the rotation tab row.
+/// Continuous-rotation source. Two distinct UIs (active-set checkboxes vs
+/// composed sequence) populate the angular velocity independently; the user
+/// picks which one drives `omega` for the spin animation via a tab in the
+/// rotation tab row.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RotationMode {
-    /// Sum of unit bivectors of planes whose checkboxes are on.
-    /// The classic toggleable mode: 1..6 keys / panel checkboxes.
+    /// Sum of unit bivectors of planes whose checkboxes are on. The classic
+    /// toggleable mode: 1..6 keys / panel checkboxes.
     Active,
-    /// Sum of bivectors derived from the composed seq: each term
-    /// contributes `scalar.unwrap_or(1.0) * sum_of_unit_bivectors`.
-    /// Apply (one-shot rotor multiplication) is still available in
-    /// this mode and is independent of the spin animation.
+    /// Sum of bivectors derived from the composed seq: each term contributes
+    /// `scalar.unwrap_or(1.0) * sum_of_unit_bivectors`. Apply (one-shot
+    /// rotor multiplication) is still available in this mode and is
+    /// independent of the spin animation.
     Composer,
 }
 
-/// Visualisation mode. Orthogonal to [`RotationMode`]: rotation
-/// configures *how* the rotor evolves, view configures *what* the
-/// scene shows. Two distinct visual demos live here, picked by a
-/// top-level tab row above the rotation tabs.
+/// Visualisation mode. Orthogonal to [`RotationMode`]: rotation configures
+/// *how* the rotor evolves, view configures *what* the scene shows. Two
+/// distinct visual demos live here, picked by a top-level tab row above the
+/// rotation tabs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ViewMode {
-    /// Multi-shape comparison: `self.row` of [`ShapeEntry`]s
-    /// rendered side-by-side at one common `w_slice`. Shape order
-    /// in the row is meaningful; drag-and-drop rearranges the
-    /// scene's left-to-right layout.
+    /// Multi-shape comparison: `self.row` of [`ShapeEntry`]s rendered
+    /// side-by-side at one common `w_slice`. Shape order in the row is
+    /// meaningful; drag-and-drop rearranges the scene's left-to-right layout.
     Shapes,
-    /// Single-shape filmstrip: one [`ShapeEntry`] (independent of
-    /// the row) rendered N times across evenly-spaced `w_slice`
-    /// values around the slider's current `w`. Order of the
-    /// scene's row is irrelevant in this mode; the row UI is
-    /// hidden entirely.
+    /// Single-shape filmstrip: one [`ShapeEntry`] (independent of the row)
+    /// rendered N times across evenly-spaced `w_slice` values around the
+    /// slider's current `w`. Order of the scene's row is irrelevant in this
+    /// mode; the row UI is hidden entirely.
     Filmstrip,
 }
 
@@ -59,39 +56,37 @@ pub(crate) enum ViewMode {
 // RotorTerm + display helpers
 // ---------------------------------------------------------------------------
 
-/// One term in the rotor-composition sequence: a sum of unit
-/// bivectors with an optional leading scalar (angle in radians).
+/// One term in the rotor-composition sequence: a sum of unit bivectors with
+/// an optional leading scalar (angle in radians).
 ///
-/// Without a scalar the term is `exp(sum_of_unit_bivectors)`,
-/// which is the natural unit-magnitude rotation along the term's
-/// bivector direction. With a scalar `phi` it becomes
-/// `exp(phi * sum_of_unit_bivectors)`. The scalar is optional by
-/// design: most uses ("rotate 90° in xy") want a scalar, but the
-/// "raw direction" form (just the bivector itself) is useful for
-/// composing isoclinics where the magnitude is implicit.
+/// Without a scalar the term is `exp(sum_of_unit_bivectors)`, which is the
+/// natural unit-magnitude rotation along the term's bivector direction.
+/// With a scalar `phi` it becomes `exp(phi * sum_of_unit_bivectors)`. The
+/// scalar is optional by design: most uses ("rotate 90° in xy") want a
+/// scalar, but the "raw direction" form (just the bivector itself) is
+/// useful for composing isoclinics where the magnitude is implicit.
 ///
-/// Bivector addition within a term is commutative, so plane order
-/// inside a term doesn't matter. Rotor multiplication between
-/// terms is non-commutative, so the seq's term order does.
+/// Bivector addition within a term is commutative, so plane order inside a
+/// term doesn't matter. Rotor multiplication between terms is
+/// non-commutative, so the seq's term order does.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RotorTerm {
-    /// Unit-bivector planes summed inside `exp(...)`. Non-empty
-    /// for a term to display; an empty term is dropped.
+    /// Unit-bivector planes summed inside `exp(...)`. Non-empty for a term
+    /// to display; an empty term is dropped.
     pub(crate) planes: Vec<Plane4>,
-    /// Optional scalar prefix `phi` in radians. `None` means the
-    /// raw bivector sum (unit magnitude); `Some(phi)` scales the
-    /// whole sum before `exp()`. The panel's "Add scalar" action
-    /// initialises this to `FRAC_PI_2`; `Default::default()` is
-    /// `None` so an empty draft commits as a unit-magnitude term.
+    /// Optional scalar prefix `phi` in radians. `None` means the raw
+    /// bivector sum (unit magnitude); `Some(phi)` scales the whole sum
+    /// before `exp()`. The panel's "Add scalar" action initialises this to
+    /// `FRAC_PI_2`; `Default::default()` is `None` so an empty draft commits
+    /// as a unit-magnitude term.
     pub(crate) scalar: Option<f32>,
 }
 
-/// Render `(p_0 + p_1 + ...)` (with parens iff multi-plane) into
-/// the current ui. Each plane goes through `render_plane`, which
-/// decides whether it's an interactive drag pill (term card),
-/// plain monospace (draft card), or anything else. The paren
-/// logic and `+` separators are shared so the visual reading of
-/// a bivector sum stays identical across all callsites.
+/// Render `(p_0 + p_1 + ...)` (with parens iff multi-plane) into the current
+/// ui. Each plane goes through `render_plane`, which decides whether it's an
+/// interactive drag pill (term card), plain monospace (draft card), or
+/// anything else. The paren logic and `+` separators are shared so the
+/// visual reading of a bivector sum stays identical across all callsites.
 pub(crate) fn render_plane_sum(
     ui: &mut rye_app::egui::Ui,
     planes: &[Plane4],
@@ -112,10 +107,9 @@ pub(crate) fn render_plane_sum(
     }
 }
 
-/// Render a single [`RotorTerm`] as the `scalar · bivec` form
-/// that appears inside `exp(...)`. Multi-plane terms get inner
-/// parens; the lone scalar prefix is dropped when absent. Pure
-/// presentation, no math.
+/// Render a single [`RotorTerm`] as the `scalar · bivec` form that appears
+/// inside `exp(...)`. Multi-plane terms get inner parens; the lone scalar
+/// prefix is dropped when absent. Pure presentation, no math.
 pub(crate) fn render_term(term: &RotorTerm) -> String {
     let plane_str = term
         .planes
@@ -134,9 +128,9 @@ pub(crate) fn render_term(term: &RotorTerm) -> String {
     }
 }
 
-/// Wrap a list of bivector-expression parts into a single bivector
-/// expression (paren-grouped when there's more than one part). None
-/// when the list is empty so the caller can return early.
+/// Wrap a list of bivector-expression parts into a single bivector expression
+/// (paren-grouped when there's more than one part). None when the list is
+/// empty so the caller can return early.
 pub(crate) fn render_bivector_sum(parts: &[String]) -> Option<String> {
     match parts {
         [] => None,
@@ -146,16 +140,15 @@ pub(crate) fn render_bivector_sum(parts: &[String]) -> Option<String> {
 }
 
 /// Angular velocity from a composed seq: sum over terms of
-/// `scalar * sum_of_unit_bivectors_in_term`, scaled by rate_scale.
-/// Bivector addition is commutative, so term order is irrelevant
-/// in this continuous mode (it matters for the multiplicative
-/// `Apply` action, but that's a separate one-shot path).
+/// `scalar * sum_of_unit_bivectors_in_term`, scaled by rate_scale. Bivector
+/// addition is commutative, so term order is irrelevant in this continuous
+/// mode (it matters for the multiplicative `Apply` action, but that's a
+/// separate one-shot path).
 ///
-/// The Active-mode angular velocity is structurally a special case:
-/// each active plane is one unit term with `scalar = None`. The
-/// app-level `omega_per_sec` dispatcher inlines that walk over the
-/// `[bool; 6]` directly to avoid allocating a transient seq each
-/// frame.
+/// The Active-mode angular velocity is structurally a special case: each
+/// active plane is one unit term with `scalar = None`. The app-level
+/// `omega_per_sec` dispatcher inlines that walk over the `[bool; 6]`
+/// directly to avoid allocating a transient seq each frame.
 pub(crate) fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> Bivector4 {
     let mut omega = Bivector4::ZERO;
     for term in seq {
@@ -171,18 +164,17 @@ pub(crate) fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> B
 // Deferred action queue
 // ---------------------------------------------------------------------------
 
-/// State mutations queued during overlay rendering and applied
-/// AFTER the overlay's measure + visible passes finish. Any
-/// mutation that changes the overlay's natural content height
-/// must go through this; applying mid-frame would make the two
-/// `BottomOverlay` passes disagree on body height and the user
-/// would see a one-frame layout mismatch as flicker.
+/// State mutations queued during overlay rendering and applied AFTER the
+/// overlay's measure + visible passes finish. Any mutation that changes the
+/// overlay's natural content height must go through this; applying mid-frame
+/// would make the two `BottomOverlay` passes disagree on body height and the
+/// user would see a one-frame layout mismatch as flicker.
 #[derive(Clone, Debug)]
 pub(crate) enum DeferredAction {
     /// `+xy` etc. button on the plane row: append to draft.
     DraftPush(Plane4),
-    /// `Add` button on the draft preview: commit current draft as a
-    /// new RotorTerm in seq, clear draft.
+    /// `Add` button on the draft preview: commit current draft as a new
+    /// RotorTerm in seq, clear draft.
     SeqCommitDraft,
     /// `×` button on the draft preview: discard the draft.
     DraftClear,
@@ -190,17 +182,17 @@ pub(crate) enum DeferredAction {
     SeqPushTerm(RotorTerm),
 }
 
-/// Drag-and-drop payload for the rotor sequence UI. Terms (whole
-/// cards) and plane entries (pills inside cards) both ride this
-/// single enum so a term card can be a single drop zone that
-/// branches on the variant: a `Term` payload reorders the seq, an
-/// `Entry` payload migrates a plane into this term.
+/// Drag-and-drop payload for the rotor sequence UI. Terms (whole cards) and
+/// plane entries (pills inside cards) both ride this single enum so a term
+/// card can be a single drop zone that branches on the variant: a `Term`
+/// payload reorders the seq, an `Entry` payload migrates a plane into this
+/// term.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DragPayload {
     /// The whole term at this seq index is being dragged.
     Term(usize),
-    /// `Entry(term_idx, plane_idx)`: a single plane pill from the
-    /// given term is being dragged.
+    /// `Entry(term_idx, plane_idx)`: a single plane pill from the given term
+    /// is being dragged.
     Entry(usize, usize),
 }
 
@@ -208,9 +200,9 @@ pub(crate) enum DragPayload {
 // Body layout helper
 // ---------------------------------------------------------------------------
 
-/// Position of the `slot`-th body in a row of `n` bodies, centred
-/// on the world origin and spaced by [`BODY_X_SPACING`]. Used by
-/// both initial body layout and per-frame body uniforms.
+/// Position of the `slot`-th body in a row of `n` bodies, centred on the
+/// world origin and spaced by [`BODY_X_SPACING`]. Used by both initial body
+/// layout and per-frame body uniforms.
 pub(crate) fn body_position(slot: usize, n: usize) -> [f32; 4] {
     let x = (slot as f32 - (n as f32 - 1.0) * 0.5) * BODY_X_SPACING;
     [x, BODY_Y, 0.0, 0.0]
@@ -226,8 +218,8 @@ pub(crate) struct Demo {
     pub(crate) orbit: OrbitController<EuclideanR3>,
     pub(crate) node: Hyperslice4DNode,
     /// Polytope row built at startup from `--shapes` CLI args (or
-    /// `DEFAULT_ROW`); drives both the body uniforms and per-body
-    /// label lookups in the overlay.
+    /// `DEFAULT_ROW`); drives both the body uniforms and per-body label
+    /// lookups in the overlay.
     pub(crate) row: Vec<ShapeEntry>,
 
     pub(crate) w_slice: f32,

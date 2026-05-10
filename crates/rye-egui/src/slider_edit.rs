@@ -17,29 +17,26 @@ use egui::{
     vec2, Align, Button, CursorIcon, DragValue, Layout, RichText, Slider, SliderClamping, Ui,
 };
 
-/// What happened to a [`slider_with_edit`] this frame. `changed`
-/// fires from either source (slider drag, popup edit, or any
-/// external mutation that the slider observes); `dragged` is
-/// strictly user-on-the-slider this frame. Callers that recompute
-/// expensive state ONLY when the user is actively scrubbing should
-/// gate on `dragged` so they don't refire when something else
-/// (e.g., a per-frame integrator) advances the value.
+/// What happened to a [`slider_with_edit`] this frame. `changed` fires from
+/// either source (slider drag, popup edit, or any external mutation that the
+/// slider observes); `dragged` is strictly user-on-the-slider this frame.
+/// Callers that recompute expensive state ONLY when the user is actively
+/// scrubbing should gate on `dragged` so they don't refire when something
+/// else (e.g., a per-frame integrator) advances the value.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct SliderInteraction {
     pub changed: bool,
     pub dragged: bool,
 }
 
-/// Render a slider with a fixed-width side cell that displays
-/// `formatted` and opens a precise-edit [`DragValue`](egui::DragValue)
-/// popup on right-click. Returns a [`SliderInteraction`] reporting
-/// whether the value changed and whether the user was actively
-/// dragging this frame.
+/// Render a slider with a fixed-width side cell that displays `formatted`
+/// and opens a precise-edit [`DragValue`](egui::DragValue) popup on
+/// right-click. Returns a [`SliderInteraction`] reporting whether the value
+/// changed and whether the user was actively dragging this frame.
 ///
-/// `value_cell_w` is the fixed width allocated to the side label
-/// cell. Without a fixed width the cell would resize as the value's
-/// character count varies, shifting the slider's right edge frame-
-/// to-frame.
+/// `value_cell_w` is the fixed width allocated to the side label cell.
+/// Without a fixed width the cell would resize as the value's character
+/// count varies, shifting the slider's right edge frame-to-frame.
 pub fn slider_with_edit(
     ui: &mut Ui,
     value: &mut f32,

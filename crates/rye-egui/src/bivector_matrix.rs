@@ -1,30 +1,29 @@
 //! Antisymmetric-matrix display of a [`Bivector4`].
 //!
 //! For a bivector `B` in 4D, the natural matrix representation is the
-//! antisymmetric 4×4 with `M_ij = B_ij = -M_ji`, where the upper-
-//! triangle entries are the six bivector components in the
-//! `e_i ∧ e_j` basis convention:
+//! antisymmetric 4×4 with `M_ij = B_ij = -M_ji`, where the upper-triangle
+//! entries are the six bivector components in the `e_i ∧ e_j` basis
+//! convention:
 //!
 //! - `M_01 = xy`, `M_02 = xz`, `M_03 = xw`
 //! - `M_12 = yz`, `M_13 = yw`, `M_23 = zw`
 //! - Diagonal is zero, lower triangle is `-M_ji`.
 //!
-//! For an angular-velocity bivector `ω`, this matrix is the operator
-//! such that `dx/dt = ω x` (treating `x` as a 4-vector), so the
-//! display reads "rate of change of axis-`i` due to motion in plane
-//! `(i, j)`." Values render in degrees per unit time.
+//! For an angular-velocity bivector `ω`, this matrix is the operator such
+//! that `dx/dt = ω x` (treating `x` as a 4-vector), so the display reads
+//! "rate of change of axis-`i` due to motion in plane `(i, j)`." Values
+//! render in degrees per unit time.
 //!
-//! Reference: any geometric-algebra textbook on bivectors as
-//! infinitesimal rotors. Hestenes & Sobczyk, *Clifford Algebra to
-//! Geometric Calculus*, ch. 1, treats the 2-blade / antisymmetric-
-//! tensor correspondence directly.
+//! Reference: any geometric-algebra textbook on bivectors as infinitesimal
+//! rotors. Hestenes & Sobczyk, *Clifford Algebra to Geometric Calculus*,
+//! ch. 1, treats the 2-blade / antisymmetric-tensor correspondence directly.
 
 use egui::{Grid, Label, Response, RichText, Ui};
 use rye_math::{Bivector4, Plane4};
 
 /// Render `b` as a labeled antisymmetric 4×4 matrix. Cells display
-/// degrees-per-unit-time with a `+5.1` format (sign, four digits,
-/// one decimal).
+/// degrees-per-unit-time with a `+5.1` format (sign, four digits, one
+/// decimal).
 pub fn bivector_matrix(ui: &mut Ui, b: &Bivector4) -> Response {
     Grid::new("rye_egui_bivector_matrix")
         .num_columns(5)
@@ -47,14 +46,14 @@ pub fn bivector_matrix(ui: &mut Ui, b: &Bivector4) -> Response {
         .response
 }
 
-/// Axis labels used for both the column header row and the leading
-/// label cell of each row.
+/// Axis labels used for both the column header row and the leading label
+/// cell of each row.
 const AXIS: [&str; 4] = ["x", "y", "z", "w"];
 
 /// Text rendered in matrix cell `(row, col)`. Public for testing the
-/// formatting contract independently of egui's render path. Diagonal
-/// is `"0"`; off-diagonal is `"+%.1"` of the signed degrees value;
-/// lower triangle inherits the negation `M_ji = -M_ij`.
+/// formatting contract independently of egui's render path. Diagonal is
+/// `"0"`; off-diagonal is `"+%.1"` of the signed degrees value; lower
+/// triangle inherits the negation `M_ji = -M_ij`.
 pub fn cell_text(b: &Bivector4, row: usize, col: usize) -> String {
     if row == col {
         "0".to_string()
@@ -85,10 +84,10 @@ mod tests {
     use super::*;
     use egui::{Pos2, Rect, Vec2};
 
-    /// Construct a `Bivector4` with a single non-zero plane set to
-    /// 1 radian. The matrix should show `+57.3` at the corresponding
-    /// upper-triangle cell, `-57.3` at the mirror lower-triangle
-    /// cell, and `0` everywhere else.
+    /// Construct a `Bivector4` with a single non-zero plane set to 1 radian.
+    /// The matrix should show `+57.3` at the corresponding upper-triangle
+    /// cell, `-57.3` at the mirror lower-triangle cell, and `0` everywhere
+    /// else.
     fn pure(plane: Plane4) -> Bivector4 {
         let mut b = Bivector4::ZERO;
         b.set_component(plane, 1.0);
@@ -106,9 +105,9 @@ mod tests {
     #[test]
     fn cell_text_zero_bivector_off_diagonal_is_signed_zero() {
         let b = Bivector4::ZERO;
-        // The `{:>+5.1}` format shows zero as ` +0.0` (leading space,
-        // sign, 0.0). We pin the format to lock the column-width
-        // contract that drove the original cell_text design.
+        // The `{:>+5.1}` format shows zero as ` +0.0` (leading space, sign,
+        // 0.0). We pin the format to lock the column-width contract that
+        // drove the original cell_text design.
         assert_eq!(cell_text(&b, 0, 1), " +0.0");
         assert_eq!(cell_text(&b, 1, 0), " -0.0");
     }
@@ -126,8 +125,8 @@ mod tests {
 
     #[test]
     fn cell_text_each_basis_plane_lights_correct_cell() {
-        // Pair-by-pair audit: which (row, col) pair corresponds to
-        // each basis plane.
+        // Pair-by-pair audit: which (row, col) pair corresponds to each
+        // basis plane.
         let cases = [
             (Plane4::Xy, (0, 1)),
             (Plane4::Xz, (0, 2)),
@@ -160,8 +159,8 @@ mod tests {
         assert_eq!(cell_text(&b, 0, 1), " +0.1");
     }
 
-    /// Headless render check: the widget allocates a non-empty rect
-    /// and doesn't panic with a representative bivector.
+    /// Headless render check: the widget allocates a non-empty rect and
+    /// doesn't panic with a representative bivector.
     #[test]
     fn renders_in_central_panel() {
         let ctx = egui::Context::default();

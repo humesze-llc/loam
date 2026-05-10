@@ -256,31 +256,31 @@ pub fn chevron_button(ui: &mut Ui, size: Vec2, up: bool, hover: &str) -> Respons
 }
 
 /// Two chevrons stacked vertically, painted as line primitives.
-/// `pointing_up = false` draws both chevrons pointing down (the
-/// "send away / collapse" direction); `true` draws them pointing
-/// up. Used as a detach / dock affordance for floating panels.
+/// `pointing_up = false` draws both chevrons pointing down (the "send away
+/// / collapse" direction); `true` draws them pointing up. Used as a detach
+/// / dock affordance for floating panels.
 ///
-/// Drawn from primitives rather than text because no Unicode
-/// codepoint renders as two chevrons stacked vertically inside a
-/// single line of monospace; the closest "Paired Arrows" and
-/// "Arrow With Double Stroke" codepoints are either side-by-side
-/// or single-arrow variants. Hover and active states inherit from
-/// egui's interaction styling via `style.fg_stroke.color`, so the
-/// icon brightens on hover without per-color hardcoding.
+/// Drawn from primitives rather than text because no Unicode codepoint
+/// renders as two chevrons stacked vertically inside a single line of
+/// monospace; the closest "Paired Arrows" and "Arrow With Double Stroke"
+/// codepoints are either side-by-side or single-arrow variants. Hover and
+/// active states inherit from egui's interaction styling via
+/// `style.fg_stroke.color`, so the icon brightens on hover without
+/// per-color hardcoding.
 ///
-/// `hover` is the tooltip string. Caller is expected to choose a
-/// `size` proportioned for vertical stacking (height noticeably
-/// larger than width); a 12×16 footprint is the canonical
-/// in-title-row size used by `rye-egui::console`.
+/// `hover` is the tooltip string. Caller is expected to choose a `size`
+/// proportioned for vertical stacking (height noticeably larger than
+/// width); a 12×16 footprint is the canonical in-title-row size used by
+/// `rye-egui::console`.
 pub fn dock_chevrons(ui: &mut Ui, size: Vec2, pointing_up: bool, hover: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let style = ui.style().interact(&response);
 
-    // Chevron geometry, scaled to the icon footprint. The
-    // proportions (~1/3 width, ~1/6 height per chevron, ~1/3
-    // height between them) were tuned at the canonical 12x16
-    // size; clamps keep the shape readable at smaller (title-row
-    // icon) and larger (debug overlay zoom) extremes alike.
+    // Chevron geometry, scaled to the icon footprint. The proportions (~1/3
+    // width, ~1/6 height per chevron, ~1/3 height between them) were tuned
+    // at the canonical 12x16 size; clamps keep the shape readable at
+    // smaller (title-row icon) and larger (debug overlay zoom) extremes
+    // alike.
     let half_w = (size.x * 0.34).clamp(2.0, 6.0);
     let half_h = (size.y * 0.16).clamp(1.5, 4.0);
     let gap = (size.y * 0.32).clamp(3.0, 8.0);

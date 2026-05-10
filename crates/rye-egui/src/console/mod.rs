@@ -2,40 +2,39 @@
 //! command registry, scrollback, hotkey binding, and tab autocomplete.
 //!
 //! The interaction model follows the idTech console (Quake, 1996): a
-//! drop-down activated by `` ` ``, monospace scrollback above an input
-//! line, history navigated with Up/Down, completion via Tab, hotkey
-//! binds for arbitrary command lines.
+//! drop-down activated by `` ` ``, monospace scrollback above an input line,
+//! history navigated with Up/Down, completion via Tab, hotkey binds for
+//! arbitrary command lines.
 //!
 //! ## What lives here vs what doesn't
 //!
 //! - **Here**: [`Console`] (the main type), [`Command`] trait + [`cmd`]
-//!   closure shim, [`ConsoleWriter`] (output collector), key handling
-//!   for the input line, the parser. `Console` is generic over a `Ctx`
-//!   type so consuming crates choose what state commands operate on.
-//! - **Not here**: built-in commands (`screenshot`, `capture.start`,
-//!   `bind`, `quit`). Those depend on app/runtime state and live in
-//!   `rye-app::builtins`. This module ships only `help` and `clear`,
-//!   which need only `Console` itself.
+//!   closure shim, [`ConsoleWriter`] (output collector), key handling for
+//!   the input line, the parser. `Console` is generic over a `Ctx` type so
+//!   consuming crates choose what state commands operate on.
+//! - **Not here**: built-in commands (`screenshot`, `capture.start`, `bind`,
+//!   `quit`). Those depend on app/runtime state and live in
+//!   `rye-app::builtins`. This module ships only `help` and `clear`, which
+//!   need only `Console` itself.
 //!
 //! ## Why egui consumes the keys before TextEdit sees them
 //!
-//! Egui's `TextEdit::singleline` swallows printable characters into
-//! the buffer and uses `Tab` to move focus. Without explicit
-//! interception, the toggle key (`` ` ``) types a backtick into the
-//! input the moment the console opens, and `Tab` shifts focus off the
-//! input box. The key handler at the top of [`Console::ui`] uses
-//! `egui::InputState::consume_key` to claim the keystrokes before
-//! TextEdit's per-frame processing runs. Up/Down/Tab/Esc/Ctrl+L/Ctrl+C
-//! are intercepted the same way; Enter is detected via the TextEdit
-//! response in the panel module so we still get `lost_focus`-on-submit
-//! semantics.
+//! Egui's `TextEdit::singleline` swallows printable characters into the
+//! buffer and uses `Tab` to move focus. Without explicit interception, the
+//! toggle key (`` ` ``) types a backtick into the input the moment the
+//! console opens, and `Tab` shifts focus off the input box. The key handler
+//! at the top of [`Console::ui`] uses `egui::InputState::consume_key` to
+//! claim the keystrokes before TextEdit's per-frame processing runs.
+//! Up/Down/Tab/Esc/Ctrl+L/Ctrl+C are intercepted the same way; Enter is
+//! detected via the TextEdit response in the panel module so we still get
+//! `lost_focus`-on-submit semantics.
 //!
 //! ## Constants
 //!
 //! Tunables are module-level `const`s ([`MAX_HISTORY_LINES`],
 //! [`MAX_INPUT_HISTORY`], [`ANIM_DURATION_SECS`],
-//! [`PANEL_HEIGHT_FRACTION`]) rather than runtime config; the values are
-//! UX choices, not deployment knobs.
+//! [`PANEL_HEIGHT_FRACTION`]) rather than runtime config; the values are UX
+//! choices, not deployment knobs.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -45,17 +44,16 @@ mod panel;
 /// Sized for a session's worth of debugging without unbounded memory.
 pub const MAX_HISTORY_LINES: usize = 2000;
 
-/// Input-history cap (Up/Down nav). 100 covers a typical session;
-/// larger and old entries become noise during cycling.
+/// Input-history cap (Up/Down nav). 100 covers a typical session; larger and
+/// old entries become noise during cycling.
 pub const MAX_INPUT_HISTORY: usize = 100;
 
-/// Slide-down animation duration. 0.15s is fast enough to feel
-/// responsive, slow enough to read as motion.
+/// Slide-down animation duration. 0.15s is fast enough to feel responsive,
+/// slow enough to read as motion.
 pub const ANIM_DURATION_SECS: f32 = 0.15;
 
-/// Fraction of the viewport height the open console occupies. 0.5 is
-/// the Quake convention: enough scrollback visible, scene visible
-/// below.
+/// Fraction of the viewport height the open console occupies. 0.5 is the
+/// Quake convention: enough scrollback visible, scene visible below.
 pub const PANEL_HEIGHT_FRACTION: f32 = 0.5;
 
 // ---------------------------------------------------------------------------
@@ -114,14 +112,13 @@ pub enum LineKind {
 // ---------------------------------------------------------------------------
 
 /// Per-invocation output sink. Commands push lines via
-/// [`ConsoleWriter::line`] / [`ConsoleWriter::error`]; the console
-/// drains the collected lines into the scrollback after the command
-/// returns.
+/// [`ConsoleWriter::line`] / [`ConsoleWriter::error`]; the console drains
+/// the collected lines into the scrollback after the command returns.
 ///
-/// The two-phase design (command writes to local Vec, console drains)
-/// avoids the borrow conflict between the command's mutable access to
-/// the registry slot and the console's mutable access to its own
-/// scrollback during the same `execute` call.
+/// The two-phase design (command writes to local Vec, console drains) avoids
+/// the borrow conflict between the command's mutable access to the registry
+/// slot and the console's mutable access to its own scrollback during the
+/// same `execute` call.
 pub struct ConsoleWriter {
     lines: Vec<HistoryLine>,
 }
@@ -136,8 +133,8 @@ impl ConsoleWriter {
         self.lines.push(HistoryLine::output(text));
     }
 
-    /// Append an error line. Use for command-level failures the user
-    /// should see; bubble unrecoverable errors via `Result` instead.
+    /// Append an error line. Use for command-level failures the user should
+    /// see; bubble unrecoverable errors via `Result` instead.
     pub fn error(&mut self, text: impl Into<String>) {
         self.lines.push(HistoryLine::error(text));
     }
@@ -148,20 +145,20 @@ impl ConsoleWriter {
 // ---------------------------------------------------------------------------
 
 /// Console command implementation. Generic over a `Ctx` type so the
-/// consuming crate decides what state commands can mutate. For Rye
-/// this is typically a struct holding `&mut dyn App`, `&mut Capture`,
-/// and an exit signal.
+/// consuming crate decides what state commands can mutate. For Rye this is
+/// typically a struct holding `&mut dyn App`, `&mut Capture`, and an exit
+/// signal.
 pub trait Command<Ctx>: 'static {
-    /// The name typed at the prompt. Conventionally lowercase, dotted
-    /// for namespacing (`capture.start`).
+    /// The name typed at the prompt. Conventionally lowercase, dotted for
+    /// namespacing (`capture.start`).
     fn name(&self) -> &str;
 
     /// One-line description shown by `help`.
     fn help(&self) -> &str;
 
-    /// Run the command. `args` are whitespace-split tokens after the
-    /// command name. Output goes to `out`; recoverable issues get
-    /// `out.error(..)`; unrecoverable ones return `Err`.
+    /// Run the command. `args` are whitespace-split tokens after the command
+    /// name. Output goes to `out`; recoverable issues get `out.error(..)`;
+    /// unrecoverable ones return `Err`.
     fn run(&mut self, args: &[&str], ctx: &mut Ctx, out: &mut ConsoleWriter) -> anyhow::Result<()>;
 }
 
@@ -172,9 +169,9 @@ pub struct FnCommand<F> {
     f: F,
 }
 
-/// Build a [`Command`] from a closure. The closure mutates a `Ctx` and
-/// writes lines into the [`ConsoleWriter`]. Idiomatic for inline
-/// per-demo registrations.
+/// Build a [`Command`] from a closure. The closure mutates a `Ctx` and writes
+/// lines into the [`ConsoleWriter`]. Idiomatic for inline per-demo
+/// registrations.
 ///
 /// ```ignore
 /// console.register(cmd("teleport", "teleport <x> <y> <z>", |args, ctx, out| {
@@ -234,30 +231,28 @@ pub struct Console<Ctx> {
     history: VecDeque<HistoryLine>,
     input: String,
     input_history: VecDeque<String>,
-    /// `Some(i)` while cycling history with Up/Down; `None` after
-    /// `Enter` or after typing into a fresh input.
+    /// `Some(i)` while cycling history with Up/Down; `None` after `Enter` or
+    /// after typing into a fresh input.
     input_history_pos: Option<usize>,
-    /// Active tab-completion cycle, if any. Cleared on any input edit
-    /// that isn't a tab-complete itself.
+    /// Active tab-completion cycle, if any. Cleared on any input edit that
+    /// isn't a tab-complete itself.
     tab: Option<TabState>,
     open: bool,
-    /// True for the frame after `open` becomes true so the panel can
-    /// request focus once.
+    /// True for the frame after `open` becomes true so the panel can request
+    /// focus once.
     pending_focus: bool,
-    /// Right-aligned text in the title row. Host fills with anything
-    /// useful (fps, recording state, current scene); empty by default.
+    /// Right-aligned text in the title row. Host fills with anything useful
+    /// (fps, recording state, current scene); empty by default.
     status: String,
-    /// `false` for the half-screen drop-down (default Quake-style),
-    /// `true` for a draggable / resizable egui Window. Detached mode
-    /// lets the user click outside the console to give keyboard
-    /// focus back to the app, since the docked console
-    /// permanently captures keyboard while open.
+    /// `false` for the half-screen drop-down (default Quake-style), `true`
+    /// for a draggable / resizable egui Window. Detached mode lets the user
+    /// click outside the console to give keyboard focus back to the app,
+    /// since the docked console permanently captures keyboard while open.
     detached: bool,
-    /// Set in docked mode when the user clicks outside the panel
-    /// rect; suppresses the input row's per-frame focus re-request
-    /// so mouse + keyboard go back to the app while the console
-    /// stays visible. Cleared by clicking back inside the panel
-    /// or by reopening the console.
+    /// Set in docked mode when the user clicks outside the panel rect;
+    /// suppresses the input row's per-frame focus re-request so mouse +
+    /// keyboard go back to the app while the console stays visible. Cleared
+    /// by clicking back inside the panel or by reopening the console.
     user_defocused: bool,
 }
 
@@ -273,8 +268,7 @@ impl<Ctx: 'static> Default for Console<Ctx> {
 }
 
 impl<Ctx: 'static> Console<Ctx> {
-    /// Empty console with no commands, no binds, default `` ` `` toggle
-    /// key.
+    /// Empty console with no commands, no binds, default `` ` `` toggle key.
     pub fn new() -> Self {
         Self {
             commands: BTreeMap::new(),
@@ -299,22 +293,22 @@ impl<Ctx: 'static> Console<Ctx> {
         self
     }
 
-    /// Register a command. Replaces any existing command of the same
-    /// name without warning; consuming crates can pre-check via
+    /// Register a command. Replaces any existing command of the same name
+    /// without warning; consuming crates can pre-check via
     /// [`Console::has_command`] if they care.
     pub fn register<C: Command<Ctx> + 'static>(&mut self, command: C) {
         let name = command.name().to_string();
         self.commands.insert(name, Box::new(command));
     }
 
-    /// True if a command with this name is registered. `help` and
-    /// `clear` are built in and always return true.
+    /// True if a command with this name is registered. `help` and `clear`
+    /// are built in and always return true.
     pub fn has_command(&self, name: &str) -> bool {
         name == "help" || name == "clear" || self.commands.contains_key(name)
     }
 
-    /// Bind `key` (no modifiers) to execute `command_line` when the
-    /// console is closed. Re-binding overwrites the previous binding.
+    /// Bind `key` (no modifiers) to execute `command_line` when the console
+    /// is closed. Re-binding overwrites the previous binding.
     pub fn bind(&mut self, key: egui::Key, command_line: impl Into<String>) {
         self.binds.insert(key, command_line.into());
     }
@@ -329,8 +323,8 @@ impl<Ctx: 'static> Console<Ctx> {
         if !self.open {
             self.open = true;
             self.pending_focus = true;
-            // Reopening clears any prior click-outside defocus so
-            // typing lands in the input again.
+            // Reopening clears any prior click-outside defocus so typing
+            // lands in the input again.
             self.user_defocused = false;
         }
     }
@@ -354,15 +348,13 @@ impl<Ctx: 'static> Console<Ctx> {
         self.open
     }
 
-    /// Switch to detached mode: console renders as a draggable /
-    /// resizable [`egui::Window`] instead of the half-screen drop-
-    /// down. Idempotent.
+    /// Switch to detached mode: console renders as a draggable / resizable
+    /// [`egui::Window`] instead of the half-screen drop-down. Idempotent.
     pub fn detach(&mut self) {
         self.detached = true;
     }
 
-    /// Switch to docked mode: half-screen drop-down (the default).
-    /// Idempotent.
+    /// Switch to docked mode: half-screen drop-down (the default). Idempotent.
     pub fn dock(&mut self) {
         self.detached = false;
     }
@@ -372,28 +364,27 @@ impl<Ctx: 'static> Console<Ctx> {
         self.detached
     }
 
-    /// Append a line to the scrollback. Useful for system messages
-    /// generated outside command execution (e.g., a background
-    /// recording finishing).
+    /// Append a line to the scrollback. Useful for system messages generated
+    /// outside command execution (e.g., a background recording finishing).
     pub fn write(&mut self, line: HistoryLine) {
         self.push_history(line);
     }
 
-    /// Set the title-row status text (right-aligned). Host calls this
-    /// each frame with whatever readout it wants visible in the
-    /// console: fps, recording elapsed, scene name, etc.
+    /// Set the title-row status text (right-aligned). Host calls this each
+    /// frame with whatever readout it wants visible in the console: fps,
+    /// recording elapsed, scene name, etc.
     pub fn set_status(&mut self, text: impl Into<String>) {
         self.status = text.into();
     }
 
-    /// Per-frame entry point. Handles toggle key, hotkey binds (when
-    /// closed), in-panel keys (when open), animation, and panel
-    /// rendering. Call once per frame from the host's egui pass.
+    /// Per-frame entry point. Handles toggle key, hotkey binds (when closed),
+    /// in-panel keys (when open), animation, and panel rendering. Call once
+    /// per frame from the host's egui pass.
     pub fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut Ctx) {
-        // 1. Toggle key always active. `consume_key` strips the Key
-        // event, but printable keys (Backtick, etc.) also produce a
-        // Text event that TextEdit reads independently; strip that
-        // too or it leaks into the input box on the second press.
+        // 1. Toggle key always active. `consume_key` strips the Key event,
+        // but printable keys (Backtick, etc.) also produce a Text event that
+        // TextEdit reads independently; strip that too or it leaks into the
+        // input box on the second press.
         let toggle_text = key_text(self.toggle_key);
         let toggle_pressed = egui_ctx.input_mut(|i| {
             let pressed = i.consume_key(egui::Modifiers::NONE, self.toggle_key);
@@ -432,11 +423,10 @@ impl<Ctx: 'static> Console<Ctx> {
             self.handle_panel_keys(egui_ctx);
         }
 
-        // 4. Animate panel height (docked only). Detached mode
-        // shows/hides instantly: the egui Window has its own
-        // appearance, so animating a slide value would only
-        // produce dead frames where `open=false` is still being
-        // drawn.
+        // 4. Animate panel height (docked only). Detached mode shows/hides
+        // instantly: the egui Window has its own appearance, so animating a
+        // slide value would only produce dead frames where `open=false` is
+        // still being drawn.
         let target = if self.open { 1.0 } else { 0.0 };
         let progress = egui_ctx.animate_value_with_time(
             egui::Id::new("rye_console_open_progress"),
@@ -553,9 +543,9 @@ impl<Ctx: 'static> Console<Ctx> {
         names
     }
 
-    /// Execute a command line. Echoes input, looks up the command,
-    /// runs it, drains output. Built-in `help` and `clear` short-
-    /// circuit before registry lookup.
+    /// Execute a command line. Echoes input, looks up the command, runs it,
+    /// drains output. Built-in `help` and `clear` short-circuit before
+    /// registry lookup.
     pub fn execute(&mut self, line: &str, ctx: &mut Ctx) {
         let line = line.trim();
         if line.is_empty() {
@@ -669,17 +659,15 @@ impl<Ctx: 'static> Console<Ctx> {
 // Parser
 // ---------------------------------------------------------------------------
 
-/// Printable text the OS produces for a key, when one exists. Used
-/// to strip the corresponding `egui::Event::Text` after consuming
-/// the key event for the toggle: without this, pressing Backtick
-/// to toggle the console open and pressing it again to toggle closed
-/// also types `` ` `` into the input box (the Key event is consumed
-/// but the Text event isn't).
+/// Printable text the OS produces for a key, when one exists. Used to strip
+/// the corresponding `egui::Event::Text` after consuming the key event for
+/// the toggle: without this, pressing Backtick to toggle the console open
+/// and pressing it again to toggle closed also types `` ` `` into the input
+/// box (the Key event is consumed but the Text event isn't).
 ///
-/// Only the keys that plausibly serve as a console-toggle are
-/// covered (Backtick is the default; Tilde is the natural alternate
-/// on US layouts). Other keys return `None`; their Text events stay
-/// untouched.
+/// Only the keys that plausibly serve as a console-toggle are covered
+/// (Backtick is the default; Tilde is the natural alternate on US layouts).
+/// Other keys return `None`; their Text events stay untouched.
 fn key_text(key: egui::Key) -> Option<&'static str> {
     match key {
         egui::Key::Backtick => Some("`"),
@@ -687,10 +675,9 @@ fn key_text(key: egui::Key) -> Option<&'static str> {
     }
 }
 
-/// Whitespace-split parser. Returns `(command_name, args)` or `None`
-/// for an empty/whitespace-only line. No quoting in v0; commands that
-/// need spaces in args should split on something else or wait for the
-/// quoted-arg upgrade.
+/// Whitespace-split parser. Returns `(command_name, args)` or `None` for an
+/// empty/whitespace-only line. No quoting in v0; commands that need spaces
+/// in args should split on something else or wait for the quoted-arg upgrade.
 fn parse_line(line: &str) -> Option<(String, Vec<String>)> {
     let mut parts = line.split_whitespace();
     let name = parts.next()?.to_string();
