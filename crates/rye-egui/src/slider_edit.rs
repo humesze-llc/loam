@@ -17,10 +17,24 @@ use egui::{
     vec2, Align, Button, CursorIcon, DragValue, Layout, RichText, Slider, SliderClamping, Ui,
 };
 
+/// What happened to a [`slider_with_edit`] this frame. `changed`
+/// fires from either source (slider drag, popup edit, or any
+/// external mutation that the slider observes); `dragged` is
+/// strictly user-on-the-slider this frame. Callers that recompute
+/// expensive state ONLY when the user is actively scrubbing should
+/// gate on `dragged` so they don't refire when something else
+/// (e.g., a per-frame integrator) advances the value.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SliderInteraction {
+    pub changed: bool,
+    pub dragged: bool,
+}
+
 /// Render a slider with a fixed-width side cell that displays
 /// `formatted` and opens a precise-edit [`DragValue`](egui::DragValue)
-/// popup on right-click. Returns `true` if the value changed this
-/// frame from either the slider drag or the popup.
+/// popup on right-click. Returns a [`SliderInteraction`] reporting
+/// whether the value changed and whether the user was actively
+/// dragging this frame.
 ///
 /// `value_cell_w` is the fixed width allocated to the side label
 /// cell. Without a fixed width the cell would resize as the value's
@@ -34,7 +48,7 @@ pub fn slider_with_edit(
     edit_suffix: &str,
     edit_decimals: usize,
     value_cell_w: f32,
-) -> bool {
+) -> SliderInteraction {
     let slider_resp = ui.add(
         Slider::new(value, range.clone())
             .show_value(false)
@@ -67,7 +81,10 @@ pub fn slider_with_edit(
                 });
         },
     );
-    slider_resp.changed() || popup_changed
+    SliderInteraction {
+        changed: slider_resp.changed() || popup_changed,
+        dragged: slider_resp.dragged(),
+    }
 }
 
 #[cfg(test)]
@@ -90,16 +107,17 @@ mod tests {
             time: Some(0.0),
             ..Default::default()
         };
-        let mut changed_reported = true;
+        let mut interaction = SliderInteraction::default();
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                changed_reported = slider_with_edit(ui, &mut value, 0.0..=1.0, "0.50", "", 2, 60.0);
+                interaction = slider_with_edit(ui, &mut value, 0.0..=1.0, "0.50", "", 2, 60.0);
             });
         });
         assert!(
-            !changed_reported,
+            !interaction.changed,
             "no input should not fire a changed event"
         );
+        assert!(!interaction.dragged, "no input should not report dragged");
         assert_eq!(value, 0.5);
     }
 

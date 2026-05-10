@@ -85,7 +85,7 @@ pub use console::{cmd, Command, Console, ConsoleWriter, HistoryLine, LineKind};
 pub use integration::UiIntegration;
 pub use linear_indicator::LinearIndicator;
 pub use overlay::BottomOverlay;
-pub use slider_edit::slider_with_edit;
+pub use slider_edit::{slider_with_edit, SliderInteraction};
 pub use world::world_to_screen;
 
 // Re-export egui so apps depend on `rye-egui` only and the version

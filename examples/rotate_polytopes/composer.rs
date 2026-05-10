@@ -30,7 +30,7 @@ use rye_egui::{
 use rye_math::{Bivector, Plane4, Rotor};
 
 use crate::consts::{CARD_ITEM_SPACING_X, CONTROL_H, MINI_BUTTON_W};
-use crate::state::{render_plane_sum, DeferredAction, DragPayload, RotatePolytopesApp, RotorTerm};
+use crate::state::{render_plane_sum, DeferredAction, RotatePolytopesApp, DragPayload, RotorTerm};
 
 // ---------------------------------------------------------------------------
 // Formula parser
@@ -255,7 +255,7 @@ impl RotatePolytopesApp {
         // -1, and 720° returns to identity.
         let formatted = format!("f {proj_deg:>+6.1}°");
         ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
-            let changed = slider_with_edit(
+            let interaction = slider_with_edit(
                 ui,
                 &mut proj_deg,
                 -360.0..=360.0,
@@ -264,7 +264,7 @@ impl RotatePolytopesApp {
                 1,
                 VALUE_CELL_W,
             );
-            if changed {
+            if interaction.changed {
                 let new_proj = proj_deg.to_radians();
                 let old_proj = bivec.dot(unit);
                 let new_b = bivec + unit * (new_proj - old_proj);
