@@ -56,6 +56,13 @@ pub(crate) const CARD_ITEM_SPACING_X: f32 = 4.0;
 pub(crate) const W_SCRUB_RATE: f32 = 0.5;
 pub(crate) const W_RANGE: f32 = 1.5;
 
+/// Animation-time scrub rate for the left / right arrow keys, in
+/// seconds-of-rot_time per real second held. 1.0 means a one-second
+/// real-time hold advances `rot_time` by one second of animation.
+/// Faster than the w-axis scrub because t scrubs "into the future"
+/// over a longer range than w's bounded slice axis.
+pub(crate) const T_SCRUB_RATE: f32 = 1.0;
+
 /// Initial maximum value for the t slider's range. Chosen so the
 /// per-pixel scrub precision matches the w slider's: w spans
 /// `2 × W_RANGE = 3.0` over the same slider track, so starting t

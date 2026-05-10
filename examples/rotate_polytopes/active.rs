@@ -8,14 +8,14 @@
 //!   combinations (single planes, isoclinics, all-w, etc.). Used by
 //!   the formula popup in `ui.rs` to give a readable name to the
 //!   current rotation when in Active mode.
-//! - The active-mode rendering methods on [`RotatePolytopesApp`]:
+//! - The active-mode rendering methods on [`Demo`]:
 //!   `render_active_mode` and `render_plane_slider_cell`.
 
 use rye_app::egui;
 use rye_math::{Bivector, Plane4, Rotor};
 
 use crate::consts::CONTROL_H;
-use crate::state::RotatePolytopesApp;
+use crate::state::Demo;
 
 /// Name a recognizable combination of active planes. Indices match
 /// `Plane4::ALL`: `0=xy 1=xz 2=xw 3=yz 4=yw 5=zw`. Order-independent,
@@ -59,7 +59,7 @@ pub(crate) fn combo_name(active: &[bool; 6]) -> Option<&'static str> {
     })
 }
 
-impl RotatePolytopesApp {
+impl Demo {
     /// Active body: 3-per-row 2-row grid of
     /// `[checkbox][label][slider][value]`. Pinned widths so
     /// columns align across rows. Each value cell is right-click

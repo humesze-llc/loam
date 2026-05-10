@@ -56,6 +56,7 @@
 use anyhow::{anyhow, Result};
 use glam::{Vec3, Vec4};
 use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use rye_egui::Console;
 use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
 use rye_render::{
     device::RenderDevice,
@@ -78,13 +79,11 @@ mod ui;
 
 use active::combo_name;
 use catalog::{parse_row_from_args, SHAPE_CATALOG};
-use consts::{BODY_SIZE, BODY_Y, T_SLIDER_INITIAL, W_RANGE, W_SCRUB_RATE};
-use state::{body_position, RotatePolytopesApp, RotationMode, ViewMode};
+use consts::{BODY_SIZE, BODY_Y, T_SCRUB_RATE, T_SLIDER_INITIAL, W_RANGE, W_SCRUB_RATE};
+use state::{body_position, Demo, RotationMode, ViewMode};
 
-impl App for RotatePolytopesApp {
-    type Space = EuclideanR3;
-
-    fn setup(ctx: &mut SetupCtx<'_>) -> Result<Self> {
+impl Demo {
+    pub(crate) fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
         let row = parse_row_from_args()?;
         if row.is_empty() {
             return Err(anyhow!("--shapes produced an empty row"));
@@ -154,6 +153,8 @@ impl App for RotatePolytopesApp {
             w_slice: initial_w,
             slider_up_held: false,
             slider_down_held: false,
+            slider_left_held: false,
+            slider_right_held: false,
             rotate: false,
             rot_state: Rotor4::IDENTITY,
             // Default: xw spin enabled (active[2] = Plane4::Xw). A
@@ -193,17 +194,39 @@ impl App for RotatePolytopesApp {
         })
     }
 
-    fn space(&self) -> &EuclideanR3 {
+    pub(crate) fn space(&self) -> &EuclideanR3 {
         &self.space
     }
 
-    fn update(&mut self, ctx: &mut FrameCtx<'_>) {
+    pub(crate) fn update(&mut self, ctx: &mut FrameCtx<'_>) {
         let dt_secs = ctx.n_ticks as f32 / 60.0;
 
-        // Slice scrub.
+        // Slice scrub (w axis, up/down arrow keys).
         let dir = (self.slider_up_held as i32 - self.slider_down_held as i32) as f32;
         if dir != 0.0 {
             self.w_slice = (self.w_slice + dir * W_SCRUB_RATE * dt_secs).clamp(-W_RANGE, W_RANGE);
+        }
+
+        // Time scrub (t axis, left/right arrow keys). Mirrors the
+        // t-slider drag: rebuild `rot_state` from the new
+        // `rot_time` via `exp(omega_animation * rot_time)`.
+        // Right = forward in time, left = back. Floors `rot_time`
+        // at zero (the t slider's lower bound).
+        let t_dir = (self.slider_right_held as i32 - self.slider_left_held as i32) as f32;
+        if t_dir != 0.0 {
+            self.rot_time = (self.rot_time + t_dir * T_SCRUB_RATE * dt_secs).max(0.0);
+            // Same runaway guard as the spin path: grow the slider
+            // range if scrub pushes us past current max.
+            const T_SLIDER_CAP: f32 = 1.0e6;
+            if self.rot_time > self.t_slider_max {
+                let new_max = (self.rot_time * 2.0).min(T_SLIDER_CAP);
+                self.t_slider_max = new_max;
+                if self.rot_time > T_SLIDER_CAP {
+                    self.rot_time = T_SLIDER_CAP;
+                }
+            }
+            let omega = self.omega_animation();
+            self.rot_state = (omega * self.rot_time).exp().normalize();
         }
 
         // 4D rotation animation. Both bodies share the same rotor
@@ -284,7 +307,7 @@ impl App for RotatePolytopesApp {
         self.node.flush_uniforms(&ctx.rd.queue);
     }
 
-    fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
+    pub(crate) fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
         // Disable Ctrl+/Ctrl- keyboard-zoom. egui's built-in zoom
         // changes pixels_per_point but the wgpu surface stays at the
         // native resolution, so the scene ends up letter-boxed
@@ -388,7 +411,7 @@ impl App for RotatePolytopesApp {
         self.render_help_window(ctx);
     }
 
-    fn on_event(&mut self, ev: &winit::event::WindowEvent, _ctx: &mut FrameCtx<'_>) {
+    pub(crate) fn on_event(&mut self, ev: &winit::event::WindowEvent, _ctx: &mut FrameCtx<'_>) {
         use winit::event::{ElementState, WindowEvent};
         use winit::keyboard::{KeyCode, PhysicalKey};
         let WindowEvent::KeyboardInput { event, .. } = ev else {
@@ -401,6 +424,8 @@ impl App for RotatePolytopesApp {
         match kc {
             KeyCode::ArrowUp => self.slider_up_held = pressed,
             KeyCode::ArrowDown => self.slider_down_held = pressed,
+            KeyCode::ArrowLeft => self.slider_left_held = pressed,
+            KeyCode::ArrowRight => self.slider_right_held = pressed,
             KeyCode::KeyR if pressed => self.reset(),
             KeyCode::KeyH if pressed => self.show_controls = !self.show_controls,
             KeyCode::KeyT | KeyCode::Space if pressed => {
@@ -425,7 +450,7 @@ impl App for RotatePolytopesApp {
         }
     }
 
-    fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
+    pub(crate) fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
         // Scene renders to the full window. The bottom controls
         // overlay floats on top; `BottomOverlay` is an Area, not
         // a docked panel, so the scene viewport doesn't need to
@@ -530,11 +555,130 @@ impl App for RotatePolytopesApp {
         }
     }
 
-    fn title(&self, _fps: f32) -> std::borrow::Cow<'static, str> {
+    pub(crate) fn title(&self, _fps: f32) -> std::borrow::Cow<'static, str> {
         // Window title is now decorative, all live state is in the
         // overlay. Keep the title static so OS task switchers show
         // a stable label.
         std::borrow::Cow::Borrowed("rotate polytopes")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App wrapper: Demo + Console<Demo>
+// ---------------------------------------------------------------------------
+//
+// Why a wrapper rather than `console` as a field of `Demo`: `Console::ui`
+// takes `(&mut self, &mut Ctx)`. If both `console` and the rest of the
+// state lived inside one struct, that call would require simultaneously
+// borrowing `&mut self.console` and `&mut self`, which the borrow checker
+// rejects. Splitting Demo + Console into a wrapper that owns both gives
+// each its own field path, so the dispatch reads as a clean two-field
+// borrow.
+
+struct RotatePolytopesApp {
+    demo: Demo,
+    console: Console<Demo>,
+    /// Cached `egui::Context::wants_keyboard_input()` from the
+    /// previous frame's UI pass. `App::on_event` runs BEFORE
+    /// `App::ui` each frame, so we can't read the current state
+    /// during event dispatch; the cached value is one frame stale
+    /// but reliably reflects whether an egui widget (the console
+    /// input, a typed-formula bar, etc.) was holding keyboard
+    /// focus when last drawn. Used to gate routing demo hotkeys
+    /// like Space / R / arrows: when egui wants the keyboard,
+    /// the demo's hotkeys must NOT fire on top.
+    last_egui_keyboard: bool,
+}
+
+impl RotatePolytopesApp {
+    fn build_console() -> Console<Demo> {
+        let mut c = Console::<Demo>::new();
+        c.register(rye_egui::cmd(
+            "reset",
+            "full reset (R)",
+            |_args, demo: &mut Demo, _out| {
+                demo.reset();
+                Ok(())
+            },
+        ));
+        c.register(rye_egui::cmd(
+            "spin",
+            "toggle continuous rotation (Space / T)",
+            |_args, demo: &mut Demo, _out| {
+                demo.rotate = !demo.rotate;
+                Ok(())
+            },
+        ));
+        c.register(rye_egui::cmd(
+            "controls",
+            "toggle the bottom controls overlay (H)",
+            |_args, demo: &mut Demo, _out| {
+                demo.show_controls = !demo.show_controls;
+                Ok(())
+            },
+        ));
+        c.register(rye_egui::cmd(
+            "formula",
+            "toggle the top-right formula popup",
+            |_args, demo: &mut Demo, _out| {
+                demo.show_formula = !demo.show_formula;
+                Ok(())
+            },
+        ));
+        c
+    }
+}
+
+impl App for RotatePolytopesApp {
+    type Space = EuclideanR3;
+
+    fn setup(ctx: &mut SetupCtx<'_>) -> Result<Self> {
+        let demo = Demo::new(ctx)?;
+        let console = Self::build_console();
+        Ok(Self {
+            demo,
+            console,
+            last_egui_keyboard: false,
+        })
+    }
+
+    fn space(&self) -> &EuclideanR3 {
+        self.demo.space()
+    }
+
+    fn update(&mut self, ctx: &mut FrameCtx<'_>) {
+        self.demo.update(ctx);
+    }
+
+    fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
+        self.demo.ui(ctx, frame);
+        self.console.ui(ctx, &mut self.demo);
+        // Stash for next frame's `on_event` to gate hotkey routing.
+        // Captured AFTER the console renders so a freshly-focused
+        // console input registers true; captured BEFORE end_pass so
+        // it reflects the state we want next-frame events to see.
+        self.last_egui_keyboard = ctx.wants_keyboard_input();
+    }
+
+    fn on_event(&mut self, ev: &winit::event::WindowEvent, ctx: &mut FrameCtx<'_>) {
+        // Suppress demo keybinds when egui is actively capturing
+        // keyboard input (any TextEdit focused: console, formula
+        // bar, etc.) so typing `reset` into the console doesn't
+        // also fire the R hotkey, etc. When the user clicks
+        // outside the egui widget that had focus, egui releases
+        // keyboard focus and the next frame's `on_event` routes
+        // hotkeys back to the demo as normal.
+        if !self.last_egui_keyboard {
+            self.demo.on_event(ev, ctx);
+        }
+    }
+
+    fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
+        self.demo.render(rd, view)
+    }
+
+    fn title(&self, fps: f32) -> std::borrow::Cow<'static, str> {
+        self.demo.title(fps)
     }
 }
 

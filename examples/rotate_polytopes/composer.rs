@@ -14,7 +14,7 @@
 //! - The formula parser (`parse_formula_term` + helpers): degrees-
 //!   default angle, optional `rad` suffix, optional `*` / `·`
 //!   between scalar and bivector, optional outer parens.
-//! - The composer-mode rendering methods on [`RotatePolytopesApp`]:
+//! - The composer-mode rendering methods on [`Demo`]:
 //!   `render_composer_mode`, `render_composer_seq_cards`,
 //!   `render_composer_scrub_slider`.
 
@@ -30,7 +30,7 @@ use rye_egui::{
 use rye_math::{Bivector, Plane4, Rotor};
 
 use crate::consts::{CARD_ITEM_SPACING_X, CONTROL_H, MINI_BUTTON_W};
-use crate::state::{render_plane_sum, DeferredAction, RotatePolytopesApp, DragPayload, RotorTerm};
+use crate::state::{render_plane_sum, DeferredAction, Demo, DragPayload, RotorTerm};
 
 // ---------------------------------------------------------------------------
 // Formula parser
@@ -121,7 +121,7 @@ fn parse_plane(s: &str) -> Result<Plane4, String> {
 // Composer-mode rendering
 // ---------------------------------------------------------------------------
 
-impl RotatePolytopesApp {
+impl Demo {
     pub(crate) fn render_composer_mode(&mut self, ui: &mut egui::Ui) {
         ui.separator();
 

@@ -16,9 +16,9 @@ use rye_egui::{
 use rye_math::{Bivector, Rotor4};
 
 use crate::consts::{CONTROL_H, CONTROL_W, MINI_BUTTON_W, PLAY_PAUSE_W, W_RANGE};
-use crate::state::{DeferredAction, RotatePolytopesApp, RotationMode, RotorTerm, ViewMode};
+use crate::state::{DeferredAction, Demo, RotationMode, RotorTerm, ViewMode};
 
-impl RotatePolytopesApp {
+impl Demo {
     /// Expanded section of the bottom overlay. Two tab rows
     /// stacked vertically:
     ///
@@ -298,7 +298,12 @@ impl RotatePolytopesApp {
     /// Two big sliders (w, t) with fixed-width monospace value
     /// labels.
     pub(crate) fn render_slider_strip(&mut self, ui: &mut egui::Ui, _area_w: f32) {
-        const VALUE_CELL_W: f32 = 86.0;
+        // Sized so "w +0.000" / "t  7.12s" (8 monospace chars at
+        // FONT_SIZE 13) fit with a few px of breathing room. Larger
+        // t values (10+ chars at huge `rot_time`) would clip the
+        // tail; that's an acceptable trade for killing the visible
+        // deadspace at typical magnitudes.
+        const VALUE_CELL_W: f32 = 72.0;
         let avail = ui.available_width();
         let spacing = ui.spacing().item_spacing.x;
         let slider_w = (avail - VALUE_CELL_W - spacing).max(140.0);
@@ -322,35 +327,24 @@ impl RotatePolytopesApp {
         let mut t_dragged = false;
         ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
             let formatted = format!("t {:>5.2}s", self.rot_time);
-            let slider_resp = ui.add(
-                egui::Slider::new(&mut self.rot_time, 0.0..=t_max)
-                    .show_value(false)
-                    .smart_aim(false)
-                    .clamping(egui::SliderClamping::Always),
+            // Same `slider_with_edit` widget as the w slider so
+            // click-drag and right-click-edit behave identically
+            // across the two rows. Gate the scrub recomputation on
+            // `dragged` (not `changed`) because the spin's per-frame
+            // `rot_time += dt` would otherwise re-fire the
+            // `(omega * t).exp()` rebuild every frame, snapping the
+            // rotor when omega shifts (e.g., toggling active planes
+            // while spinning).
+            let interaction = slider_with_edit(
+                ui,
+                &mut self.rot_time,
+                0.0..=t_max,
+                &formatted,
+                "s",
+                2,
+                VALUE_CELL_W,
             );
-            t_dragged = slider_resp.dragged();
-            ui.allocate_ui_with_layout(
-                egui::vec2(VALUE_CELL_W, 14.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    let label_resp = ui.add(
-                        egui::Button::new(egui::RichText::new(formatted).monospace())
-                            .frame(false)
-                            .small(),
-                    );
-                    label_resp
-                        .on_hover_cursor(egui::CursorIcon::ContextMenu)
-                        .on_hover_text("Right-click to edit value")
-                        .context_menu(|ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut self.rot_time)
-                                    .range(0.0..=f32::INFINITY)
-                                    .suffix("s")
-                                    .fixed_decimals(2),
-                            );
-                        });
-                },
-            );
+            t_dragged = interaction.dragged;
         });
         if t_dragged {
             // Scrub uses the rate-independent `omega_animation`;

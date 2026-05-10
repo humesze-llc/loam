@@ -16,9 +16,9 @@ use rye_render::raymarch::{SHAPE_120CELL, SHAPE_600CELL};
 
 use crate::catalog::{render_shape_catalog_menu, ShapeEntry};
 use crate::consts::{CARD_ITEM_SPACING_X, CONTROL_H, CONTROL_W, MAX_ROW_LEN, SHAPE_CARD_WIDTH};
-use crate::state::RotatePolytopesApp;
+use crate::state::Demo;
 
-impl RotatePolytopesApp {
+impl Demo {
     /// Shape row + add-menu + drag-and-drop reorder. Extracted as a
     /// method so it can be called from both rotation modes (after
     /// the active-set checkboxes in `Active`, after the seq +

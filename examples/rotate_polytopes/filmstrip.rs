@@ -10,9 +10,9 @@ use rye_render::raymarch::{SHAPE_120CELL, SHAPE_600CELL};
 
 use crate::catalog::render_shape_catalog_menu;
 use crate::consts::BODY_SIZE;
-use crate::state::RotatePolytopesApp;
+use crate::state::Demo;
 
-impl RotatePolytopesApp {
+impl Demo {
     /// Render axis labels around the filmstrip grid. Top edge
     /// gets w-value tags above each column (whichever axis
     /// carries w); left edge gets t-offset tags beside each row

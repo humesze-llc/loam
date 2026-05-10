@@ -1,11 +1,11 @@
-//! Demo state: the [`RotatePolytopesApp`] struct, the mode/view/
+//! Demo state: the [`Demo`] struct, the mode/view/
 //! deferred-action enums, the [`RotorTerm`] data type and its display
 //! helpers, the angular-velocity derivation, body layout, and full
 //! reset.
 //!
 //! This module owns the data model. Per-mode UI rendering lives in
 //! `modes/{active,composer,filmstrip,shapes}.rs` as additional `impl
-//! RotatePolytopesApp` blocks; cross-cutting overlay UI lives in
+//! Demo` blocks; cross-cutting overlay UI lives in
 //! `ui.rs`. All struct fields are `pub(crate)` so those sibling impls
 //! can access them directly without per-field accessors.
 
@@ -220,7 +220,7 @@ pub(crate) fn body_position(slot: usize, n: usize) -> [f32; 4] {
 // The App struct
 // ---------------------------------------------------------------------------
 
-pub(crate) struct RotatePolytopesApp {
+pub(crate) struct Demo {
     pub(crate) space: EuclideanR3,
     pub(crate) camera: Camera<EuclideanR3>,
     pub(crate) orbit: OrbitController<EuclideanR3>,
@@ -233,6 +233,8 @@ pub(crate) struct RotatePolytopesApp {
     pub(crate) w_slice: f32,
     pub(crate) slider_up_held: bool,
     pub(crate) slider_down_held: bool,
+    pub(crate) slider_left_held: bool,
+    pub(crate) slider_right_held: bool,
 
     pub(crate) rotate: bool,
     pub(crate) rot_state: Rotor4,
@@ -348,7 +350,7 @@ pub(crate) struct RotatePolytopesApp {
 // State methods
 // ---------------------------------------------------------------------------
 
-impl RotatePolytopesApp {
+impl Demo {
     /// The composer seq's net bivector direction (no rate or
     /// base-rate scaling). This is the "function" the seq
     /// describes: sum over terms of `scalar * sum_planes`. The
