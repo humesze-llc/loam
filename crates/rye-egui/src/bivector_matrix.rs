@@ -141,14 +141,12 @@ mod tests {
             assert_eq!(
                 cell_text(&b, row, col),
                 "+57.3",
-                "plane {:?} should populate ({row}, {col})",
-                plane
+                "plane {plane:?} should populate ({row}, {col})",
             );
             assert_eq!(
                 cell_text(&b, col, row),
                 "-57.3",
-                "plane {:?} mirror ({col}, {row}) should be negated",
-                plane
+                "plane {plane:?} mirror ({col}, {row}) should be negated",
             );
         }
     }
