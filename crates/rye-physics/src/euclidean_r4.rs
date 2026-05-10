@@ -500,8 +500,8 @@ pub fn polytope_body_r4(
     )
 }
 
-// ---------------------------------------------------------------------------
-// 4D regular polytopes. Six exist in 4D (five analogues of the Platonic
+// --------------------------------------------------------------------------- 4D regular
+// polytopes. Six exist in 4D (five analogues of the Platonic
 // solids plus the 24-cell which has no 3D counterpart). The four most
 // physically useful for games, 5-cell, tesseract, 16-cell, 24-cell,
 // are generated here. The 120-cell (600 vertices) and 600-cell (120
@@ -1513,8 +1513,8 @@ mod tests {
         outside + inside
     }
 
-    /// Wolfe SDF on the tesseract matches the closed-form `outside +
-    /// inside` SDF across all Voronoi regions: interior, face, edge,
+    /// Wolfe SDF on the tesseract matches the closed-form `outside + inside` SDF across all
+    /// Voronoi regions: interior, face, edge,
     /// 2-face, and vertex. Each `cases` entry exercises a different
     /// `|S|` (active-set size) in the projection chain.
     #[test]

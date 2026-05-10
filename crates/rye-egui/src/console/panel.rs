@@ -283,8 +283,8 @@ fn draw_input_row<Ctx: 'static>(
 
             // Submit on Enter detected BEFORE rendering the TextEdit, so we
             // can consume the key event and prevent it from being
-            // interpreted as TextEdit input. Using `Response::lost_focus +
-            // Enter` is the egui-idiomatic pattern but conflicts with the
+            // interpreted as TextEdit input. Using `Response::lost_focus + Enter` is the
+            // egui-idiomatic pattern but conflicts with the
             // unconditional `request_focus()` we issue every frame in docked
             // mode to keep typing anchored on the input box; the focus never
             // gets a chance to be "lost" between frames, so `lost_focus()`

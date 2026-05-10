@@ -22,15 +22,13 @@ pub enum AssetEventKind {
     Removed,
 }
 
-/// Watches one or more filesystem paths and yields coalesced
-/// [`AssetEvent`]s on demand.
+/// Watches one or more filesystem paths and yields coalesced [`AssetEvent`]s on demand.
 ///
 /// Events arrive on a background thread managed by `notify`; [`poll`](Self::poll)
-/// drains the channel non-blockingly and deduplicates events per path
-/// within one poll cycle. That means editor saves that produce a burst
-/// of raw events (remove temp -> create target -> modify) collapse to a
-/// single `Modified` or `Created` event per file. That's the usual
-/// shape a shader cache wants.
+/// drains the channel non-blockingly and deduplicates events per path within one poll
+/// cycle. That means editor saves that produce a burst of raw events (remove temp ->
+/// create target -> modify) collapse to a single `Modified` or `Created` event per
+/// file. That's the usual shape a shader cache wants.
 ///
 /// Not `Sync`: own one per app. `Send` is fine.
 pub struct AssetWatcher {
@@ -72,10 +70,9 @@ impl AssetWatcher {
 
     /// Drain all pending events, deduplicating per path.
     ///
-    /// When the same path produces multiple events since the last poll,
-    /// they are merged: `Created` beats `Modified`
-    /// (a new file should look new, not merely modified), otherwise the
-    /// later event wins. Events that aren't create/modify/remove
+    /// When the same path produces multiple events since the last poll, they are
+    /// merged: `Created` beats `Modified` (a new file should look new, not merely
+    /// modified), otherwise the later event wins. Events that aren't create/modify/remove
     /// (access, metadata, other) are dropped.
     pub fn poll(&self) -> Vec<AssetEvent> {
         let mut latest: HashMap<PathBuf, AssetEventKind> = HashMap::new();
@@ -114,11 +111,10 @@ impl AssetWatcher {
 
 /// Merge two events for the same path within a single poll cycle.
 ///
-/// `Created` is preserved across a subsequent `Modified`, on Windows,
-/// `fs::write` on a fresh file emits Create+Modify, and downstream
-/// consumers expect "new file" to look different from "existing file
-/// changed." Otherwise the later event wins, which correctly handles
-/// save-by-atomic-replace (Remove->Create->target exists).
+/// `Created` is preserved across a subsequent `Modified`, on Windows, `fs::write` on
+/// a fresh file emits Create+Modify, and downstream consumers expect "new file" to
+/// look different from "existing file changed." Otherwise the later event wins, which
+/// correctly handles save-by-atomic-replace (Remove->Create->target exists).
 fn merge_kinds(old: AssetEventKind, new: AssetEventKind) -> AssetEventKind {
     use AssetEventKind::*;
     match (old, new) {

@@ -423,8 +423,8 @@ impl TextRenderer {
 /// can be tested with a hand-built glyph table.
 ///
 /// `position` is the top-left of the first line in viewport
-/// coordinates; `size_px` is the rendered glyph height; `scale = size_px /
-/// bake_size_px` rescales the baked atlas geometry to the requested
+/// coordinates; `size_px` is the rendered glyph height; `scale = size_px / bake_size_px`
+/// rescales the baked atlas geometry to the requested
 /// size. Newlines reset `cursor_x` to `position[0]` and advance
 /// `cursor_y` by `line_height_px * scale`. Non-printable / out-of-
 /// ASCII chars are skipped silently; chars with no glyph in the

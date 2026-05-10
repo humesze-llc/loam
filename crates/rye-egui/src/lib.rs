@@ -30,8 +30,8 @@
 //!
 //! [egui]: https://github.com/emilk/egui
 //!
-//! Apps interact with the UI by overriding `App::ui(&mut self, ctx,
-//! frame)` and writing immediate-mode egui code:
+//! Apps interact with the UI by overriding `App::ui(&mut self, ctx, frame)` and writing
+//! immediate-mode egui code:
 //!
 //! ```ignore
 //! fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {

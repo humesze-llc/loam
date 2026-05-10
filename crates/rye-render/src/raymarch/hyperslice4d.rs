@@ -239,10 +239,10 @@ pub struct Hyperslice4DUniforms {
     /// Pixel offset of the viewport's top-left corner within the
     /// framebuffer. Lets the fragment shader convert `frag_pos.xy`
     /// (always framebuffer-space) into normalised viewport
-    /// coordinates: `uv = (frag_pos.xy - viewport_origin) /
-    /// resolution`. Both axes are zero when the scene fills the
-    /// full framebuffer; the side-panel case sets `viewport_origin =
-    /// [panel_width, 0]` and `resolution` to the carved-out region.
+    /// coordinates: `uv = (frag_pos.xy - viewport_origin) / resolution`. Both axes are zero
+    /// when the scene fills the
+    /// full framebuffer; the side-panel case sets `viewport_origin = [panel_width, 0]` and
+    /// `resolution` to the carved-out region.
     pub viewport_origin: [f32; 2],
     /// Four scalar knobs for user-shader-side parameters. Same
     /// shape as `RayMarchUniforms::params` for symmetry.
@@ -513,8 +513,8 @@ fn duocylinder_sdf_local(p: vec4<f32>) -> f32 {
 }
 
 // Clifford torus, "filled" as a 4-D tube of radius `tube`
-// around the 2-D torus surface `length(p.xy) = r1, length(p.zw)
-// = r2`. The center curve is codimension 2, so the SDF takes a
+// around the 2-D torus surface `length(p.xy) = r1, length(p.zw) = r2`. The center curve is
+// codimension 2, so the SDF takes a
 // vec2 length in the (q1, q2) normal plane and subtracts the
 // tube radius. Numbers chosen so the bounding 4-ball is unit.
 fn clifford_torus_sdf_local(p: vec4<f32>) -> f32 {

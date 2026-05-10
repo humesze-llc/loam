@@ -2,21 +2,17 @@
 //!
 //! Parallel to [`super::epa`][mod@super::epa] (3D) with three dimensionality changes:
 //!
-//! 1. **Faces** are tetrahedra (3-simplices, 4 vertex indices), not
-//!    triangles.
-//! 2. **Face normals** come from the Hodge dual of the trivector
-//!    `(b−a) ∧ (c−a) ∧ (d−a)`. Concretely this is the 4D
-//!    "generalized cross product", four signed 3×3 determinants of
-//!    the 3-row matrix `[b−a; c−a; d−a]`. The result is perpendicular
-//!    to all three edge vectors.
-//! 3. **Horizon** of a polytope expansion: triangles shared between
-//!    removed tetrahedral faces are interior; unique triangles are the
-//!    3D horizon. Each horizon triangle, combined with the new
-//!    support point, becomes a new tetrahedral face.
+//! 1. **Faces** are tetrahedra (3-simplices, 4 vertex indices), not triangles.
+//! 2. **Face normals** come from the Hodge dual of the trivector `(b−a) ∧ (c−a) ∧ (d−a)`.
+//!    Concretely this is the 4D "generalized cross product", four signed 3×3 determinants
+//!    of the 3-row matrix `[b−a; c−a; d−a]`. The result is perpendicular to all three
+//!    edge vectors.
+//! 3. **Horizon** of a polytope expansion: triangles shared between removed tetrahedral
+//!    faces are interior; unique triangles are the 3D horizon. Each horizon triangle,
+//!    combined with the new support point, becomes a new tetrahedral face.
 //!
-//! Barycentric reconstruction for the contact point uses the Gram-
-//! matrix projection from [`super::simplex_r4`] applied to the
-//! terminating face's four vertices.
+//! Barycentric reconstruction for the contact point uses the Gram-matrix projection from
+//! [`super::simplex_r4`] applied to the terminating face's four vertices.
 
 use glam::Vec4;
 
@@ -47,12 +43,10 @@ struct Face4 {
 struct Polytope4 {
     vertices: Vec<MinkowskiPoint4>,
     faces: Vec<Face4>,
-    /// Centroid of the seed 5-simplex. Guaranteed interior to the
-    /// polytope for all subsequent convex expansions, so it's a
-    /// reliable tiebreaker when the origin itself sits on a face
-    /// plane (common for symmetric Minkowski differences, the
-    /// origin lies on an edge of the seed simplex and multiple
-    /// initial faces pass through it).
+    /// Centroid of the seed 5-simplex. Guaranteed interior to the polytope for all
+    /// subsequent convex expansions, so it's a reliable tiebreaker when the origin itself
+    /// sits on a face plane (common for symmetric Minkowski differences, where the origin
+    /// lies on an edge of the seed simplex and multiple initial faces pass through it).
     centroid: Vec4,
 }
 
@@ -93,20 +87,17 @@ impl Polytope4 {
 
     /// Face with smallest distance from origin.
     ///
-    /// Distance-0 faces are common in 4D EPA: many Minkowski-diff
-    /// vertices end up coplanar (e.g. pentatope-pentatope produces
-    /// dozens of `w=0` points), which spawns "through-origin" faces
-    /// during expansion. Naively picking the smallest distance always
-    /// chases these spurious faces and never converges on the real
-    /// Minkowski boundary.
+    /// Distance-0 faces are common in 4D EPA: many Minkowski-diff vertices end up coplanar
+    /// (e.g. pentatope-pentatope produces dozens of `w=0` points), which spawns
+    /// "through-origin" faces during expansion. Naively picking the smallest distance
+    /// always chases these spurious faces and never converges on the real Minkowski
+    /// boundary.
     ///
-    /// Strategy: if the polytope has any **strictly positive-
-    /// distance** face, prefer the smallest of those, they're real
-    /// boundary candidates. Only fall back to a distance-0 face when
-    /// no positive face exists (the boundary genuinely touches the
-    /// origin, e.g. tangent shapes; or the seed simplex is so
-    /// symmetric that every face passes through origin and we need
-    /// expansion to break the symmetry).
+    /// Strategy: if the polytope has any **strictly positive-distance** face, prefer the
+    /// smallest of those — they're real boundary candidates. Only fall back to a
+    /// distance-0 face when no positive face exists (the boundary genuinely touches the
+    /// origin, e.g. tangent shapes; or the seed simplex is so symmetric that every face
+    /// passes through origin and we need expansion to break the symmetry).
     fn closest_face(&self) -> Option<usize> {
         if let Some((idx, _)) = self
             .faces
@@ -188,10 +179,9 @@ fn tet_triangles(tet: &[usize; 4]) -> [Triangle; 4] {
     [(a, b, c), (a, b, d), (a, c, d), (b, c, d)]
 }
 
-/// Add a triangle to the horizon, or cancel it if the same (index-
-/// set) triangle is already present. Two removed tetra share one
-/// triangle; that triangle's inside the region being removed and
-/// contributes no horizon.
+/// Add a triangle to the horizon, or cancel it if the same (index-set) triangle is
+/// already present. Two removed tetra share one triangle; that triangle is inside the
+/// region being removed and contributes no horizon.
 fn add_or_remove_triangle(horizon: &mut Vec<Triangle>, tri: Triangle) {
     let key = sort_triangle(tri);
     if let Some(pos) = horizon.iter().position(|t| sort_triangle(*t) == key) {
@@ -212,18 +202,16 @@ fn sort_triangle(t: Triangle) -> (usize, usize, usize) {
 ///
 /// # Orientation (hybrid rule)
 ///
-/// EPA's invariant is that both the origin and the polytope's
-/// centroid are interior points. The outward normal should put both
-/// on the same (negative-distance) side of the face plane. Usually
-/// they agree; the tricky case is when **the origin lies on a face
-/// plane**: common for symmetric Minkowski differences where the
-/// seed 5-simplex has an edge passing through origin. Then the
-/// origin-based test gives no signal, and we fall back to the seed
-/// centroid (guaranteed off-plane except for contrived full-symmetry
+/// EPA's invariant is that both the origin and the polytope's centroid are interior
+/// points. The outward normal should put both on the same (negative-distance) side of the
+/// face plane. Usually they agree; the tricky case is when **the origin lies on a face
+/// plane**: common for symmetric Minkowski differences where the seed 5-simplex has an
+/// edge passing through origin. Then the origin-based test gives no signal, and we fall
+/// back to the seed centroid (guaranteed off-plane except for contrived full-symmetry
 /// cases, where the face is degenerate anyway).
 ///
-/// Returns `None` when the face is degenerate (three edges nearly
-/// coplanar -> tiny normal magnitude).
+/// Returns `None` when the face is degenerate (three edges nearly coplanar, yielding a
+/// tiny normal magnitude).
 fn build_face(
     verts: &[MinkowskiPoint4],
     a: usize,
@@ -277,13 +265,12 @@ fn build_face(
     })
 }
 
-/// Generalized 4D cross product: the vector perpendicular to three
-/// 4-vectors `u`, `v`, `w`. Equal to the Hodge dual of the trivector
-/// `u ∧ v ∧ w`, which for basis `e_ijk` maps
-/// `e_123 -> −e_4, e_124 -> +e_3, e_134 -> −e_2, e_234 -> +e_1`.
+/// Generalized 4D cross product: the vector perpendicular to three 4-vectors `u`, `v`,
+/// `w`. Equal to the Hodge dual of the trivector `u ∧ v ∧ w`, which for basis `e_ijk`
+/// maps `e_123 -> −e_4, e_124 -> +e_3, e_134 -> −e_2, e_234 -> +e_1`.
 ///
-/// Components are four 3×3 determinants of the column-sub-matrices
-/// of `[u; v; w]`, with alternating signs.
+/// Components are four 3×3 determinants of the column-sub-matrices of `[u; v; w]`, with
+/// alternating signs.
 fn hodge_dual_of_trivector_wedge(u: Vec4, v: Vec4, w: Vec4) -> Vec4 {
     // u ∧ v ∧ w trivector components:
     //   t_ijk = det of (u, v, w) columns (i, j, k).
@@ -355,9 +342,8 @@ pub fn epa_r4<A: SupportFn4, B: SupportFn4>(
         }
     }
 
-    // Iteration cap, return best-estimate contact from current
-    // closest face rather than failing. Debug-level trace so the
-    // 4D narrowphase tuning has the same observability as 3D.
+    // Iteration cap: return best-estimate contact from current closest face rather than
+    // failing. Debug-level trace so 4D narrowphase tuning has the same observability as 3D.
     tracing::debug!(
         max_iterations = EPA_MAX_ITERATIONS,
         vertices = polytope.vertices.len(),
@@ -489,11 +475,10 @@ mod tests {
         assert!(contact.point.w.abs() < 0.1);
     }
 
-    /// Two overlapping pentatopes produce a finite penetration with
-    /// a unit-length normal. This is the case that used to collapse
-    /// to a zero-distance face under the fragile interior-reference
-    /// orientation heuristic; robustified via the hybrid origin-
-    /// first, centroid-fallback rule in `build_face`.
+    /// Two overlapping pentatopes produce a finite penetration with a unit-length normal.
+    /// This is the case that used to collapse to a zero-distance face under the fragile
+    /// interior-reference orientation heuristic; robustified via the hybrid origin-first,
+    /// centroid-fallback rule in `build_face`.
     #[test]
     fn pentatope_pentatope_penetration_nonzero() {
         use crate::collision::gjk_r4::ConvexHull4;
@@ -524,9 +509,8 @@ mod tests {
         );
     }
 
-    /// Two tesseracts sharing a corner region along all four axes.
-    /// Sharper features than the pentatope; used to be another EPA-
-    /// collapse source before the orientation fix.
+    /// Two tesseracts sharing a corner region along all four axes. Sharper features than
+    /// the pentatope; used to be another EPA-collapse source before the orientation fix.
     #[test]
     fn tesseract_tesseract_penetration_nonzero() {
         use crate::collision::gjk_r4::ConvexHull4;
@@ -552,9 +536,9 @@ mod tests {
         );
     }
 
-    /// 16-cell vs 16-cell: the cross-polytope with 8 vertices. Tests
-    /// the GJK->EPA pipeline on a sharp-vertexed polytope that has
-    /// fewer support points than the tesseract.
+    /// 16-cell vs 16-cell: the cross-polytope with 8 vertices. Tests the GJK->EPA
+    /// pipeline on a sharp-vertexed polytope that has fewer support points than the
+    /// tesseract.
     #[test]
     fn cell16_cell16_penetration_nonzero() {
         use crate::collision::gjk_r4::ConvexHull4;

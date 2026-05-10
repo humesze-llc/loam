@@ -8,8 +8,8 @@
 //! fn <name>(p: vec4<f32>) -> f32
 //! ```
 //!
-//! Returns the signed distance to the shape's surface in 4D
-//! (positive outside, negative inside, zero on the boundary). The
+//! Returns the signed distance to the shape's surface in 4D (positive outside, negative inside,
+//! zero on the boundary). The
 //! hyperslicing render path consumes these by passing
 //! `vec4(xyz, w_slice)` and treating the returned scalar as a 3D
 //! SDF for ray-marching at that fixed `w`. The eventual full 4D

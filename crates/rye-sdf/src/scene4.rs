@@ -335,8 +335,8 @@ mod tests {
     fn hyperslice_wraps_4d_with_w_slice() {
         let scene = Scene4::new(SceneNode4::hypersphere(Vec4::ZERO, 0.5));
         let wgsl = scene.to_hyperslice_wgsl("u.w_slice");
-        // Parameter is `p3` to avoid colliding with the inner `let
-        // p` 4D point, WGSL doesn't allow declaring a let with the
+        // Parameter is `p3` to avoid colliding with the inner `let p` 4D point, WGSL doesn't
+        // allow declaring a let with the
         // same name as a function parameter.
         assert!(wgsl.contains("fn rye_scene_sdf(p3: vec3<f32>) -> f32"));
         assert!(wgsl.contains("let p = vec4<f32>(p3, u.w_slice)"));

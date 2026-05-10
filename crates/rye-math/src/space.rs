@@ -152,8 +152,7 @@ pub trait Space {
 /// forced to know anything about WGSL.
 pub trait WgslSpace: Space {
     /// WGSL source providing this space's primitives, for inlining into
-    /// shaders by `rye-shader`.
-    ///
+    /// shaders by `rye-shader`. 
     /// The v0 shader ABI is deliberately tiny and single-space:
     ///
     /// ```wgsl

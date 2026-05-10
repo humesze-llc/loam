@@ -1,13 +1,12 @@
 //! WGSL combinator helpers.
 //!
-//! Each combinator emits a named WGSL function that takes pre-evaluated
-//! distance values and returns a combined distance. The Scene tree calls
-//! the SDF sub-functions first, stores results in `let` bindings, then
-//! passes them to the combinator function.
+//! Each combinator emits a named WGSL function that takes pre-evaluated distance values
+//! and returns a combined distance. The Scene tree calls the SDF sub-functions first,
+//! stores results in `let` bindings, then passes them to the combinator function.
 //!
-//! All combinators are Space-agnostic: they operate on scalar distances
-//! returned by `rye_distance`-based SDF functions, so they are correct
-//! in E³, H³, and S³ without modification.
+//! All combinators are Space-agnostic: they operate on scalar distances returned by
+//! `rye_distance`-based SDF functions, so they are correct in E³, H³, and S³ without
+//! modification.
 
 /// Emit a WGSL expression for the union (minimum) of two distances.
 ///
@@ -30,9 +29,9 @@ pub fn difference_expr(da: &str, db: &str) -> String {
 /// Emit a named WGSL helper function implementing smooth-minimum
 /// (Inigo Quilez polynomial blend).
 ///
-/// `k` controls the blend radius (in Space distance units). The function
-/// takes two pre-evaluated distances `(a: f32, b: f32)` and returns the
-/// blended distance. Call it as `{name}(da, db)` in the scene body.
+/// `k` controls the blend radius (in Space distance units). The function takes two
+/// pre-evaluated distances `(a: f32, b: f32)` and returns the blended distance. Call
+/// it as `{name}(da, db)` in the scene body.
 pub fn smooth_min_fn(name: &str, k: f32) -> String {
     format!(
         "fn {name}(a: f32, b: f32) -> f32 {{\n\

@@ -1,15 +1,14 @@
 //! Narrowphase collision dispatch table.
 //!
-//! `Narrowphase<S>` is a `HashMap` keyed by `(ColliderKind, ColliderKind)`
-//! with entries that are function pointers. When a broadphase candidate
-//! pair is tested, the narrowphase looks up the entry for the bodies'
-//! collider kinds and calls it.
+//! `Narrowphase<S>` is a `HashMap` keyed by `(ColliderKind, ColliderKind)` with
+//! entries that are function pointers. When a broadphase candidate pair is tested, the
+//! narrowphase looks up the entry for the bodies' collider kinds and calls it.
 //!
-//! This is the core extension point for adding new collider types, new
-//! spaces, or new collision algorithms without modifying existing code.
-//! To add H³ horosphere colliders: define `Collider::Horosphere`, add
-//! `ColliderKind::Horosphere`, and register `sphere_horosphere` /
-//! `horosphere_horosphere` functions. Nothing else changes.
+//! This is the core extension point for adding new collider types, new spaces, or new
+//! collision algorithms without modifying existing code. To add H³ horosphere
+//! colliders: define `Collider::Horosphere`, add `ColliderKind::Horosphere`, and
+//! register `sphere_horosphere` / `horosphere_horosphere` functions. Nothing else
+//! changes.
 
 use std::collections::HashMap;
 
@@ -18,9 +17,9 @@ use crate::collider::ColliderKind;
 use crate::integrator::PhysicsSpace;
 use crate::response::Contact;
 
-/// A narrowphase collision function. Returns `Some(contact)` if bodies
-/// `a` and `b` overlap, `None` otherwise. Always called with `a.kind()`
-/// matching the key's first component.
+/// A narrowphase collision function. Returns `Some(contact)` if bodies `a` and `b`
+/// overlap, `None` otherwise. Always called with `a.kind()` matching the key's first
+/// component.
 pub type NarrowphaseFn<S> = fn(a: &RigidBody<S>, b: &RigidBody<S>, space: &S) -> Option<Contact<S>>;
 
 /// Registry of narrowphase functions, keyed by the collider kinds of
@@ -42,15 +41,14 @@ impl<S: PhysicsSpace> Narrowphase<S> {
         Self::default()
     }
 
-    /// Register a narrowphase function for a specific collider pair.
-    /// Registering a new pair is additive; registering over an existing
-    /// pair replaces it.
+    /// Register a narrowphase function for a specific collider pair. Registering a new
+    /// pair is additive; registering over an existing pair replaces it.
     pub fn register(&mut self, a: ColliderKind, b: ColliderKind, f: NarrowphaseFn<S>) {
         self.dispatch.insert((a, b), f);
     }
 
-    /// Look up and call the narrowphase function for this pair. Returns
-    /// `None` if no function is registered.
+    /// Look up and call the narrowphase function for this pair. Returns `None` if no
+    /// function is registered.
     pub fn test(&self, a: &RigidBody<S>, b: &RigidBody<S>, space: &S) -> Option<Contact<S>>
     where
         S::Vector: std::ops::Mul<f32, Output = S::Vector>,

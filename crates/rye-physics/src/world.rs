@@ -43,8 +43,8 @@ use crate::manifold::{
 use crate::narrowphase::Narrowphase;
 use crate::response::FRICTION_COEFF;
 
-/// Pair key for the persistent manifold cache. Convention: `(small,
-/// large)` so a pair has one canonical key regardless of iteration
+/// Pair key for the persistent manifold cache. Convention: `(small, large)` so a pair has one
+/// canonical key regardless of iteration
 /// order in broadphase.
 pub type PairKey = (usize, usize);
 

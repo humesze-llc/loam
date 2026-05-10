@@ -128,8 +128,7 @@ pub trait App: Sized + 'static {
     ///   orbits in flat Euclidean space, but the shader prelude is
     ///   non-Euclidean to apply a geodesic-fog metric. e.g.
     ///   `App::Space = HyperbolicH3` + `Camera<EuclideanR3>`. The
-    ///   camera math is Cartesian; the shader applies H³ only to
-    ///   the fog distance.
+    ///   camera math is Cartesian; the shader applies H³ only to the fog distance.
     ///
     /// The conflation hazard: if you write `Camera<Self::Space>`
     /// without thinking, you commit your scene to live in that

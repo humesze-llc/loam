@@ -1,15 +1,14 @@
 //! GJK in R⁴ using dimension-agnostic closest-point-on-simplex.
 //!
-//! Parallels [`crate::collision::gjk`] (3D) but substitutes the 3D's
-//! hand-rolled Voronoi-region simplex analysis with the Gram-matrix
-//! projection from [`super::simplex_r4`]. That lets us handle all
-//! simplex sizes (1 through 5) uniformly, which matters in 4D because
-//! a 4-simplex (pentatope) is the first volume-enclosing case; the 3D
-//! "tetrahedron encloses when all three face-normals point inward"
-//! logic has no direct 4D analogue worth hand-deriving.
+//! Parallels [`crate::collision::gjk`] (3D) but substitutes the 3D's hand-rolled
+//! Voronoi-region simplex analysis with the Gram-matrix projection from
+//! [`super::simplex_r4`]. That lets us handle all simplex sizes (1 through 5) uniformly,
+//! which matters in 4D because a 4-simplex (pentatope) is the first volume-enclosing
+//! case; the 3D "tetrahedron encloses when all three face-normals point inward" logic has
+//! no direct 4D analogue worth hand-deriving.
 //!
-//! The support-function side (`Sphere`, `ConvexHull`, `SupportFn`)
-//! parallels the 3D module with `Vec4` replacements.
+//! The support-function side (`Sphere`, `ConvexHull`, `SupportFn`) parallels the 3D
+//! module with `Vec4` replacements.
 
 use glam::Vec4;
 
@@ -58,9 +57,9 @@ impl SupportFn4 for Sphere4 {
     }
 }
 
-/// Minkowski-difference support: the point on `A ⊖ B` farthest along
-/// `direction`, with the contributing pre-image points on `A` and
-/// `B` cached for EPA's contact-point reconstruction.
+/// Minkowski-difference support: the point on `A ⊖ B` farthest along `direction`, with
+/// the contributing pre-image points on `A` and `B` cached for EPA's contact-point
+/// reconstruction.
 #[derive(Clone, Copy, Debug)]
 pub struct MinkowskiPoint4 {
     pub point: Vec4,
@@ -82,21 +81,19 @@ pub fn minkowski_support_r4<A: SupportFn4, B: SupportFn4>(
     }
 }
 
-/// GJK result: either the shapes overlap, in which case we hand the
-/// final simplex plus its surviving sub-simplex to EPA, or they
-/// don't. In 4D the enclosing simplex always has 5 vertices; EPA
-/// receives exactly that.
+/// GJK result: either the shapes overlap, in which case we hand the final simplex plus
+/// its surviving sub-simplex to EPA, or they don't. In 4D the enclosing simplex always
+/// has 5 vertices; EPA receives exactly that.
 ///
-/// The variants are asymmetric in size (an inline `[MinkowskiPoint4; 5]`
-/// is ~240 bytes; `Separated` is 0). We keep it inline, the enum is
-/// a short-lived stack return from narrowphase, not a stored field,
-/// so the size asymmetry doesn't matter in practice.
+/// The variants are asymmetric in size (an inline `[MinkowskiPoint4; 5]` is ~240 bytes;
+/// `Separated` is 0). We keep it inline — the enum is a short-lived stack return from
+/// narrowphase, not a stored field, so the size asymmetry doesn't matter in practice.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum GjkResult4 {
     Intersecting {
-        /// 4D simplex (5 points) whose convex hull encloses the
-        /// origin. Used to seed 4D EPA's polytope expansion.
+        /// 4D simplex (5 points) whose convex hull encloses the origin. Used to seed 4D
+        /// EPA's polytope expansion.
         simplex: [MinkowskiPoint4; 5],
     },
     Separated,
@@ -105,17 +102,15 @@ pub enum GjkResult4 {
 const GJK_MAX_ITERATIONS: u32 = 48;
 const GJK_EPS: f32 = 1e-6;
 
-/// Test whether `a` and `b` overlap via GJK on their Minkowski
-/// difference. Returns `Intersecting` with an enclosing 4-simplex for
-/// downstream EPA, or `Separated`.
+/// Test whether `a` and `b` overlap via GJK on their Minkowski difference. Returns
+/// `Intersecting` with an enclosing 4-simplex for downstream EPA, or `Separated`.
 ///
-/// Strategy: maintain a growing simplex inside `A ⊖ B`; each iteration
-/// computes the closest point on the current simplex to the origin
-/// (via [`closest_to_origin`]), drops any unused vertices, then
-/// searches for a new support in the direction from the closest point
-/// toward the origin. Terminates when (i) a new support can't advance
-/// toward the origin (-> separated), (ii) the simplex's closest point
-/// reaches the origin (-> intersecting), or (iii) iteration cap is hit.
+/// Strategy: maintain a growing simplex inside `A ⊖ B`; each iteration computes the
+/// closest point on the current simplex to the origin (via [`closest_to_origin`]), drops
+/// any unused vertices, then searches for a new support in the direction from the closest
+/// point toward the origin. Terminates when (i) a new support can't advance toward the
+/// origin (-> separated), (ii) the simplex's closest point reaches the origin
+/// (-> intersecting), or (iii) iteration cap is hit.
 pub fn gjk_intersect_r4<A: SupportFn4, B: SupportFn4>(
     a: &A,
     b: &B,
@@ -131,11 +126,10 @@ pub fn gjk_intersect_r4<A: SupportFn4, B: SupportFn4>(
     dir = -simplex[0].point;
 
     // ---- Phase 1: standard GJK, searching toward the origin.
-    // Terminates when either (a) a new support fails to cross the
-    // origin along the search direction (-> Separated) or (b) the
-    // current simplex's closest-point to origin is already at the
-    // origin (-> shapes intersect, exit to Phase 2 to grow the
-    // simplex to 5 points for EPA).
+    // Terminates when either (a) a new support fails to cross the origin along the search
+    // direction (-> Separated) or (b) the current simplex's closest-point to origin is
+    // already at the origin (-> shapes intersect, exit to Phase 2 to grow the simplex to
+    // 5 points for EPA).
     for _ in 0..GJK_MAX_ITERATIONS {
         if dir.length_squared() < GJK_EPS {
             break;
@@ -173,11 +167,10 @@ pub fn gjk_intersect_r4<A: SupportFn4, B: SupportFn4>(
     }
 
     // ---- Phase 2: grow the (already-enclosing) simplex to 5 points.
-    // Each iteration picks a direction orthogonal to the current
-    // simplex's affine hull and adds the support point there, either
-    // it's a genuine new hull vertex (simplex grows) or it's
-    // co-located with an existing vertex (polytope is too thin along
-    // that axis, try the opposite sign, then bail).
+    // Each iteration picks a direction orthogonal to the current simplex's affine hull
+    // and adds the support point there — either it's a genuine new hull vertex (simplex
+    // grows) or it's co-located with an existing vertex (polytope is too thin along that
+    // axis, try the opposite sign, then bail).
     let mut tried: Vec<Vec4> = Vec::new();
     while simplex.len() < 5 {
         let Some(probe) = orthogonal_to_hull(&simplex, &tried) else {
@@ -222,14 +215,12 @@ fn finalize_intersecting(simplex: Vec<MinkowskiPoint4>) -> GjkResult4 {
     }
 }
 
-/// A unit vector perpendicular to the affine hull of the current
-/// `simplex`, **and** not parallel to any already-tried direction.
-/// Used to grow a partial simplex after GJK has already established
-/// that the origin lies in its hull.
+/// A unit vector perpendicular to the affine hull of the current `simplex`, **and** not
+/// parallel to any already-tried direction. Used to grow a partial simplex after GJK has
+/// already established that the origin lies in its hull.
 ///
-/// `tried` is consulted so we don't re-pick a direction that the
-/// caller has already probed (which would just return the same
-/// support and stall growth).
+/// `tried` is consulted so we don't re-pick a direction that the caller has already
+/// probed (which would just return the same support and stall growth).
 fn orthogonal_to_hull(simplex: &[MinkowskiPoint4], tried: &[Vec4]) -> Option<Vec4> {
     let points: Vec<Vec4> = simplex.iter().map(|p| p.point).collect();
     let basis: Vec<Vec4> = if points.len() <= 1 {
@@ -252,9 +243,9 @@ fn orthogonal_to_hull(simplex: &[MinkowskiPoint4], tried: &[Vec4]) -> Option<Vec
         }
     }
 
-    // For each cardinal axis, compute the residual after projecting
-    // out the basis and out every already-tried direction. Rank
-    // candidates by residual magnitude; return the strongest.
+    // For each cardinal axis, compute the residual after projecting out the basis and out
+    // every already-tried direction. Rank candidates by residual magnitude; return the
+    // strongest.
     let axes = [Vec4::X, Vec4::Y, Vec4::Z, Vec4::W];
     let mut best: Option<(f32, Vec4)> = None;
     for &axis in &axes {
@@ -306,8 +297,8 @@ mod tests {
             center: Vec4::new(1.0, 0.0, 0.0, 0.0),
             radius: 2.0,
         };
-        // Overlapping spheres must report Intersecting, though the
-        // simplex shape itself we don't inspect here.
+        // Overlapping spheres must report Intersecting, though the simplex shape itself
+        // we don't inspect here.
         assert!(matches!(
             gjk_intersect_r4(&a, &b, Vec4::X),
             GjkResult4::Intersecting { .. }
@@ -318,9 +309,9 @@ mod tests {
     fn tesseracts_overlap_past_touching() {
         use crate::euclidean_r4::tesseract_vertices;
         let va: Vec<Vec4> = tesseract_vertices(1.0);
-        // Shift less than 1 so they overlap well past a single-corner
-        // touch. (Exact-touch at `(1,1,1,1)` is a boundary case GJK
-        // handles probabilistically, dropped as a test case.)
+        // Shift less than 1 so they overlap well past a single-corner touch. (Exact-touch
+        // at `(1,1,1,1)` is a boundary case GJK handles probabilistically, dropped as a
+        // test case.)
         let vb: Vec<Vec4> = tesseract_vertices(1.0)
             .into_iter()
             .map(|v| v + Vec4::new(0.6, 0.6, 0.6, 0.6))
@@ -337,8 +328,8 @@ mod tests {
     fn deeply_overlapping_pentatopes() {
         use crate::euclidean_r4::pentatope_vertices;
         let va: Vec<Vec4> = pentatope_vertices(1.0);
-        // Pentatope at origin vs pentatope shifted by a small vector,
-        // they should overlap substantially.
+        // Pentatope at origin vs pentatope shifted by a small vector; they should overlap
+        // substantially.
         let vb: Vec<Vec4> = pentatope_vertices(1.0)
             .into_iter()
             .map(|v| v + Vec4::new(0.2, 0.0, 0.0, 0.0))

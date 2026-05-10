@@ -1,8 +1,7 @@
 //! `impl PhysicsSpace for EuclideanR2`, 2D Euclidean rigid-body physics.
 //!
-//! Angular velocity is a scalar ([`Bivector2`]); inertia is the scalar
-//! moment of inertia. Orientation integrates by composing a rotor
-//! derived from `ω·dt`.
+//! Angular velocity is a scalar ([`Bivector2`]); inertia is the scalar moment of inertia.
+//! Orientation integrates by composing a rotor derived from `ω·dt`.
 
 use glam::Vec2;
 
@@ -125,9 +124,8 @@ pub fn sphere_body(
     )
 }
 
-/// Register all 2D Euclidean narrowphase functions:
-/// sphere-sphere, polygon-polygon, sphere-polygon (reversed pair handled
-/// by the dispatch table's auto-flip).
+/// Register all 2D Euclidean narrowphase functions: sphere-sphere, polygon-polygon,
+/// sphere-polygon (reversed pair handled by the dispatch table's auto-flip).
 pub fn register_default_narrowphase(np: &mut Narrowphase<EuclideanR2>) {
     np.register(ColliderKind::Sphere, ColliderKind::Sphere, sphere_sphere_r2);
     np.register(
@@ -164,10 +162,9 @@ fn sphere_sphere_r2(
     let len = log.length();
     let normal = if len > 1e-8 { log / len } else { Vec2::Y };
 
-    // Contact point: midpoint of the two surface points along the line
-    // between centers. For equal-radius spheres this is just the
-    // midpoint; for unequal radii it's biased toward the smaller one,
-    // which is what impulse response wants.
+    // Contact point: midpoint of the two surface points along the line between centers.
+    // For equal-radius spheres this is just the midpoint; for unequal radii it's biased
+    // toward the smaller one, which is what impulse response wants.
     let surface_a = a.position + normal * ra;
     let surface_b = b.position - normal * rb;
     let point = (surface_a + surface_b) * 0.5;
@@ -212,9 +209,8 @@ fn project_onto(axis: Vec2, verts: &[Vec2]) -> (f32, f32) {
     (lo, hi)
 }
 
-/// Best (smallest-overlap) axis found by iterating `sides`'s edge
-/// normals and projecting both polygons. Returns `None` when any axis
-/// shows separation (i.e. no collision).
+/// Best (smallest-overlap) axis found by iterating `sides`'s edge normals and projecting
+/// both polygons. Returns `None` when any axis shows separation (i.e. no collision).
 fn best_axis_from(sides: &[Vec2], other: &[Vec2]) -> Option<(Vec2, f32)> {
     let n = sides.len();
     let mut best: Option<(Vec2, f32)> = None;
@@ -261,8 +257,8 @@ fn polygon_polygon_r2(
     let va = world_vertices(a_local, a.position, a.orientation.rotation);
     let vb = world_vertices(b_local, b.position, b.orientation.rotation);
 
-    // Take the minimum across both polygons' edge normals. If either
-    // polygon's axes find full separation, there is no collision.
+    // Take the minimum across both polygons' edge normals. If either polygon's axes find
+    // full separation, there is no collision.
     let mut best = best_axis_from(&va, &vb)?;
     if let Some((n, o)) = best_axis_from(&vb, &va) {
         if o < best.1 {
@@ -281,14 +277,12 @@ fn polygon_polygon_r2(
         normal = -normal;
     }
 
-    // Contact-point heuristic: find the deepest-penetrating vertex of
-    // each polygon (projected along the contact normal), then pick
-    // whichever actually lies inside the other polygon. In a vertex-
-    // face contact only one side has a penetrating vertex, that vertex
-    // IS the contact point. For edge-edge (both inside) or grazing
-    // (neither strictly inside), fall back to the midpoint of the two
-    // candidates. Imperfect; replace with a full Sutherland-Hodgman
-    // manifold when stability demands it.
+    // Contact-point heuristic: find the deepest-penetrating vertex of each polygon
+    // (projected along the contact normal), then pick whichever actually lies inside the
+    // other polygon. In a vertex-face contact only one side has a penetrating vertex, and
+    // that vertex IS the contact point. For edge-edge (both inside) or grazing (neither
+    // strictly inside), fall back to the midpoint of the two candidates. Imperfect;
+    // replace with a full Sutherland-Hodgman manifold when stability demands it.
     let mut deepest_a = va[0];
     let mut max_proj = va[0].dot(normal);
     for &v in &va[1..] {
@@ -324,9 +318,9 @@ fn polygon_polygon_r2(
     })
 }
 
-/// True if `p` lies inside the convex polygon given by CCW vertices `poly`.
-/// Used by sphere-polygon to detect the "sphere center has tunneled
-/// inside" case and flip the normal accordingly.
+/// True if `p` lies inside the convex polygon given by CCW vertices `poly`. Used by
+/// sphere-polygon to detect the "sphere center has tunneled inside" case and flip the
+/// normal accordingly.
 fn point_in_convex_ccw(poly: &[Vec2], p: Vec2) -> bool {
     for i in 0..poly.len() {
         let v0 = poly[i];
@@ -340,8 +334,8 @@ fn point_in_convex_ccw(poly: &[Vec2], p: Vec2) -> bool {
     true
 }
 
-/// Closest point on the polygon boundary (edges) to an external point,
-/// plus its distance.
+/// Closest point on the polygon boundary (edges) to an external point, plus its
+/// distance.
 fn closest_on_polygon_boundary(poly: &[Vec2], p: Vec2) -> (Vec2, f32) {
     let mut best = poly[0];
     let mut best_d2 = (best - p).length_squared();
@@ -385,10 +379,9 @@ fn sphere_polygon_r2(
     let (closest, dist) = closest_on_polygon_boundary(&vb, center);
 
     if point_in_convex_ccw(&vb, center) {
-        // Sphere center is inside the polygon, maximal penetration.
-        // Push the sphere out along (center - closest) = toward the
-        // nearest edge. Normal A->B is from sphere toward polygon =
-        // (closest - center) direction, but since the center is inside
+        // Sphere center is inside the polygon, maximal penetration. Push the sphere out
+        // along (center - closest) toward the nearest edge. Normal A->B is from sphere
+        // toward polygon = (closest - center) direction, but since the center is inside
         // we flip to push it out.
         let dir = (center - closest).try_normalize().unwrap_or(Vec2::Y);
         return Some(Contact {
@@ -433,13 +426,13 @@ pub fn regular_polygon_vertices(n: u32, r: f32) -> Vec<Vec2> {
         .collect()
 }
 
-/// Moment of inertia of a solid regular n-gon of mass `m` and
-/// circumradius `r` about its centroid:
+/// Moment of inertia of a solid regular n-gon of mass `m` and circumradius `r` about its
+/// centroid:
 ///
 /// `I = (m·r²/6) · (1 + 2·cos²(π/n))`
 ///
-/// Reduces to `m·r²/4` for n=3, `m·r²/3` for n=4, and `m·r²/2` in the
-/// disk limit as n->∞.
+/// Reduces to `m·r²/4` for n=3, `m·r²/3` for n=4, and `m·r²/2` in the disk limit as
+/// n->∞.
 pub fn regular_polygon_inertia(mass: f32, n: u32, r: f32) -> f32 {
     use std::f32::consts::PI;
     let c = (PI / n as f32).cos();
@@ -485,9 +478,8 @@ pub fn rectangle_body(
     half_extents: Vec2,
     mass: f32,
 ) -> RigidBody<EuclideanR2> {
-    // Rectangle moment of inertia about its center: m·(w² + h²)/12,
-    // where w = 2·half.x, h = 2·half.y, so I = m·(4·hx² + 4·hy²)/12
-    // = m·(hx² + hy²)/3.
+    // Rectangle moment of inertia about its center: m·(w² + h²)/12, where w = 2·half.x,
+    // h = 2·half.y, so I = m·(4·hx² + 4·hy²)/12 = m·(hx² + hy²)/3.
     let inertia = mass * (half_extents.x * half_extents.x + half_extents.y * half_extents.y) / 3.0;
     RigidBody::new(
         center,
@@ -501,16 +493,16 @@ pub fn rectangle_body(
     )
 }
 
-/// Build a static (infinite-mass) rectangular wall with CCW-wound
-/// corners. `half_extents` is (width/2, height/2).
+/// Build a static (infinite-mass) rectangular wall with CCW-wound corners. `half_extents`
+/// is (width/2, height/2).
 pub fn static_wall(center: Vec2, half_extents: Vec2) -> RigidBody<EuclideanR2> {
     RigidBody::fixed(
         center,
         Collider::Polygon2D {
             vertices: rectangle_vertices(half_extents),
         },
-        // Any finite value is fine, the solver gates angular response
-        // on `inv_mass > 0`, so static walls never actually rotate.
+        // Any finite value is fine — the solver gates angular response on `inv_mass > 0`,
+        // so static walls never actually rotate.
         1.0,
         &EuclideanR2,
     )
@@ -583,8 +575,7 @@ mod tests {
 
     #[test]
     fn regular_polygon_vertices_are_ccw() {
-        // CCW square at the origin: cross product of successive edges
-        // should be positive.
+        // CCW square at the origin: cross product of successive edges should be positive.
         let verts = regular_polygon_vertices(4, 1.0);
         assert_eq!(verts.len(), 4);
         for i in 0..4 {
@@ -605,8 +596,8 @@ mod tests {
         let mut np = Narrowphase::<EuclideanR2>::new();
         register_default_narrowphase(&mut np);
 
-        // Two axis-aligned unit squares (half-extent 1), centers 1.5
-        // apart along X -> x-extents overlap by 0.5.
+        // Two axis-aligned unit squares (half-extent 1), centers 1.5 apart along X ->
+        // x-extents overlap by 0.5.
         let a = aa_box(Vec2::ZERO, Vec2::ONE, 1.0);
         let b = aa_box(Vec2::new(1.5, 0.0), Vec2::ONE, 1.0);
 
@@ -644,8 +635,8 @@ mod tests {
         let mut np = Narrowphase::<EuclideanR2>::new();
         register_default_narrowphase(&mut np);
 
-        // Two squares (circumradius 1) centers 1.9 apart. When unrotated
-        // their x-extent is ±1, so they overlap.
+        // Two squares (circumradius 1) centers 1.9 apart. When unrotated their x-extent
+        // is ±1, so they overlap.
         let a = polygon_body(Vec2::ZERO, Vec2::ZERO, 4, 1.0, 1.0);
         let b = polygon_body(Vec2::new(1.9, 0.0), Vec2::ZERO, 4, 1.0, 1.0);
         assert!(
@@ -653,9 +644,9 @@ mod tests {
             "unrotated squares at 1.9 should overlap"
         );
 
-        // Rotate B by 45°. Its x-extent becomes ±√2/2 ≈ ±0.707, so the
-        // gap between A's right edge (x=1) and B's left edge (x=1.9−0.707=1.193)
-        // is positive -> no collision.
+        // Rotate B by 45°. Its x-extent becomes ±√2/2 ≈ ±0.707, so the gap between A's
+        // right edge (x=1) and B's left edge (x=1.9−0.707=1.193) is positive -> no
+        // collision.
         let mut b = polygon_body(Vec2::new(1.9, 0.0), Vec2::ZERO, 4, 1.0, 1.0);
         b.orientation = Iso2 {
             rotation: rye_math::Bivector2(std::f32::consts::FRAC_PI_4).exp(),
@@ -669,9 +660,8 @@ mod tests {
         let mut np = Narrowphase::<EuclideanR2>::new();
         register_default_narrowphase(&mut np);
 
-        // Square circumradius 1 at origin. Its right edge is at x=1.
-        // Sphere radius 0.5 at (1.3, 0) -> distance from center to edge
-        // is 0.3, penetration = 0.5 − 0.3 = 0.2.
+        // Square circumradius 1 at origin. Its right edge is at x=1. Sphere radius 0.5
+        // at (1.3, 0) -> distance from center to edge is 0.3, penetration = 0.5−0.3 = 0.2.
         let square = polygon_body(Vec2::ZERO, Vec2::ZERO, 4, 1.0, 1.0);
         let sphere = sphere_body(Vec2::new(1.3, 0.0), Vec2::ZERO, 0.5, 1.0);
 
@@ -699,9 +689,8 @@ mod tests {
 
     #[test]
     fn sphere_polygon_reverse_pair_handled() {
-        // Registered as (Sphere, Polygon2D). When bodies come in as
-        // (Polygon2D, Sphere), the dispatch table should flip and
-        // negate the normal.
+        // Registered as (Sphere, Polygon2D). When bodies come in as (Polygon2D, Sphere),
+        // the dispatch table should flip and negate the normal.
         let mut np = Narrowphase::<EuclideanR2>::new();
         register_default_narrowphase(&mut np);
 
@@ -718,10 +707,9 @@ mod tests {
 
     #[test]
     fn off_center_impact_produces_angular_velocity() {
-        // A stationary square hit by a sphere falling onto its top-
-        // right corner should acquire clockwise (negative) angular
-        // velocity. This is the core bug the angular-response fix
-        // addresses: without torque from off-center contact, the
+        // A stationary square hit by a sphere falling onto its top-right corner should
+        // acquire clockwise (negative) angular velocity. This is the core bug the
+        // angular-response fix addresses: without torque from off-center contact, the
         // square would just translate.
         let mut world = World::new(EuclideanR2);
         register_default_narrowphase(&mut world.narrowphase);
@@ -749,9 +737,9 @@ mod tests {
 
     #[test]
     fn head_on_contact_produces_no_rotation() {
-        // Symmetrically aligned sphere-sphere head-on collision should
-        // only produce linear response, no spin. Sanity-check that
-        // angular response doesn't leak into axis-aligned cases.
+        // Symmetrically aligned sphere-sphere head-on collision should only produce linear
+        // response, no spin. Sanity-check that angular response doesn't leak into
+        // axis-aligned cases.
         let mut world = World::new(EuclideanR2);
         register_default_narrowphase(&mut world.narrowphase);
 
@@ -776,8 +764,8 @@ mod tests {
 
     #[test]
     fn polygons_settle_on_floor_without_penetration() {
-        // Drop a ring of polygons onto a static floor; after enough
-        // time they should all rest above the floor surface.
+        // Drop a ring of polygons onto a static floor; after enough time they should all
+        // rest above the floor surface.
         let mut world = World::new(EuclideanR2);
         register_default_narrowphase(&mut world.narrowphase);
 
@@ -803,9 +791,9 @@ mod tests {
             world.step(1.0 / 60.0);
         }
 
-        // Every dynamic body's lowest point should be ≥ floor_top minus
-        // a small slop tolerance (one tick of gravity-driven residual
-        // penetration is expected in a non-iterative solver).
+        // Every dynamic body's lowest point should be ≥ floor_top minus a small slop
+        // tolerance (one tick of gravity-driven residual penetration is expected in a
+        // non-iterative solver).
         for (idx, body) in world.bodies.iter().enumerate().skip(1) {
             let lowest = body.position.y - 0.4;
             assert!(
@@ -839,8 +827,8 @@ mod tests {
             world.step(1.0 / 60.0);
         }
 
-        // Velocities should have their sign reversed in the x direction
-        // for an elastic-ish bounce.
+        // Velocities should have their sign reversed in the x direction for an elastic-ish
+        // bounce.
         assert!(
             world.bodies[0].velocity.x < 0.0,
             "body 0 should bounce back"
@@ -853,24 +841,20 @@ mod tests {
 
     #[test]
     fn box_stack_settles_to_rest() {
-        // Stack three unit boxes vertically on a static floor and run
-        // long enough for them to come to rest. Without persistent
-        // manifolds + iterative PGS this stack jitters indefinitely:
-        // single-contact-per-pair single-pass resolution can't satisfy
-        // the bottom box's two simultaneous constraints (floor below,
-        // box above) in one impulse application. With manifolds + PGS,
-        // both constraints are visible to the solver each iteration
-        // and the stack settles to rest.
+        // Stack three unit boxes vertically on a static floor and run long enough for
+        // them to come to rest. Without persistent manifolds + iterative PGS this stack
+        // jitters indefinitely: single-contact-per-pair single-pass resolution can't
+        // satisfy the bottom box's two simultaneous constraints (floor below, box above)
+        // in one impulse application. With manifolds + PGS, both constraints are visible
+        // to the solver each iteration and the stack settles to rest.
         //
-        // Capped at 3 because tall polygon stacks need SAT manifold
-        // clipping (Sutherland-Hodgman edge-to-face) to produce two
-        // corner contacts per pair per frame, which is what gives a
-        // stack torque resistance against tipping. Today's narrowphase
-        // returns one contact per pair per frame; persistent manifolds
-        // accumulate corner contacts over frames as the stack settles,
-        // but for fast-loading tall stacks the top boxes can drift off
-        // before manifolds populate. SAT clipping (Sutherland-Hodgman
-        // edge-to-face) is on the follow-up list.
+        // Capped at 3 because tall polygon stacks need SAT manifold clipping
+        // (Sutherland-Hodgman edge-to-face) to produce two corner contacts per pair per
+        // frame, which is what gives a stack torque resistance against tipping. Today's
+        // narrowphase returns one contact per pair per frame; persistent manifolds
+        // accumulate corner contacts over frames as the stack settles, but for
+        // fast-loading tall stacks the top boxes can drift off before manifolds populate.
+        // SAT clipping (Sutherland-Hodgman edge-to-face) is on the follow-up list.
         let mut world = World::new(EuclideanR2);
         register_default_narrowphase(&mut world.narrowphase);
 
@@ -889,9 +873,8 @@ mod tests {
             body.restitution = 0.0;
             world.push_body(body);
         }
-        // Tall stacks need more iterations than the default to
-        // converge, impulses propagate one box per iteration through
-        // the chain of contacts.
+        // Tall stacks need more iterations than the default to converge — impulses
+        // propagate one box per iteration through the chain of contacts.
         world.pgs_iters = 16;
 
         world.push_field(Box::new(crate::field::Gravity::new(Vec2::new(0.0, -9.8))));
@@ -901,9 +884,8 @@ mod tests {
             world.step(1.0 / 60.0);
         }
 
-        // After settling: every box is at rest (low linear and angular
-        // velocity), and the stack hasn't fallen over (x-positions
-        // close to original).
+        // After settling: every box is at rest (low linear and angular velocity), and the
+        // stack hasn't fallen over (x-positions close to original).
         for (idx, body) in world.bodies.iter().enumerate().skip(1) {
             assert!(
                 body.position.is_finite() && body.velocity.is_finite(),
@@ -924,9 +906,8 @@ mod tests {
                 "body {idx} drifted off stack: x = {}",
                 body.position.x
             );
-            // No body should be below the floor surface (small slop
-            // tolerance for residual penetration the Baumgarte bias
-            // hasn't fully corrected).
+            // No body should be below the floor surface (small slop tolerance for residual
+            // penetration the Baumgarte bias hasn't fully corrected).
             assert!(
                 body.position.y - HALF >= floor_top - 0.1,
                 "body {idx} sank into floor: y_bottom = {}",

@@ -1,20 +1,16 @@
-//! Space-generic first-person player controller. Reads
-//! [`rye_input::FrameInput`] and advances a position along the
-//! ambient [`rye_math::Space`]'s geodesics, matched against a yaw
-//! angle for facing.
+//! Space-generic first-person player controller. Reads [`rye_input::FrameInput`] and
+//! advances a position along the ambient [`rye_math::Space`]'s geodesics, matched
+//! against a yaw angle for facing.
 //!
-//! Movement convention: WASD drives forward/back/strafe relative to
-//! the player's yaw; Space / Shift drive world-Y up/down. The tangent
-//! vector is built in the Space's chart coordinates, then `space.exp`
-//! integrates it for one tick of motion. In Euclidean Spaces this
-//! collapses to `position += tangent * speed`; in curved Spaces the
-//! geodesic step bends the path naturally without further work in
-//! the controller.
+//! Movement convention: WASD drives forward/back/strafe relative to the player's yaw;
+//! Space / Shift drive world-Y up/down. The tangent vector is built in the Space's chart
+//! coordinates, then `space.exp` integrates it for one tick of motion. In Euclidean
+//! Spaces this collapses to `position += tangent * speed`; in curved Spaces the geodesic
+//! step bends the path naturally without further work in the controller.
 //!
-//! Yaw is kept as an explicit `f32` (not a rotor) because the
-//! player's facing only ever rotates about the Y axis here. A 4D
-//! player or a player that needs full rotor orientation would use
-//! a different controller.
+//! Yaw is kept as an explicit `f32` (not a rotor) because the player's facing only ever
+//! rotates about the Y axis here. A 4D player or a player that needs full rotor
+//! orientation would use a different controller.
 
 use glam::Vec3;
 use rye_input::FrameInput;
@@ -51,9 +47,9 @@ impl<S: Space<Point = Vec3, Vector = Vec3>> PlayerState<S> {
 
     /// Move the player along a geodesic for one tick.
     ///
-    /// `speed` is in Space-distance units per tick. The tangent direction is
-    /// built from `input.move_forward / move_right / move_up` rotated by
-    /// `self.yaw`. A zero-length tangent produces no movement.
+    /// `speed` is in Space-distance units per tick. The tangent direction is built from
+    /// `input.move_forward / move_right / move_up` rotated by `self.yaw`. A zero-length
+    /// tangent produces no movement.
     pub fn advance(&mut self, input: &FrameInput, space: &S, speed: f32) {
         let sin_y = self.yaw.sin();
         let cos_y = self.yaw.cos();
@@ -126,10 +122,9 @@ mod tests {
         assert_close(player.yaw, -0.2);
     }
 
-    /// W+D should travel `speed` units along the geodesic, not
-    /// `sqrt(2) * speed`. The tangent vector is the diagonal of forward
-    /// and right; without normalization, diagonal motion would be
-    /// faster than axis-aligned motion.
+    /// W+D should travel `speed` units along the geodesic, not `sqrt(2) * speed`. The
+    /// tangent vector is the diagonal of forward and right; without normalization,
+    /// diagonal motion would be faster than axis-aligned motion.
     #[test]
     fn advance_diagonal_input_speed_matches_axis_aligned_speed() {
         let mut player: PlayerState<EuclideanR3> = PlayerState::new(Vec3::ZERO);
@@ -179,10 +174,9 @@ mod tests {
         assert_close(player.position.z, 0.0);
     }
 
-    /// W in H³ from the origin moves along the ambient axis but the
-    /// resulting position must stay strictly inside the Poincaré ball
-    /// (`|p| < 1`), and the geodesic step is shorter than the
-    /// Euclidean equivalent because H³ stretches distance away from the
+    /// W in H³ from the origin moves along the ambient axis but the resulting position
+    /// must stay strictly inside the Poincaré ball (`|p| < 1`), and the geodesic step is
+    /// shorter than the Euclidean equivalent because H³ stretches distance away from the
     /// origin.
     #[test]
     fn advance_in_hyperbolic_h3_stays_inside_ball() {
@@ -208,9 +202,8 @@ mod tests {
         assert!(player.position.z < 0.0);
     }
 
-    /// Same shape in S³: position must stay inside the unit-3-sphere
-    /// embedding (`|p| < 1`) and motion direction is consistent with
-    /// the −Z forward convention.
+    /// Same shape in S³: position must stay inside the unit-3-sphere embedding (`|p| < 1`)
+    /// and motion direction is consistent with the −Z forward convention.
     #[test]
     fn advance_in_spherical_s3_stays_inside_embedding() {
         use rye_math::SphericalS3;

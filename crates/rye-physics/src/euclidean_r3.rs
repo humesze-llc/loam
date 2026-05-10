@@ -1,15 +1,13 @@
 //! `impl PhysicsSpace for EuclideanR3`, 3D Euclidean rigid-body physics.
 //!
-//! Angular velocity is a [`Bivector3`] (3 independent rotation-plane
-//! components); inertia is the scalar moment for isotropic bodies
-//! (spheres, the regular polyhedra). Non-isotropic inertia tensors land
-//! when a game actually needs them, a full 3×3 `Inertia` type is a
-//! structural change to the trait and can happen later.
+//! Angular velocity is a [`Bivector3`] (3 independent rotation-plane components);
+//! inertia is the scalar moment for isotropic bodies (spheres, the regular polyhedra).
+//! Non-isotropic inertia tensors land when a game actually needs them — a full 3×3
+//! `Inertia` type is a structural change to the trait and can happen later.
 //!
-//! Orientation integration bridges `Bivector3` -> `Rotor3` -> `Quat` (the
-//! type stored in `Iso3`). The conversion is a fixed mapping
-//! (xy↔z, yz↔x, zx↔y) defined by how rotor sandwich matches quaternion
-//! conjugation for the three cardinal axes.
+//! Orientation integration bridges `Bivector3` -> `Rotor3` -> `Quat` (the type stored in
+//! `Iso3`). The conversion is a fixed mapping (xy↔z, yz↔x, zx↔y) defined by how rotor
+//! sandwich matches quaternion conjugation for the three cardinal axes.
 
 use glam::{Quat, Vec3};
 
@@ -22,11 +20,10 @@ use crate::integrator::PhysicsSpace;
 use crate::narrowphase::Narrowphase;
 use crate::response::Contact;
 
-/// Convert a [`Rotor3`] to a [`Quat`] via the mapping
-/// `(s, xy, yz, zx) ↔ (w, z, x, y)`. This is the correspondence that
-/// makes `Rotor3::apply` agree with `Quat::mul_vec3` for the three
-/// cardinal-plane rotations; verified by `rotor3_matches_glam_quat_for_axis_rotation`
-/// in `rye-math`.
+/// Convert a [`Rotor3`] to a [`Quat`] via the mapping `(s, xy, yz, zx) ↔ (w, z, x, y)`.
+/// This is the correspondence that makes `Rotor3::apply` agree with `Quat::mul_vec3` for
+/// the three cardinal-plane rotations; verified by
+/// `rotor3_matches_glam_quat_for_axis_rotation` in `rye-math`.
 fn rotor_to_quat(r: rye_math::Rotor3) -> Quat {
     Quat::from_xyzw(r.yz, r.zx, r.xy, r.s)
 }
@@ -65,24 +62,23 @@ fn inv_inertia(body: &RigidBody<EuclideanR3>) -> f32 {
 
 impl PhysicsSpace for EuclideanR3 {
     type AngVel = Bivector3;
-    /// Scalar isotropic moment of inertia. Suitable for spheres and
-    /// the five Platonic solids about their centroids; a full 3×3
-    /// tensor comes later if an anisotropic collider needs it.
+    /// Scalar isotropic moment of inertia. Suitable for spheres and the five Platonic
+    /// solids about their centroids; a full 3×3 tensor comes later if an anisotropic
+    /// collider needs it.
     type Inertia = f32;
 
     fn integrate_orientation(&self, iso: Iso3, omega: Bivector3, dt: f32) -> Iso3 {
-        // Catch NaN/infinite angular velocity at the source rather
-        // than letting it propagate through the rotor and into the
-        // GPU buffer. Debug-only; release builds trust internal callers.
+        // Catch NaN/infinite angular velocity at the source rather than letting it
+        // propagate through the rotor and into the GPU buffer. Debug-only; release builds
+        // trust internal callers.
         debug_assert!(
             omega.xy.is_finite() && omega.yz.is_finite() && omega.zx.is_finite(),
             "non-finite Bivector3 angular velocity in integrate_orientation",
         );
         let delta_rotor = (omega * dt).exp();
         let delta_quat = rotor_to_quat(delta_rotor);
-        // Compose: delta applied after existing rotation. Renormalize
-        // the result to prevent slow drift off the unit manifold under
-        // repeated f32 composition.
+        // Compose: delta applied after existing rotation. Renormalize the result to
+        // prevent slow drift off the unit manifold under repeated f32 composition.
         let composed = delta_quat * iso.rotation;
         let rotation = composed.normalize();
         Iso3 {
@@ -222,17 +218,15 @@ fn world_vertices(local: &[Vec3], pos: Vec3, rot: Quat) -> Vec<Vec3> {
     local.iter().map(|&v| rot * v + pos).collect()
 }
 
-/// Shared sanity check on EPA output: reject results that are
-/// numerically bad (NaN, infinite, zero-length normal, or implausibly
-/// large depth) or that signal a degenerate touching contact
-/// (penetration below `MIN_PENETRATION`). A bad contact left in
-/// circulation feeds NaN velocities back into the integrator and
-/// compounds across frames; better to return None.
+/// Shared sanity check on EPA output: reject results that are numerically bad (NaN,
+/// infinite, zero-length normal, or implausibly large depth) or that signal a degenerate
+/// touching contact (penetration below `MIN_PENETRATION`). A bad contact left in
+/// circulation feeds NaN velocities back into the integrator and compounds across frames;
+/// better to return None.
 const MIN_POLYTOPE_PENETRATION: f32 = 1e-4;
-/// Upper bound on penetration depth we accept. Any deeper is almost
-/// certainly an EPA iteration-cap fallback on a numerically wild
-/// input, applying an impulse scaled by that depth would detonate
-/// body velocities.
+/// Upper bound on penetration depth we accept. Any deeper is almost certainly an EPA
+/// iteration-cap fallback on a numerically wild input — applying an impulse scaled by
+/// that depth would detonate body velocities.
 const MAX_POLYTOPE_PENETRATION: f32 = 5.0;
 
 fn validate_contact(
@@ -260,9 +254,9 @@ fn validate_contact(
     })
 }
 
-/// Conservative bounding-sphere radius of a polytope about its
-/// centroid. Used as a cheap pre-cull before running GJK, if the
-/// bounding spheres don't overlap, the polytopes can't overlap either.
+/// Conservative bounding-sphere radius of a polytope about its centroid. Used as a cheap
+/// pre-cull before running GJK — if the bounding spheres don't overlap, the polytopes
+/// can't overlap either.
 fn polytope_bounding_radius(local_vertices: &[Vec3]) -> f32 {
     local_vertices
         .iter()
@@ -283,9 +277,9 @@ fn polytope_polytope_r3(
         return None;
     };
 
-    // Bounding-sphere pre-cull. Cheap sphere-sphere test; skips the
-    // entire GJK/EPA path whenever the polytopes can't possibly touch.
-    // Also sidesteps numerical thrashing on far-apart pairs.
+    // Bounding-sphere pre-cull. Cheap sphere-sphere test; skips the entire GJK/EPA path
+    // whenever the polytopes can't possibly touch. Also sidesteps numerical thrashing on
+    // far-apart pairs.
     let ra = polytope_bounding_radius(va_local);
     let rb = polytope_bounding_radius(vb_local);
     let center_dist_sq = (b.position - a.position).length_squared();
@@ -344,10 +338,9 @@ fn sphere_polytope_r3(
     validate_contact(&info, a, b)
 }
 
-/// Polytope vs half-space: analytical deep-vertex search. The polytope
-/// vertex penetrating deepest into the half-space is the contact point;
-/// normal = −plane_normal (A->B, from polytope into the solid side),
-/// depth = how far that vertex is beyond the plane.
+/// Polytope vs half-space: analytical deep-vertex search. The polytope vertex penetrating
+/// deepest into the half-space is the contact point; normal = −plane_normal (A->B, from
+/// polytope into the solid side), depth = how far that vertex is beyond the plane.
 fn polytope_halfspace_r3(
     a: &RigidBody<EuclideanR3>,
     b: &RigidBody<EuclideanR3>,
@@ -368,8 +361,8 @@ fn polytope_halfspace_r3(
     let mut deepest_depth = 0.0_f32;
     for &v_local in va_local {
         let v_world = a.orientation.rotation * v_local + a.position;
-        // Signed distance to the plane. Positive = outside half-space,
-        // negative = inside (penetrating). We want the deepest negative.
+        // Signed distance to the plane. Positive = outside half-space, negative = inside
+        // (penetrating). We want the deepest negative.
         let signed = v_world.dot(plane_n) - offset;
         let depth = -signed;
         if depth > deepest_depth {
@@ -440,9 +433,8 @@ pub fn sphere_body_r3(
     )
 }
 
-/// Static half-space body. `normal` is the outward direction (the side
-/// where the world is); `offset` places the plane at
-/// `dot(p, normal) = offset`.
+/// Static half-space body. `normal` is the outward direction (the side where the world
+/// is); `offset` places the plane at `dot(p, normal) = offset`.
 pub fn halfspace_body_r3(normal: Vec3, offset: f32) -> RigidBody<EuclideanR3> {
     let n = normal.try_normalize().unwrap_or(Vec3::Y);
     RigidBody::fixed(
@@ -454,17 +446,15 @@ pub fn halfspace_body_r3(normal: Vec3, offset: f32) -> RigidBody<EuclideanR3> {
 }
 
 // ---------------------------------------------------------------------------
-// Polytope builders. Inertia is computed as isotropic (scalar), for a
-// prototype this is a reasonable approximation for roughly cube-ish or
-// regular shapes. A full 3×3 inertia tensor is a structural change to
-// `PhysicsSpace::Inertia` and lands when a game actually needs non-
-// isotropic rigid bodies.
+// Polytope builders. Inertia is computed as isotropic (scalar); for a prototype this is a
+// reasonable approximation for roughly cube-ish or regular shapes. A full 3×3 inertia
+// tensor is a structural change to `PhysicsSpace::Inertia` and lands when a game actually
+// needs non-isotropic rigid bodies.
 // ---------------------------------------------------------------------------
 
-/// Isotropic inertia for a box: `m·(w² + h² + d²) / 18`, which is the
-/// average of the three diagonal entries of the principal-axis tensor.
-/// For a cube this reduces to `m·(3·s²) / 18 = m·s²/6`, matching the
-/// exact cube inertia.
+/// Isotropic inertia for a box: `m·(w² + h² + d²) / 18`, which is the average of the
+/// three diagonal entries of the principal-axis tensor. For a cube this reduces to
+/// `m·(3·s²) / 18 = m·s²/6`, matching the exact cube inertia.
 pub fn box_inertia(mass: f32, half_extents: Vec3) -> f32 {
     let w = half_extents.x * 2.0;
     let h = half_extents.y * 2.0;
@@ -506,10 +496,10 @@ pub fn box_body(
     )
 }
 
-/// Dynamic convex polytope body with caller-provided vertices and an
-/// isotropic-inertia approximation: `(2/5)·m·r²` where `r` is the
-/// bounding-sphere radius. Exact for spheres; for polytopes it sits in
-/// the right order of magnitude and suffices for prototypes.
+/// Dynamic convex polytope body with caller-provided vertices and an isotropic-inertia
+/// approximation: `(2/5)·m·r²` where `r` is the bounding-sphere radius. Exact for
+/// spheres; for polytopes it sits in the right order of magnitude and suffices for
+/// prototypes.
 pub fn polytope_body(
     position: Vec3,
     velocity: Vec3,
@@ -532,16 +522,14 @@ pub fn polytope_body(
 }
 
 // ---------------------------------------------------------------------------
-// Platonic solid vertex generators. Each centered at origin, scaled so
-// the bounding-sphere (circumradius) radius = 1.0. Callers scale by
-// their desired radius. All vertex lists are convex hulls, GJK doesn't
-// care about face winding.
+// Platonic solid vertex generators. Each centered at origin, scaled so the bounding-
+// sphere (circumradius) radius = 1.0. Callers scale by their desired radius. All vertex
+// lists are convex hulls; GJK doesn't care about face winding.
 // ---------------------------------------------------------------------------
 
 /// Tetrahedron (4 vertices). Bounding-sphere radius 1.
 pub fn tetrahedron_vertices(r: f32) -> Vec<Vec3> {
-    // Standard construction: alternating corners of a cube. Scale to
-    // unit circumradius.
+    // Standard construction: alternating corners of a cube. Scale to unit circumradius.
     let k = r / 3.0_f32.sqrt();
     vec![
         Vec3::new(k, k, k),
@@ -663,9 +651,9 @@ mod tests {
         let mut world = World::new(EuclideanR3);
         register_default_narrowphase(&mut world.narrowphase);
 
-        // Spheres start 2 m apart, radius 0.5 each, closing at 4 m/s.
-        // They need ~0.25 s of simulated time just to touch, so run
-        // enough ticks for the contact + bounce to resolve fully.
+        // Spheres start 2 m apart, radius 0.5 each, closing at 4 m/s. They need ~0.25 s
+        // of simulated time just to touch, so run enough ticks for the contact + bounce
+        // to resolve fully.
         world.push_body(sphere_body_r3(
             Vec3::new(-1.0, 0.0, 0.0),
             Vec3::new(2.0, 0.0, 0.0),
@@ -682,10 +670,9 @@ mod tests {
         for _ in 0..120 {
             world.step(1.0 / 120.0);
         }
-        // No angular velocity should develop from an axis-aligned
-        // sphere-sphere impact, they touch along their shared line of
-        // centers, so the contact point lies on each body's axis and
-        // r × n = 0 for the normal impulse. There's also no tangential
+        // No angular velocity should develop from an axis-aligned sphere-sphere impact —
+        // they touch along their shared line of centers, so the contact point lies on each
+        // body's axis and r × n = 0 for the normal impulse. There's also no tangential
         // relative velocity for friction to act on.
         let a = &world.bodies[0];
         let b = &world.bodies[1];
@@ -698,15 +685,14 @@ mod tests {
 
     #[test]
     fn off_center_glancing_hit_produces_angular_velocity() {
-        // A static-ish target sphere at the origin is hit by a moving
-        // sphere offset vertically from the collision axis. The
-        // contact point lies off each body's geometric center -> the
-        // impact should impart angular velocity.
+        // A static-ish target sphere at the origin is hit by a moving sphere offset
+        // vertically from the collision axis. The contact point lies off each body's
+        // geometric center -> the impact should impart angular velocity.
         let mut world = World::new(EuclideanR3);
         register_default_narrowphase(&mut world.narrowphase);
 
-        // Target: heavy, so most of the impulse ends up as motion/spin
-        // on the lighter projectile.
+        // Target: heavy, so most of the impulse ends up as motion/spin on the lighter
+        // projectile.
         let target_id = world.push_body(sphere_body_r3(Vec3::ZERO, Vec3::ZERO, 0.5, 10.0));
         // Projectile offset +0.4 in y; moving in −x to collide.
         let projectile_id = world.push_body(sphere_body_r3(
@@ -716,14 +702,14 @@ mod tests {
             1.0,
         ));
 
-        // 120 ticks at 1/240 s = 0.5 s, enough for the projectile
-        // (5 m/s) to close the ~1.3 m horizontal gap to contact.
+        // 120 ticks at 1/240 s = 0.5 s, enough for the projectile (5 m/s) to close the
+        // ~1.3 m horizontal gap to contact.
         for _ in 0..120 {
             world.step(1.0 / 240.0);
         }
 
-        // Both bodies should have picked up some angular velocity in
-        // the xy-plane (from offset contact with xy offset in r).
+        // Both bodies should have picked up some angular velocity in the xy-plane (from
+        // offset contact with xy offset in r).
         let target_omega = world.bodies[target_id].angular_velocity.magnitude();
         let proj_omega = world.bodies[projectile_id].angular_velocity.magnitude();
         assert!(
@@ -738,9 +724,9 @@ mod tests {
 
     #[test]
     fn integration_preserves_unit_rotor() {
-        // Integrating orientation over many ticks should not drift
-        // outside the unit-quat manifold. Tests that the rotor↔quat
-        // conversion is round-trippable for the common case.
+        // Integrating orientation over many ticks should not drift outside the unit-quat
+        // manifold. Tests that the rotor↔quat conversion is round-trippable for the
+        // common case.
         let space = EuclideanR3;
         let mut iso = Iso3::IDENTITY;
         let omega = Bivector3::new(0.2, 0.3, -0.1);

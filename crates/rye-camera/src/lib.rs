@@ -2,22 +2,19 @@
 //!
 //! Two layers, used together:
 //!
-//! 1. [`Camera<S>`]: Space-generic position + tangent frame. Pure
-//!    data; storage agnostic to which controller is driving it.
-//!    Works for any `Space` whose `Point` and `Vector` are
-//!    `glam::Vec3` (i.e. all the closed-form 3D Spaces today).
-//! 2. [`CameraController`]: input-driven logic that mutates a
-//!    `Camera<S>` each frame. Concrete impls: [`OrbitController`],
-//!    [`FirstPersonController`].
+//! 1. [`Camera<S>`]: Space-generic position + tangent frame. Pure data; storage
+//!    agnostic to which controller is driving it. Works for any `Space` whose `Point`
+//!    and `Vector` are `glam::Vec3` (i.e. all the closed-form 3D Spaces today).
+//! 2. [`CameraController`]: input-driven logic that mutates a `Camera<S>` each frame.
+//!    Concrete impls: [`OrbitController`], [`FirstPersonController`].
 //!
 //! ## Legacy Euclidean-only types
 //!
-//! [`OrbitCamera`] and [`FirstPersonCamera`] predate the
-//! Space-generic refactor. They remain exported and unchanged so
-//! existing examples build during incremental migration; new code
-//! should prefer `OrbitController<EuclideanR3>` /
-//! `FirstPersonController<EuclideanR3>`. They will be removed once
-//! every example has migrated.
+//! [`OrbitCamera`] and [`FirstPersonCamera`] predate the Space-generic refactor. They
+//! remain exported and unchanged so existing examples build during incremental
+//! migration; new code should prefer `OrbitController<EuclideanR3>` /
+//! `FirstPersonController<EuclideanR3>`. They will be removed once every example has
+//! migrated.
 
 mod camera;
 mod controller;
@@ -167,13 +164,11 @@ impl FirstPersonCamera {
         }
     }
 
-    /// Rotate look direction from mouse delta. Always integrates the
-    /// delta, so pointer-locked windows just call it every frame.
-    /// Callers that want a hold-to-look UX wrap the call in their own
-    /// `if input.left_mouse_down { ... }` (or right-button gate); doing
-    /// it inside the controller would force the always-on case to
-    /// fight against gating, which is the more common mode in
-    /// SDF-render demos.
+    /// Rotate look direction from mouse delta. Always integrates the delta, so
+    /// pointer-locked windows just call it every frame. Callers that want a
+    /// hold-to-look UX wrap the call in their own `if input.left_mouse_down { ... }`
+    /// (or right-button gate); doing it inside the controller would force the always-on
+    /// case to fight against gating, which is the more common mode in SDF-render demos.
     pub fn advance_look(&mut self, input: FrameInput) {
         self.yaw -= input.mouse_delta.x * FIRST_PERSON_MOUSE_SENSITIVITY;
         self.pitch = (self.pitch - input.mouse_delta.y * FIRST_PERSON_MOUSE_SENSITIVITY)

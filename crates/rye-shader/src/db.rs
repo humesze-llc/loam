@@ -841,8 +841,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    /// CPU/GPU parity for `BlendedSpace<EuclideanR3, HyperbolicH3,
-    /// LinearBlendX>`, restricted to `rye_exp`. Transport parity has
+    /// CPU/GPU parity for `BlendedSpace<EuclideanR3, HyperbolicH3, LinearBlendX>`, restricted
+    /// to `rye_exp`. Transport parity has
     /// its own probe at `blended_e3_h3_gpu_probe_transport_matches_cpu`.
     ///
     /// The other two ABI methods are intentionally divergent:
@@ -909,9 +909,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    /// CPU/GPU parity for `BlendedSpace<EuclideanR3, HyperbolicH3,
-    /// LinearBlendX>::parallel_transport`. Both sides run 8 RK4
-    /// sub-steps along the chart-coordinate line from `a` to `b`, so
+    /// CPU/GPU parity for
+    /// `BlendedSpace<EuclideanR3, HyperbolicH3, LinearBlendX>::parallel_transport`.
+    /// Both sides run 8 RK4 sub-steps along the chart-coordinate line from `a` to `b`, so
     /// agreement is to 4th-order truncation modulo f32 noise.
     ///
     /// Chosen test paths sample the three regions: pure E3 (transport

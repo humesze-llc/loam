@@ -510,8 +510,7 @@ const LOG_JACOBIAN_EPS: f32 = 1.0e-3;
 ///
 /// 1. Forward-evaluate `exp_from(v_k)` to get the current
 ///    geodesic endpoint.
-/// 2. Compute residual `r = to − endpoint`. If `|r| <
-///    LOG_RESIDUAL_TOL`, return `v_k`.
+/// 2. Compute residual `r = to − endpoint`. If `|r| < LOG_RESIDUAL_TOL`, return `v_k`.
 /// 3. Estimate the Jacobian `J[i][j] = ∂exp[i]/∂v[j]` by
 ///    finite differences (3 axis-aligned perturbations of
 ///    `v_k`, central differences).
@@ -810,8 +809,8 @@ impl BlendingField for LinearBlendX {
 // WGSL emission
 // ---------------------------------------------------------------------------
 
-/// WGSL prelude for the **specific** `BlendedSpace<EuclideanR3,
-/// HyperbolicH3, LinearBlendX>` instantiation used by the
+/// WGSL prelude for the **specific** `BlendedSpace<EuclideanR3, HyperbolicH3, LinearBlendX>`
+/// instantiation used by the
 /// `examples/blended` demo.
 ///
 /// **Scope.** This is a hand-rolled, parametric prelude, not a
@@ -1218,8 +1217,8 @@ mod tests {
     ///
     /// Tolerance choice: central differences with `EPS = 1e-3`
     /// have leading truncation `O(EPS² · f''') ≈ 1e-6` for the
-    /// smooth conformal factor here, plus f32 roundoff `O(1/EPS) ·
-    /// eps_machine ≈ 1e-4`. Bound at `5e-3` leaves ~50x headroom
+    /// smooth conformal factor here, plus f32 roundoff `O(1/EPS) · eps_machine ≈ 1e-4`. Bound
+    /// at `5e-3` leaves ~50x headroom
     /// over both, tight enough to catch a sign error or missing
     /// chain-rule term but loose enough that the H3 Poincaré
     /// factor's `(1−r²)` denominator at the |r|≈0.7 sample point

@@ -51,9 +51,11 @@ pub trait PhysicsSpace: Space {
     /// PGS solver divides by this to convert a velocity constraint to
     /// an impulse magnitude:
     ///
-    ///   `K = inv_m_a + inv_m_b
-    ///        + ((r_a ∧ n) · I_a⁻¹ · (r_a ∧ n))
-    ///        + ((r_b ∧ n) · I_b⁻¹ · (r_b ∧ n))`
+    /// ```text
+    /// K = inv_m_a + inv_m_b
+    ///      + ((r_a ∧ n) · I_a⁻¹ · (r_a ∧ n))
+    ///      + ((r_b ∧ n) · I_b⁻¹ · (r_b ∧ n))
+    /// ```
     ///
     /// Returns 0 only when both bodies are static.
     fn effective_mass_inv(

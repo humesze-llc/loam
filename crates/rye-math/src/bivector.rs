@@ -465,13 +465,12 @@ impl Bivector4 {
     }
 
     /// Inner product treating both bivectors as 6-component
-    /// vectors over the orthonormal basis `{xy, xz, xw, yz, yw,
-    /// zw}`. Equivalent to `-(A * B).scalar_part()` for the
-    /// Clifford product when `A * B` is computed in G(4, 0),
+    /// vectors over the orthonormal basis `{xy, xz, xw, yz, yw, zw}`. Equivalent to
+    /// `-(A * B).scalar_part()` for the Clifford product when `A * B` is computed in G(4, 0),
     /// since the basis bivectors satisfy `e_ij · e_ij = -1`;
     /// the convention used here is the *Euclidean* inner
-    /// product on the coefficient vector, which is positive
-    /// definite. Used to project one bivector onto another's
+    /// product on the coefficient vector, which is positive definite. Used to project one
+    /// bivector onto another's
     /// direction (e.g., the angle a rotor has accumulated along
     /// a fixed bivector axis).
     pub fn dot(self, other: Self) -> f32 {
@@ -510,8 +509,7 @@ impl Bivector4 {
     /// Clifford left-contraction `B ⌋ v`, the grade-1 part of the
     /// geometric product `B · v`, with the standard mathematical
     /// sign convention. For `B = e_xy` and `v = e_x` this returns
-    /// `−e_y` (because `e_xy · e_x = e_x e_y e_x = −e_x e_x e_y =
-    /// −e_y`).
+    /// `−e_y` (because `e_xy · e_x = e_x e_y e_x = −e_x e_x e_y = −e_y`).
     ///
     /// **Note for physics callers**: rigid-body dynamics wants
     /// `ω × r` with the *opposite* sign, `e_xy` "applied to" `e_x`
@@ -556,8 +554,8 @@ impl Bivector4 {
 /// axes into the hidden 4th dimension; the three pure-3D planes
 /// (`xy`, `xz`, `yz`) act as ordinary 3D rotations on the 3D
 /// cross-section. Sum-of-bivectors composition is **commutative**
-/// (vector-space addition), so building `omega = sum_of_planes ·
-/// rate` is order-independent and the resulting rotor `omega.exp()`
+/// (vector-space addition), so building `omega = sum_of_planes · rate` is order-independent and
+/// the resulting rotor `omega.exp()`
 /// depends only on the *set* of active planes, not their order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(usize)]
@@ -644,8 +642,8 @@ impl Bivector for Bivector4 {
     /// 2. `δ ≈ 0` (simple bivector, single rotation plane) -> 3D-style
     ///    closed form `cos(|B|/2) + sin(|B|/2)/|B| · B`.
     /// 3. `disc ≈ 0` with `δ ≠ 0` (isoclinic: equal angles in two
-    ///    orthogonal planes) -> closed form using `sinc(θ)` so the
-    ///    general-case `1/(θ₁²−θ₂²)` singularity never appears.
+    ///    orthogonal planes) -> closed form using `sinc(θ)` so the general-case
+    ///    `1/(θ₁²−θ₂²)` singularity never appears.
     /// 4. General case (`θ₁ ≠ θ₂`, both nonzero) -> expansion of
     ///    `exp(B_a/2)·exp(B_b/2)` in the basis `{1, B, B*, I}`.
     fn exp(self) -> Rotor4 {
@@ -779,8 +777,8 @@ impl Rotor4 {
         xyzw: 0.0,
     };
 
-    /// Identity rotor packed into the `[s, xy, xz, xw, yz, yw, zw,
-    /// xyzw]` slot order used by `From<Rotor4> for [f32; 8]`.
+    /// Identity rotor packed into the `[s, xy, xz, xw, yz, yw, zw, xyzw]` slot order used by
+    /// `From<Rotor4> for [f32; 8]`.
     /// Convenience for initializing GPU uniform-buffer rotor fields
     /// without having to spell out the eight-tuple at every call
     /// site.
@@ -950,8 +948,8 @@ impl Rotor for Rotor4 {
     ///   collapses to the other index, with a sign from anticommuting
     ///   through); else gives a trivector `e_{abc}` (sorted).
     /// - `I · e_k`: `−e_234, +e_134, −e_124, +e_123` for `k = 1..4`.
-    /// - `e_ijk · e_lm` with `{l,m} ⊂ {i,j,k}`: collapses to `±e_{one
-    ///   remaining}` per the standard reduction.
+    /// - `e_ijk · e_lm` with `{l,m} ⊂ {i,j,k}`: collapses to `±e_{one remaining}` per the
+    /// standard reduction.
     /// - `e_ijk · I`: `−e_l` (with `l` the missing index), signed by
     ///   the parity of the `e_{ijk}·e_l -> I` permutation.
     fn apply(&self, v: Vec4) -> Vec4 {
@@ -1898,8 +1896,8 @@ mod tests {
         assert_eq!(Plane4::Zw.label(), "zw");
     }
 
-    /// `From<Rotor4> for [f32; 8]` packs in the order `[s, xy, xz,
-    /// xw, yz, yw, zw, xyzw]`. This pinned ordering is what GPU
+    /// `From<Rotor4> for [f32; 8]` packs in the order `[s, xy, xz, xw, yz, yw, zw, xyzw]`. This
+    /// pinned ordering is what GPU
     /// uniform buffers (e.g. `BodyUniform.rotor`) consume; a future
     /// refactor that swaps fields must also update this conversion
     /// in lockstep, and this test catches the mismatch.

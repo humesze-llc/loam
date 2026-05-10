@@ -8,20 +8,19 @@
 use glam::{Mat4, Vec3, Vec4Swizzles};
 use rye_camera::CameraView;
 
-/// Project a world-space point to screen pixel coordinates via the
-/// camera's view + perspective projection.
+/// Project a world-space point to screen pixel coordinates via the camera's view +
+/// perspective projection.
 ///
-/// Returns `None` if the point is behind the camera or outside the
-/// canonical view volume after projection (clipped).
+/// Returns `None` if the point is behind the camera or outside the canonical view volume
+/// after projection (clipped).
 ///
-/// `viewport` is `(width_px, height_px)`. `fov_y_radians` matches the
-/// `Camera::fov_y` field; `aspect` should be `width_px / height_px`.
-/// `near` and `far` should match the renderer's depth setup; for
-/// screen-anchoring purposes `near = 0.05`, `far = 100.0` is fine
-/// since we only care about NDC.
+/// `viewport` is `(width_px, height_px)`. `fov_y_radians` matches the `Camera::fov_y`
+/// field; `aspect` should be `width_px / height_px`. `near` and `far` should match the
+/// renderer's depth setup; for screen-anchoring purposes `near = 0.05`, `far = 100.0`
+/// is fine since we only care about NDC.
 ///
-/// The returned [`egui::Pos2`] is in egui's pixel coordinates (top-left
-/// origin, y-down), ready to pass to `egui::Area::fixed_pos`.
+/// The returned [`egui::Pos2`] is in egui's pixel coordinates (top-left origin, y-down),
+/// ready to pass to `egui::Area::fixed_pos`.
 pub fn world_to_screen(
     world: Vec3,
     camera: &CameraView,
@@ -36,9 +35,9 @@ pub fn world_to_screen(
     }
     let aspect = vw / vh;
 
-    // Build a right-handed view matrix from the camera's orthonormal
-    // frame: camera looks along `forward`, with `right` and `up` as
-    // the screen axes. `Mat4::look_to_rh` is exactly this.
+    // Build a right-handed view matrix from the camera's orthonormal frame: camera looks
+    // along `forward`, with `right` and `up` as the screen axes. `Mat4::look_to_rh` is
+    // exactly this.
     let view = Mat4::look_to_rh(camera.position, camera.forward, camera.up);
     let proj = Mat4::perspective_rh(fov_y_radians, aspect, near, far);
     let clip = proj * view * world.extend(1.0);
@@ -74,8 +73,7 @@ mod tests {
         }
     }
 
-    /// A point at the camera's gaze direction projects to the centre
-    /// of the viewport.
+    /// A point at the camera's gaze direction projects to the centre of the viewport.
     #[test]
     fn point_in_front_projects_to_centre() {
         let camera = camera_at(Vec3::ZERO, -Vec3::Z, Vec3::Y);
@@ -98,10 +96,9 @@ mod tests {
         );
     }
 
-    /// Off-axis world points map to the correct screen quadrant.
-    /// A point above-and-right of the gaze direction lands in the
-    /// upper-right of the screen (small x > centre, small y < centre
-    /// because egui is y-down).
+    /// Off-axis world points map to the correct screen quadrant. A point above-and-right
+    /// of the gaze direction lands in the upper-right of the screen (small x > centre,
+    /// small y < centre because egui is y-down).
     #[test]
     fn upper_right_world_lands_upper_right_screen() {
         let camera = camera_at(Vec3::ZERO, -Vec3::Z, Vec3::Y);
@@ -112,8 +109,8 @@ mod tests {
         assert!(pos.y < 300.0, "expected upper half (y-down): y={}", pos.y);
     }
 
-    /// A point far outside the frustum's lateral extent is clipped to
-    /// None rather than producing nonsense pixel coordinates.
+    /// A point far outside the frustum's lateral extent is clipped to None rather than
+    /// producing nonsense pixel coordinates.
     #[test]
     fn point_outside_frustum_returns_none() {
         let camera = camera_at(Vec3::ZERO, -Vec3::Z, Vec3::Y);
@@ -124,8 +121,7 @@ mod tests {
         );
     }
 
-    /// Zero-area viewport returns None rather than panicking on a
-    /// divide.
+    /// Zero-area viewport returns None rather than panicking on a divide.
     #[test]
     fn zero_viewport_returns_none() {
         let camera = camera_at(Vec3::ZERO, -Vec3::Z, Vec3::Y);

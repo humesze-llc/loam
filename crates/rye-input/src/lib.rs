@@ -1,27 +1,24 @@
-//! Per-frame input accumulator. Routes raw winit events into a
-//! [`FrameInput`] snapshot the rest of the engine consumes.
+//! Per-frame input accumulator. Routes raw winit events into a [`FrameInput`] snapshot
+//! the rest of the engine consumes.
 //!
 //! ## Drain semantic
 //!
-//! [`InputState`] accumulates mouse motion / scroll / key state as
-//! winit events arrive. [`InputState::take_frame`] returns the
-//! current snapshot **and resets the per-tick deltas** (mouse delta,
-//! scroll lines): callers see exactly the motion that happened
-//! since the last drain. Held state (button-down, WASD axes) is
-//! preserved across drains so a user holding a key continues to
-//! produce non-zero `move_*` until they release.
+//! [`InputState`] accumulates mouse motion / scroll / key state as winit events arrive.
+//! [`InputState::take_frame`] returns the current snapshot **and resets the per-tick
+//! deltas** (mouse delta, scroll lines): callers see exactly the motion that happened
+//! since the last drain. Held state (button-down, WASD axes) is preserved across
+//! drains so a user holding a key continues to produce non-zero `move_*` until they
+//! release.
 //!
 //! ## Focus / cursor-loss contract
 //!
-//! Window focus loss and cursor exit are handled by
-//! [`InputState::cursor_invalidated`] (called from the framework's
-//! `WindowEvent::CursorLeft` / `Focused(false)` branches). It zeroes
-//! the cursor-relative state to avoid a snap when the cursor
-//! re-enters at a different position. [`InputState::release_buttons`]
-//! is similarly called on focus loss to drop held buttons cleanly.
-//! Apps that bind their own keyboard handling should call
-//! [`InputState::release_buttons`] when their gameplay needs the
-//! same clean-on-defocus semantic.
+//! Window focus loss and cursor exit are handled by [`InputState::cursor_invalidated`]
+//! (called from the framework's `WindowEvent::CursorLeft` / `Focused(false)` branches).
+//! It zeroes the cursor-relative state to avoid a snap when the cursor re-enters at a
+//! different position. [`InputState::release_buttons`] is similarly called on focus
+//! loss to drop held buttons cleanly. Apps that bind their own keyboard handling should
+//! call [`InputState::release_buttons`] when their gameplay needs the same
+//! clean-on-defocus semantic.
 
 use glam::{Vec2, Vec3};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};

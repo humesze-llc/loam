@@ -1,31 +1,28 @@
 //! EPA: Expanding Polytope Algorithm.
 //!
-//! Given the tetrahedron simplex produced by [`super::gjk_intersect`]
-//! when two shapes overlap, EPA expands that simplex into a convex
-//! polytope whose surface matches (locally) the boundary of the
-//! Minkowski difference `A ⊖ B`. The point on that surface closest to
-//! the origin gives the **minimum translation** needed to separate the
-//! shapes, i.e. the contact normal and penetration depth.
+//! Given the tetrahedron simplex produced by [`super::gjk_intersect`] when two shapes
+//! overlap, EPA expands that simplex into a convex polytope whose surface matches
+//! (locally) the boundary of the Minkowski difference `A ⊖ B`. The point on that
+//! surface closest to the origin gives the **minimum translation** needed to separate
+//! the shapes, i.e. the contact normal and penetration depth.
 //!
-//! Contact point reconstruction uses the barycentric coordinates of
-//! the closest point on the terminating face, applied to the original
-//! support points on A and B (which GJK already cached in each
-//! [`MinkowskiPoint`]).
+//! Contact point reconstruction uses the barycentric coordinates of the closest point
+//! on the terminating face, applied to the original support points on A and B (which
+//! GJK already cached in each [`MinkowskiPoint`]).
 //!
 //! Algorithm (repeated until convergence):
 //! 1. Find the face of the current polytope closest to the origin.
 //! 2. Query a new support point along that face's outward normal.
-//! 3. If the support's distance from the origin ≈ the face's distance,
-//!    the face is on the Minkowski boundary, we're done.
-//! 4. Otherwise, add the support to the polytope: remove every face
-//!    whose outward normal "sees" the new point, then stitch a fan of
-//!    new triangles from each horizon edge to the new vertex.
+//! 3. If the support's distance from the origin ≈ the face's distance, the face is on
+//!    the Minkowski boundary, we're done.
+//! 4. Otherwise, add the support to the polytope: remove every face whose outward
+//!    normal "sees" the new point, then stitch a fan of new triangles from each
+//!    horizon edge to the new vertex.
 //!
-//! 3D only for now. The face-normal reconstruction step uses the
-//! cross product; generalizing to 4D requires a "generalized cross"
-//! (the vector orthogonal to three given vectors, via a 4D
-//! determinant expansion). When 4D lands, this module splits into a
-//! dimension-specific normal helper with the rest of EPA shared.
+//! 3D only for now. The face-normal reconstruction step uses the cross product;
+//! generalizing to 4D requires a "generalized cross" (the vector orthogonal to three
+//! given vectors, via a 4D determinant expansion). When 4D lands, this module splits
+//! into a dimension-specific normal helper with the rest of EPA shared.
 
 use glam::Vec3;
 
@@ -41,24 +38,24 @@ const EPA_MAX_VERTICES: usize = 96;
 /// a [`crate::Contact`].
 #[derive(Clone, Copy, Debug)]
 pub struct ContactInfo {
-    /// Unit vector from A toward B in world coordinates. Matches the
-    /// `Contact::normal` convention the PGS solver expects.
+    /// Unit vector from A toward B in world coordinates. Matches the `Contact::normal`
+    /// convention the PGS solver expects.
     pub normal: Vec3,
     /// How far the shapes overlap along `normal`.
     pub penetration: f32,
-    /// World-space contact point (midpoint between the surfaces of A
-    /// and B at the closest feature).
+    /// World-space contact point (midpoint between the surfaces of A and B at the
+    /// closest feature).
     pub point: Vec3,
 }
 
 /// Triangle face of the expanding polytope, stored by vertex index.
 #[derive(Clone, Copy, Debug)]
 struct Face {
-    /// Indices into `Polytope::vertices`. Winding is kept consistent
-    /// with `normal` pointing outward from the origin-side interior.
+    /// Indices into `Polytope::vertices`. Winding is kept consistent with `normal`
+    /// pointing outward from the origin-side interior.
     v: [usize; 3],
-    /// Unit outward normal. `normal * distance` is the closest point
-    /// on the face's plane to the origin.
+    /// Unit outward normal. `normal * distance` is the closest point on the face's
+    /// plane to the origin.
     normal: Vec3,
     /// Distance from origin to the face's plane. Always ≥ 0 by
     /// construction.
@@ -68,12 +65,11 @@ struct Face {
 struct Polytope {
     vertices: Vec<MinkowskiPoint>,
     faces: Vec<Face>,
-    /// Centroid of the seed tetrahedron. Stays interior to the
-    /// polytope for all subsequent (convex) expansions, so it's the
-    /// reliable reference for orienting new faces outward, much more
-    /// robust than "pick any old vertex," which can happen to lie on
-    /// a degenerate-face plane and produce an inward orientation that
-    /// cascades into a corrupted polytope.
+    /// Centroid of the seed tetrahedron. Stays interior to the polytope for all
+    /// subsequent (convex) expansions, so it's the reliable reference for orienting new
+    /// faces outward, much more robust than "pick any old vertex," which can happen to
+    /// lie on a degenerate-face plane and produce an inward orientation that cascades
+    /// into a corrupted polytope.
     interior: glam::Vec3,
 }
 
@@ -95,10 +91,10 @@ impl Polytope {
         }
     }
 
-    /// Index of the face with the smallest distance from origin, or
-    /// `None` if the polytope has no faces (should not happen in a
-    /// well-formed expansion, but a degenerate support sequence can
-    /// remove every face without producing any stitch replacements).
+    /// Index of the face with the smallest distance from origin, or `None` if the
+    /// polytope has no faces (should not happen in a well-formed expansion, but a
+    /// degenerate support sequence can remove every face without producing any stitch
+    /// replacements).
     fn closest_face(&self) -> Option<usize> {
         let (idx, _) = self
             .faces
@@ -108,17 +104,16 @@ impl Polytope {
         Some(idx)
     }
 
-    /// Add `support` to the polytope: remove all faces whose outward
-    /// normal is oriented toward `support` (we can "see" the support
-    /// from outside those faces), then rebuild by connecting `support`
-    /// to every horizon edge.
+    /// Add `support` to the polytope: remove all faces whose outward normal is oriented
+    /// toward `support` (we can "see" the support from outside those faces), then
+    /// rebuild by connecting `support` to every horizon edge.
     fn expand(&mut self, support: MinkowskiPoint) {
         let new_idx = self.vertices.len();
         self.vertices.push(support);
 
-        // Collect horizon edges: edges of removed faces that are *not*
-        // shared with any other removed face. Represent edges as
-        // sorted vertex-index pairs for deduplication.
+        // Collect horizon edges: edges of removed faces that are *not* shared with any
+        // other removed face. Represent edges as sorted vertex-index pairs for
+        // deduplication.
         let mut horizon: Vec<(usize, usize)> = Vec::new();
         let mut keep = Vec::with_capacity(self.faces.len());
 
@@ -135,14 +130,12 @@ impl Polytope {
         }
         self.faces = keep;
 
-        // Stitch new faces from each horizon edge to the new vertex.
-        // Orientation uses `self.interior`, the seed tetrahedron's
-        // centroid, as a guaranteed interior reference. Using an
-        // arbitrary old vertex was the source of the "polytope face
-        // count explodes" bug: when an old vertex happens to lie on
-        // the plane of a new face, the sign test is ambiguous, the
-        // face gets an inward-facing normal, downstream visibility
-        // tests lie about it, and faces multiply without bound.
+        // Stitch new faces from each horizon edge to the new vertex. Orientation uses
+        // `self.interior`, the seed tetrahedron's centroid, as a guaranteed interior
+        // reference. Using an arbitrary old vertex was the source of the "polytope face
+        // count explodes" bug: when an old vertex happens to lie on the plane of a new
+        // face, the sign test is ambiguous, the face gets an inward-facing normal,
+        // downstream visibility tests lie about it, and faces multiply without bound.
         let interior = self.interior;
         for &(i, j) in &horizon {
             self.faces
@@ -151,9 +144,9 @@ impl Polytope {
     }
 }
 
-/// Build a face with outward normal, orienting it away from
-/// `interior_point`, which the caller guarantees is inside the
-/// polytope (the seed tetrahedron's centroid satisfies this).
+/// Build a face with outward normal, orienting it away from `interior_point`, which
+/// the caller guarantees is inside the polytope (the seed tetrahedron's centroid
+/// satisfies this).
 fn build_face_vs_point(
     verts: &[MinkowskiPoint],
     a: usize,
@@ -194,13 +187,12 @@ fn build_face_vs_point(
     }
 }
 
-/// Track a single horizon edge with its original winding direction.
-/// Two removed faces that share an edge store it with opposite
-/// orientation (because the adjacent faces wind in opposite directions
-/// along their shared edge); we detect that by looking for `(b, a)`
-/// already in the list and cancelling it. The surviving edges are the
-/// horizon in the winding direction that gives correct outward normals
-/// when stitched to the new vertex.
+/// Track a single horizon edge with its original winding direction. Two removed faces
+/// that share an edge store it with opposite orientation (because the adjacent faces
+/// wind in opposite directions along their shared edge); we detect that by looking for
+/// `(b, a)` already in the list and cancelling it. The surviving edges are the horizon
+/// in the winding direction that gives correct outward normals when stitched to the
+/// new vertex.
 fn add_or_remove_edge(horizon: &mut Vec<(usize, usize)>, a: usize, b: usize) {
     if let Some(pos) = horizon.iter().position(|&e| e == (b, a)) {
         horizon.swap_remove(pos);
@@ -209,9 +201,8 @@ fn add_or_remove_edge(horizon: &mut Vec<(usize, usize)>, a: usize, b: usize) {
     }
 }
 
-/// Barycentric coordinates (u, v, w) of point `p` projected onto the
-/// triangle `(a, b, c)`. Returns the triple such that
-/// `u·a + v·b + w·c` is the projection.
+/// Barycentric coordinates (u, v, w) of point `p` projected onto the triangle
+/// `(a, b, c)`. Returns the triple such that `u·a + v·b + w·c` is the projection.
 fn barycentric(a: Vec3, b: Vec3, c: Vec3, p: Vec3) -> (f32, f32, f32) {
     let v0 = b - a;
     let v1 = c - a;
@@ -231,18 +222,17 @@ fn barycentric(a: Vec3, b: Vec3, c: Vec3, p: Vec3) -> (f32, f32, f32) {
     (u, v, w)
 }
 
-/// Compute penetration normal, depth, and contact point for two
-/// overlapping shapes, given GJK's terminating tetrahedron simplex.
+/// Compute penetration normal, depth, and contact point for two overlapping shapes,
+/// given GJK's terminating tetrahedron simplex.
 pub fn epa<A: SupportFn, B: SupportFn>(
     a: &A,
     b: &B,
     initial_simplex: [MinkowskiPoint; 4],
 ) -> Option<ContactInfo> {
-    // Reject degenerate starting simplices: if the 4 GJK points are
-    // (nearly) coplanar, the tetrahedron has ~zero volume and EPA
-    // cannot produce meaningful outward normals. The signed volume is
-    // det([p1-p0, p2-p0, p3-p0])/6, and sign flips depending on
-    // handedness, we only care about magnitude.
+    // Reject degenerate starting simplices: if the 4 GJK points are (nearly) coplanar,
+    // the tetrahedron has ~zero volume and EPA cannot produce meaningful outward
+    // normals. The signed volume is det([p1-p0, p2-p0, p3-p0])/6, and sign flips
+    // depending on handedness, we only care about magnitude.
     let p0 = initial_simplex[0].point;
     let p1 = initial_simplex[1].point;
     let p2 = initial_simplex[2].point;
@@ -255,19 +245,18 @@ pub fn epa<A: SupportFn, B: SupportFn>(
     let mut polytope = Polytope::from_tetra(initial_simplex);
 
     for _ in 0..EPA_MAX_ITERATIONS {
-        // If expansion has collapsed the polytope (no faces), we've
-        // left the domain where EPA can give a meaningful answer.
-        // Bail cleanly rather than panicking on the empty slice.
+        // If expansion has collapsed the polytope (no faces), we've left the domain
+        // where EPA can give a meaningful answer. Bail cleanly rather than panicking
+        // on the empty slice.
         let face_idx = polytope.closest_face()?;
         let face = polytope.faces[face_idx];
 
         let support = minkowski_support(a, b, face.normal);
         let new_distance = support.point.dot(face.normal);
 
-        // Guard: if the support query produced non-finite values, the
-        // Minkowski diff has pathological inputs, bail rather than
-        // feed bad data back into `expand()` and grow the polytope
-        // with NaN vertices.
+        // Guard: if the support query produced non-finite values, the Minkowski diff
+        // has pathological inputs, bail rather than feed bad data back into `expand()`
+        // and grow the polytope with NaN vertices.
         if !new_distance.is_finite() || !support.point.is_finite() {
             return None;
         }
@@ -284,10 +273,9 @@ pub fn epa<A: SupportFn, B: SupportFn>(
         }
     }
 
-    // Iteration cap reached; return the current best estimate rather
-    // than failing outright. Happens only for nearly-degenerate inputs.
-    // Emit a debug-level trace so developers tuning narrowphase can
-    // count cap hits without spamming release logs.
+    // Iteration cap reached; return the current best estimate rather than failing
+    // outright. Happens only for nearly-degenerate inputs. Emit a debug-level trace so
+    // developers tuning narrowphase can count cap hits without spamming release logs.
     tracing::debug!(
         max_iterations = EPA_MAX_ITERATIONS,
         vertices = polytope.vertices.len(),
