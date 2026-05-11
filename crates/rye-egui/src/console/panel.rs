@@ -292,32 +292,40 @@ fn draw_input_row<Ctx: 'static>(
 
             let prev_input = console.input.clone();
             let ghost = console.tab_preview();
-            let response = ui.add(
-                TextEdit::singleline(&mut console.input)
-                    .font(FontId::monospace(FONT_SIZE))
-                    .frame(false)
-                    .desired_width(width - 32.0)
-                    .text_color(COLOR_INPUT_ECHO),
-            );
+            // `TextEdit::show` returns the actual screen-space text origin + galley so
+            // the ghost paint lands exactly where the input ends; measuring the text
+            // with a separate `painter.layout_no_wrap` was off by a few pixels because
+            // the TextEdit has internal padding the painter doesn't see.
+            let output = TextEdit::singleline(&mut console.input)
+                .font(FontId::monospace(FONT_SIZE))
+                .frame(false)
+                .desired_width(width - 32.0)
+                .text_color(COLOR_INPUT_ECHO)
+                .show(ui);
+            let response = output.response;
 
-            // Paint the tab-completion preview right after the live input. The TextEdit
-            // is left-anchored within its allocated rect, so measuring the input string
-            // in the same monospace font gives the x-offset for the ghost. Painted with
-            // foreground order so it sits over the (transparent) TextEdit area without
-            // shifting layout.
             if let Some(ghost) = ghost {
-                let font_id = FontId::monospace(FONT_SIZE);
-                let painter = ui.painter();
-                let input_galley = painter.layout_no_wrap(
-                    console.input.clone(),
-                    font_id.clone(),
-                    COLOR_INPUT_ECHO,
+                let ghost_pos = output.galley_pos + egui::vec2(output.galley.size().x, 0.0);
+                ui.painter().text(
+                    ghost_pos,
+                    egui::Align2::LEFT_TOP,
+                    ghost,
+                    FontId::monospace(FONT_SIZE),
+                    COLOR_GHOST,
                 );
-                let pos = egui::pos2(
-                    response.rect.left() + input_galley.size().x,
-                    response.rect.center().y,
-                );
-                painter.text(pos, egui::Align2::LEFT_CENTER, ghost, font_id, COLOR_GHOST);
+            }
+
+            // Snap the TextEdit cursor to the end of `console.input` when something
+            // outside the TextEdit (tab-complete, history nav) replaced the buffer.
+            // Without this, the cursor stays at byte 0 and the user has to End-key.
+            if console.pending_cursor_to_end {
+                let mut state = output.state;
+                let end = egui::text::CCursor::new(console.input.chars().count());
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                state.store(ui.ctx(), response.id);
+                console.pending_cursor_to_end = false;
             }
 
             // Any input change outside of tab-cycling invalidates the tab-completion

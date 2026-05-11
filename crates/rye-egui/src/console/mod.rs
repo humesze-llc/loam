@@ -285,6 +285,11 @@ pub struct Console<Ctx> {
     /// while the console stays visible. Cleared by clicking back inside the panel or
     /// by reopening the console.
     user_defocused: bool,
+    /// One-frame flag set whenever code outside the TextEdit mutates [`Self::input`]
+    /// (tab-complete cycles, history nav). The panel snaps the TextEdit's internal
+    /// cursor to the end of the new input and clears the flag, so typing continues
+    /// from the tail rather than wherever the cursor previously sat.
+    pending_cursor_to_end: bool,
 }
 
 struct TabState {
@@ -340,6 +345,7 @@ impl<Ctx: 'static> Console<Ctx> {
             status: String::new(),
             detached: false,
             user_defocused: false,
+            pending_cursor_to_end: false,
         }
     }
 
@@ -545,6 +551,7 @@ impl<Ctx: 'static> Console<Ctx> {
         self.input.clone_from(&self.input_history[pos]);
         self.input_history_pos = Some(pos);
         self.tab = None;
+        self.pending_cursor_to_end = true;
     }
 
     fn history_next(&mut self) {
@@ -559,6 +566,7 @@ impl<Ctx: 'static> Console<Ctx> {
             self.input.clone_from(&self.input_history[pos + 1]);
         }
         self.tab = None;
+        self.pending_cursor_to_end = true;
     }
 
     fn tab_complete(&mut self) {
@@ -568,6 +576,7 @@ impl<Ctx: 'static> Console<Ctx> {
                 tab.index = (tab.index + 1) % tab.matches.len();
                 let new_input = apply_completion(&self.input, &tab.ctx, &tab.matches[tab.index]);
                 self.input = new_input;
+                self.pending_cursor_to_end = true;
                 return;
             }
         }
@@ -584,6 +593,7 @@ impl<Ctx: 'static> Console<Ctx> {
             return;
         }
         self.input = apply_completion(&self.input, &ctx, &matches[0]);
+        self.pending_cursor_to_end = true;
         if matches.len() > 1 {
             self.tab = Some(TabState {
                 matches,
@@ -857,7 +867,6 @@ fn apply_completion(input: &str, ctx: &CompletionContext, choice: &str) -> Strin
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
