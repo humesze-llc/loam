@@ -664,6 +664,25 @@ impl<Ctx: 'static> Console<Ctx> {
                 let Some(cmd) = self.commands.get(cmd_name) else {
                     return Vec::new();
                 };
+
+                // Identify key-value args already provided in earlier positions
+                // (e.g. `fps=30`) so we don't suggest the same key again. Skips the
+                // partial last token (that's what we're completing). Stage keywords
+                // and plain positionals aren't filtered: re-typing a positional may
+                // be intentional, and the parser would just overwrite an earlier
+                // value.
+                let parsed: Vec<&str> = self.input.split_whitespace().collect();
+                let trailing_ws = self.input.ends_with(char::is_whitespace);
+                let consumed = if trailing_ws {
+                    parsed.as_slice()
+                } else {
+                    &parsed[..parsed.len().saturating_sub(1)]
+                };
+                let used_kv_prefixes: Vec<&str> = consumed
+                    .iter()
+                    .filter_map(|t| t.find('=').map(|i| &t[..=i]))
+                    .collect();
+
                 // Sort matches alphabetically so command authors can declare choices in
                 // any order (workflow, frequency, narrative) without affecting Tab
                 // cycling order. Matches the command-name path, which is also sorted.
@@ -671,6 +690,9 @@ impl<Ctx: 'static> Console<Ctx> {
                     .arg_choices(*arg_index)
                     .iter()
                     .filter(|choice| choice.starts_with(prefix.as_str()))
+                    .filter(|choice| {
+                        !choice.ends_with('=') || !used_kv_prefixes.iter().any(|u| *u == **choice)
+                    })
                     .map(|choice| (*choice).to_string())
                     .collect();
                 matches.sort();
@@ -958,6 +980,36 @@ mod tests {
         // Past the declared arg list: no completion.
         c.input = "capture png post extra ".into();
         assert_eq!(c.tab_preview(), None);
+    }
+
+    #[test]
+    fn arg_completion_filters_already_used_kv_prefixes() {
+        let mut c = Console::<Ctx>::new();
+        c.register(cmd("rec", "", |_, _, _| Ok(())).with_args(&[
+            &["both", "fps=", "post", "scale="],
+            &["fps=", "scale="],
+            &["fps=", "scale="],
+        ]));
+
+        // Fresh prompt: every choice surfaces.
+        c.input = "rec ".into();
+        let ctx = c.completion_context().unwrap();
+        let m = c.completion_matches(&ctx);
+        assert!(m.contains(&"fps=".into()));
+        assert!(m.contains(&"scale=".into()));
+
+        // After picking `fps=30`, the next completion shouldn't suggest fps= again.
+        c.input = "rec fps=30 ".into();
+        let ctx = c.completion_context().unwrap();
+        let m = c.completion_matches(&ctx);
+        assert!(!m.contains(&"fps=".into()), "got matches: {m:?}");
+        assert!(m.contains(&"scale=".into()));
+
+        // Both kv prefixes used -> no kv suggestions remain.
+        c.input = "rec fps=30 scale=720 ".into();
+        let ctx = c.completion_context().unwrap();
+        let m = c.completion_matches(&ctx);
+        assert!(m.is_empty(), "got matches: {m:?}");
     }
 
     #[test]
