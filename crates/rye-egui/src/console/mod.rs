@@ -535,6 +535,32 @@ impl<Ctx: 'static> Console<Ctx> {
         names
     }
 
+    /// Suffix of the longest common prefix of all commands that start with the current
+    /// input. Used by the panel to paint a dim ghost preview after the cursor so the user
+    /// sees what `Tab` would insert.
+    ///
+    /// Returns `None` when the input is empty, when no command matches, or when the input
+    /// already equals (or extends past) the longest common prefix of the matches.
+    pub fn tab_preview(&self) -> Option<String> {
+        if self.input.is_empty() {
+            return None;
+        }
+        let matches: Vec<String> = self
+            .all_command_names()
+            .into_iter()
+            .filter(|name| name.starts_with(&self.input))
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        let lcp = longest_common_prefix(&matches);
+        if lcp.len() > self.input.len() {
+            Some(lcp[self.input.len()..].to_string())
+        } else {
+            None
+        }
+    }
+
     /// Execute a command line. Echoes input, looks up the command, runs it, drains
     /// output. Built-in `help` and `clear` short-circuit before registry lookup.
     pub fn execute(&mut self, line: &str, ctx: &mut Ctx) {
@@ -676,6 +702,28 @@ fn parse_line(line: &str) -> Option<(String, Vec<String>)> {
     Some((name, args))
 }
 
+/// Longest common byte prefix shared by every string in `strs`. Returns an empty string
+/// when `strs` is empty. Operates on bytes, which is safe for ASCII command names; if
+/// commands grow multi-byte UTF-8 names we'll need a char-boundary fix.
+fn longest_common_prefix(strs: &[String]) -> String {
+    let Some(first) = strs.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for s in &strs[1..] {
+        let limit = end.min(s.len());
+        let mut i = 0;
+        while i < limit && first.as_bytes()[i] == s.as_bytes()[i] {
+            i += 1;
+        }
+        end = i;
+        if end == 0 {
+            break;
+        }
+    }
+    first[..end].to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -702,6 +750,48 @@ mod tests {
             out.line(format!("ctx={ctx}"));
             Ok(())
         })
+    }
+
+    #[test]
+    fn tab_preview_returns_lcp_suffix() {
+        // Use the four built-in commands: clear, detach, dock, help. No additional
+        // registrations needed.
+        let mut c = Console::<Ctx>::new();
+
+        // Empty input -> no preview.
+        c.input = String::new();
+        assert_eq!(c.tab_preview(), None);
+
+        // Single match -> preview is the rest of that command.
+        c.input = "de".into();
+        assert_eq!(c.tab_preview().as_deref(), Some("tach"));
+
+        c.input = "do".into();
+        assert_eq!(c.tab_preview().as_deref(), Some("ck"));
+
+        c.input = "cl".into();
+        assert_eq!(c.tab_preview().as_deref(), Some("ear"));
+
+        c.input = "h".into();
+        assert_eq!(c.tab_preview().as_deref(), Some("elp"));
+
+        // Multiple matches whose LCP equals the input -> no preview.
+        c.input = "d".into();
+        assert_eq!(c.tab_preview(), None);
+
+        // No match -> no preview.
+        c.input = "zzz".into();
+        assert_eq!(c.tab_preview(), None);
+    }
+
+    #[test]
+    fn longest_common_prefix_basic_cases() {
+        let v = |s: &[&str]| -> Vec<String> { s.iter().map(|x| x.to_string()).collect() };
+        assert_eq!(longest_common_prefix(&v(&[])), "");
+        assert_eq!(longest_common_prefix(&v(&["foo"])), "foo");
+        assert_eq!(longest_common_prefix(&v(&["foobar", "foobaz"])), "fooba");
+        assert_eq!(longest_common_prefix(&v(&["foo", "bar"])), "");
+        assert_eq!(longest_common_prefix(&v(&["", "foo"])), "");
     }
 
     #[test]

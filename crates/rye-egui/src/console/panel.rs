@@ -42,6 +42,9 @@ const COLOR_SYSTEM: Color32 = Color32::from_rgb(140, 200, 220);
 const COLOR_PROMPT: Color32 = Color32::from_rgb(160, 200, 140);
 const COLOR_TITLE: Color32 = Color32::from_rgb(200, 200, 210);
 const COLOR_SEPARATOR: Color32 = Color32::from_rgb(60, 60, 70);
+/// Tab-completion preview text painted after the live input. Dim enough to read as a
+/// hint rather than committed input.
+const COLOR_GHOST: Color32 = Color32::from_rgb(110, 110, 120);
 const FONT_SIZE: f32 = 13.0;
 const ROW_TITLE_HEIGHT: f32 = 22.0;
 const ROW_INPUT_HEIGHT: f32 = 24.0;
@@ -288,6 +291,7 @@ fn draw_input_row<Ctx: 'static>(
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
 
             let prev_input = console.input.clone();
+            let ghost = console.tab_preview();
             let response = ui.add(
                 TextEdit::singleline(&mut console.input)
                     .font(FontId::monospace(FONT_SIZE))
@@ -295,6 +299,26 @@ fn draw_input_row<Ctx: 'static>(
                     .desired_width(width - 32.0)
                     .text_color(COLOR_INPUT_ECHO),
             );
+
+            // Paint the tab-completion preview right after the live input. The TextEdit
+            // is left-anchored within its allocated rect, so measuring the input string
+            // in the same monospace font gives the x-offset for the ghost. Painted with
+            // foreground order so it sits over the (transparent) TextEdit area without
+            // shifting layout.
+            if let Some(ghost) = ghost {
+                let font_id = FontId::monospace(FONT_SIZE);
+                let painter = ui.painter();
+                let input_galley = painter.layout_no_wrap(
+                    console.input.clone(),
+                    font_id.clone(),
+                    COLOR_INPUT_ECHO,
+                );
+                let pos = egui::pos2(
+                    response.rect.left() + input_galley.size().x,
+                    response.rect.center().y,
+                );
+                painter.text(pos, egui::Align2::LEFT_CENTER, ghost, font_id, COLOR_GHOST);
+            }
 
             // Any input change outside of tab-cycling invalidates the tab-completion
             // state.
