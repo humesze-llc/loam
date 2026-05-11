@@ -12,7 +12,7 @@ default = ["capture"]
 # Frame-capture: PNG single-shot + PNG sequence writers wired into the render loop,
 # plus GIF stream encoder + console commands + hotkeys. Disable for lean builds
 # that don't need the diagnostic plumbing.
-capture = ["dep:image", "dep:gif", "dep:color_quant"]
+capture = ["dep:image", "dep:gif"]
 
 [dependencies]
 anyhow.workspace = true
@@ -25,7 +25,6 @@ winit.workspace = true
 
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 gif = { version = "0.13", optional = true }
-color_quant = { version = "1.1", optional = true }
 
 rye-asset  = { path = "../rye-asset" }
 rye-camera = { path = "../rye-camera" }
