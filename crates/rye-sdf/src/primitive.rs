@@ -7,13 +7,13 @@
 //!
 //! ## Variants and their SDFs
 //!
-//! - [`Shape::Sphere`], `rye_distance(p, center) − radius`. The center is part of the
-//!   shape (unlike physics, where the body's position is the center); SDF scenes use it
-//!   to place spheres without a transform combinator.
+//! - [`Shape::Sphere`], `rye_distance(p, center) − radius`. The center is part of the shape
+//!   (unlike physics, where the body's position is the center); SDF scenes use it to place
+//!   spheres without a transform combinator.
 //! - [`Shape::Box3`], standard Euclidean box SDF (`max(abs(p) − b, 0)` and the
-//!   negative-interior correction). Axis-aligned, centered at the local frame's origin.
-//!   Honest in E³; chart-coordinate in H³/S³ (the trait rule treats this as accepted
-//!   because no geodesic-box SDF exists in closed form).
+//!   negative-interior correction). Axis-aligned, centered at the local frame's origin. Honest
+//!   in E³; chart-coordinate in H³/S³ (the trait rule treats this as accepted because no
+//!   geodesic-box SDF exists in closed form).
 //! - [`Shape::HalfSpace`], chart-coord `dot(p, n) − offset` **only in flat Spaces** (gated by
 //!   `WgslSpace::is_chart_flat`). In curved Spaces (H³, S³, `BlendedSpace`) it would draw the
 //!   chart's straight plane, not the geodesic plane, so the emission falls back to the `+1e9`
@@ -25,8 +25,7 @@
 //!
 //! - [`Shape::HalfSpace4D`]: 4D variant; lives in [`Primitive4`](crate::Primitive4).
 //! - [`Shape::Polygon2D`], [`Shape::ConvexPolytope3D`], [`Shape::ConvexPolytope4D`]:
-//!   vertex-list shapes that need either a baked mesh-SDF or a runtime convex-hull
-//!   kernel.
+//!   vertex-list shapes that need either a baked mesh-SDF or a runtime convex-hull kernel.
 //! - [`Shape::HyperSphere4D`]: 4D variant; lives in [`Primitive4`](crate::Primitive4).
 
 use rye_math::WgslSpace;

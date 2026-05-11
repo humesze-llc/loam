@@ -6,16 +6,15 @@
 //!
 //! The emitted WGSL fragment defines:
 //!
-//! - `CELL_INRADIUS_UNIT: f32`: shared inradius constant for both
-//!   polytopes at unit circumradius (`φ²/(2√2)`).
-//! - `CELL120_FACE_NORMALS: array<vec4<f32>, 120>`: 120-cell face
-//!   directions (= 600-cell vertex set).
-//! - `CELL600_FACE_NORMALS: array<vec4<f32>, 600>`: 600-cell face
-//!   directions (= 120-cell vertex set).
-//! - `CELL120_VERTICES: array<vec4<f32>, 600>`: 120-cell vertex set,
-//!   used by the |S|=4 vertex-lookup branch of the 120-cell Wolfe SDF.
-//! - `CELL600_VERTICES: array<vec4<f32>, 120>`: analogous for
-//!   600-cell.
+//! - `CELL_INRADIUS_UNIT: f32`: shared inradius constant for both polytopes at unit
+//!   circumradius (`φ²/(2√2)`).
+//! - `CELL120_FACE_NORMALS: array<vec4<f32>, 120>`: 120-cell face directions (= 600-cell vertex
+//!   set).
+//! - `CELL600_FACE_NORMALS: array<vec4<f32>, 600>`: 600-cell face directions (= 120-cell vertex
+//!   set).
+//! - `CELL120_VERTICES: array<vec4<f32>, 600>`: 120-cell vertex set, used by the |S|=4
+//!   vertex-lookup branch of the 120-cell Wolfe SDF.
+//! - `CELL600_VERTICES: array<vec4<f32>, 120>`: analogous for 600-cell.
 //! - `cell120_sdf_local(p: vec4<f32>) -> f32`: true-Euclidean SDF.
 //! - `cell600_sdf_local(p: vec4<f32>) -> f32`: true-Euclidean SDF.
 //!
@@ -24,8 +23,8 @@
 //!   - |S|=1: project onto closest face plane.
 //!   - |S|=2: 2x2 Lagrange-multiplier solve.
 //!   - |S|=3: 3x3 Lagrange-multiplier solve via cofactor expansion.
-//!   - |S|=4: closest polytope vertex (the 4-plane intersection IS a
-//!     vertex; brute-force search the vertex array).
+//!   - |S|=4: closest polytope vertex (the 4-plane intersection IS a vertex; brute-force search
+//!     the vertex array).
 //!
 //! Total emitted size: ~24 KB of WGSL (mostly the const-array literals).
 
@@ -43,8 +42,8 @@ use rye_physics::euclidean_r4::{
 ///
 /// The kernel's `body_polytope_sdf_4d` always references both function names: naga rejects the
 /// WGSL otherwise: so callers must include either this stub or [`polytope_extended_sdfs_wgsl`].
-/// The stub is tiny (~150 bytes) and adds zero register pressure; prefer it when the scene
-/// contains no 120-cell or 600-cell bodies.
+/// The stub is tiny (~150 bytes) and adds zero register pressure; prefer it when the scene contains
+/// no 120-cell or 600-cell bodies.
 pub fn polytope_stub_sdfs_wgsl() -> &'static str {
     "// ---- Polytope stub SDFs (no 120-cell/600-cell bodies in scene) ----\n\
      fn cell120_sdf_local(p: vec4<f32>) -> f32 { return 1.0e9; }\n\
@@ -55,9 +54,9 @@ pub fn polytope_stub_sdfs_wgsl() -> &'static str {
 /// hyperslice4d kernel before naga validation.
 ///
 /// Includes ~24 KB of `const` array data (face normals + vertex sets for both polytopes). On
-/// some GPU drivers this constant data competes with scalar registers and slows ALL
-/// pixel-shader work, even when the cell120/cell600 dispatch branches are never reached. If
-/// your scene has no 120-cell or 600-cell bodies, prefer [`polytope_stub_sdfs_wgsl`] instead.
+/// some GPU drivers this constant data competes with scalar registers and slows ALL pixel-shader
+/// work, even when the cell120/cell600 dispatch branches are never reached. If your scene has no
+/// 120-cell or 600-cell bodies, prefer [`polytope_stub_sdfs_wgsl`] instead.
 pub fn polytope_extended_sdfs_wgsl() -> String {
     let mut s = String::with_capacity(32 * 1024);
     s.push_str("// ---- Extended polytope SDFs (120-cell, 600-cell) ----\n");
@@ -117,8 +116,8 @@ fn emit_vec4_array(out: &mut String, name: &str, data: &[Vec4]) {
 
 /// Project `p` onto the intersection of `count` (1..=3) active hyperplanes
 /// (`dot(active[i], q) = inradius`) via Lagrange multipliers. Mirrors
-/// `rye_physics::euclidean_r4::project_onto_active_planes` 1:1 for the |S|=1, 2, 3 cases;
-/// |S|=4 is handled by the per-polytope SDF via vertex lookup.
+/// `rye_physics::euclidean_r4::project_onto_active_planes` 1:1 for the |S|=1, 2, 3 cases; |S|=4
+/// is handled by the per-polytope SDF via vertex lookup.
 const WOLFE_PROJECTION_HELPER_WGSL: &str = r#"
 fn polytope_project_active(
     p: vec4<f32>,
@@ -255,13 +254,13 @@ fn {fn_name}(p: vec4<f32>) -> f32 {{
 mod tests {
     use super::*;
 
-    /// The emitted WGSL fragment parses and validates against naga. Catches any drift between
-    /// the emit shape and WGSL syntax.
+    /// The emitted WGSL fragment parses and validates against naga. Catches any drift between the
+    /// emit shape and WGSL syntax.
     #[test]
     fn polytope_extended_sdfs_wgsl_validates() {
         let wgsl = polytope_extended_sdfs_wgsl();
-        // Wrap with a minimal compute shader that calls each SDF, so naga
-        // has an entry point to anchor validation against.
+        // Wrap with a minimal compute shader that calls each SDF, so naga has an entry point to
+        // anchor validation against.
         let probe = format!(
             "{wgsl}\n\
              @compute @workgroup_size(1) fn main() {{\n\

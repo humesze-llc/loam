@@ -1,15 +1,15 @@
 //! `rye-sdf`: signed-distance field primitives and scene builders for Rye.
 //!
-//! [`Primitive`] is the typed abstraction for geometric objects. Every primitive emits a
-//! WGSL function `fn {name}(p: vec3<f32>) -> f32` that uses only `rye_*` Space-prelude
-//! functions, guaranteeing correctness across E³, H³, and S³.
+//! [`Primitive`] is the typed abstraction for geometric objects. Every primitive emits a WGSL
+//! function `fn {name}(p: vec3<f32>) -> f32` that uses only `rye_*` Space-prelude functions,
+//! guaranteeing correctness across E³, H³, and S³.
 //!
-//! [`combinator`] provides Space-agnostic combinators (union, intersection, smooth-min)
-//! that operate on the scalar distances returned by primitive SDFs.
+//! [`combinator`] provides Space-agnostic combinators (union, intersection, smooth-min) that
+//! operate on the scalar distances returned by primitive SDFs.
 //!
-//! Demo-shaped scene wrappers (geodesic spheres, corridor, lattice) live in their
-//! respective `examples/<name>/scene.rs` files. The crate proper keeps only the typed
-//! primitive + scene layer.
+//! Demo-shaped scene wrappers (geodesic spheres, corridor, lattice) live in their respective
+//! `examples/<name>/scene.rs` files. The crate proper keeps only the typed primitive + scene
+//! layer.
 
 pub mod combinator;
 pub mod primitive;
@@ -71,8 +71,8 @@ mod tests {
     }
 
     /// `HalfSpace` in a curved Space has no honest closed-form SDF today, so it sentinels until
-    /// artanh-of-Möbius (H³) / chord-distance (S³) implementations land. Pinned here so a
-    /// future regression that re-enables raw `dot()` in curved Spaces fails loud.
+    /// artanh-of-Möbius (H³) / chord-distance (S³) implementations land. Pinned here so a future
+    /// regression that re-enables raw `dot()` in curved Spaces fails loud.
     #[test]
     fn halfspace_sentinels_in_curved_chart() {
         use rye_math::HyperbolicH3;
@@ -121,8 +121,8 @@ mod tests {
     // ---- Scene-tree integration tests ------------------------------------
     //
     // These cover behaviours the legacy demo-scene tests used to gate. The demo wrappers
-    // themselves now live in their respective examples; this layer pins the behaviour at
-    // the underlying typed-scene API.
+    // themselves now live in their respective examples; this layer pins the behaviour at the
+    // underlying typed-scene API.
 
     /// A Scene with a sphere and a half-space plane in flat E³ must emit both `rye_distance`
     /// (sphere) and `dot(p,` (plane), all inside a single `rye_scene_sdf` entry point.
@@ -139,8 +139,8 @@ mod tests {
         assert!(src.contains("-0.500000"));
     }
 
-    /// A sphere-only scene must not emit any `dot()` calls; the half-space gate stays inert
-    /// when no plane leaves are present.
+    /// A sphere-only scene must not emit any `dot()` calls; the half-space gate stays inert when
+    /// no plane leaves are present.
     #[test]
     fn sphere_only_scene_emits_no_chart_coord_dot() {
         use rye_math::EuclideanR3;
@@ -161,8 +161,8 @@ mod tests {
         assert!(src.contains("0.500000, 0.000000, 0.000000"));
     }
 
-    /// Same construction in H³ must NOT emit the E³-style literal, because the lattice-style
-    /// usage pre-computes centres via `space.exp` and tanh-compresses them. This test fakes the
+    /// Same construction in H³ must NOT emit the E³-style literal, because the lattice-style usage
+    /// pre-computes centres via `space.exp` and tanh-compresses them. This test fakes the
     /// compression by exping a tangent vector through HyperbolicH3 and confirming the emitted
     /// literal differs.
     #[test]
@@ -178,8 +178,7 @@ mod tests {
 
     // ---- Semantic-SDF correctness + Lipschitz-bound tests ------------------
     // The string-emit tests above verify the right WGSL is produced. These verify the
-    // mathematical SDF each primitive represents: sign correctness, surface zero,
-    // Lipschitz-1.
+    // mathematical SDF each primitive represents: sign correctness, surface zero, Lipschitz-1.
 
     fn sphere_sdf_cpu(p: Vec3, center: Vec3, radius: f32) -> f32 {
         (p - center).length() - radius

@@ -1,9 +1,9 @@
 //! Closest-point-on-simplex for GJK in R⁴.
 //!
-//! In 3D the GJK simplex logic uses explicit Voronoi-region analysis
-//! (line/triangle/tetrahedron) with hand-tuned cross products. That approach doesn't generalize
-//! cleanly to 4D, a triangle's "normal" is now a 2D space, a tetrahedron's is a 1D line, and a
-//! 4-simplex is the first volume-enclosing case.
+//! In 3D the GJK simplex logic uses explicit Voronoi-region analysis (line/triangle/tetrahedron)
+//! with hand-tuned cross products. That approach doesn't generalize cleanly to 4D, a triangle's
+//! "normal" is now a 2D space, a tetrahedron's is a 1D line, and a 4-simplex is the first
+//! volume-enclosing case.
 //!
 //! Instead, this module computes the closest point on the simplex's convex hull to the origin
 //! via **Gram-matrix projection** onto each sub-simplex's affine hull, keeping the one with
@@ -11,29 +11,29 @@
 //! O(2^k · k³) operation; with k ≤ 4 (4D) it reduces to at most 31 × 64 ≈ 2000 f32 ops,
 //! dominated by collision check setup anyway.
 //!
-//! The approach trades absolute speed for obvious correctness and dimension-agnostic
-//! simplicity. A future revision could swap in the signed-volumes method (Montanari-Petrinic
-//! 2018) once the 4D collision layer has tests covering its edge cases.
+//! The approach trades absolute speed for obvious correctness and dimension-agnostic simplicity.
+//! A future revision could swap in the signed-volumes method (Montanari-Petrinic 2018) once the
+//! 4D collision layer has tests covering its edge cases.
 
 use glam::Vec4;
 
-/// Closest point on the simplex's convex hull to the origin, plus the sub-simplex that
-/// realizes that closest point.
+/// Closest point on the simplex's convex hull to the origin, plus the sub-simplex that realizes
+/// that closest point.
 #[derive(Debug, Clone)]
 pub struct Closest {
     /// World-space closest point, `Σ weight_i · simplex_i`.
     pub point: Vec4,
-    /// Barycentric weights over the input simplex; entries not in `kept` are exactly zero. Weights
-    /// in `kept` are ≥ 0 and sum to 1 within f32 tolerance.
+    /// Barycentric weights over the input simplex; entries not in `kept` are exactly zero.
+    /// Weights in `kept` are ≥ 0 and sum to 1 within f32 tolerance.
     pub weights: Vec<f32>,
     /// Indices of the simplex vertices whose weights are non-zero, the sub-simplex GJK should
     /// carry forward into the next iter.
     pub kept: Vec<usize>,
 }
 
-/// Compute the closest point on the convex hull of `simplex` to the origin. `simplex.len()`
-/// must be in `1..=5` (4D simplex can have at most 5 vertices). Returns the closest point with
-/// its barycentric decomposition.
+/// Compute the closest point on the convex hull of `simplex` to the origin. `simplex.len()` must
+/// be in `1..=5` (4D simplex can have at most 5 vertices). Returns the closest point with its
+/// barycentric decomposition.
 pub fn closest_to_origin(simplex: &[Vec4]) -> Closest {
     let n = simplex.len();
     debug_assert!((1..=5).contains(&n), "simplex size {n} out of 1..=5");
@@ -82,8 +82,8 @@ pub fn closest_to_origin(simplex: &[Vec4]) -> Closest {
 }
 
 /// Project the origin onto the affine hull of the sub-simplex with indices `subset` into
-/// `simplex`. Returns the projected point and the barycentric weights over the sub-simplex,
-/// or `None` when the sub-simplex is degenerate (e.g. two vertices at the same point).
+/// `simplex`. Returns the projected point and the barycentric weights over the sub-simplex, or
+/// `None` when the sub-simplex is degenerate (e.g. two vertices at the same point).
 ///
 /// The minimization:
 /// ```text
@@ -132,9 +132,9 @@ fn project_origin_onto_affine_hull(subset: &[usize], simplex: &[Vec4]) -> Option
     Some((point, weights))
 }
 
-/// Gauss-Jordan solve of a small symmetric positive-semidefinite system `G · α = b`.
-/// In-place on the augmented matrix; returns `None` if any pivot is too small to
-/// trust (degenerate simplex).
+/// Gauss-Jordan solve of a small symmetric positive-semidefinite system `G · α = b`. In-place
+/// on the augmented matrix; returns `None` if any pivot is too small to trust (degenerate
+/// simplex).
 fn solve_spd_system(g: &mut [[f32; 4]; 4], b: &mut [f32; 4], k: usize) -> Option<Vec<f32>> {
     // Augmented: `[G | b]`.
     for i in 0..k {
@@ -259,8 +259,8 @@ mod tests {
 
     #[test]
     fn pentatope_containing_origin() {
-        // 5-simplex in 4D enclosing origin. Using the 16-cell's vertex set minus a few,
-        // actually easier: use 5 vertices of a symmetric 4-simplex.
+        // 5-simplex in 4D enclosing origin. Using the 16-cell's vertex set minus a few, actually
+        // easier: use 5 vertices of a symmetric 4-simplex.
         let c = closest_to_origin(&[
             Vec4::new(1.0, 1.0, 1.0, -1.0 / 5.0_f32.sqrt()),
             Vec4::new(1.0, -1.0, -1.0, -1.0 / 5.0_f32.sqrt()),

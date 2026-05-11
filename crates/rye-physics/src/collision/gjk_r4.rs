@@ -80,12 +80,12 @@ pub fn minkowski_support_r4<A: SupportFn4, B: SupportFn4>(
 }
 
 /// GJK result: either the shapes overlap, in which case we hand the final simplex plus its
-/// surviving sub-simplex to EPA, or they don't. In 4D the enclosing simplex always has
-/// 5 vertices; EPA receives exactly that.
+/// surviving sub-simplex to EPA, or they don't. In 4D the enclosing simplex always has 5
+/// vertices; EPA receives exactly that.
 ///
 /// The variants are asymmetric in size (an inline `[MinkowskiPoint4; 5]` is ~240 bytes;
-/// `Separated` is 0). We keep it inline — the enum is a short-lived stack return from narrowphase,
-/// not a stored field, so the size asymmetry doesn't matter in practice.
+/// `Separated` is 0). We keep it inline — the enum is a short-lived stack return from
+/// narrowphase, not a stored field, so the size asymmetry doesn't matter in practice.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum GjkResult4 {
@@ -106,9 +106,9 @@ const GJK_EPS: f32 = 1e-6;
 /// Strategy: maintain a growing simplex inside `A ⊖ B`; each iteration computes the closest
 /// point on the current simplex to the origin (via [`closest_to_origin`]), drops any unused
 /// vertices, then searches for a new support in the direction from the closest point toward the
-/// origin. Terminates when (i) a new support can't advance toward the origin (-> separated), (ii)
-/// the simplex's closest point reaches the origin (-> intersecting), or (iii) iteration cap is
-/// hit.
+/// origin. Terminates when (i) a new support can't advance toward the origin (-> separated),
+/// (ii) the simplex's closest point reaches the origin (-> intersecting), or (iii) iteration cap
+/// is hit.
 pub fn gjk_intersect_r4<A: SupportFn4, B: SupportFn4>(
     a: &A,
     b: &B,
@@ -125,8 +125,8 @@ pub fn gjk_intersect_r4<A: SupportFn4, B: SupportFn4>(
 
     // ---- Phase 1: standard GJK, searching toward the origin.
     // Terminates when either (a) a new support fails to cross the origin along the search
-    // direction (-> Separated) or (b) the current simplex's closest-point to origin is already at
-    // the origin (-> shapes intersect, exit to Phase 2 to grow the simplex to 5 points for
+    // direction (-> Separated) or (b) the current simplex's closest-point to origin is already
+    // at the origin (-> shapes intersect, exit to Phase 2 to grow the simplex to 5 points for
     // EPA).
     for _ in 0..GJK_MAX_ITERATIONS {
         if dir.length_squared() < GJK_EPS {
@@ -192,8 +192,7 @@ pub fn gjk_intersect_r4<A: SupportFn4, B: SupportFn4>(
             simplex.push(sup_neg);
             continue;
         }
-        // Polytope is truly flat along this probe axis; mark as
-        // tried and move on.
+        // Polytope is truly flat along this probe axis; mark as tried and move on.
     }
 
     if simplex.len() == 5 {
@@ -213,11 +212,11 @@ fn finalize_intersecting(simplex: Vec<MinkowskiPoint4>) -> GjkResult4 {
     }
 }
 
-/// A unit vector perpendicular to the affine hull of the current `simplex`, **and** not parallel
-/// to any already-tried direction. Used to grow a partial simplex after GJK has already
-/// established that the origin lies in its hull.
+/// A unit vector perpendicular to the affine hull of the current `simplex`, and not parallel to
+/// any already-tried direction. Used to grow a partial simplex after GJK has already established
+/// that the origin lies in its hull.
 ///
-/// `tried` is consulted so we don't re-pick a direction that the caller has already probed (which
+/// `tried` is consulted so we don't re-pick a direction the caller has already probed (which
 /// would just return the same support and stall growth).
 fn orthogonal_to_hull(simplex: &[MinkowskiPoint4], tried: &[Vec4]) -> Option<Vec4> {
     let points: Vec<Vec4> = simplex.iter().map(|p| p.point).collect();
@@ -294,8 +293,8 @@ mod tests {
             center: Vec4::new(1.0, 0.0, 0.0, 0.0),
             radius: 2.0,
         };
-        // Overlapping spheres must report Intersecting, though the simplex shape itself
-        // we don't inspect here.
+        // Overlapping spheres must report Intersecting, though the simplex shape itself we don't
+        // inspect here.
         assert!(matches!(
             gjk_intersect_r4(&a, &b, Vec4::X),
             GjkResult4::Intersecting { .. }
@@ -306,8 +305,8 @@ mod tests {
     fn tesseracts_overlap_past_touching() {
         use crate::euclidean_r4::tesseract_vertices;
         let va: Vec<Vec4> = tesseract_vertices(1.0);
-        // Shift less than 1 so they overlap well past a single-corner touch. (Exact-touch
-        // at `(1,1,1,1)` is a boundary case GJK handles probabilistically, dropped as a test case.)
+        // Shift less than 1 so they overlap well past a single-corner touch. (Exact-touch at
+        // `(1,1,1,1)` is a boundary case GJK handles probabilistically, dropped as a test case.)
         let vb: Vec<Vec4> = tesseract_vertices(1.0)
             .into_iter()
             .map(|v| v + Vec4::new(0.6, 0.6, 0.6, 0.6))

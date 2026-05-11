@@ -91,9 +91,8 @@ impl<S: Space<Point = Vec3, Vector = Vec3>> OrbitController<S> {
         }
     }
 
-    /// Snap to a fixed orbit position. Used by capture / movie
-    /// mode (mirror of the legacy
-    /// [`crate::OrbitCamera::set_orbit`]).
+    /// Snap to a fixed orbit position. Used by capture / movie mode (mirror of the
+    /// legacy [`crate::OrbitCamera::set_orbit`]).
     pub fn set_orbit(&mut self, distance: f32, pitch: f32) {
         self.distance = distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
         self.pitch = pitch.clamp(MIN_ORBIT_PITCH, MAX_ORBIT_PITCH);

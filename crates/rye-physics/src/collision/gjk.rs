@@ -1,30 +1,30 @@
 //! GJK containment test for convex shapes.
 //!
 //! The algorithm, briefly:
-//! - The *Minkowski difference* `A ⊖ B = { a − b : a ∈ A, b ∈ B }` contains the origin if
-//!   and only if `A ∩ B` is non-empty. GJK tests exactly this origin-containment property.
-//! - A *support function* `s(d)` returns the point of the shape farthest along direction `d`. The
-//!   Minkowski difference has an easy support: `s_{A⊖B}(d) = s_A(d) − s_B(−d)`.
+//! - The *Minkowski difference* `A ⊖ B = { a − b : a ∈ A, b ∈ B }` contains the origin if and
+//!   only if `A ∩ B` is non-empty. GJK tests exactly this origin-containment property.
+//! - A *support function* `s(d)` returns the point of the shape farthest along direction `d`.
+//!   The Minkowski difference has an easy support: `s_{A⊖B}(d) = s_A(d) − s_B(−d)`.
 //! - GJK maintains a simplex of such support points inside `A ⊖ B` and iteratively refines it,
 //!   always moving toward the origin, until it either encloses the origin (-> intersection) or
 //!   finds a direction where no new support point makes progress (-> separation).
 //!
-//! This module is the 3D specialization: a simplex can be at most a tetrahedron (4 points).
-//! The Voronoi-region logic for the line -> triangle -> tetrahedron cases is hand-written. The
+//! This module is the 3D specialization: a simplex can be at most a tetrahedron (4 points). The
+//! Voronoi-region logic for the line -> triangle -> tetrahedron cases is hand-written. The
 //! support-function side is generic over `VectorOps`, so when 4D lands, only the simplex-case
 //! logic needs a 4D cousin (pentachoron = 5 points); the support-function path, the iteration
 //! loop, and all the numerics are shared.
 
 use glam::Vec3;
 
-/// Shape-side abstraction GJK operates on: a function from direction to the farthest
-/// point of the shape in world coordinates.
+/// Shape-side abstraction GJK operates on: a function from direction to the farthest point of
+/// the shape in world coordinates.
 pub trait SupportFn {
     fn support(&self, direction: Vec3) -> Vec3;
 }
 
-/// Convex hull of a finite vertex set in world coordinates. Used as the concrete support
-/// for polytope colliders (caller transforms vertices to world space before constructing).
+/// Convex hull of a finite vertex set in world coordinates. Used as the concrete support for
+/// polytope colliders (caller transforms vertices to world space before constructing).
 pub struct ConvexHull<'a> {
     pub vertices: &'a [Vec3],
 }
@@ -113,8 +113,8 @@ pub fn gjk_intersect<A: SupportFn, B: SupportFn>(
         sa: Vec3::ZERO,
         sb: Vec3::ZERO,
     }; 4];
-    // Seed the simplex with the first support and start searching from
-    // the side of that point opposite the origin.
+    // Seed the simplex with the first support and start searching from the side of that point
+    // opposite the origin.
     simplex[0] = minkowski_support(a, b, dir);
     let mut n = 1usize;
     dir = -simplex[0].point;
@@ -156,11 +156,11 @@ pub fn gjk_intersect<A: SupportFn, B: SupportFn>(
 
 /// Voronoi-region simplex logic. Reduces the simplex to the feature (vertex / edge / face /
 /// volume) closest to the origin and returns a new search direction pointing *from that feature
-/// toward the origin*. Also returns `true` if the simplex encloses the origin (only possible with
-/// 4 points in 3D).
+/// toward the origin*. Also returns `true` if the simplex encloses the origin (only possible
+/// with 4 points in 3D).
 ///
-/// On entry `simplex[0..n]` holds `n` points with the most recently added at index `n-1`. On exit
-/// `simplex[0..new_n]` holds the surviving points.
+/// On entry `simplex[0..n]` holds `n` points with the most recently added at index `n-1`. On
+/// exit `simplex[0..new_n]` holds the surviving points.
 fn do_simplex(simplex: &mut [MinkowskiPoint; 4], n: usize) -> (bool, usize, Vec3) {
     match n {
         2 => do_line(simplex),
@@ -249,12 +249,10 @@ fn do_triangle(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
 
     // Above or below the triangle.
     if abc.dot(ao) > 0.0 {
-        // Origin is on the "abc" side, keep winding [c, b, a],
-        // search normal is +abc.
+        // Origin is on the "abc" side, keep winding [c, b, a], search normal is +abc.
         (false, 3, abc)
     } else {
-        // Origin is on the other side, flip winding by swapping b
-        // and c, search normal is -abc.
+        // Origin is on the other side, flip winding by swapping b and c, search normal is -abc.
         simplex.swap(0, 1);
         (false, 3, -abc)
     }
@@ -318,9 +316,8 @@ fn do_tetrahedron(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
         return do_triangle(simplex);
     }
 
-    // Origin is on the inward side of all three adjacent faces
-    // (opposite-d face is implicitly the 4th face; origin's being
-    // inside the tetrahedron is exactly these three checks).
+    // Origin is on the inward side of all three adjacent faces (opposite-d face is implicitly
+    // the 4th face; origin's being inside the tetrahedron is exactly these three checks).
     (true, 4, Vec3::ZERO)
 }
 
@@ -376,8 +373,8 @@ mod tests {
 
     #[test]
     fn touching_boxes_report_intersection() {
-        // Boundaries exactly meeting count as intersecting (GJK finds the origin on the
-        // boundary of the Minkowski difference).
+        // Boundaries exactly meeting count as intersecting (GJK finds the origin on the boundary
+        // of the Minkowski difference).
         let va = box_vertices(Vec3::ZERO, Vec3::ONE);
         let vb = box_vertices(Vec3::new(2.0, 0.0, 0.0), Vec3::ONE);
         let a = ConvexHull { vertices: &va };

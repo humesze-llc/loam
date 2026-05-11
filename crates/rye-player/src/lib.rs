@@ -1,16 +1,16 @@
 //! Space-generic first-person player controller. Reads [`rye_input::FrameInput`] and
-//! advances a position along the ambient [`rye_math::Space`]'s geodesics, matched
-//! against a yaw angle for facing.
+//! advances a position along the ambient [`rye_math::Space`]'s geodesics, matched against
+//! a yaw angle for facing.
 //!
 //! Movement convention: WASD drives forward/back/strafe relative to the player's yaw;
 //! Space / Shift drive world-Y up/down. The tangent vector is built in the Space's chart
-//! coordinates, then `space.exp` integrates it for one tick of motion. In Euclidean
-//! Spaces this collapses to `position += tangent * speed`; in curved Spaces the geodesic
-//! step bends the path naturally without further work in the controller.
+//! coordinates, then `space.exp` integrates it for one tick of motion. In Euclidean Spaces
+//! this collapses to `position += tangent * speed`; in curved Spaces the geodesic step
+//! bends the path naturally without further work in the controller.
 //!
 //! Yaw is kept as an explicit `f32` (not a rotor) because the player's facing only ever
-//! rotates about the Y axis here. A 4D player or a player that needs full rotor
-//! orientation would use a different controller.
+//! rotates about the Y axis here. A 4D player or a player that needs full rotor orientation
+//! would use a different controller.
 
 use glam::Vec3;
 use rye_input::FrameInput;

@@ -14,15 +14,13 @@ use rye_render::raymarch::{
     SHAPE_DUOCYLINDER, SHAPE_PENTATOPE, SHAPE_SPHERINDER, SHAPE_TESSERACT,
 };
 
-/// One polytope's metadata: shape index in the kernel's table,
-/// per-body fragment color (driven into `BodyUniform.color` on the
-/// GPU side, NOT the panel's card color; those are uniformly grey
-/// in the redesigned UI), short display label, and long
-/// mathematical name shown in card tooltips. The long name uses
-/// the `pentachoron` / `tesseract` / `hexadecachoron` family; the
-/// `*-plex` aliases (pentaplex, dodecaplex, ...) are deliberately
-/// avoided since "plex" is dimension-generalized rather than
-/// being the actual 4D name.
+/// One polytope's metadata: shape index in the kernel's table, per-body fragment color
+/// (driven into `BodyUniform.color` on the GPU side, NOT the panel's card color; those
+/// are uniformly grey in the redesigned UI), short display label, and long mathematical
+/// name shown in card tooltips. The long name uses the `pentachoron` / `tesseract` /
+/// `hexadecachoron` family; the `*-plex` aliases (pentaplex, dodecaplex, ...) are
+/// deliberately avoided since "plex" is dimension-generalized rather than being the
+/// actual 4D name.
 #[derive(Copy, Clone, PartialEq)]
 pub(crate) struct ShapeEntry {
     pub(crate) shape: u32,
@@ -31,10 +29,9 @@ pub(crate) struct ShapeEntry {
     pub(crate) long_name: &'static str,
 }
 
-/// Default row when no `--shapes` argument is given. Ordered to put
-/// the 24-cell first (most "4D-distinct" cross-section), then the
-/// pentachoron / 16-cell / tesseract triple; visually contrasting
-/// shapes left-to-right.
+/// Default row when no `--shapes` argument is given. Ordered to put the 24-cell first
+/// (most "4D-distinct" cross-section), then the pentachoron / 16-cell / tesseract
+/// triple; visually contrasting shapes left-to-right.
 pub(crate) const DEFAULT_ROW: &[ShapeEntry] = &[
     ShapeEntry {
         shape: SHAPE_24CELL,
@@ -62,12 +59,11 @@ pub(crate) const DEFAULT_ROW: &[ShapeEntry] = &[
     },
 ];
 
-/// Catalog of every shipped 4D shape: the six convex regular
-/// polychora plus four non-polychoral SDF-trivial shapes
-/// (3-sphere, duocylinder, Clifford torus, spherinder). Used by
-/// the filmstrip subject picker and the `+` shape menu. Colours
-/// are RGB float channels passed straight to the WGSL kernel
-/// (engine doesn't constrain the colour space).
+/// Catalog of every shipped 4D shape: the six convex regular polychora plus four
+/// non-polychoral SDF-trivial shapes (3-sphere, duocylinder, Clifford torus, spherinder).
+/// Used by the filmstrip subject picker and the `+` shape menu. Colours are RGB float
+/// channels passed straight to the WGSL kernel (engine doesn't constrain the colour
+/// space).
 pub(crate) const SHAPE_CATALOG: &[ShapeEntry] = &[
     ShapeEntry {
         shape: SHAPE_PENTATOPE,
@@ -131,13 +127,11 @@ pub(crate) const SHAPE_CATALOG: &[ShapeEntry] = &[
     },
 ];
 
-/// Render a category-grouped shape menu into the current ui.
-/// Both call sites (the `+` shape menu and the filmstrip
-/// subject combo) use this so the layout stays consistent: top
-/// level lists the [`SHAPE_CATEGORIES`] entries, each opens a
-/// nested submenu of the shapes in that category, every entry
-/// carries a `long_name` hover tooltip. `on_select` fires when
-/// the user clicks an entry; the helper closes the menu.
+/// Render a category-grouped shape menu into the current ui. Both call sites (the `+`
+/// shape menu and the filmstrip subject combo) use this so the layout stays consistent:
+/// top level lists the [`SHAPE_CATEGORIES`] entries, each opens a nested submenu of the
+/// shapes in that category, every entry carries a `long_name` hover tooltip. `on_select`
+/// fires when the user clicks an entry; the helper closes the menu.
 pub(crate) fn render_shape_catalog_menu(ui: &mut egui::Ui, mut on_select: impl FnMut(ShapeEntry)) {
     for cat in SHAPE_CATEGORIES {
         ui.menu_button(cat.name, |ui| {
@@ -155,12 +149,11 @@ pub(crate) fn render_shape_catalog_menu(ui: &mut egui::Ui, mut on_select: impl F
     }
 }
 
-/// Subcategories of [`SHAPE_CATALOG`], expressed as half-open
-/// index ranges into the catalog. Used by the shape menus
-/// (`+` button and filmstrip subject combo) to group entries
-/// with a header label and separator. Keeping the categories as
-/// ranges (rather than nested slices) lets `parse_shape_name`
-/// and direct `SHAPE_CATALOG[i]` lookups stay flat.
+/// Subcategories of [`SHAPE_CATALOG`], expressed as half-open index ranges into the
+/// catalog. Used by the shape menus (`+` button and filmstrip subject combo) to group
+/// entries with a header label and separator. Keeping the categories as ranges (rather
+/// than nested slices) lets `parse_shape_name` and direct `SHAPE_CATALOG[i]` lookups
+/// stay flat.
 struct ShapeCategory {
     name: &'static str,
     start: usize,
@@ -180,9 +173,9 @@ const SHAPE_CATEGORIES: &[ShapeCategory] = &[
     },
 ];
 
-/// Catalog of named shapes. Both common math-name aliases (the
-/// `n-cell` form) and Platonic-slice aliases (the `tetrahedron` /
-/// `cube` / etc. form) resolve to the same shape index.
+/// Catalog of named shapes. Both common math-name aliases (the `n-cell` form) and
+/// Platonic-slice aliases (the `tetrahedron` / `cube` / etc. form) resolve to the same
+/// shape index.
 pub(crate) fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
     let n = name.to_lowercase();
     let needle: &str = n.as_str();
@@ -215,9 +208,8 @@ pub(crate) fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
     })
 }
 
-/// Parse the row from CLI arguments. Looks for `--shapes name1 name2 ...`
-/// (consumes everything after the flag). Returns [`DEFAULT_ROW`] if
-/// the flag isn't present.
+/// Parse the row from CLI arguments. Looks for `--shapes name1 name2 ...` (consumes
+/// everything after the flag). Returns [`DEFAULT_ROW`] if the flag isn't present.
 pub(crate) fn parse_row_from_args() -> Result<Vec<ShapeEntry>> {
     let args: Vec<String> = std::env::args().collect();
     let Some(idx) = args.iter().position(|a| a == "--shapes") else {

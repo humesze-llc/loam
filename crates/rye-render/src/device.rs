@@ -1,12 +1,12 @@
 //! Window surface + wgpu adapter/device acquisition.
 //!
 //! [`RenderDevice::new`] picks a high-performance adapter and an sRGB surface format when
-//! available, then optionally allocates a multisampled color attachment matching the surface's
-//! size and format. Resize is handled by [`RenderDevice::resize`].
+//! available, then optionally allocates a multisampled color attachment matching the surface's size
+//! and format. Resize is handled by [`RenderDevice::resize`].
 //! [`RenderDevice::begin_frame`] returns the per-frame `(SurfaceTexture, TextureView)` pair the
 //! render graph draws into; when MSAA is enabled, [`RenderDevice::msaa_view`] is the actual
-//! render target and the swapchain view is used as the resolve target at the end of the egui
-//! paint pass.
+//! render target and the swapchain view is used as the resolve target at the end of the egui paint
+//! pass.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -22,8 +22,8 @@ pub struct SurfaceBundle {
 }
 
 /// Multisampled color attachment paired with the surface. Allocated when the configured sample
-/// count is > 1; [`MsaaTarget::view`] is the render target every scene + UI pass writes
-/// into, with the swapchain view used as the resolve target.
+/// count is > 1; [`MsaaTarget::view`] is the render target every scene + UI pass writes into,
+/// with the swapchain view used as the resolve target.
 pub struct MsaaTarget {
     // Held to keep the GPU allocation alive for the lifetime of `view` (which is a borrow into
     // this texture). Never read through the field itself.
@@ -33,9 +33,8 @@ pub struct MsaaTarget {
 }
 
 /// All wgpu state the engine carries: shared `Instance`, the chosen `Adapter`, the logical
-/// `Device`, the submission `Queue`, the current surface bundle, and an optional
-/// multisampled color attachment matching the surface. One per app; cloning this is not
-/// supported.
+/// `Device`, the submission `Queue`, the current surface bundle, and an optional multisampled
+/// color attachment matching the surface. One per app; cloning this is not supported.
 pub struct RenderDevice {
     pub instance: Instance,
     pub adapter: Adapter,
@@ -124,8 +123,8 @@ impl RenderDevice {
     }
 
     /// Reconfigure the surface for the new window size. No-ops on width or height of zero (the
-    /// minimized-window case wgpu rejects outright). Recreates the MSAA texture to match the
-    /// new dimensions when MSAA is enabled.
+    /// minimized-window case wgpu rejects outright). Recreates the MSAA texture to match the new
+    /// dimensions when MSAA is enabled.
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width == 0 || new_size.height == 0 {
             return;
@@ -147,9 +146,9 @@ impl RenderDevice {
         }
     }
 
-    /// Acquire the next swapchain texture and its default view, ready for a render pass.
-    /// Returns the wgpu surface error directly so callers can branch on `Lost` / `Outdated` /
-    /// `Timeout` without extra wrapping.
+    /// Acquire the next swapchain texture and its default view, ready for a render pass. Returns
+    /// the wgpu surface error directly so callers can branch on `Lost` / `Outdated` / `Timeout`
+    /// without extra wrapping.
     ///
     /// When [`RenderDevice::sample_count`] is > 1, the swapchain view is the *resolve target*,
     /// not the direct render target; pass [`RenderDevice::msaa_view`]'s result to render passes
@@ -172,9 +171,8 @@ impl RenderDevice {
     }
 
     /// View into the multisampled color attachment, when MSAA is enabled. `None` when
-    /// [`RenderDevice::sample_count`] is 1. Render passes should use this as the color
-    /// attachment view when present, with the swapchain view as the resolve target on the final
-    /// pass.
+    /// [`RenderDevice::sample_count`] is 1. Render passes should use this as the color attachment
+    /// view when present, with the swapchain view as the resolve target on the final pass.
     pub fn msaa_view(&self) -> Option<&TextureView> {
         self.msaa_target.as_ref().map(|t| &t.view)
     }

@@ -6,8 +6,8 @@
 //! # Emission strategy
 //!
 //! Each leaf emits a named WGSL helper function (`sdf_p{n}`). Each combinator emits a `let`
-//! binding in the body of `rye_scene_sdf`. The walk is depth-first; children always appear
-//! before their parent in the emitted body, so variables are always in scope when referenced.
+//! binding in the body of `rye_scene_sdf`. The walk is depth-first; children always appear before
+//! their parent in the emitted body, so variables are always in scope when referenced.
 //!
 //! # Example
 //!
@@ -106,8 +106,8 @@ impl SceneNode {
 
 // ---- Scene ------------------------------------------------------------------
 
-/// A complete SDF scene: a single root [`SceneNode`] that emits `fn rye_scene_sdf(p:
-/// vec3<f32>) -> f32` when compiled for a given Space.
+/// A complete SDF scene: a single root [`SceneNode`] that emits
+/// `fn rye_scene_sdf(p: vec3<f32>) -> f32` when compiled for a given Space.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scene {
     pub root: SceneNode,
@@ -153,9 +153,8 @@ impl Scene {
 
 // ---- Recursive emitter ------------------------------------------------------
 
-/// Walk `node` depth-first, appending helper function definitions to `helpers` and `let`
-/// bindings to `body`. Returns the WGSL variable name holding the signed distance for
-/// this node.
+/// Walk `node` depth-first, appending helper function definitions to `helpers` and `let` bindings to
+/// `body`. Returns the WGSL variable name holding the signed distance for this node.
 fn emit_node<S: WgslSpace>(
     node: &SceneNode,
     space: &S,

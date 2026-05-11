@@ -10,11 +10,10 @@
 //!
 //! ## Legacy Euclidean-only types
 //!
-//! [`OrbitCamera`] and [`FirstPersonCamera`] predate the Space-generic refactor. They
-//! remain exported and unchanged so existing examples build during incremental
-//! migration; new code should prefer `OrbitController<EuclideanR3>` /
-//! `FirstPersonController<EuclideanR3>`. They will be removed once every example has
-//! migrated.
+//! [`OrbitCamera`] and [`FirstPersonCamera`] predate the Space-generic refactor. They remain
+//! exported and unchanged so existing examples build during incremental migration; new code
+//! should prefer `OrbitController<EuclideanR3>` / `FirstPersonController<EuclideanR3>`. They
+//! will be removed once every example has migrated.
 
 mod camera;
 mod controller;

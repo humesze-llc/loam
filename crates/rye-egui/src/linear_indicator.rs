@@ -1,16 +1,14 @@
-//! Horizontal scrub-bar indicator: a 1D track with a marker at the
-//! current value and a label.
+//! Horizontal scrub-bar indicator: a 1D track with a marker at the current value and
+//! a label.
 //!
-//! Designed for "where am I in this 1D parameter range" debug HUDs:
-//! the `w` slice plane in a 4D viewer, the current frame in a
-//! recorded sequence, the player's depth in a Busemann-coordinate
-//! tube, etc. Read-only; for editable scrub use `egui::Slider`.
+//! Designed for "where am I in this 1D parameter range" debug HUDs: the `w` slice
+//! plane in a 4D viewer, the current frame in a recorded sequence, the player's depth
+//! in a Busemann-coordinate tube, etc. Read-only; for editable scrub use `egui::Slider`.
 
 use egui::{Color32, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2};
 
-/// Read-only horizontal indicator showing where `value` sits in
-/// `range` as a small marker on a track. Optional label drawn at
-/// the right edge.
+/// Read-only horizontal indicator showing where `value` sits in `range` as a small
+/// marker on a track. Optional label drawn at the right edge.
 ///
 /// ```ignore
 /// rye_egui::LinearIndicator::new("w_slice", w, -1.5..=1.5)
@@ -47,9 +45,8 @@ impl<'a> LinearIndicator<'a> {
     }
 
     pub fn show(self, ui: &mut Ui) -> Response {
-        // Allocate enough space for the track plus a small label
-        // cell at the right edge so the indicator reads as a single
-        // labeled row.
+        // Allocate enough space for the track plus a small label cell at the right
+        // edge so the indicator reads as a single labeled row.
         const LABEL_W: f32 = 78.0;
         let total = Vec2::new(self.desired_width + LABEL_W, self.height.max(14.0));
         let (rect, response) = ui.allocate_exact_size(total, Sense::hover());
@@ -66,8 +63,8 @@ impl<'a> LinearIndicator<'a> {
             StrokeKind::Inside,
         );
 
-        // Tick at zero if it's inside the range. Visual cue that
-        // the parameter is signed and zero is meaningful.
+        // Tick at zero if it's inside the range. Visual cue that the parameter is
+        // signed and zero is meaningful.
         let lo = *self.range.start();
         let hi = *self.range.end();
         if lo < 0.0 && hi > 0.0 {
@@ -114,8 +111,8 @@ impl<'a> LinearIndicator<'a> {
 mod tests {
     use super::*;
 
-    /// Renders without panicking and produces a non-empty response
-    /// rect. Sanity check the headless allocation path.
+    /// Renders without panicking and produces a non-empty response rect. Sanity check
+    /// the headless allocation path.
     #[test]
     fn renders_in_central_panel() {
         let ctx = egui::Context::default();

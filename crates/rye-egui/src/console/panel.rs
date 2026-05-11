@@ -1,33 +1,31 @@
-//! Egui rendering for the console in two modes: docked half-screen drop-down
-//! (default) and detached draggable [`egui::Window`].
+//! Egui rendering for the console in two modes: docked half-screen drop-down (default)
+//! and detached draggable [`egui::Window`].
 //!
-//! Both modes share the same inner content (title row, scrollback, input
-//! row) via [`draw_content`]; only the outer container differs. Switching
-//! modes is a state flip on [`Console`] and toggles which container the
-//! renderer chooses on the next frame.
+//! Both modes share the same inner content (title row, scrollback, input row) via
+//! [`draw_content`]; only the outer container differs. Switching modes is a state flip
+//! on [`Console`] and toggles which container the renderer chooses on the next frame.
 //!
 //! ## Docked
 //!
-//! An [`egui::Area`] anchored at the viewport top, sized to the full width
-//! and `PANEL_HEIGHT_FRACTION` of viewport height. Vertical translation
-//! `-panel_height * (1.0 - progress)` slides the panel down from above as
-//! `progress` interpolates 0 -> 1 in [`super::ANIM_DURATION_SECS`]. The whole
-//! panel is always laid out at full height; only the position changes, so
-//! the input row stays pinned to the bottom of the panel during the slide.
+//! An [`egui::Area`] anchored at the viewport top, sized to the full width and
+//! `PANEL_HEIGHT_FRACTION` of viewport height. Vertical translation
+//! `-panel_height * (1.0 - progress)` slides the panel down from above as `progress`
+//! interpolates 0 -> 1 in [`super::ANIM_DURATION_SECS`]. The whole panel is always
+//! laid out at full height; only the position changes, so the input row stays pinned
+//! to the bottom of the panel during the slide.
 //!
 //! ## Detached
 //!
-//! An [`egui::Window`] with `title_bar(false)` (we render our own title row
-//! inside) plus `resizable(true)` and `movable(true)`. egui persists position
-//! and size across frames via the window id.
+//! An [`egui::Window`] with `title_bar(false)` (we render our own title row inside)
+//! plus `resizable(true)` and `movable(true)`. egui persists position and size across
+//! frames via the window id.
 //!
 //! ## Focus
 //!
-//! In docked mode the input row's TextEdit re-requests focus every frame so
-//! typing always lands there; the docked panel is modal-by-design (no other
-//! egui widgets sit above it). In detached mode focus is only requested on
-//! `pending_focus` (the open frame), so the user can click outside the
-//! window to give keyboard back to the app.
+//! In docked mode the input row's TextEdit re-requests focus every frame so typing
+//! always lands there; the docked panel is modal-by-design (no other egui widgets sit
+//! above it). In detached mode focus is only requested on `pending_focus` (the open
+//! frame), so the user can click outside the window to give keyboard back to the app.
 
 use egui::{
     Color32, FontId, Frame, Layout, Margin, Order, RichText, ScrollArea, Sense, Stroke, TextEdit,
@@ -48,9 +46,9 @@ const FONT_SIZE: f32 = 13.0;
 const ROW_TITLE_HEIGHT: f32 = 22.0;
 const ROW_INPUT_HEIGHT: f32 = 24.0;
 
-/// Default detached-window dimensions, used the first frame the user switches
-/// to detached mode. Subsequent frames respect whatever position/size egui's
-/// window memory has remembered.
+/// Default detached-window dimensions, used the first frame the user switches to
+/// detached mode. Subsequent frames respect whatever position/size egui's window memory
+/// has remembered.
 const DETACHED_DEFAULT_W: f32 = 520.0;
 const DETACHED_DEFAULT_H: f32 = 320.0;
 const DETACHED_MIN_W: f32 = 280.0;
@@ -80,14 +78,14 @@ fn draw_docked<Ctx: 'static>(
     let y_offset = -panel_height * (1.0 - progress);
     let width = viewport.width();
 
-    // Click-outside-defocus: pointer presses below the panel rect release
-    // input focus so mouse + keyboard go back to the app while the console
-    // stays open. Pressing back inside the panel re-enables the per-frame
-    // focus re-request the input row uses to keep typing anchored.
+    // Click-outside-defocus: pointer presses below the panel rect release input focus
+    // so mouse + keyboard go back to the app while the console stays open. Pressing
+    // back inside the panel re-enables the per-frame focus re-request the input row
+    // uses to keep typing anchored.
     //
-    // Computed against the FULL panel rect (no animation offset), so a click
-    // during the slide-in/out doesn't toggle the wrong way as the panel
-    // passes under the cursor.
+    // Computed against the FULL panel rect (no animation offset), so a click during
+    // the slide-in/out doesn't toggle the wrong way as the panel passes under the
+    // cursor.
     let panel_rect = egui::Rect::from_min_size(
         egui::pos2(viewport.min.x, viewport.min.y),
         egui::vec2(width, panel_height),
@@ -145,20 +143,18 @@ fn draw_detached<Ctx: 'static>(console: &mut Console<Ctx>, ctx: &egui::Context, 
         .min_height(DETACHED_MIN_H)
         .frame(frame)
         .show(ctx, |ui| {
-            // Tight vertical layout: drop inter-item spacing between title,
-            // separators, scrollback, and input row so they sum to exactly
-            // `available_height`. Without this, the default `item_spacing.y`
-            // (~3 px) accumulates across the four gaps and pushes content
-            // past the Window's interior, which auto-sizes the Window larger
-            // each frame in a positive-feedback loop (the previous
+            // Tight vertical layout: drop inter-item spacing between title, separators,
+            // scrollback, and input row so they sum to exactly `available_height`.
+            // Without this, the default `item_spacing.y` (~3 px) accumulates across the
+            // four gaps and pushes content past the Window's interior, which auto-sizes
+            // the Window larger each frame in a positive-feedback loop (the previous
             // "stretches vertically" bug).
             //
-            // Likewise, `ui.available_*` is the Window's INNER content area;
-            // the Window's outer rect (e.g., `Memory::area_rect`) includes
-            // egui's resize-handle chrome on each side, and over-allocating
-            // by that chrome stretches the Window horizontally one frame at
-            // a time (the "stretches horizontally" follow-up bug from the
-            // cached-rect attempt at the same fix).
+            // Likewise, `ui.available_*` is the Window's INNER content area; the
+            // Window's outer rect (e.g., `Memory::area_rect`) includes egui's
+            // resize-handle chrome on each side, and over-allocating by that chrome
+            // stretches the Window horizontally one frame at a time (the "stretches
+            // horizontally" follow-up bug from the cached-rect attempt at the same fix).
             ui.spacing_mut().item_spacing.y = 0.0;
             let width = ui.available_width();
             let scroll_h =
@@ -167,9 +163,9 @@ fn draw_detached<Ctx: 'static>(console: &mut Console<Ctx>, ctx: &egui::Context, 
         });
 }
 
-/// Inner content shared by both modes. `scroll_height` is the pinned height
-/// of the scrollback area; both modes pre-compute it from their container's
-/// outer size minus the title and input rows.
+/// Inner content shared by both modes. `scroll_height` is the pinned height of the
+/// scrollback area; both modes pre-compute it from their container's outer size minus
+/// the title and input rows.
 fn draw_content<Ctx: 'static>(
     ui: &mut egui::Ui,
     console: &mut Console<Ctx>,
@@ -281,15 +277,13 @@ fn draw_input_row<Ctx: 'static>(
                     .strong(),
             );
 
-            // Submit on Enter detected BEFORE rendering the TextEdit, so we
-            // can consume the key event and prevent it from being
-            // interpreted as TextEdit input. Using `Response::lost_focus + Enter` is the
-            // egui-idiomatic pattern but conflicts with the
-            // unconditional `request_focus()` we issue every frame in docked
-            // mode to keep typing anchored on the input box; the focus never
-            // gets a chance to be "lost" between frames, so `lost_focus()`
-            // never fires. `consume_key` sidesteps the focus-state dance
-            // entirely.
+            // Submit on Enter detected BEFORE rendering the TextEdit, so we can consume
+            // the key event and prevent it from being interpreted as TextEdit input.
+            // Using `Response::lost_focus + Enter` is the egui-idiomatic pattern but
+            // conflicts with the unconditional `request_focus()` we issue every frame
+            // in docked mode to keep typing anchored on the input box; the focus never
+            // gets a chance to be "lost" between frames, so `lost_focus()` never fires.
+            // `consume_key` sidesteps the focus-state dance entirely.
             let enter_pressed =
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
 
@@ -302,23 +296,21 @@ fn draw_input_row<Ctx: 'static>(
                     .text_color(COLOR_INPUT_ECHO),
             );
 
-            // Any input change outside of tab-cycling invalidates the
-            // tab-completion state.
+            // Any input change outside of tab-cycling invalidates the tab-completion
+            // state.
             if console.input != prev_input {
                 console.tab = None;
             }
 
             // Focus policy:
-            //   - `pending_focus` is set on open; one-shot focus request
-            //     applies in both modes.
-            //   - Docked: re-request focus every frame so the panel feels
-            //     modal (no other egui widget should steal typing) UNLESS
-            //     `user_defocused` (the user clicked outside the panel area
-            //     to talk to the app); then leave focus alone until they
-            //     click back inside the panel.
-            //   - Detached: leave focus alone after the initial request so
-            //     the user can click outside the window to give keyboard
-            //     back to the app.
+            //   - `pending_focus` is set on open; one-shot focus request applies in
+            //     both modes.
+            //   - Docked: re-request focus every frame so the panel feels modal (no
+            //     other egui widget should steal typing) UNLESS `user_defocused` (the
+            //     user clicked outside the panel area to talk to the app); then leave
+            //     focus alone until they click back inside the panel.
+            //   - Detached: leave focus alone after the initial request so the user can
+            //     click outside the window to give keyboard back to the app.
             if console.pending_focus {
                 response.request_focus();
                 console.pending_focus = false;

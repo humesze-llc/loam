@@ -80,13 +80,13 @@ fn reports_modified_file() {
     );
 }
 
-/// `Removed` event fires end-to-end when a watched file is deleted. Pinned because
-/// the merge logic in `watcher.rs::merge_kinds` special-cases Created/Modified bursts
-/// but a delete should pass through cleanly.
+/// `Removed` event fires end-to-end when a watched file is deleted. Pinned because the
+/// merge logic in `watcher.rs::merge_kinds` special-cases Created/Modified bursts but a
+/// delete should pass through cleanly.
 ///
 /// Compares by file name + parent-directory containment (not `canonicalize`-equality)
-/// because `canonicalize` fails on a removed path, and on Windows the notify-reported
-/// path lacks the `\\?\` verbatim prefix that `canonicalize` would add.
+/// because `canonicalize` fails on a removed path, and on Windows the notify-reported path
+/// lacks the `\\?\` verbatim prefix that `canonicalize` would add.
 #[test]
 fn reports_removed_file() {
     let dir = tempfile::tempdir().unwrap();

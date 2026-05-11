@@ -1,45 +1,41 @@
 //! Bivectors and rotors, the N-dim rotation primitive.
 //!
-//! A **bivector** represents an oriented plane of rotation plus a magnitude.
-//! Its exponential is a **rotor**, which acts on vectors via the sandwich
-//! product and composes via Clifford multiplication.
+//! A **bivector** represents an oriented plane of rotation plus a magnitude. Its exponential is
+//! a **rotor**, which acts on vectors via the sandwich product and composes via Clifford
+//! multiplication.
 //!
-//! This module exposes two traits ([`Bivector`], [`Rotor`]) so physics and
-//! other consumers can be written generically over dimension. Concrete
-//! implementations ship per-N: [`Bivector2`] / [`Rotor2`],
-//! [`Bivector3`] / [`Rotor3`], [`Bivector4`] / [`Rotor4`].
+//! This module exposes two traits ([`Bivector`], [`Rotor`]) so physics and other consumers can
+//! be written generically over dimension. Concrete implementations ship per-N: [`Bivector2`] /
+//! [`Rotor2`], [`Bivector3`] / [`Rotor3`], [`Bivector4`] / [`Rotor4`].
 //!
-//! Per-N hand-rolled impls (rather than `generic_const_exprs`) because
-//! the Clifford multiplication tables are dimension-specific anyway and
-//! the closed-form exp/log derivations differ qualitatively (3D is
-//! always single-plane; 4D needs invariant decomposition).
+//! Per-N hand-rolled impls (rather than `generic_const_exprs`) because the Clifford
+//! multiplication tables are dimension-specific anyway and the closed-form exp/log derivations differ
+//! qualitatively (3D is always single-plane; 4D needs invariant decomposition).
 //!
 //! ## Convention
 //!
-//! `R = exp(B/2)`, so a bivector of magnitude θ in plane `e_i ∧ e_j`
-//! produces a rotor that rotates by θ in that plane, from `e_i` toward
-//! `e_j`. Applying a rotor to a vector uses the sandwich product
-//! `v' = R̃ · v · R`, implemented here in closed form per dimension.
+//! `R = exp(B/2)`, so a bivector of magnitude θ in plane `e_i ∧ e_j` produces a rotor that
+//! rotates by θ in that plane, from `e_i` toward `e_j`. Applying a rotor to a vector uses the
+//! sandwich product `v' = R̃ · v · R`, implemented here in closed form per dimension.
 
 use std::ops::{Add, Mul};
 
 use glam::{Vec2, Vec3, Vec4};
 
-/// A bivector in some geometric algebra G(N, 0). Represents an oriented
-/// plane of rotation × magnitude; exponentiates to a rotor.
+/// A bivector in some geometric algebra G(N, 0). Represents an oriented plane of rotation ×
+/// magnitude; exponentiates to a rotor.
 pub trait Bivector: Copy + Add<Output = Self> + Mul<f32, Output = Self> {
     type Rotor: Rotor<Bivector = Self>;
 
     /// Zero bivector. `zero().exp()` is the identity rotor.
     fn zero() -> Self;
 
-    /// Exponential map: `exp(B) = sum_k B^k / k!`, closed-form per
-    /// dimension. Rotates by the bivector's magnitude in its plane.
+    /// Exponential map: `exp(B) = sum_k B^k / k!`, closed-form per dimension. Rotates by the
+    /// bivector's magnitude in its plane.
     fn exp(self) -> Self::Rotor;
 }
 
-/// A rotor in some geometric algebra G(N, 0). Elements of Spin(N), unit-
-/// norm by construction.
+/// A rotor in some geometric algebra G(N, 0). Elements of Spin(N), unit-norm by construction.
 pub trait Rotor: Copy + Mul<Output = Self> {
     type Bivector: Bivector<Rotor = Self>;
     type Vector: Copy;
@@ -47,16 +43,14 @@ pub trait Rotor: Copy + Mul<Output = Self> {
     /// Identity rotor. Applying to any vector returns it unchanged.
     fn identity() -> Self;
 
-    /// Reverse / conjugate rotor. `R · R.inverse() == identity()` within
-    /// floating-point error.
+    /// Reverse / conjugate rotor. `R · R.inverse() == identity()` within floating-point error.
     fn inverse(self) -> Self;
 
     /// Rotate a vector via the sandwich product.
     fn apply(&self, v: Self::Vector) -> Self::Vector;
 
-    /// Logarithm: the bivector whose `exp` is this rotor. Inverse of
-    /// [`Bivector::exp`] modulo branch selection (we pick the principal
-    /// branch, angle in `[−π, π]`).
+    /// Logarithm: the bivector whose `exp` is this rotor. Inverse of [`Bivector::exp`] modulo
+    /// branch selection (we pick the principal branch, angle in `[−π, π]`).
     fn log(self) -> Self::Bivector;
 }
 
@@ -65,8 +59,8 @@ pub trait Rotor: Copy + Mul<Output = Self> {
 // unit complex number (cos(θ/2), sin(θ/2)).
 // ---------------------------------------------------------------------------
 
-/// 2D bivector: a scalar coefficient on the single basis plane `e1∧e2`.
-/// Represents a rotation angle in radians (from `x` toward `y`).
+/// 2D bivector: a scalar coefficient on the single basis plane `e1∧e2`. Represents a rotation
+/// angle in radians (from `x` toward `y`).
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Bivector2(pub f32);
 
@@ -100,8 +94,8 @@ impl Bivector for Bivector2 {
     }
 }
 
-/// 2D rotor: a unit complex number `a + b·e1e2` with `a² + b² = 1`.
-/// `a = cos(θ/2)`, `b = sin(θ/2)` for a rotation of θ.
+/// 2D rotor: a unit complex number `a + b·e1e2` with `a² + b² = 1`. `a = cos(θ/2)`,
+/// `b = sin(θ/2)` for a rotation of θ.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Rotor2 {
     pub a: f32,
@@ -146,16 +140,15 @@ impl Rotor for Rotor2 {
     }
 
     fn apply(&self, v: Vec2) -> Vec2 {
-        // Sandwich collapses to the standard 2D rotation matrix where
-        // cos(θ) = a² − b² and sin(θ) = 2ab.
+        // Sandwich collapses to the standard 2D rotation matrix where cos(θ) = a² − b² and
+        // sin(θ) = 2ab.
         let c = self.a * self.a - self.b * self.b;
         let s = 2.0 * self.a * self.b;
         Vec2::new(c * v.x - s * v.y, s * v.x + c * v.y)
     }
 
     fn log(self) -> Bivector2 {
-        // Full angle θ = 2·atan2(b, a); principal branch by construction
-        // of atan2.
+        // Full angle θ = 2·atan2(b, a); principal branch by construction of atan2.
         Bivector2(2.0 * self.b.atan2(self.a))
     }
 }
@@ -167,8 +160,8 @@ impl Rotor for Rotor2 {
 // `v' = R̃·v·R` rather than the quaternion `q·v·q*`.
 // ---------------------------------------------------------------------------
 
-/// 3D bivector. The three components are the coefficients on the basis
-/// planes `e1∧e2`, `e2∧e3`, `e3∧e1`. Magnitude encodes rotation angle.
+/// 3D bivector. The three components are the coefficients on the basis planes `e1∧e2`, `e2∧e3`,
+/// `e3∧e1`. Magnitude encodes rotation angle.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Bivector3 {
     /// Coefficient on `e1∧e2`, rotation in the xy plane.
@@ -190,8 +183,7 @@ impl Bivector3 {
         Self { xy, yz, zx }
     }
 
-    /// Magnitude of the bivector, the rotation angle when used as a
-    /// rotor generator.
+    /// Magnitude of the bivector, the rotation angle when used as a rotor generator.
     pub fn magnitude(self) -> f32 {
         (self.xy * self.xy + self.yz * self.yz + self.zx * self.zx).sqrt()
     }
@@ -226,9 +218,8 @@ impl Bivector for Bivector3 {
         Self::ZERO
     }
 
-    /// Exponential map. For a bivector `B` of magnitude `θ`,
-    /// `exp(B/2) = cos(θ/2) + sin(θ/2)·B̂`. In 3D every bivector is
-    /// simple (single plane), so the closed form is direct, no
+    /// Exponential map. For a bivector `B` of magnitude `θ`, `exp(B/2) = cos(θ/2) + sin(θ/2)·B̂`.
+    /// In 3D every bivector is simple (single plane), so the closed form is direct, no
     /// decomposition needed (unlike 4D).
     fn exp(self) -> Rotor3 {
         let mag_sq = self.xy * self.xy + self.yz * self.yz + self.zx * self.zx;
@@ -257,9 +248,8 @@ impl Bivector for Bivector3 {
     }
 }
 
-/// 3D rotor: scalar part plus a bivector part, unit-norm by
-/// construction. `s² + xy² + yz² + zx² = 1` for any rotor produced by
-/// `Bivector3::exp` or by composing rotors.
+/// 3D rotor: scalar part plus a bivector part, unit-norm by construction.
+/// `s² + xy² + yz² + zx² = 1` for any rotor produced by `Bivector3::exp` or by composing rotors.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Rotor3 {
     pub s: f32,
@@ -285,8 +275,8 @@ impl Default for Rotor3 {
 
 impl Mul for Rotor3 {
     type Output = Self;
-    /// Geometric product of two rotors. Derived from the Clifford
-    /// multiplication table for bivector basis elements of G(3,0).
+    /// Geometric product of two rotors. Derived from the Clifford multiplication table for
+    /// basis elements of G(3,0).
     fn mul(self, rhs: Self) -> Self {
         let (s1, a1, b1, c1) = (self.s, self.xy, self.yz, self.zx);
         let (s2, a2, b2, c2) = (rhs.s, rhs.xy, rhs.yz, rhs.zx);
@@ -308,8 +298,7 @@ impl Rotor for Rotor3 {
     }
 
     fn inverse(self) -> Self {
-        // Reverse: flip sign of grade-2 part. For unit rotors this is
-        // the geometric inverse.
+        // Reverse: flip sign of grade-2 part. For unit rotors this is the geometric inverse.
         Self {
             s: self.s,
             xy: -self.xy,
@@ -318,9 +307,9 @@ impl Rotor for Rotor3 {
         }
     }
 
-    /// Apply the rotor to a vector via the sandwich `R̃ · v · R`.
-    /// Computed in two stages: first `R̃ · v` (produces vector + trivector),
-    /// then multiply by `R` (the trivector part cancels for unit rotors).
+    /// Apply the rotor to a vector via the sandwich `R̃ · v · R`. Computed in two stages: first
+    /// `R̃ · v` (produces vector + trivector), then multiply by `R` (the trivector part cancels
+    /// for unit rotors).
     fn apply(&self, v: Vec3) -> Vec3 {
         let (s, a, b, c) = (self.s, self.xy, self.yz, self.zx);
         let (vx, vy, vz) = (v.x, v.y, v.z);
@@ -340,8 +329,8 @@ impl Rotor for Rotor3 {
     }
 
     fn log(self) -> Bivector3 {
-        // Inverse of `Bivector3::exp`. The bivector part has magnitude
-        // sin(θ/2); the scalar is cos(θ/2). θ = 2·atan2(sin, cos).
+        // Inverse of `Bivector3::exp`. The bivector part has magnitude sin(θ/2); the scalar is
+        // cos(θ/2). θ = 2·atan2(sin, cos).
         let mag_sq = self.xy * self.xy + self.yz * self.yz + self.zx * self.zx;
         if mag_sq < 1e-16 {
             // Near-identity: use linear term (log ≈ 2·bivector_part).
@@ -375,12 +364,11 @@ impl Rotor for Rotor3 {
 // bivector is simple and the decomposition is trivial.
 // ---------------------------------------------------------------------------
 
-/// 4D bivector with six components, one per basis plane
-/// `e_i ∧ e_j` for `i < j`. Magnitude encodes rotation angle(s).
+/// 4D bivector with six components, one per basis plane `e_i ∧ e_j` for `i < j`. Magnitude
+/// encodes rotation angle(s).
 ///
-/// Unlike [`Bivector3`], a 4D bivector can describe a **double rotation**
-/// (two independent rotation planes at once). The exponential handles
-/// this via the invariant decomposition.
+/// Unlike [`Bivector3`], a 4D bivector can describe a **double rotation** (two independent
+/// rotation planes at once). The exponential handles this via the invariant decomposition.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Bivector4 {
     pub xy: f32,
@@ -413,16 +401,16 @@ impl Bivector4 {
     }
 
     /// Unit basis bivector at index `i` in `Plane4`'s ordering:
-    /// `0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw`. Panics if `i >= 6`.
-    /// Use [`Plane4::unit_bivector`] for the type-safe form.
+    /// `0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw`. Panics if `i >= 6`. Use
+    /// [`Plane4::unit_bivector`] for the type-safe form.
     pub fn basis(i: usize) -> Self {
         let mut c = [0.0_f32; 6];
         c[i] = 1.0;
         Self::new(c[0], c[1], c[2], c[3], c[4], c[5])
     }
 
-    /// `|B|² = Σ α²_ij` over all six components. Equal to the sum of
-    /// squared eigenvalue magnitudes: `θ₁² + θ₂²`.
+    /// `|B|² = Σ α²_ij` over all six components. Equal to the sum of squared eigenvalue
+    /// magnitudes: `θ₁² + θ₂²`.
     pub fn magnitude_squared(self) -> f32 {
         self.xy * self.xy
             + self.xz * self.xz
@@ -436,10 +424,8 @@ impl Bivector4 {
         self.magnitude_squared().sqrt()
     }
 
-    /// Read the coefficient of a basis plane. The 6 basis
-    /// bivectors form an orthonormal basis of the bivector
-    /// space; this returns the bivector's component along the
-    /// given basis direction.
+    /// Read the coefficient of a basis plane. The 6 basis bivectors form an orthonormal basis
+    /// of the bivector space; this returns the bivector's component along the given basis direction.
     pub fn component(self, plane: Plane4) -> f32 {
         match plane {
             Plane4::Xy => self.xy,
@@ -451,8 +437,7 @@ impl Bivector4 {
         }
     }
 
-    /// Set the coefficient of a basis plane in place. Mirror of
-    /// [`Self::component`].
+    /// Set the coefficient of a basis plane in place. Mirror of [`Self::component`].
     pub fn set_component(&mut self, plane: Plane4, value: f32) {
         match plane {
             Plane4::Xy => self.xy = value,
@@ -464,15 +449,12 @@ impl Bivector4 {
         }
     }
 
-    /// Inner product treating both bivectors as 6-component
-    /// vectors over the orthonormal basis `{xy, xz, xw, yz, yw, zw}`. Equivalent to
-    /// `-(A * B).scalar_part()` for the Clifford product when `A * B` is computed in G(4, 0),
-    /// since the basis bivectors satisfy `e_ij · e_ij = -1`;
-    /// the convention used here is the *Euclidean* inner
-    /// product on the coefficient vector, which is positive definite. Used to project one
-    /// bivector onto another's
-    /// direction (e.g., the angle a rotor has accumulated along
-    /// a fixed bivector axis).
+    /// Inner product treating both bivectors as 6-component vectors over the orthonormal basis
+    /// `{xy, xz, xw, yz, yw, zw}`. Equivalent to `-(A * B).scalar_part()` for the Clifford
+    /// product when `A * B` is computed in G(4, 0), since the basis bivectors satisfy
+    /// `e_ij · e_ij = -1`; the convention used here is the *Euclidean* inner product on the
+    /// coefficient vector, which is positive definite. Used to project one bivector onto
+    /// another's direction (e.g., the angle a rotor has accumulated along a fixed bivector axis).
     pub fn dot(self, other: Self) -> f32 {
         self.xy * other.xy
             + self.xz * other.xz
@@ -482,18 +464,16 @@ impl Bivector4 {
             + self.zw * other.zw
     }
 
-    /// Coefficient of the pseudoscalar `I = e1∧e2∧e3∧e4` in the wedge
-    /// product `B ∧ B`. Computed from the three complementary-plane
-    /// pairings: `xy·zw − xz·yw + xw·yz`, times 2. For a simple
-    /// bivector this is zero; a nonzero value means `B` is compound and
-    /// the exponential requires the invariant decomposition.
+    /// Coefficient of the pseudoscalar `I = e1∧e2∧e3∧e4` in the wedge product `B ∧ B`. Computed
+    /// from the three complementary-plane pairings: `xy·zw − xz·yw + xw·yz`, times 2. For a
+    /// simple bivector this is zero; a nonzero value means `B` is compound and the exponential
+    /// requires the invariant decomposition.
     pub fn wedge_self_coeff(self) -> f32 {
         2.0 * (self.xy * self.zw - self.xz * self.yw + self.xw * self.yz)
     }
 
-    /// Wedge product of two 4-vectors: `u ∧ v` as a bivector. Each
-    /// basis plane coefficient is the 2×2 determinant of the two
-    /// components it projects onto, e.g. `xy = u.x·v.y − u.y·v.x`.
+    /// Wedge product of two 4-vectors: `u ∧ v` as a bivector. Each basis plane coefficient is
+    /// the 2×2 determinant of the two components it projects onto, e.g. `xy = u.x·v.y − u.y·v.x`.
     /// Used by physics to build the torque bivector `r ∧ f`.
     pub fn wedge(u: Vec4, v: Vec4) -> Self {
         Self {
@@ -506,20 +486,16 @@ impl Bivector4 {
         }
     }
 
-    /// Clifford left-contraction `B ⌋ v`, the grade-1 part of the
-    /// geometric product `B · v`, with the standard mathematical
-    /// sign convention. For `B = e_xy` and `v = e_x` this returns
+    /// Clifford left-contraction `B ⌋ v`, the grade-1 part of the geometric product `B · v`,
+    /// with the standard mathematical sign convention. For `B = e_xy` and `v = e_x` this returns
     /// `−e_y` (because `e_xy · e_x = e_x e_y e_x = −e_x e_x e_y = −e_y`).
     ///
-    /// **Note for physics callers**: rigid-body dynamics wants
-    /// `ω × r` with the *opposite* sign, `e_xy` "applied to" `e_x`
-    /// should give `+e_y`, since rotating in the +xy plane sends the
-    /// +x axis toward +y. Use `rye_physics::euclidean_r4::omega_cross_r`
-    /// (or just negate the result of this function) when you want
-    /// the physics convention. Keeping the math primitive
-    /// Clifford-pure means future generic-`N` callers and the
-    /// inevitable `Bivector5`/`Bivector6` get consistent semantics
-    /// across dimensions, instead of a surprise sign flip at one
+    /// **Note for physics callers**: rigid-body dynamics wants `ω × r` with the *opposite* sign,
+    /// `e_xy` "applied to" `e_x` should give `+e_y`, since rotating in the +xy plane sends the
+    /// +x axis toward +y. Use `rye_physics::euclidean_r4::omega_cross_r` (or just negate the
+    /// result of this function) when you want the physics convention. Keeping the math primitive
+    /// Clifford-pure means future generic-`N` callers and the inevitable `Bivector5`/`Bivector6`
+    /// get consistent semantics across dimensions, instead of a surprise sign flip at one
     /// specific dimension.
     pub fn contract_vec(self, v: Vec4) -> Vec4 {
         Vec4::new(
@@ -530,10 +506,9 @@ impl Bivector4 {
         )
     }
 
-    /// Hodge dual `B* = B · I`. Swaps each plane with its orthogonal
-    /// complement (with signs from reordering basis vectors):
-    /// `xy ↔ −zw`, `xz ↔ +yw`, `xw ↔ −yz` (and the reverse swaps for
-    /// the other three). Used inside the invariant decomposition.
+    /// Hodge dual `B* = B · I`. Swaps each plane with its orthogonal complement (with signs from
+    /// reordering basis vectors): `xy ↔ −zw`, `xz ↔ +yw`, `xw ↔ −yz` (and the reverse swaps
+    /// for the other three). Used inside the invariant decomposition.
     pub fn dual(self) -> Self {
         Self {
             xy: -self.zw,
@@ -546,17 +521,14 @@ impl Bivector4 {
     }
 }
 
-/// One of the six elementary 4D rotation planes; a basis bivector
-/// of [`Bivector4`]. Indices and label match `Bivector4`'s field
-/// order: `0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw`.
+/// One of the six elementary 4D rotation planes; a basis bivector of [`Bivector4`]. Indices
+/// and label match `Bivector4`'s field order: `0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw`.
 ///
-/// The three w-involving planes (`xw`, `yw`, `zw`) pull visible
-/// axes into the hidden 4th dimension; the three pure-3D planes
-/// (`xy`, `xz`, `yz`) act as ordinary 3D rotations on the 3D
-/// cross-section. Sum-of-bivectors composition is **commutative**
-/// (vector-space addition), so building `omega = sum_of_planes · rate` is order-independent and
-/// the resulting rotor `omega.exp()`
-/// depends only on the *set* of active planes, not their order.
+/// The three w-involving planes (`xw`, `yw`, `zw`) pull visible axes into the hidden 4th
+/// dimension; the three pure-3D planes (`xy`, `xz`, `yz`) act as ordinary 3D rotations on the
+/// 3D cross-section. Sum-of-bivectors composition is **commutative** (vector-space addition),
+/// so building `omega = sum_of_planes · rate` is order-independent and the resulting rotor
+/// `omega.exp()` depends only on the *set* of active planes, not their order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(usize)]
 pub enum Plane4 {
@@ -572,8 +544,8 @@ impl Plane4 {
     /// All six planes in the canonical `Bivector4` field order.
     pub const ALL: [Self; 6] = [Self::Xy, Self::Xz, Self::Xw, Self::Yz, Self::Yw, Self::Zw];
 
-    /// Lowercase two-letter label, e.g. `"xy"`. Stable identifier
-    /// suitable for UI labels, debug output, and serialization keys.
+    /// Lowercase two-letter label, e.g. `"xy"`. Stable identifier suitable for UI labels, debug
+    /// output, and serialization keys.
     pub fn label(self) -> &'static str {
         match self {
             Self::Xy => "xy",
@@ -748,10 +720,9 @@ impl Bivector for Bivector4 {
     }
 }
 
-/// 4D rotor: even-graded element of G(4,0). Eight components:
-/// scalar, six bivector coefficients, and a pseudoscalar. Unit-norm
-/// by construction when produced by [`Bivector4::exp`] or by composing
-/// rotors.
+/// 4D rotor: even-graded element of G(4,0). Eight components: scalar, six bivector coefficients,
+/// and a pseudoscalar. Unit-norm by construction when produced by [`Bivector4::exp`] or by
+/// composing rotors.
 #[derive(Copy, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Rotor4 {
     pub s: f32,
@@ -778,15 +749,12 @@ impl Rotor4 {
     };
 
     /// Identity rotor packed into the `[s, xy, xz, xw, yz, yw, zw, xyzw]` slot order used by
-    /// `From<Rotor4> for [f32; 8]`.
-    /// Convenience for initializing GPU uniform-buffer rotor fields
-    /// without having to spell out the eight-tuple at every call
-    /// site.
+    /// `From<Rotor4> for [f32; 8]`. Convenience for initializing GPU uniform-buffer rotor
+    /// fields without having to spell out the eight-tuple at every call site.
     pub const IDENTITY_SLOT: [f32; 8] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-    /// Squared norm under the reverse: `<R̃·R>_0`. For a proper rotor
-    /// this is `1`. Used internally for renormalization after long
-    /// chains of compositions.
+    /// Squared norm under the reverse: `<R̃·R>_0`. For a proper rotor this is `1`. Used
+    /// internally for renormalization after long chains of compositions.
     pub fn norm_squared(self) -> f32 {
         self.s * self.s
             + self.xy * self.xy
@@ -798,8 +766,8 @@ impl Rotor4 {
             + self.xyzw * self.xyzw
     }
 
-    /// Renormalize onto the unit manifold of Spin(4). Apply after long
-    /// integrator runs to counter f32 drift.
+    /// Renormalize onto the unit manifold of Spin(4). Apply after long integrator runs to
+    /// counter f32 drift.
     pub fn normalize(self) -> Self {
         let n = self.norm_squared().sqrt();
         if n > 0.0 {
@@ -826,10 +794,9 @@ impl Default for Rotor4 {
     }
 }
 
-/// Pack into the `[s, xy, xz, xw, yz, yw, zw, xyzw]` slot order
-/// used by GPU uniform buffers (e.g. `rye-render`'s `BodyUniform`).
-/// Centralizing this packing convention here means downstream
-/// crates and examples never spell out the field order by hand.
+/// Pack into the `[s, xy, xz, xw, yz, yw, zw, xyzw]` slot order used by GPU uniform buffers
+/// (e.g. `rye-render`'s `BodyUniform`). Centralizing this packing convention here means
+/// downstream crates and examples never spell out the field order by hand.
 impl From<Rotor4> for [f32; 8] {
     fn from(r: Rotor4) -> Self {
         [r.s, r.xy, r.xz, r.xw, r.yz, r.yw, r.zw, r.xyzw]
@@ -838,10 +805,9 @@ impl From<Rotor4> for [f32; 8] {
 
 impl Mul for Rotor4 {
     type Output = Self;
-    /// Geometric product of two 4D rotors, expanded in the even-graded
-    /// basis `{1, e12, e13, e14, e23, e24, e34, I}`. The product of
-    /// each pair of basis elements is worked out by direct Clifford
-    /// reduction, e.g. `e12·e13 = −e23` (swap `e2·e1 = −e1·e2`,
+    /// Geometric product of two 4D rotors, expanded in the even-graded basis
+    /// `{1, e12, e13, e14, e23, e24, e34, I}`. The product of each pair of basis elements is
+    /// worked out by direct Clifford reduction, e.g. `e12·e13 = −e23` (swap `e2·e1 = −e1·e2`,
     /// then `e1·e1 = 1`), `e12·e34 = I`, `e12·I = −e34`, etc.
     fn mul(self, rhs: Self) -> Self {
         let (a0, a12, a13, a14, a23, a24, a34, a_i) = (
@@ -919,9 +885,8 @@ impl Rotor for Rotor4 {
         Self::IDENTITY
     }
 
-    /// Reverse `R̃`: flip the sign of every grade whose
-    /// `k(k−1)/2 mod 2 = 1`. For a 4D rotor that's grade 2 (bivectors)
-    /// only; grade 0 (scalar) and grade 4 (pseudoscalar in G(4,0),
+    /// Reverse `R̃`: flip the sign of every grade whose `k(k−1)/2 mod 2 = 1`. For a 4D rotor
+    /// that's grade 2 (bivectors) only; grade 0 (scalar) and grade 4 (pseudoscalar in G(4,0),
     /// since `4·3/2 = 6` is even) both keep their sign.
     fn inverse(self) -> Self {
         Self {
@@ -938,20 +903,18 @@ impl Rotor for Rotor4 {
 
     /// Apply the rotor to a 4-vector via the sandwich `R̃ · v · R`.
     ///
-    /// Two-stage multivector multiplication. Stage 1 is `R̃ · v`
-    /// yielding an odd multivector (1-vector + 3-vector, eight
-    /// coefficients). Stage 2 multiplies by `R` on the right and
-    /// extracts the 1-vector part. Every basis-element product used
-    /// below is derived by direct Clifford reduction in G(4,0):
+    /// Two-stage multivector multiplication. Stage 1 is `R̃ · v` yielding an odd multivector
+    /// (1-vector + 3-vector, eight coefficients). Stage 2 multiplies by `R` on the right and
+    /// extracts the 1-vector part. Every basis-element product used below is derived by direct
+    /// Clifford reduction in G(4,0):
     ///
-    /// - `e_ab · e_c`: if `c ∈ {a, b}` gives `±e_k` (bivector-vector
-    ///   collapses to the other index, with a sign from anticommuting
-    ///   through); else gives a trivector `e_{abc}` (sorted).
+    /// - `e_ab · e_c`: if `c ∈ {a, b}` gives `±e_k` (bivector-vector collapses to the other
+    ///   index, with a sign from anticommuting through); else gives a trivector `e_{abc}` (sorted).
     /// - `I · e_k`: `−e_234, +e_134, −e_124, +e_123` for `k = 1..4`.
     /// - `e_ijk · e_lm` with `{l,m} ⊂ {i,j,k}`: collapses to `±e_{one remaining}` per the
-    /// standard reduction.
-    /// - `e_ijk · I`: `−e_l` (with `l` the missing index), signed by
-    ///   the parity of the `e_{ijk}·e_l -> I` permutation.
+    ///   standard reduction.
+    /// - `e_ijk · I`: `−e_l` (with `l` the missing index), signed by the parity of the
+    ///   `e_{ijk}·e_l -> I` permutation.
     fn apply(&self, v: Vec4) -> Vec4 {
         let (vx, vy, vz, vw) = (v.x, v.y, v.z, v.w);
         let rs = self.s;
@@ -963,18 +926,16 @@ impl Rotor for Rotor4 {
         let rzw = self.zw;
         let r_i = self.xyzw;
 
-        // Stage 1: R̃·v. R̃ has the bivector signs flipped relative to
-        // R (grade-2 reverses), but scalar and pseudoscalar stay.
-        // Using R's components directly, with the sign flip folded
+        // Stage 1: R̃·v. R̃ has the bivector signs flipped relative to R (grade-2 reverses), but
+        // scalar and pseudoscalar stay. Using R's components directly, with the sign flip folded
         // into the formulas:
         let p1 = rs * vx - rxy * vy - rxz * vz - rxw * vw;
         let p2 = rs * vy + rxy * vx - ryz * vz - ryw * vw;
         let p3 = rs * vz + rxz * vx + ryz * vy - rzw * vw;
         let p4 = rs * vw + rxw * vx + ryw * vy + rzw * vz;
 
-        // 3-vector part of R̃·v in basis (e123, e124, e134, e234).
-        // Each comes from one of the three bivector contributions
-        // whose planes span that trivector, plus a pseudoscalar term
+        // 3-vector part of R̃·v in basis (e123, e124, e134, e234). Each comes from one of the
+        // three bivector contributions whose planes span that trivector, plus a pseudoscalar term
         // from `I·e_k`.
         let t123 = -rxy * vz + rxz * vy - ryz * vx + r_i * vw;
         let t124 = -rxy * vw + rxw * vy - ryw * vx - r_i * vz;
@@ -1007,10 +968,9 @@ impl Rotor for Rotor4 {
         Vec4::new(q1, q2, q3, q4)
     }
 
-    /// Logarithm: inverse of [`Bivector4::exp`]. Recovers the bivector
-    /// whose half-exponential is this rotor. Uses the same invariant
-    /// decomposition: scalar + pseudoscalar recover the two half-
-    /// angles, then the bivector & dual parts give the two planes.
+    /// Logarithm: inverse of [`Bivector4::exp`]. Recovers the bivector whose half-exponential is
+    /// this rotor. Uses the same invariant decomposition: scalar + pseudoscalar recover the two
+    /// half-angles, then the bivector & dual parts give the two planes.
     fn log(self) -> Bivector4 {
         // `c = cos(θ₁/2)·cos(θ₂/2)`, `p = sin(θ₁/2)·sin(θ₂/2)`.
         // Product-to-sum: `c ± p = cos((θ₁ ∓ θ₂)/2)`.
@@ -1269,9 +1229,8 @@ mod tests {
 
     #[test]
     fn rotor3_composition_matches_sequential_apply() {
-        // With the `v' = R̃·v·R` sandwich, multiplication order equals
-        // application order: `(ra · rb).apply(v) = rb.apply(ra.apply(v))`,
-        // i.e. `ra` is applied first, then `rb`.
+        // With the `v' = R̃·v·R` sandwich, multiplication order equals application order:
+        // `(ra · rb).apply(v) = rb.apply(ra.apply(v))`, i.e. `ra` is applied first, then `rb`.
         let ra = Bivector3::new(0.4, 0.0, 0.0).exp();
         let rb = Bivector3::new(0.0, 0.5, 0.0).exp();
         let composed = ra * rb;
@@ -1360,8 +1319,8 @@ mod tests {
         assert_eq!(r, Rotor4::IDENTITY);
     }
 
-    /// `component(plane)` reads the plane's coefficient;
-    /// `set_component` writes it; round-trip is the identity.
+    /// `component(plane)` reads the plane's coefficient; `set_component` writes it; round-trip
+    /// is the identity.
     #[test]
     fn bivector4_component_round_trip() {
         let b = Bivector4::new(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
@@ -1378,10 +1337,9 @@ mod tests {
         assert_eq!(c, b);
     }
 
-    /// `dot` is the Euclidean inner product on the 6-coefficient
-    /// vector. Sanity checks: orthogonal basis bivectors give 0;
-    /// a basis bivector dotted with itself gives 1; bilinearity
-    /// holds.
+    /// `dot` is the Euclidean inner product on the 6-coefficient vector. Sanity checks:
+    /// orthogonal basis bivectors give 0; a basis bivector dotted with itself gives 1;
+    /// bilinearity holds.
     #[test]
     fn bivector4_dot_inner_product_invariants() {
         let xy = Plane4::Xy.unit_bivector();
@@ -1443,8 +1401,8 @@ mod tests {
         assert_vec4_close(r.apply(Vec4::W), -Vec4::Z);
     }
 
-    /// A simple bivector (one plane only) has `B ∧ B = 0`, this test
-    /// locks the wedge-coefficient helper against that invariant.
+    /// A simple bivector (one plane only) has `B ∧ B = 0`, this test locks the wedge-coefficient
+    /// helper against that invariant.
     #[test]
     fn simple_bivector_has_zero_wedge_self() {
         for b in [
@@ -1561,8 +1519,8 @@ mod tests {
 
     #[test]
     fn rotor4_composition_matches_sequential_apply() {
-        // With the `v' = R̃·v·R` sandwich, `(ra·rb).apply(v)` equals
-        // `rb.apply(ra.apply(v))`, ra applied first.
+        // With the `v' = R̃·v·R` sandwich, `(ra·rb).apply(v)` equals `rb.apply(ra.apply(v))`,
+        // ra applied first.
         let ra = Bivector4::new(0.4, 0.0, 0.0, 0.0, 0.0, 0.0).exp();
         let rb = Bivector4::new(0.0, 0.0, 0.0, 0.5, 0.0, 0.0).exp();
         let composed = ra * rb;
@@ -1585,9 +1543,8 @@ mod tests {
         }
     }
 
-    /// `log ∘ exp` for a compound bivector recovers it up to the
-    /// branch ambiguity inherent in the invariant decomposition.
-    /// Verified here by applying both bivectors and checking the
+    /// `log ∘ exp` for a compound bivector recovers it up to the branch ambiguity inherent in
+    /// the invariant decomposition. Verified here by applying both bivectors and checking the
     /// resulting rotations match on a set of probe vectors.
     #[test]
     fn rotor4_log_is_inverse_of_exp_compound() {
@@ -1606,9 +1563,9 @@ mod tests {
         }
     }
 
-    /// Cross-check cardinal-plane rotations against `glam::Mat4`
-    /// rotations in 3D subspaces. An xy-plane rotation in 4D restricted
-    /// to the xy-subspace should agree with `Mat4::from_rotation_z`.
+    /// Cross-check cardinal-plane rotations against `glam::Mat4` rotations in 3D subspaces. An
+    /// xy-plane rotation in 4D restricted to the xy-subspace should agree with
+    /// `Mat4::from_rotation_z`.
     #[test]
     fn rotor4_xy_matches_mat4_rotation_z_on_xy_subspace() {
         use glam::Mat4;
@@ -1646,9 +1603,8 @@ mod tests {
         assert_close(back.norm_squared(), 1.0);
     }
 
-    /// Small-angle path accuracy: a bivector with magnitude near f32
-    /// precision must produce a rotor that rotates vectors by ≈ that
-    /// magnitude rather than collapsing to identity.
+    /// Small-angle path accuracy: a bivector with magnitude near f32 precision must produce a
+    /// rotor that rotates vectors by ≈ that magnitude rather than collapsing to identity.
     #[test]
     fn rotor4_small_angle_path() {
         let eps = 1e-3_f32;
@@ -1658,12 +1614,10 @@ mod tests {
         assert_vec4_close_tol(rotated, expected, 1e-5);
     }
 
-    /// Composition `(R_xy * R_xw).apply(v)` must equal
-    /// `R_xw.apply(R_xy.apply(v))`. The earlier
-    /// `rotor4_composition_matches_sequential_apply` test only
-    /// covers two pure-3D planes (xy + yz); a sign error specific
-    /// to the geometric product's w-mixing terms would survive
-    /// that test and only show up here.
+    /// Composition `(R_xy * R_xw).apply(v)` must equal `R_xw.apply(R_xy.apply(v))`. The earlier
+    /// `rotor4_composition_matches_sequential_apply` test only covers two pure-3D planes (xy +
+    /// yz); a sign error specific to the geometric product's w-mixing terms would survive that
+    /// test and only show up here.
     #[test]
     fn rotor4_composition_xy_then_xw_matches_sequential_apply() {
         let r_xy = Bivector4::new(0.4, 0.0, 0.0, 0.0, 0.0, 0.0).exp();
@@ -1682,17 +1636,15 @@ mod tests {
 
     /// The rotate_polytopes demo's update loop:
     ///   per frame at 60 Hz: orientation = (omega * dt).exp() * orientation
-    /// Over N steps with constant `omega`, the result must equal the
-    /// closed-form `(omega * N * dt).exp()` within float tolerance.
-    /// Catches both additive (sum-of-plane-bivectors) and
-    /// multiplicative (rotor compose) drift specific to compound
+    /// Over N steps with constant `omega`, the result must equal the closed-form
+    /// `(omega * N * dt).exp()` within float tolerance. Catches both additive
+    /// (sum-of-plane-bivectors) and multiplicative (rotor compose) drift specific to compound
     /// bivectors that include w-mixing planes.
     ///
-    /// `omega = e_xy + e_xz + e_xw + e_yz` is the exact bivector the
-    /// failing-screenshot rotate_polytopes run had active. Regression
-    /// gate for the issue #37 fix in `Rotor4::mul` (the e14·e24 /
-    /// e24·e14 pair's signs in the e12 output were swapped). Pre-fix
-    /// drift was ~1.3%; post-fix it sits at f32 noise (~5e-7).
+    /// `omega = e_xy + e_xz + e_xw + e_yz` is the exact bivector the failing-screenshot
+    /// rotate_polytopes run had active. Regression gate for the issue #37 fix in `Rotor4::mul`
+    /// (the e14·e24 / e24·e14 pair's signs in the e12 output were swapped). Pre-fix drift was
+    /// ~1.3%; post-fix it sits at f32 noise (~5e-7).
     #[test]
     fn rotor4_compound_xy_xz_xw_yz_integrated_matches_closed_form() {
         let omega = Bivector4::new(1.0, 1.0, 1.0, 1.0, 0.0, 0.0);
@@ -1734,11 +1686,10 @@ mod tests {
         }
     }
 
-    /// 60 Hz × 15 s = 900 rotor multiplications, mirroring the
-    /// pentatope_smoke screenshot's `t = 14.97 s` state. The rotor's
-    /// norm-squared must stay near 1; visible drift here would mean
-    /// vertices grow / shrink under sustained spin (suspect for the
-    /// "polytopes appear to grow" symptom).
+    /// 60 Hz × 15 s = 900 rotor multiplications, mirroring the pentatope_smoke screenshot's
+    /// `t = 14.97 s` state. The rotor's norm-squared must stay near 1; visible drift here would
+    /// mean vertices grow / shrink under sustained spin (suspect for the "polytopes appear to
+    /// grow" symptom).
     #[test]
     fn rotor4_compound_integration_preserves_unit_norm_over_900_steps() {
         let omega = Bivector4::new(1.0, 1.0, 1.0, 1.0, 0.0, 0.0);
@@ -1758,12 +1709,10 @@ mod tests {
         );
     }
 
-    /// Vertex-level invariant for the rotate-polytopes "are the shapes
-    /// growing?" question: a unit-radius polytope vertex started at
-    /// `(1, 0, 0, 0)` must stay at radius 1 after sustained
-    /// integration. Length drift here would expand the rendered
-    /// cross-section even for pure 3D rotations. Tests **raw**
-    /// composition without intermediate `.normalize()` to catch
+    /// Vertex-level invariant for the rotate-polytopes "are the shapes growing?" question: a
+    /// unit-radius polytope vertex started at `(1, 0, 0, 0)` must stay at radius 1 after
+    /// sustained integration. Length drift here would expand the rendered cross-section even for
+    /// pure 3D rotations. Tests **raw** composition without intermediate `.normalize()` to catch
     /// algebraic drift in the geometric product itself.
     #[test]
     fn polytope_vertex_stays_on_unit_hypersphere_over_900_steps() {
@@ -1784,8 +1733,8 @@ mod tests {
             let v_rotated = r.apply(v0);
             let l0 = v0.length();
             let l_rot = v_rotated.length();
-            // Pre-fix: vertex grew to ~16.4. Post-fix: drift sits at
-            // ~2e-6 from f32 accumulation over 900 raw composes.
+            // Pre-fix: vertex grew to ~16.4. Post-fix: drift sits at ~2e-6 from f32
+            // accumulation over 900 raw composes.
             assert!(
                 (l_rot - l0).abs() < 1e-5,
                 "vertex length drift over 900 steps: {v0:?} (|v|={l0}) -> {v_rotated:?} (|Rv|={l_rot})",
@@ -1793,14 +1742,12 @@ mod tests {
         }
     }
 
-    /// Same 900-step integration but **with `.normalize()` after each
-    /// composition**, mirroring the actual integrator path in
-    /// `rye_physics::euclidean_r4::integrate_orientation`. If this
-    /// fails, the rotate-polytopes "shapes growing" symptom is the
-    /// visible bug; if this passes, the integrator's existing
-    /// normalize handles the algebraic drift the previous test
-    /// catches and the visual issue is somewhere else (cross-section
-    /// shape change, dispatcher inverse rotor, etc.).
+    /// Same 900-step integration but **with `.normalize()` after each composition**, mirroring
+    /// the actual integrator path in `rye_physics::euclidean_r4::integrate_orientation`. If this
+    /// fails, the rotate-polytopes "shapes growing" symptom is the visible bug; if this passes,
+    /// the integrator's existing normalize handles the algebraic drift the previous test catches
+    /// and the visual issue is somewhere else (cross-section shape change, dispatcher inverse
+    /// rotor, etc.).
     #[test]
     fn polytope_vertex_stays_on_unit_hypersphere_with_normalize_path() {
         let omega = Bivector4::new(1.0, 1.0, 1.0, 1.0, 0.0, 0.0);
@@ -1820,11 +1767,9 @@ mod tests {
             let v_rotated = r.apply(v0);
             let l0 = v0.length();
             let l_rot = v_rotated.length();
-            // Pre-fix (with normalize): vertex shrunk to ~0.65 because
-            // normalization to a unit 8-sphere is the wrong manifold
-            // when the rotor itself was wrong. Post-fix the drift is
-            // essentially zero (the normalize re-projects onto the
-            // correct manifold each step).
+            // Pre-fix (with normalize): vertex shrunk to ~0.65 because normalization to a unit
+            // 8-sphere is the wrong manifold when the rotor itself was wrong. Post-fix the drift
+            // is essentially zero (the normalize re-projects onto the correct manifold each step).
             assert!(
                 (l_rot - l0).abs() < 1e-5,
                 "normalized-path vertex length drift over 900 steps: \
@@ -1833,13 +1778,11 @@ mod tests {
         }
     }
 
-    /// `Bivector4::contract_vec` is the **Clifford left-contraction**
-    /// `B ⌋ v` (grade-1 part of `B · v`), not the physics-side
-    /// `ω × r`. This test pins down the sign convention so the
-    /// future `Bivector5` / `Bivector6` impls inherit consistent
-    /// semantics, and so the deviation a physics caller needs (a
-    /// negation) stays explicit at the call site rather than baked
-    /// into the bivector type itself.
+    /// `Bivector4::contract_vec` is the **Clifford left-contraction** `B ⌋ v` (grade-1 part of
+    /// `B · v`), not the physics-side `ω × r`. This test pins down the sign convention so the
+    /// future `Bivector5` / `Bivector6` impls inherit consistent semantics, and so the deviation
+    /// a physics caller needs (a negation) stays explicit at the call site rather than baked into
+    /// the bivector type itself.
     #[test]
     fn bivector4_contract_vec_is_clifford_left_contraction() {
         // e_xy ⌋ e_x = -e_y (because e_xy · e_x = e_x e_y e_x =
@@ -1858,9 +1801,8 @@ mod tests {
         assert_vec4_close_tol(b.contract_vec(Vec4::W), Vec4::ZERO, 1e-6);
     }
 
-    /// `Plane4::ALL[i].unit_bivector()` must equal `Bivector4::basis(i)`,
-    /// and both must agree with `Bivector4`'s field ordering; index
-    /// `i` sets exactly the i-th field to 1.
+    /// `Plane4::ALL[i].unit_bivector()` must equal `Bivector4::basis(i)`, and both must agree
+    /// with `Bivector4`'s field ordering; index `i` sets exactly the i-th field to 1.
     #[test]
     fn plane4_unit_bivector_matches_bivector4_field_order() {
         // Order: 0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw.
@@ -1897,10 +1839,9 @@ mod tests {
     }
 
     /// `From<Rotor4> for [f32; 8]` packs in the order `[s, xy, xz, xw, yz, yw, zw, xyzw]`. This
-    /// pinned ordering is what GPU
-    /// uniform buffers (e.g. `BodyUniform.rotor`) consume; a future
-    /// refactor that swaps fields must also update this conversion
-    /// in lockstep, and this test catches the mismatch.
+    /// pinned ordering is what GPU uniform buffers (e.g. `BodyUniform.rotor`) consume; a future
+    /// refactor that swaps fields must also update this conversion in lockstep, and this test
+    /// catches the mismatch.
     #[test]
     fn rotor4_to_slot_packs_in_canonical_order() {
         let r = Rotor4 {

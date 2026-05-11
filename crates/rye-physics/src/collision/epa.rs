@@ -13,8 +13,8 @@
 //! Algorithm (repeated until convergence):
 //! 1. Find the face of the current polytope closest to the origin.
 //! 2. Query a new support point along that face's outward normal.
-//! 3. If the support's distance from the origin ≈ the face's distance, the face is on
-//!    the Minkowski boundary, we're done.
+//! 3. If the support's distance from the origin ≈ the face's distance, the face is on the
+//!    Minkowski boundary, we're done.
 //! 4. Otherwise, add the support to the polytope: remove every face whose outward normal "sees"
 //!    the new point, then stitch a fan of new triangles from each horizon edge to the new vertex.
 //!
@@ -29,21 +29,20 @@ use super::gjk::{minkowski_support, MinkowskiPoint, SupportFn};
 
 const EPA_MAX_ITERATIONS: u32 = 48;
 const EPA_TOLERANCE: f32 = 1e-4;
-/// Sanity cap: a well-formed EPA typically finishes with < 30 vertices.
-/// If we blow through this we're likely in a degenerate stall.
+/// Sanity cap: a well-formed EPA typically finishes with < 30 vertices. If we blow through this
+/// we're likely in a degenerate stall.
 const EPA_MAX_VERTICES: usize = 96;
 
-/// Output of [`epa`], the resolved contact info, ready to plug into
-/// a [`crate::Contact`].
+/// Output of [`epa`], the resolved contact info, ready to plug into a [`crate::Contact`].
 #[derive(Clone, Copy, Debug)]
 pub struct ContactInfo {
-    /// Unit vector from A toward B in world coordinates. Matches the `Contact::normal`
-    /// convention the PGS solver expects.
+    /// Unit vector from A toward B in world coordinates. Matches the `Contact::normal` convention
+    /// the PGS solver expects.
     pub normal: Vec3,
     /// How far the shapes overlap along `normal`.
     pub penetration: f32,
-    /// World-space contact point (midpoint between the surfaces of A and B at the
-    /// closest feature).
+    /// World-space contact point (midpoint between the surfaces of A and B at the closest
+    /// feature).
     pub point: Vec3,
 }
 
@@ -64,10 +63,9 @@ struct Polytope {
     vertices: Vec<MinkowskiPoint>,
     faces: Vec<Face>,
     /// Centroid of the seed tetrahedron. Stays interior to the polytope for all subsequent
-    /// (convex) expansions, so it's the reliable reference for orienting new faces outward,
-    /// much more robust than "pick any old vertex," which can happen to lie on a
-    /// degenerate-face plane and produce an inward orientation that cascades into a corrupted
-    /// polytope.
+    /// (convex) expansions, so it's the reliable reference for orienting new faces outward, much
+    /// more robust than "pick any old vertex," which can happen to lie on a degenerate-face plane
+    /// and produce an inward orientation that cascades into a corrupted polytope.
     interior: glam::Vec3,
 }
 
@@ -75,9 +73,8 @@ impl Polytope {
     fn from_tetra(tetra: [MinkowskiPoint; 4]) -> Self {
         let vertices = tetra.to_vec();
         let interior = (tetra[0].point + tetra[1].point + tetra[2].point + tetra[3].point) * 0.25;
-        // Four triangular faces of the tetrahedron. Winding chosen so
-        // that each face's cross-product normal points away from the
-        // opposite vertex.
+        // Four triangular faces of the tetrahedron. Winding chosen so that each face's
+        // cross-product normal points away from the opposite vertex.
         let mut faces = Vec::with_capacity(4);
         for &(i, j, k, l) in &[(0, 1, 2, 3), (0, 3, 1, 2), (0, 2, 3, 1), (1, 3, 2, 0)] {
             faces.push(build_face_vs_point(&vertices, i, j, k, vertices[l].point));
@@ -128,10 +125,10 @@ impl Polytope {
 
         // Stitch new faces from each horizon edge to the new vertex. Orientation uses
         // `self.interior`, the seed tetrahedron's centroid, as a guaranteed interior reference.
-        // Using an arbitrary old vertex was the source of the "polytope face count explodes"
-        // bug: when an old vertex happens to lie on the plane of a new face, the sign test is
-        // ambiguous, the face gets an inward-facing normal, downstream visibility tests lie
-        // about it, and faces multiply without bound.
+        // Using an arbitrary old vertex was the source of the "polytope face count explodes" bug:
+        // when an old vertex happens to lie on the plane of a new face, the sign test is
+        // ambiguous, the face gets an inward-facing normal, downstream visibility tests lie about
+        // it, and faces multiply without bound.
         let interior = self.interior;
         for &(i, j) in &horizon {
             self.faces
@@ -161,8 +158,8 @@ fn build_face_vs_point(
         normal /= len;
     }
 
-    // Orient away from the interior reference point. If the normal
-    // currently points *toward* the interior, flip it.
+    // Orient away from the interior reference point. If the normal currently points *toward* the
+    // interior, flip it.
     let to_interior = interior_point - pa;
     let (v_order, outward_normal) = if normal.dot(to_interior) > 0.0 {
         ([a, c, b], -normal)
@@ -170,9 +167,8 @@ fn build_face_vs_point(
         ([a, b, c], normal)
     };
 
-    // Signed distance from origin to the face's plane along the
-    // outward normal. Clamped at zero for numerical noise near the
-    // origin-on-boundary case.
+    // Signed distance from origin to the face's plane along the outward normal. Clamped at zero
+    // for numerical noise near the origin-on-boundary case.
     let raw_distance = outward_normal.dot(verts[v_order[0]].point);
     let distance = raw_distance.max(0.0);
     Face {
@@ -224,9 +220,9 @@ pub fn epa<A: SupportFn, B: SupportFn>(
     initial_simplex: [MinkowskiPoint; 4],
 ) -> Option<ContactInfo> {
     // Reject degenerate starting simplices: if the 4 GJK points are (nearly) coplanar, the
-    // tetrahedron has ~zero volume and EPA cannot produce meaningful outward normals. The
-    // signed volume is det([p1-p0, p2-p0, p3-p0])/6, and sign flips depending on handedness, we
-    // only care about magnitude.
+    // tetrahedron has ~zero volume and EPA cannot produce meaningful outward normals. The signed
+    // volume is det([p1-p0, p2-p0, p3-p0])/6, and sign flips depending on handedness, we only
+    // care about magnitude.
     let p0 = initial_simplex[0].point;
     let p1 = initial_simplex[1].point;
     let p2 = initial_simplex[2].point;
@@ -266,8 +262,8 @@ pub fn epa<A: SupportFn, B: SupportFn>(
         }
     }
 
-    // Iteration cap reached; return the current best estimate rather than failing outright. Happens
-    // only for nearly-degenerate inputs. Emit a debug-level trace so developers tuning
+    // Iteration cap reached; return the current best estimate rather than failing outright.
+    // Happens only for nearly-degenerate inputs. Emit a debug-level trace so developers tuning
     // narrowphase can count cap hits without spamming release logs.
     tracing::debug!(
         max_iterations = EPA_MAX_ITERATIONS,

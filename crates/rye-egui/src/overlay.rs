@@ -126,8 +126,8 @@ impl BottomOverlay {
     ///
     /// `content` should render in normal top-down order (mode header / body / footer style).
     /// The overlay sizes to its content (or to a caller-pinned `target_h`); height transitions
-    /// animate smoothly, and during shrinks the TOP is clipped via an internal `ScrollArea`
-    /// so widgets rendered late (the footer) stay in view.
+    /// animate smoothly, and during shrinks the TOP is clipped via an internal `ScrollArea` so
+    /// widgets rendered late (the footer) stay in view.
     ///
     /// `content` is called *twice per frame*: once invisibly to measure this frame's natural
     /// content height, then again for the actual paint at the correctly-anchored position.
@@ -357,12 +357,11 @@ mod tests {
         );
     }
 
-    /// The "chevron toggles expand/collapse" pattern: `target_h` is small + body
-    /// conditionally hidden (collapsed), then `target_h` grows + body conditionally rendered
-    /// (expanded).
+    /// The "chevron toggles expand/collapse" pattern: `target_h` is small + body conditionally
+    /// hidden (collapsed), then `target_h` grows + body conditionally rendered (expanded).
     /// After settling in the expanded state, the body's widget rects MUST intersect the
-    /// overlay's rect; i.e., the body actually shows up to the user, not just renders into
-    /// some clipped void.
+    /// overlay's rect; i.e., the body actually shows up to the user, not just renders into some
+    /// clipped void.
     ///
     /// This is the test for the regression where expanding a `BottomOverlay` produces a
     /// visibly larger panel but with the same content as the collapsed state; body widgets get

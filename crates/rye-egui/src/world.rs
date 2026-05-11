@@ -1,5 +1,4 @@
-//! World-space to screen-space projection for anchoring egui widgets
-//! to 3D points.
+//! World-space to screen-space projection for anchoring egui widgets to 3D points.
 //!
 //! References:
 //! - Akenine-Möller, Haines, Hoffman, *Real-Time Rendering* (4th ed,
@@ -11,13 +10,13 @@ use rye_camera::CameraView;
 /// Project a world-space point to screen pixel coordinates via the camera's view +
 /// perspective projection.
 ///
-/// Returns `None` if the point is behind the camera or outside the canonical view volume
-/// after projection (clipped).
+/// Returns `None` if the point is behind the camera or outside the canonical view volume after
+/// projection (clipped).
 ///
-/// `viewport` is `(width_px, height_px)`. `fov_y_radians` matches the `Camera::fov_y`
-/// field; `aspect` should be `width_px / height_px`. `near` and `far` should match the
-/// renderer's depth setup; for screen-anchoring purposes `near = 0.05`, `far = 100.0`
-/// is fine since we only care about NDC.
+/// `viewport` is `(width_px, height_px)`. `fov_y_radians` matches the `Camera::fov_y` field;
+/// `aspect` should be `width_px / height_px`. `near` and `far` should match the renderer's
+/// depth setup; for screen-anchoring purposes `near = 0.05`, `far = 100.0` is fine since we
+/// only care about NDC.
 ///
 /// The returned [`egui::Pos2`] is in egui's pixel coordinates (top-left origin, y-down),
 /// ready to pass to `egui::Area::fixed_pos`.
@@ -35,9 +34,8 @@ pub fn world_to_screen(
     }
     let aspect = vw / vh;
 
-    // Build a right-handed view matrix from the camera's orthonormal frame: camera looks
-    // along `forward`, with `right` and `up` as the screen axes. `Mat4::look_to_rh` is
-    // exactly this.
+    // Build a right-handed view matrix from the camera's orthonormal frame: camera looks along
+    // `forward`, with `right` and `up` as the screen axes. `Mat4::look_to_rh` is exactly this.
     let view = Mat4::look_to_rh(camera.position, camera.forward, camera.up);
     let proj = Mat4::perspective_rh(fov_y_radians, aspect, near, far);
     let clip = proj * view * world.extend(1.0);
@@ -96,9 +94,9 @@ mod tests {
         );
     }
 
-    /// Off-axis world points map to the correct screen quadrant. A point above-and-right
-    /// of the gaze direction lands in the upper-right of the screen (small x > centre,
-    /// small y < centre because egui is y-down).
+    /// Off-axis world points map to the correct screen quadrant. A point above-and-right of
+    /// the gaze direction lands in the upper-right of the screen (small x > centre, small y <
+    /// centre because egui is y-down).
     #[test]
     fn upper_right_world_lands_upper_right_screen() {
         let camera = camera_at(Vec3::ZERO, -Vec3::Z, Vec3::Y);
