@@ -650,11 +650,17 @@ impl<Ctx: 'static> Console<Ctx> {
                 let Some(cmd) = self.commands.get(cmd_name) else {
                     return Vec::new();
                 };
-                cmd.arg_choices(*arg_index)
+                // Sort matches alphabetically so command authors can declare choices in
+                // any order (workflow, frequency, narrative) without affecting Tab
+                // cycling order. Matches the command-name path, which is also sorted.
+                let mut matches: Vec<String> = cmd
+                    .arg_choices(*arg_index)
                     .iter()
                     .filter(|choice| choice.starts_with(prefix.as_str()))
                     .map(|choice| (*choice).to_string())
-                    .collect()
+                    .collect();
+                matches.sort();
+                matches
             }
         }
     }
@@ -975,12 +981,11 @@ mod tests {
 
         c.input = "capture png p".into();
         c.tab_complete();
-        // `p` matches `pre` and `post`, LCP = `p`; first match = `pre` (sort order).
-        assert!(
-            c.input == "capture png pre" || c.input == "capture png post",
-            "got {:?}",
-            c.input
-        );
+        // Matches are sorted: `post` < `pre` (o < r at second char). First Tab lands on
+        // `post`; pressing Tab again cycles to `pre`.
+        assert_eq!(c.input, "capture png post");
+        c.tab_complete();
+        assert_eq!(c.input, "capture png pre");
     }
 
     #[test]
