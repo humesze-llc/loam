@@ -10,9 +10,9 @@ description = "Rye App: thin trait + event-loop runner that extracts the winit b
 [features]
 default = ["capture"]
 # Frame-capture: PNG single-shot + PNG sequence writers wired into the render loop,
-# plus the console commands and hotkeys that drive them. Disable for lean builds
+# plus GIF stream encoder + console commands + hotkeys. Disable for lean builds
 # that don't need the diagnostic plumbing.
-capture = ["dep:image"]
+capture = ["dep:image", "dep:gif"]
 
 [dependencies]
 anyhow.workspace = true
@@ -24,6 +24,7 @@ wgpu.workspace = true
 winit.workspace = true
 
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+gif = { version = "0.13", optional = true }
 
 rye-asset  = { path = "../rye-asset" }
 rye-camera = { path = "../rye-camera" }

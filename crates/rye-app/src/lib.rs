@@ -21,11 +21,11 @@
 //! - A camera framework. The user owns [`Camera<S>`] and a [`CameraController<S>`] in
 //!   their `App` struct, advanced from inside `App::update`. The framework only hands
 //!   them the drained input.
-//! - A frame-capture pipeline. Use OBS or another external screen recorder. (TODO:
-//!   revisit if a built-in capture knob becomes load-bearing for CI / regression-image
-//!   generation. The future shape: GIF-preferred output, separate from any rotation
-//!   flag. Capture and auto-rotate are independent concerns and coupling them was a
-//!   2026-04-28 mistake; see issue tracker.)
+//!
+//! A frame-capture pipeline is included behind the `capture` feature (default-on); see
+//! [`capture`] for the console commands, hotkeys, and two-tap (pre-egui / post-egui)
+//! readback model. External screen recorders (OBS) remain the right tool for long
+//! recording sessions that need codec choice + audio + multi-source mixing.
 //!
 //! Designed for a small ergonomic gain; explicitly not an ECS or scene graph.
 //!
@@ -398,24 +398,36 @@ impl<A: App> Runner<A> {
     fn time(&self) -> f32 {
         self.start.elapsed().as_secs_f32()
     }
+}
 
-    /// Read back `texture` and write it as PNG to `path`. Logs and swallows errors so a
-    /// transient capture failure doesn't abort the render loop.
-    #[cfg(feature = "capture")]
-    fn capture_to(&self, path: &std::path::Path, rd: &RenderDevice, texture: &wgpu::Texture) {
-        let result = capture::read_texture_rgba(
-            &rd.device,
-            &rd.queue,
-            texture,
-            rd.surface_bundle.size.width,
-            rd.surface_bundle.size.height,
-            rd.surface_bundle.config.format,
-        )
-        .and_then(|img| capture::write_png(path, &img));
-        match result {
-            Ok(()) => tracing::info!("capture: wrote {}", path.display()),
-            Err(e) => tracing::error!("capture: failed to write {}: {e:#}", path.display()),
+/// Read back `texture` and hand the pixels to the capture state machine, which
+/// dispatches to the active writer (one-shot PNG, sequence PNG, or GIF encoder).
+/// Logs and swallows errors so a transient capture failure doesn't abort the render
+/// loop. Free function (not a method on Runner) so the borrow checker can see that
+/// `&mut capture` and `&rd` are disjoint borrows.
+#[cfg(feature = "capture")]
+fn capture_consume(
+    capture: &mut capture::Capture,
+    rd: &RenderDevice,
+    texture: &wgpu::Texture,
+    is_pre: bool,
+) {
+    let img = match capture::read_texture_rgba(
+        &rd.device,
+        &rd.queue,
+        texture,
+        rd.surface_bundle.size.width,
+        rd.surface_bundle.size.height,
+        rd.surface_bundle.config.format,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::error!("capture: readback failed: {e:#}");
+            return;
         }
+    };
+    if let Err(e) = capture.consume_frame(is_pre, img.rgba, img.width, img.height) {
+        tracing::error!("capture: write failed: {e:#}");
     }
 }
 
@@ -705,6 +717,13 @@ impl<A: App> Runner<A> {
         //   - `post`-egui: after ui.paint, before frame.present. Reads the swapchain
         //     view, which contains the final composite (and the MSAA resolve target
         //     when MSAA is on). This is what DWM receives.
+        // FPS-gate decides whether either tap fires this frame. Computed once before the
+        // render pass so the same `now` is used to schedule the next capture interval.
+        #[cfg(feature = "capture")]
+        let capture_now = Instant::now();
+        #[cfg(feature = "capture")]
+        let do_capture = self.capture.should_capture(capture_now);
+
         match rd.begin_frame() {
             Ok((frame, swap_view)) => {
                 let mut last_err: Option<anyhow::Error> = None;
@@ -718,17 +737,14 @@ impl<A: App> Runner<A> {
 
                 // Pre-egui capture tap. Only valid with MSAA off (see above).
                 #[cfg(feature = "capture")]
-                if self.capture.wants_pre() {
-                    let (path_pre, _) = self.capture.frame_paths();
-                    if let Some(path) = path_pre {
-                        if rd.sample_count() > 1 {
-                            tracing::warn!(
-                                "capture: `pre` stage skipped because MSAA is on; \
-                                 set RunConfig::msaa_samples = 1 for diagnostic capture"
-                            );
-                        } else {
-                            self.capture_to(&path, rd, &frame.texture);
-                        }
+                if do_capture && self.capture.wants_pre() {
+                    if rd.sample_count() > 1 {
+                        tracing::warn!(
+                            "capture: `pre` stage skipped because MSAA is on; \
+                             set RunConfig::msaa_samples = 1 for diagnostic capture"
+                        );
+                    } else {
+                        capture_consume(&mut self.capture, rd, &frame.texture, true);
                     }
                 }
 
@@ -754,14 +770,13 @@ impl<A: App> Runner<A> {
 
                 // Post-egui capture tap. Always valid: swapchain has final composite.
                 #[cfg(feature = "capture")]
-                if self.capture.wants_post() {
-                    let (_, path_post) = self.capture.frame_paths();
-                    if let Some(path) = path_post {
-                        self.capture_to(&path, rd, &frame.texture);
-                    }
+                if do_capture && self.capture.wants_post() {
+                    capture_consume(&mut self.capture, rd, &frame.texture, false);
                 }
                 #[cfg(feature = "capture")]
-                self.capture.advance_frame();
+                if do_capture {
+                    self.capture.advance_frame(capture_now);
+                }
 
                 frame.present();
                 if let Some(err) = last_err {
