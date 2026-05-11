@@ -326,40 +326,44 @@ impl Drop for GifWorker {
     }
 }
 
+/// Encoder + global-palette quantizer pair. Built lazily from the first frame so the
+/// palette captures the actual scene colors, then reused for every subsequent frame.
+/// This is the dominant fix for GIF flicker on raymarched content: per-frame palette
+/// regeneration would otherwise pick slightly different 256-color sets each frame,
+/// shifting the same RGB to different palette indices and producing visible noise.
+struct GifEncoderState {
+    encoder: gif::Encoder<BufWriter<File>>,
+    /// Global NeuQuant kept around for per-pixel `index_of` lookups on subsequent
+    /// frames. Building the quantizer is the slow step (~50 ms at 1080p); reusing
+    /// it means only the linear pixel-to-index map runs per frame.
+    nq: color_quant::NeuQuant,
+    out_w: u32,
+    out_h: u32,
+}
+
 fn gif_encoder_loop(path: PathBuf, rx: Receiver<GifFrame>) {
-    let mut encoder: Option<gif::Encoder<BufWriter<File>>> = None;
+    let mut state: Option<GifEncoderState> = None;
     for frame in rx {
-        if let Err(e) = encode_one_frame(&path, &mut encoder, frame) {
+        if let Err(e) = encode_one_frame(&path, &mut state, frame) {
             tracing::error!("capture: gif encode error: {e:#}");
             return;
         }
     }
-    // `encoder` drops here, flushing the trailer.
+    // `state` (and its encoder) drops here, flushing the GIF trailer.
 }
 
 fn encode_one_frame(
     path: &Path,
-    encoder: &mut Option<gif::Encoder<BufWriter<File>>>,
+    state: &mut Option<GifEncoderState>,
     frame: GifFrame,
 ) -> Result<()> {
     let (out_w, out_h) = scaled_dims(frame.src_width, frame.src_height, frame.scale)?;
     let w_u16: u16 = out_w.try_into().context("gif width > 65535")?;
     let h_u16: u16 = out_h.try_into().context("gif height > 65535")?;
 
-    let enc = match encoder {
-        Some(e) => e,
-        None => {
-            let file = File::create(path)
-                .with_context(|| format!("create gif output {}", path.display()))?;
-            let mut e = gif::Encoder::new(BufWriter::new(file), w_u16, h_u16, &[])
-                .context("init gif encoder")?;
-            e.set_repeat(gif::Repeat::Infinite).context("gif repeat")?;
-            *encoder = Some(e);
-            encoder.as_mut().unwrap()
-        }
-    };
-
-    let mut buf: Vec<u8> = if frame.scale.is_some() {
+    // Lanczos3 downscale before quantization. Better edge / gradient quality than
+    // running NeuQuant on full-res and downsampling indexed pixels afterwards.
+    let rgba: Vec<u8> = if frame.scale.is_some() {
         let src: ::image::RgbaImage =
             ::image::ImageBuffer::from_raw(frame.src_width, frame.src_height, frame.rgba)
                 .ok_or_else(|| {
@@ -376,9 +380,63 @@ fn encode_one_frame(
         frame.rgba
     };
 
-    let mut gif_frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 10);
-    gif_frame.delay = frame.delay_cs;
-    enc.write_frame(&gif_frame).context("gif encode")?;
+    // Lazy init: build the global NeuQuant from the first frame's pixels and open
+    // the encoder with that palette. Sample factor 10 is the gif crate's default
+    // (good quality / latency balance). The palette is fixed for the whole stream.
+    let s = match state {
+        Some(s) => s,
+        None => {
+            let nq = color_quant::NeuQuant::new(10, 256, &rgba);
+            let palette = nq.color_map_rgb();
+            let file = File::create(path)
+                .with_context(|| format!("create gif output {}", path.display()))?;
+            let mut encoder = gif::Encoder::new(BufWriter::new(file), w_u16, h_u16, &palette)
+                .context("init gif encoder")?;
+            encoder
+                .set_repeat(gif::Repeat::Infinite)
+                .context("gif repeat")?;
+            *state = Some(GifEncoderState {
+                encoder,
+                nq,
+                out_w,
+                out_h,
+            });
+            state.as_mut().unwrap()
+        }
+    };
+
+    // Reject mid-stream resizes. The LSD is fixed at encoder creation; the user
+    // restarts capture to pick up new window dimensions.
+    if out_w != s.out_w || out_h != s.out_h {
+        return Err(anyhow!(
+            "gif frame dims {}x{} != first frame {}x{}",
+            out_w,
+            out_h,
+            s.out_w,
+            s.out_h
+        ));
+    }
+
+    // Map each pixel to its global-palette index. `index_of` is a Voronoi lookup
+    // (~constant time per pixel after init). No dither: dithering against a fixed
+    // palette can introduce its own moving noise pattern, which is its own form of
+    // flicker. Mild posterization on smooth gradients is the tradeoff.
+    let mut indices: Vec<u8> = Vec::with_capacity((out_w as usize) * (out_h as usize));
+    for px in rgba.chunks_exact(4) {
+        indices.push(s.nq.index_of(px) as u8);
+    }
+
+    let gif_frame = gif::Frame {
+        width: w_u16,
+        height: h_u16,
+        buffer: std::borrow::Cow::Owned(indices),
+        delay: frame.delay_cs,
+        dispose: gif::DisposalMethod::Keep,
+        // palette: None => use the global palette set on encoder init.
+        palette: None,
+        ..gif::Frame::default()
+    };
+    s.encoder.write_frame(&gif_frame).context("gif encode")?;
     Ok(())
 }
 
