@@ -66,6 +66,7 @@ use std::time::Instant;
 
 #[cfg(feature = "capture")]
 pub mod capture;
+pub mod log;
 
 use winit::{
     application::ApplicationHandler,
@@ -297,18 +298,24 @@ pub fn run<A: App>() -> anyhow::Result<()> {
 
 /// Run an app with custom config.
 pub fn run_with_config<A: App>(config: RunConfig) -> anyhow::Result<()> {
-    if let Some(filter) = &config.log_filter {
-        // Best-effort init; ignore "already initialised" errors so
-        // running tests / repeated `run` calls don't panic.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter.clone()))
-            .try_init();
-    } else {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "info".into()),
-            )
+    // Compose two tracing layers: the standard fmt layer (writes to stdout) and our
+    // ConsoleLayer (pushes events into the in-process ring buffer for the dev
+    // console). Both subscribe to the same EnvFilter so RUST_LOG / log_filter
+    // controls both outputs uniformly. `try_init` is best-effort: if a subscriber is
+    // already installed (tests, repeated calls) we silently no-op so the existing
+    // sink keeps working.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let filter = match &config.log_filter {
+            Some(s) => tracing_subscriber::EnvFilter::new(s.clone()),
+            None => tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        };
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(log::ConsoleLayer)
             .try_init();
     }
 

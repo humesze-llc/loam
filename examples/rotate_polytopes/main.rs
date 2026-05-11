@@ -645,6 +645,10 @@ impl RotatePolytopesApp {
         rye_app::capture::register_commands(&mut c);
         rye_app::capture::bind_default_hotkeys(&mut c);
 
+        // Framework-provided log mirror: `log on|off|toggle` toggles whether
+        // `tracing::*` events show up in the console scrollback.
+        rye_app::log::register_command(&mut c);
+
         c
     }
 }
@@ -674,6 +678,9 @@ impl App for RotatePolytopesApp {
     fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
         self.demo.ui(ctx, frame);
         self.capture_panel.show(ctx);
+        // Pump any pending tracing events into the console scrollback BEFORE rendering
+        // it, so the user sees mirrored log lines this frame instead of next.
+        rye_app::log::pump_into(&mut self.console);
         self.console.ui(ctx, &mut self.demo);
         // Stash for next frame's `on_event` to gate hotkey routing.
         // Captured AFTER the console renders so a freshly-focused
