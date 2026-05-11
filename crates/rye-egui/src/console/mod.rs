@@ -150,6 +150,14 @@ pub trait Command<Ctx>: 'static {
     /// One-line description shown by `help`.
     fn help(&self) -> &str;
 
+    /// Tab-completion choices for the `arg_index`-th positional argument. Default is
+    /// empty (no completion / free-form arg like a path or number). Override via
+    /// [`FnCommand::with_args`] when an arg is a fixed enum like `pre|post|both`.
+    fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
+        let _ = arg_index;
+        &[]
+    }
+
     /// Run the command. `args` are whitespace-split tokens after the command name.
     /// Output goes to `out`; recoverable issues get `out.error(..)`; unrecoverable
     /// ones return `Err`.
@@ -160,7 +168,26 @@ pub trait Command<Ctx>: 'static {
 pub struct FnCommand<F> {
     name: &'static str,
     help: &'static str,
+    arg_choices: Vec<Vec<&'static str>>,
     f: F,
+}
+
+impl<F> FnCommand<F> {
+    /// Declare positional-argument choices for tab-completion. Each inner slice lists
+    /// the valid values for that positional position. Trailing free-form args (paths,
+    /// numbers, expressions) can be omitted; the console returns no completions for
+    /// positions beyond the declared list.
+    ///
+    /// ```ignore
+    /// cmd("capture", "...", |args, ctx, out| { ... }).with_args(&[
+    ///     &["png", "frames", "toggle", "stop"],
+    ///     &["pre", "post", "both"],
+    /// ])
+    /// ```
+    pub fn with_args(mut self, choices: &[&[&'static str]]) -> Self {
+        self.arg_choices = choices.iter().map(|s| s.to_vec()).collect();
+        self
+    }
 }
 
 /// Build a [`Command`] from a closure. The closure mutates a `Ctx` and writes lines
@@ -178,7 +205,12 @@ pub fn cmd<Ctx, F>(name: &'static str, help: &'static str, f: F) -> FnCommand<F>
 where
     F: FnMut(&[&str], &mut Ctx, &mut ConsoleWriter) -> anyhow::Result<()> + 'static,
 {
-    FnCommand { name, help, f }
+    FnCommand {
+        name,
+        help,
+        arg_choices: Vec::new(),
+        f,
+    }
 }
 
 impl<Ctx, F> Command<Ctx> for FnCommand<F>
@@ -190,6 +222,12 @@ where
     }
     fn help(&self) -> &str {
         self.help
+    }
+    fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
+        self.arg_choices
+            .get(arg_index)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
     fn run(&mut self, args: &[&str], ctx: &mut Ctx, out: &mut ConsoleWriter) -> anyhow::Result<()> {
         (self.f)(args, ctx, out)
@@ -252,6 +290,31 @@ pub struct Console<Ctx> {
 struct TabState {
     matches: Vec<String>,
     index: usize,
+    ctx: CompletionContext,
+}
+
+/// What the user is currently typing, partitioned for completion. `prefix` is the
+/// partially-typed token under the cursor; an empty `prefix` with trailing whitespace
+/// means the user has finished the previous token and is starting the next one.
+#[derive(Clone, Debug)]
+enum CompletionContext {
+    /// Completing the command name (no whitespace yet, or whitespace-leading input).
+    Command { prefix: String },
+    /// Completing positional argument `arg_index` of `cmd_name`.
+    Arg {
+        cmd_name: String,
+        arg_index: usize,
+        prefix: String,
+    },
+}
+
+impl CompletionContext {
+    fn prefix(&self) -> &str {
+        match self {
+            CompletionContext::Command { prefix } => prefix,
+            CompletionContext::Arg { prefix, .. } => prefix,
+        }
+    }
 }
 
 impl<Ctx: 'static> Default for Console<Ctx> {
@@ -503,23 +566,26 @@ impl<Ctx: 'static> Console<Ctx> {
         if let Some(tab) = self.tab.as_mut() {
             if !tab.matches.is_empty() {
                 tab.index = (tab.index + 1) % tab.matches.len();
-                self.input.clone_from(&tab.matches[tab.index]);
+                let new_input = apply_completion(&self.input, &tab.ctx, &tab.matches[tab.index]);
+                self.input = new_input;
                 return;
             }
         }
-        // Fresh completion: collect all command names with the input as prefix.
-        let prefix = self.input.clone();
-        let matches: Vec<String> = self
-            .all_command_names()
-            .into_iter()
-            .filter(|name| name.starts_with(&prefix))
-            .collect();
+        // Fresh completion: build context from current input.
+        let Some(ctx) = self.completion_context() else {
+            return;
+        };
+        let matches = self.completion_matches(&ctx);
         if matches.is_empty() {
             return;
         }
-        self.input.clone_from(&matches[0]);
+        self.input = apply_completion(&self.input, &ctx, &matches[0]);
         if matches.len() > 1 {
-            self.tab = Some(TabState { matches, index: 0 });
+            self.tab = Some(TabState {
+                matches,
+                index: 0,
+                ctx,
+            });
         } else {
             self.tab = None;
         }
@@ -535,27 +601,82 @@ impl<Ctx: 'static> Console<Ctx> {
         names
     }
 
-    /// Suffix of the longest common prefix of all commands that start with the current
-    /// input. Used by the panel to paint a dim ghost preview after the cursor so the user
-    /// sees what `Tab` would insert.
-    ///
-    /// Returns `None` when the input is empty, when no command matches, or when the input
-    /// already equals (or extends past) the longest common prefix of the matches.
-    pub fn tab_preview(&self) -> Option<String> {
+    /// Inspect [`Console::input`] to decide what the user is currently completing: the
+    /// command name, or the n-th positional argument of a known command. Returns `None`
+    /// for empty input.
+    fn completion_context(&self) -> Option<CompletionContext> {
         if self.input.is_empty() {
             return None;
         }
-        let matches: Vec<String> = self
-            .all_command_names()
-            .into_iter()
-            .filter(|name| name.starts_with(&self.input))
-            .collect();
+        let parsed: Vec<&str> = self.input.split_whitespace().collect();
+        if parsed.is_empty() {
+            return None;
+        }
+        let trailing_ws = self.input.ends_with(char::is_whitespace);
+
+        // No whitespace yet: still typing the command name.
+        if parsed.len() == 1 && !trailing_ws {
+            return Some(CompletionContext::Command {
+                prefix: parsed[0].to_string(),
+            });
+        }
+
+        // After whitespace: we're on an argument. `arg_index` is 0-based positional.
+        let cmd_name = parsed[0].to_string();
+        let (arg_index, prefix) = if trailing_ws {
+            (parsed.len() - 1, String::new())
+        } else {
+            (parsed.len() - 2, parsed.last().unwrap().to_string())
+        };
+        Some(CompletionContext::Arg {
+            cmd_name,
+            arg_index,
+            prefix,
+        })
+    }
+
+    fn completion_matches(&self, ctx: &CompletionContext) -> Vec<String> {
+        match ctx {
+            CompletionContext::Command { prefix } => self
+                .all_command_names()
+                .into_iter()
+                .filter(|name| name.starts_with(prefix.as_str()))
+                .collect(),
+            CompletionContext::Arg {
+                cmd_name,
+                arg_index,
+                prefix,
+            } => {
+                let Some(cmd) = self.commands.get(cmd_name) else {
+                    return Vec::new();
+                };
+                cmd.arg_choices(*arg_index)
+                    .iter()
+                    .filter(|choice| choice.starts_with(prefix.as_str()))
+                    .map(|choice| (*choice).to_string())
+                    .collect()
+            }
+        }
+    }
+
+    /// Suffix of the longest common prefix of all completions that match the current
+    /// input. The panel paints this as dim ghost text after the cursor so the user sees
+    /// what `Tab` would insert.
+    ///
+    /// Works for both command names and positional argument choices (whichever the user
+    /// is currently typing). Returns `None` when input is empty, when nothing matches,
+    /// or when the input already covers the full common prefix of the matches (multiple
+    /// completions diverge from the next character).
+    pub fn tab_preview(&self) -> Option<String> {
+        let ctx = self.completion_context()?;
+        let matches = self.completion_matches(&ctx);
         if matches.is_empty() {
             return None;
         }
         let lcp = longest_common_prefix(&matches);
-        if lcp.len() > self.input.len() {
-            Some(lcp[self.input.len()..].to_string())
+        let prefix_len = ctx.prefix().len();
+        if lcp.len() > prefix_len {
+            Some(lcp[prefix_len..].to_string())
         } else {
             None
         }
@@ -702,6 +823,31 @@ fn parse_line(line: &str) -> Option<(String, Vec<String>)> {
     Some((name, args))
 }
 
+/// Splice `choice` into `input` at the position the user is completing, preserving
+/// everything before. For command-name completion this replaces the whole input; for
+/// argument completion it replaces only the last partial token (or appends after a
+/// trailing space when starting a fresh argument).
+fn apply_completion(input: &str, ctx: &CompletionContext, choice: &str) -> String {
+    match ctx {
+        CompletionContext::Command { .. } => choice.to_string(),
+        CompletionContext::Arg { .. } => {
+            let parsed: Vec<&str> = input.split_whitespace().collect();
+            let trailing_ws = input.ends_with(char::is_whitespace);
+            let kept = if trailing_ws {
+                &parsed[..]
+            } else {
+                &parsed[..parsed.len() - 1]
+            };
+            let mut result = kept.join(" ");
+            if !result.is_empty() {
+                result.push(' ');
+            }
+            result.push_str(choice);
+            result
+        }
+    }
+}
+
 /// Longest common byte prefix shared by every string in `strs`. Returns an empty string
 /// when `strs` is empty. Operates on bytes, which is safe for ASCII command names; if
 /// commands grow multi-byte UTF-8 names we'll need a char-boundary fix.
@@ -782,6 +928,59 @@ mod tests {
         // No match -> no preview.
         c.input = "zzz".into();
         assert_eq!(c.tab_preview(), None);
+    }
+
+    #[test]
+    fn tab_preview_completes_declared_arg_choices() {
+        let mut c = Console::<Ctx>::new();
+        c.register(cmd("capture", "", |_, _, _| Ok(())).with_args(&[
+            &["png", "frames", "toggle", "stop"],
+            &["pre", "post", "both"],
+        ]));
+
+        // Mid-arg-0 prefix narrows to a single choice; ghost = its suffix.
+        c.input = "capture p".into();
+        assert_eq!(c.tab_preview().as_deref(), Some("ng"));
+
+        // Multiple matches with common prefix `to` -> ghost = `ggle` suffix beyond
+        // the `t` the user typed (matches: `toggle`, no others starting with `t`).
+        c.input = "capture t".into();
+        assert_eq!(c.tab_preview().as_deref(), Some("oggle"));
+
+        // Trailing whitespace = starting next arg. arg_1 choices share no prefix, so
+        // no ghost (user must type a char or press Tab to cycle).
+        c.input = "capture png ".into();
+        assert_eq!(c.tab_preview(), None);
+
+        // Mid-arg-1: `po` -> `post`.
+        c.input = "capture png po".into();
+        assert_eq!(c.tab_preview().as_deref(), Some("st"));
+
+        // Past the declared arg list: no completion.
+        c.input = "capture png post extra ".into();
+        assert_eq!(c.tab_preview(), None);
+    }
+
+    #[test]
+    fn tab_complete_applies_arg_choice() {
+        let mut c = Console::<Ctx>::new();
+        c.register(cmd("capture", "", |_, _, _| Ok(())).with_args(&[
+            &["png", "frames", "toggle", "stop"],
+            &["pre", "post", "both"],
+        ]));
+
+        c.input = "capture p".into();
+        c.tab_complete();
+        assert_eq!(c.input, "capture png");
+
+        c.input = "capture png p".into();
+        c.tab_complete();
+        // `p` matches `pre` and `post`, LCP = `p`; first match = `pre` (sort order).
+        assert!(
+            c.input == "capture png pre" || c.input == "capture png post",
+            "got {:?}",
+            c.input
+        );
     }
 
     #[test]
