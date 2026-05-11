@@ -363,7 +363,7 @@ fn encode_one_frame(
 
     // Lanczos3 downscale before quantization. Better edge / gradient quality than
     // running NeuQuant on full-res and downsampling indexed pixels afterwards.
-    let rgba: Vec<u8> = if frame.scale.is_some() {
+    let mut rgba: Vec<u8> = if frame.scale.is_some() {
         let src: ::image::RgbaImage =
             ::image::ImageBuffer::from_raw(frame.src_width, frame.src_height, frame.rgba)
                 .ok_or_else(|| {
@@ -379,6 +379,18 @@ fn encode_one_frame(
     } else {
         frame.rgba
     };
+
+    // Normalize alpha to 0xFF for any opaque pixel, matching the behavior of
+    // `gif::Frame::from_rgba_speed`. Without this, varying alpha in the swapchain
+    // readback (DWM-side post-multiplication, egui blend output, anything ≠ 1.0)
+    // biases NeuQuant's 4D RGBA cluster centroids and the resulting palette gets
+    // the colors visibly wrong. GIF is RGB output; alpha is only meaningful as a
+    // 0/non-0 transparency flag.
+    for px in rgba.chunks_exact_mut(4) {
+        if px[3] != 0 {
+            px[3] = 0xFF;
+        }
+    }
 
     // Lazy init: build the global NeuQuant from the first frame's pixels and open
     // the encoder with that palette. Sample factor 10 is the gif crate's default
