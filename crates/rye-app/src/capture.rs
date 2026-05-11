@@ -449,12 +449,13 @@ fn encode_one_frame(
     };
 
     // `from_rgba_speed` handles alpha normalization, NeuQuant training, and index
-    // mapping in one pass. Speed 1 = samplefac 1 = NeuQuant trains on every pixel
-    // (best quality, ~10x slower than the crate's "default" of 10). Slower per-frame
-    // encoding is absorbed by the worker thread; the win is a more representative
-    // palette so similar-looking consecutive frames produce more similar palettes,
-    // reducing visible flicker.
-    let mut gif_frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 1);
+    // mapping in one pass. Speed 10 is the gif crate's default and matches the rate
+    // the encoder thread can actually sustain (~30 fps at 800x600); pushing to
+    // samplefac=1 trades palette stability for sluggish playback because the
+    // backpressure drops dominate. Flicker from per-frame palette regeneration is
+    // the accepted tradeoff (filed as a known issue; the workaround is PNG sequence
+    // + ffmpeg for high-quality clips).
+    let mut gif_frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 10);
     gif_frame.delay = delay_cs;
     // Force decoders to clear to background between frames rather than relying on
     // the gif crate's unspecified default (`DisposalMethod::Any`), which different
