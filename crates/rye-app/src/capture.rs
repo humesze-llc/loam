@@ -36,6 +36,18 @@
 //! - GIF stream:   `{dir}/{name}.gif`
 //!
 //! `dir` defaults to `./captures/`; `name` defaults to `{example}_{unix_secs}`.
+//!
+//! ## Converting a captured GIF to WebP (for README embeds)
+//!
+//! GIF is the streaming output we ship. For smaller / higher-quality WebP, post-process
+//! with ffmpeg (one pass handles format conversion + downscale + fps cap):
+//!
+//! ```text
+//! ffmpeg -i in.gif \
+//!   -vf "fps=30,scale=720:-1:flags=lanczos" \
+//!   -loop 0 -lossless 0 -q:v 75 \
+//!   out.webp
+//! ```
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -116,6 +128,10 @@ pub enum CaptureRequest {
         /// Capture rate cap in frames per second. `None` means "every render frame";
         /// for GIF the runner uses [`CaptureFormat::default_fps`] when `None`.
         fps: Option<u16>,
+        /// Output width in pixels for downscaled streams. Height computed to preserve
+        /// aspect ratio. `None` captures at native swapchain resolution. GIF-only;
+        /// PNG sequences ignore this for diagnostic fidelity.
+        scale: Option<u32>,
     },
     /// Stop the current sequence, if any. No-op when idle.
     Stop,
@@ -127,6 +143,7 @@ pub enum CaptureRequest {
         dir: Option<PathBuf>,
         name: Option<String>,
         fps: Option<u16>,
+        scale: Option<u32>,
     },
 }
 
@@ -181,6 +198,9 @@ enum SequenceWriter {
         path: PathBuf,
         /// Pre-computed delay in centiseconds, from the sequence's target fps.
         delay_cs: u16,
+        /// Optional output width in pixels. Frames are Lanczos3-resampled before
+        /// palette quantization; aspect ratio is preserved.
+        scale: Option<u32>,
     },
 }
 
@@ -217,7 +237,8 @@ impl Capture {
                     dir,
                     name,
                     fps,
-                } => match self.start_sequence(format, stage, dir, name, fps) {
+                    scale,
+                } => match self.start_sequence(format, stage, dir, name, fps, scale) {
                     Ok(msg) => log.push(msg),
                     Err(e) => log.push(format!("capture: failed to start sequence: {e:#}")),
                 },
@@ -228,11 +249,12 @@ impl Capture {
                     dir,
                     name,
                     fps,
+                    scale,
                 } => {
                     if matches!(self.state, CaptureState::Sequence { .. }) {
                         self.stop(&mut log);
                     } else {
-                        match self.start_sequence(format, stage, dir, name, fps) {
+                        match self.start_sequence(format, stage, dir, name, fps, scale) {
                             Ok(msg) => log.push(msg),
                             Err(e) => log.push(format!("capture: failed to start sequence: {e:#}")),
                         }
@@ -250,6 +272,7 @@ impl Capture {
         dir: Option<PathBuf>,
         name: Option<String>,
         fps: Option<u16>,
+        scale: Option<u32>,
     ) -> Result<String> {
         let dir = dir.unwrap_or_else(|| self.default_dir.clone());
         let name = name.unwrap_or_else(default_name);
@@ -280,6 +303,7 @@ impl Capture {
                     encoder: None,
                     path,
                     delay_cs,
+                    scale,
                 }
             }
         };
@@ -441,13 +465,15 @@ impl SequenceWriter {
                 encoder,
                 path,
                 delay_cs,
+                scale,
             } => {
-                let w_u16: u16 = width.try_into().context("gif width > 65535")?;
-                let h_u16: u16 = height.try_into().context("gif height > 65535")?;
+                let (out_w, out_h) = scaled_dims(width, height, *scale)?;
+                let w_u16: u16 = out_w.try_into().context("gif width > 65535")?;
+                let h_u16: u16 = out_h.try_into().context("gif height > 65535")?;
 
-                // Lazily build the encoder against the first frame's dimensions. The
-                // LSD (Logical Screen Descriptor) is fixed for the whole stream, so we
-                // can't accept a resize mid-capture; pinned to the first frame.
+                // Lazily build the encoder against the first frame's output dimensions.
+                // The LSD (Logical Screen Descriptor) is fixed for the whole stream, so
+                // we can't accept a resize mid-capture; it's pinned to the first frame.
                 let enc = match encoder {
                     Some(e) => e,
                     None => {
@@ -461,19 +487,52 @@ impl SequenceWriter {
                     }
                 };
 
+                // Downscale before NeuQuant if requested; smaller buffers also encode
+                // faster per frame. Lanczos3 picks up edges and gradients better than
+                // Triangle / Nearest, at moderate extra cost.
+                let mut buf: Vec<u8> = if scale.is_some() {
+                    let src: ::image::RgbaImage =
+                        ::image::ImageBuffer::from_raw(width, height, rgba.to_vec())
+                            .ok_or_else(|| anyhow!("RGBA size mismatch at {width}x{height}"))?;
+                    let dst = ::image::imageops::resize(
+                        &src,
+                        out_w,
+                        out_h,
+                        ::image::imageops::FilterType::Lanczos3,
+                    );
+                    dst.into_raw()
+                } else {
+                    rgba.to_vec()
+                };
+
                 // `gif::Frame::from_rgba_speed` mutates the pixel buffer in place
-                // (NeuQuant runs over it). Allocate a fresh copy; the source `rgba`
-                // belongs to the runner's readback path. Speed 30 is the fastest
-                // NeuQuant setting; quality is acceptable for demo clips and keeps
-                // per-frame encode under a few ms at 1080p.
-                let mut buf = rgba.to_vec();
-                let mut frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 30);
+                // (NeuQuant runs over it). Speed 10 is the gif crate's default: a
+                // reasonable quality / latency balance. Lower (1-5) is better quality
+                // but encode time can dominate; higher (20-30) is visibly worse on
+                // gradients.
+                let mut frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 10);
                 frame.delay = *delay_cs;
                 enc.write_frame(&frame).context("gif encode")?;
                 Ok(())
             }
         }
     }
+}
+
+/// Compute the output dimensions for a captured frame given an optional target width.
+/// Aspect ratio preserved; height rounds to the nearest pixel and is clamped to >= 1
+/// so degenerate 1xN scenes don't crash the encoder.
+fn scaled_dims(width: u32, height: u32, scale: Option<u32>) -> Result<(u32, u32)> {
+    let Some(target_w) = scale else {
+        return Ok((width, height));
+    };
+    if target_w == 0 || width == 0 || height == 0 {
+        return Err(anyhow!(
+            "invalid scale: target_w={target_w}, src={width}x{height}"
+        ));
+    }
+    let h = ((target_w as u64 * height as u64 + (width as u64) / 2) / width as u64) as u32;
+    Ok((target_w, h.max(1)))
 }
 
 fn fps_to_centiseconds(fps: u16) -> u16 {
@@ -610,10 +669,15 @@ fn write_png_bytes(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<
 ///
 /// Commands registered:
 /// - `capture png     [pre|post|both] [dir]`: one-shot PNG screenshot
-/// - `capture frames  [pre|post|both] [dir]`: start PNG sequence
-/// - `capture gif     [post|pre]      [dir]`: start GIF stream (default 30 fps)
-/// - `capture toggle  [png|gif] [pre|post|both] [dir]`: toggle a sequence
+/// - `capture frames  [pre|post|both] [dir] [fps=N]`: start PNG sequence
+/// - `capture gif     [post|pre]      [dir] [fps=N] [scale=W]`: start GIF stream
+/// - `capture toggle  [png|gif] [pre|post|both] [dir] [fps=N] [scale=W]`: toggle a sequence
 /// - `capture stop`: stop sequence (or cancel a pending one-shot)
+///
+/// `fps=N` caps the capture rate (default 30 for GIF, unlimited for PNG sequences).
+/// `scale=W` downscales each frame to width W in pixels before encoding (Lanczos3,
+/// aspect preserved); GIF-only. Args are key-value, not in arg_choices, so tab
+/// completion doesn't surface them (free-form values aren't enumerable).
 pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
     console.register(
         cmd("capture", capture_help(), |args, _ctx: &mut Ctx, out| {
@@ -630,7 +694,7 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
 }
 
 fn capture_help() -> &'static str {
-    "capture <png|frames|gif|toggle|stop> [pre|post|both] [dir]"
+    "capture <png|frames|gif|toggle|stop> [pre|post|both] [dir] [fps=N] [scale=W]"
 }
 
 fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
@@ -640,53 +704,59 @@ fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
     };
     match *sub {
         "png" => {
-            let (stage, dir) = parse_stage_and_dir(rest);
+            let p = parse_capture_args(rest);
             enqueue(CaptureRequest::OneShot {
-                stage,
-                dir,
+                stage: p.stage,
+                dir: p.dir,
                 name: None,
             });
-            out.line(format!("queued one-shot ({stage:?})"));
+            out.line(format!("queued one-shot ({:?})", p.stage));
         }
         "frames" => {
-            let (stage, dir) = parse_stage_and_dir(rest);
+            let p = parse_capture_args(rest);
             enqueue(CaptureRequest::StartSequence {
                 format: CaptureFormat::Png,
-                stage,
-                dir,
+                stage: p.stage,
+                dir: p.dir,
                 name: None,
-                fps: None,
+                fps: p.fps,
+                scale: None,
             });
-            out.line(format!("started PNG sequence ({stage:?})"));
+            out.line(format!("started PNG sequence ({:?})", p.stage));
         }
         "gif" => {
-            let (stage, dir) = parse_stage_and_dir(rest);
+            let p = parse_capture_args(rest);
             enqueue(CaptureRequest::StartSequence {
                 format: CaptureFormat::Gif,
-                stage,
-                dir,
+                stage: p.stage,
+                dir: p.dir,
                 name: None,
-                fps: None,
+                fps: p.fps,
+                scale: p.scale,
             });
-            out.line(format!("started GIF stream ({stage:?})"));
+            out.line(format!(
+                "started GIF stream ({:?}, fps={}, scale={})",
+                p.stage,
+                p.fps.map_or("default".into(), |f| f.to_string()),
+                p.scale.map_or("native".into(), |s| s.to_string()),
+            ));
         }
         "stop" => {
             enqueue(CaptureRequest::Stop);
             out.line("stop queued");
         }
         "toggle" => {
-            // First arg may be a format (png|gif|frames), default gif. Remaining args
-            // parse as stage + dir.
             let (format, after_format) = parse_format(rest);
-            let (stage, dir) = parse_stage_and_dir(after_format);
+            let p = parse_capture_args(after_format);
             enqueue(CaptureRequest::Toggle {
                 format,
-                stage,
-                dir,
+                stage: p.stage,
+                dir: p.dir,
                 name: None,
-                fps: None,
+                fps: p.fps,
+                scale: p.scale,
             });
-            out.line(format!("toggle queued ({format:?}, {stage:?})"));
+            out.line(format!("toggle queued ({format:?}, {:?})", p.stage));
         }
         other => {
             out.error(format!("unknown sub-command `{other}`. {}", capture_help()));
@@ -695,18 +765,50 @@ fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
     Ok(())
 }
 
-fn parse_stage_and_dir(args: &[&str]) -> (CaptureStage, Option<PathBuf>) {
-    let mut stage = CaptureStage::Post;
-    let mut dir: Option<PathBuf> = None;
-    for arg in args {
-        match *arg {
-            "pre" => stage = CaptureStage::Pre,
-            "post" => stage = CaptureStage::Post,
-            "both" => stage = CaptureStage::Both,
-            other => dir = Some(PathBuf::from(other)),
+struct ParsedCaptureArgs {
+    stage: CaptureStage,
+    dir: Option<PathBuf>,
+    fps: Option<u16>,
+    scale: Option<u32>,
+}
+
+impl Default for ParsedCaptureArgs {
+    fn default() -> Self {
+        Self {
+            stage: CaptureStage::Post,
+            dir: None,
+            fps: None,
+            scale: None,
         }
     }
-    (stage, dir)
+}
+
+/// Tokenise post-format positional args:
+/// - `pre|post|both` => stage
+/// - `fps=N`         => target frame rate
+/// - `scale=N`       => output width in pixels (GIF only)
+/// - anything else   => treat as output directory
+fn parse_capture_args(args: &[&str]) -> ParsedCaptureArgs {
+    let mut p = ParsedCaptureArgs::default();
+    for arg in args {
+        if let Some(v) = arg.strip_prefix("fps=") {
+            if let Ok(n) = v.parse::<u16>() {
+                p.fps = Some(n);
+            }
+        } else if let Some(v) = arg.strip_prefix("scale=") {
+            if let Ok(n) = v.parse::<u32>() {
+                p.scale = Some(n);
+            }
+        } else {
+            match *arg {
+                "pre" => p.stage = CaptureStage::Pre,
+                "post" => p.stage = CaptureStage::Post,
+                "both" => p.stage = CaptureStage::Both,
+                other => p.dir = Some(PathBuf::from(other)),
+            }
+        }
+    }
+    p
 }
 
 fn parse_format<'a>(args: &'a [&'a str]) -> (CaptureFormat, &'a [&'a str]) {
@@ -725,4 +827,47 @@ fn parse_format<'a>(args: &'a [&'a str]) -> (CaptureFormat, &'a [&'a str]) {
 pub fn bind_default_hotkeys<Ctx: 'static>(console: &mut Console<Ctx>) {
     console.bind(rye_egui::egui::Key::F12, "capture png post");
     console.bind(rye_egui::egui::Key::F9, "capture toggle gif post");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaled_dims_preserves_aspect_ratio() {
+        // 1920x1080 -> 720 width should give 405 height (16:9).
+        assert_eq!(scaled_dims(1920, 1080, Some(720)).unwrap(), (720, 405));
+        // Square downsample.
+        assert_eq!(scaled_dims(1024, 1024, Some(512)).unwrap(), (512, 512));
+        // Tall portrait.
+        assert_eq!(scaled_dims(1080, 1920, Some(360)).unwrap(), (360, 640));
+        // None -> identity.
+        assert_eq!(scaled_dims(800, 600, None).unwrap(), (800, 600));
+        // Height clamped to >= 1 for degenerate aspect ratios.
+        assert_eq!(scaled_dims(10000, 1, Some(100)).unwrap(), (100, 1));
+    }
+
+    #[test]
+    fn scaled_dims_rejects_zero_target() {
+        assert!(scaled_dims(1920, 1080, Some(0)).is_err());
+        assert!(scaled_dims(0, 1080, Some(720)).is_err());
+        assert!(scaled_dims(1920, 0, Some(720)).is_err());
+    }
+
+    #[test]
+    fn parse_capture_args_extracts_kv_pairs() {
+        let p = parse_capture_args(&["pre", "./shots", "fps=24", "scale=480"]);
+        assert_eq!(p.stage, CaptureStage::Pre);
+        assert_eq!(p.dir.as_deref(), Some(std::path::Path::new("./shots")));
+        assert_eq!(p.fps, Some(24));
+        assert_eq!(p.scale, Some(480));
+    }
+
+    #[test]
+    fn parse_capture_args_ignores_malformed_kv() {
+        // `fps=` with non-numeric value silently drops; user gets default.
+        let p = parse_capture_args(&["fps=abc", "scale=xyz"]);
+        assert!(p.fps.is_none());
+        assert!(p.scale.is_none());
+    }
 }
