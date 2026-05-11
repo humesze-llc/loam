@@ -3,22 +3,20 @@
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-/// Default cap on how many simulation ticks we'll run per frame when
-/// catching up to wall-clock time. Excess is dropped to avoid the
-/// "spiral of death" where a slow sim falls further behind each frame.
+/// Default cap on how many simulation ticks we'll run per frame when catching up to
+/// wall-clock time. Excess is dropped to avoid the "spiral of death" where a slow sim
+/// falls further behind each frame.
 pub const DEFAULT_MAX_CATCH_UP: u32 = 10;
 
 /// Tick-rate accumulator driving a deterministic sim from wall-clock time.
 ///
-/// Construct with [`FixedTimestep::new`], then each frame call
-/// [`FixedTimestep::advance`] with the current [`Instant`] and iterate
-/// the returned range to run sim ticks. [`FixedTimestep::alpha`] gives
-/// the interpolation factor for rendering between the last two tick
-/// states.
+/// Construct with [`FixedTimestep::new`], then each frame call [`FixedTimestep::advance`]
+/// with the current [`Instant`] and iterate the returned range to run sim ticks.
+/// [`FixedTimestep::alpha`] gives the interpolation factor for rendering between the
+/// last two tick states.
 ///
-/// Tick duration is stored as nanoseconds computed from the target Hz,
-/// so a given `FixedTimestep::new(hz)` produces the same tick duration
-/// on every machine.
+/// Tick duration is stored as nanoseconds computed from the target Hz, so a given
+/// `FixedTimestep::new(hz)` produces the same tick duration on every machine.
 #[derive(Debug, Clone)]
 pub struct FixedTimestep {
     dt: Duration,
@@ -49,8 +47,8 @@ impl FixedTimestep {
         self
     }
 
-    /// Current tick number. Monotonic, starts at 0, advances by one for
-    /// each tick yielded by [`FixedTimestep::advance`].
+    /// Current tick number. Monotonic, starts at 0, advances by one for each tick
+    /// yielded by [`FixedTimestep::advance`].
     pub fn tick(&self) -> u64 {
         self.tick
     }
@@ -60,29 +58,28 @@ impl FixedTimestep {
         self.dt
     }
 
-    /// Duration of one sim tick as f32 seconds. Use this for physics
-    /// integration in sim code.
+    /// Duration of one sim tick as f32 seconds. Use this for physics integration in sim
+    /// code.
     pub fn dt_seconds(&self) -> f32 {
         self.dt.as_secs_f32()
     }
 
-    /// Interpolation alpha in `[0.0, 1.0)`: how far between the last
-    /// completed tick and the next pending tick we are in wall-clock
-    /// time. Use for render-side smoothing.
+    /// Interpolation alpha in `[0.0, 1.0)`: how far between the last completed tick and
+    /// the next pending tick we are in wall-clock time. Use for render-side smoothing.
     pub fn alpha(&self) -> f32 {
         let a = self.accumulator.as_secs_f64() / self.dt.as_secs_f64();
         (a as f32).clamp(0.0, 1.0)
     }
 
-    /// Advance wall-clock time to `now` and return the range of tick
-    /// numbers the caller should execute this frame.
+    /// Advance wall-clock time to `now` and return the range of tick numbers the caller
+    /// should execute this frame.
     ///
-    /// The first call after construction primes the wall-clock reference
-    /// and returns an empty range (no elapsed time to account for yet).
+    /// The first call after construction primes the wall-clock reference and returns an
+    /// empty range (no elapsed time to account for yet).
     ///
-    /// If the sim has fallen further than `max_catch_up` ticks behind
-    /// wall-clock time, the excess is dropped rather than queued, the
-    /// render loop recovers to real-time at the cost of a visual jump.
+    /// If the sim has fallen further than `max_catch_up` ticks behind wall-clock time,
+    /// the excess is dropped rather than queued, the render loop recovers to real-time
+    /// at the cost of a visual jump.
     pub fn advance(&mut self, now: Instant) -> Range<u64> {
         let last = match self.last_instant.replace(now) {
             Some(t) => t,

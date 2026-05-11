@@ -185,8 +185,12 @@ impl App for HypersphereApp {
                 label: Some("hypersphere shader"),
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
-        let node =
-            Hyperslice4DNode::new(&ctx.rd.device, ctx.rd.surface_bundle.config.format, &module);
+        let node = Hyperslice4DNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            &module,
+            ctx.rd.sample_count(),
+        );
 
         let (world, ball_ids) = build_world(count);
         Ok(Self {

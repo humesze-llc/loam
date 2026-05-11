@@ -1,8 +1,8 @@
 //! Euclidean R³, the sanity-check implementation of [`Space`].
 //!
-//! Exists primarily so the [`Space`] contract has a concrete witness with
-//! obviously-correct behavior. Hyperbolic and spherical impls can compare
-//! their round-trips against this one in tests.
+//! Exists primarily so the [`Space`] contract has a concrete witness with obviously-correct
+//! behavior. Hyperbolic and spherical impls can compare their round-trips against this one in
+//! tests.
 
 use std::borrow::Cow;
 
@@ -43,8 +43,8 @@ impl Iso3 {
 
 /// Euclidean R³ with the standard metric.
 ///
-/// Stateless: a unit struct that monomorphizes away. Construct via
-/// `EuclideanR3` directly; there is only one R³.
+/// Stateless: a unit struct that monomorphizes away. Construct via `EuclideanR3` directly;
+/// there is only one R³.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EuclideanR3;
 
@@ -105,24 +105,21 @@ impl WgslSpace for EuclideanR3 {
     fn wgsl_impl(&self) -> Cow<'static, str> {
         Cow::Borrowed(WGSL_IMPL)
     }
-    /// ℝ³ is globally flat: chart-coord SDFs (planes, axis-aligned
-    /// boxes) are mathematically correct.
+    /// ℝ³ is globally flat: chart-coord SDFs (planes, axis-aligned boxes) are mathematically
+    /// correct.
     fn is_chart_flat(&self) -> bool {
         true
     }
 }
 
-// TODO(rye-shader): distance / exp / log / parallel_transport are the
-// v0 WGSL ABI. Remaining questions:
-//   - Struct layout for Point/Vector/Iso across shader stages.
-//     `vec3<f32>` is 16-byte-aligned in uniform buffers; packed `vec4<f32>`
-//     may be preferable for cache / alignment reasons.
-//   - Function-name mangling when multiple Space impls coexist in one
-//     shader module (e.g. a portal between R3 and H3 in the fractal
-//     ray-marcher).
-//   - How `iso_apply` / `iso_transport` are exposed to user WGSL, free
-//     functions, struct methods, or a uniform-buffer-bound operator
-//     pattern.
+// TODO(rye-shader): distance / exp / log / parallel_transport are the v0 WGSL ABI. Remaining
+// questions:
+//   - Struct layout for Point/Vector/Iso across shader stages. `vec3<f32>` is 16-byte-aligned
+//     in uniform buffers; packed `vec4<f32>` may be preferable for cache / alignment reasons.
+//   - Function-name mangling when multiple Space impls coexist in one shader module (e.g. a
+//     portal between R3 and H3 in the fractal ray-marcher).
+//   - How `iso_apply` / `iso_transport` are exposed to user WGSL, free functions, struct
+//     methods, or a uniform-buffer-bound operator pattern.
 //
 // `from` is a WGSL reserved keyword (WGSL spec §3.2); use `p_from`/`p_to`.
 const WGSL_IMPL: &str = r#"
@@ -219,14 +216,11 @@ mod tests {
         assert_relative_eq!(v.length(), v_at_to.length());
     }
 
-    /// In flat space the path-aware primitive is the identity for any
-    /// path. Default impl chains the segment-by-segment transport,
-    /// which for E³ is the identity per segment. Pins:
-    /// (1) empty / singleton paths return `v` unchanged, and
-    /// (2) multi-segment paths agree with single-segment transport.
-    /// Both invariants matter as the trait is consumed by camera and
-    /// player controllers that construct polyline paths from per-frame
-    /// motion.
+    /// In flat space the path-aware primitive is the identity for any path. Default impl
+    /// chains the segment-by-segment transport, which for E³ is the identity per segment.
+    /// Pins: (1) empty / singleton paths return `v` unchanged, and (2) multi-segment paths
+    /// agree with single-segment transport. Both invariants matter as the trait is consumed by
+    /// camera and player controllers that construct polyline paths from per-frame motion.
     #[test]
     fn parallel_transport_along_default_impl_is_identity_in_flat_space() {
         let s = r3();

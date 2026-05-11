@@ -1,22 +1,18 @@
 //! Typed 4D scene tree, the 4D analogue of [`crate::scene::Scene`].
 //!
-//! Build a [`Scene4`] from [`SceneNode4`] combinators and emit
-//! WGSL for either:
+//! Build a [`Scene4`] from [`SceneNode4`] combinators and emit WGSL for either:
 //!
 //! - **Native 4D**: `fn rye_scene_sdf_4d(p: vec4<f32>) -> f32`,
 //!   useful for full 4D ray-march renderers (future).
-//! - **Hyperslice**: `fn rye_scene_sdf(p: vec3<f32>) -> f32` that
-//!   evaluates the 4D SDF at `vec4(p, w_slice)`, where `w_slice`
-//!   is a uniform. This is the production path today,
+//! - **Hyperslice**: `fn rye_scene_sdf(p: vec3<f32>) -> f32` that evaluates the 4D SDF at
+//!   `vec4(p, w_slice)`, where `w_slice` is a uniform. This is the production path today,
 //!   `Hyperslice4DNode` consumes it as the SDF for a 3D ray march.
 //!
 //! ## Why a parallel `Scene4`, not `Scene<S, const DIM>`
 //!
-//! The 3D and 4D paths share no shader code (different SDF signatures,
-//! different ray equations,
-//! different uniforms), so dimensioning [`crate::scene::Scene`]
-//! generically saves no implementation work and obscures the
-//! difference. Parallel hierarchies keep each clear.
+//! The 3D and 4D paths share no shader code (different SDF signatures, different ray equations,
+//! different uniforms), so dimensioning [`crate::scene::Scene`] generically saves no
+//! implementation work and obscures the difference. Parallel hierarchies keep each clear.
 //!
 //! ## Example
 //!
@@ -47,12 +43,11 @@ use serde::{Deserialize, Serialize};
 use crate::primitive4::Primitive4;
 pub use rye_shape::Shape;
 
-/// A node in the 4D scene tree. Mirrors
-/// [`crate::scene::SceneNode`] but operates on 4D primitives only.
+/// A node in the 4D scene tree. Mirrors [`crate::scene::SceneNode`] but operates on 4D
+/// primitives only.
 ///
-/// Smooth-min isn't included today; the math is identical (use the
-/// same `smooth_min_fn` wrapper on `f32`) but no demo currently
-/// needs it. Add when one does.
+/// Smooth-min isn't included today; the math is identical (use the same `smooth_min_fn` wrapper
+/// on `f32`) but no demo currently needs it. Add when one does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SceneNode4 {
     Leaf(Shape),
@@ -69,24 +64,20 @@ impl SceneNode4 {
         SceneNode4::Leaf(Shape::HyperSphere4D { center, radius })
     }
 
-    /// Half-space (hyperplane) leaf. ℝ⁴ is the only 4D Space rye
-    /// ships and it's flat, so [`crate::Primitive4`] emits an
-    /// honest `dot(p, n) - offset` hyperplane SDF here. When a
-    /// curved 4D Space lands (`BlendedSpace4`, hyperbolic 4-space)
-    /// `Primitive4` will grow a `space: &S` parameter and gate this
-    /// emission on `WgslSpace::is_chart_flat` the same way the 3D
-    /// path does today. The shape itself is canonical, also used
-    /// by `rye-physics` for 4D collision walls.
+    /// Half-space (hyperplane) leaf. ℝ⁴ is the only 4D Space rye ships and it's flat, so
+    /// [`crate::Primitive4`] emits an honest `dot(p, n) - offset` hyperplane SDF here. When a
+    /// curved 4D Space lands (`BlendedSpace4`, hyperbolic 4-space) `Primitive4` will grow a
+    /// `space: &S` parameter and gate this emission on `WgslSpace::is_chart_flat` the same way
+    /// the 3D path does today. The shape itself is canonical, also used by `rye-physics` for
+    /// 4D collision walls.
     pub fn halfspace(normal: Vec4, offset: f32) -> Self {
         SceneNode4::Leaf(Shape::HalfSpace4D { normal, offset })
     }
 
-    /// Convex 4D polytope leaf. Note: the static `Primitive4` emit
-    /// returns a sentinel today; the production path is via
-    /// `Hyperslice4DNode`'s per-frame uniform buffer (the body's
-    /// world-space face hyperplanes are computed CPU-side and
-    /// uploaded). Until that path lands, polytope leaves render
-    /// invisible.
+    /// Convex 4D polytope leaf. Note: the static `Primitive4` emit returns a sentinel today;
+    /// the production path is via `Hyperslice4DNode`'s per-frame uniform buffer (the body's
+    /// world-space face hyperplanes are computed CPU-side and uploaded). Until that path lands,
+    /// polytope leaves render invisible.
     pub fn polytope(vertices: Vec<Vec4>) -> Self {
         SceneNode4::Leaf(Shape::ConvexPolytope4D { vertices })
     }
@@ -106,10 +97,9 @@ impl SceneNode4 {
     }
 }
 
-/// A complete 4D SDF scene, a single root [`SceneNode4`] that
-/// emits either `rye_scene_sdf_4d(p: vec4<f32>) -> f32` (full 4D)
-/// or `rye_scene_sdf(p: vec3<f32>) -> f32` (hyperslice at the
-/// `w_slice` uniform).
+/// A complete 4D SDF scene, a single root [`SceneNode4`] that emits either
+/// `rye_scene_sdf_4d(p: vec4<f32>) -> f32` (full 4D) or `rye_scene_sdf(p: vec3<f32>) -> f32`
+/// (hyperslice at the `w_slice` uniform).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scene4 {
     pub root: SceneNode4,
@@ -120,10 +110,9 @@ impl Scene4 {
         Self { root }
     }
 
-    /// Emit `fn rye_scene_sdf_4d(p: vec4<f32>) -> f32`. Used by
-    /// future full-4D ray-march renderers; the hyperslice path uses
-    /// [`Self::to_hyperslice_wgsl`]. Kind-tracking bindings are
-    /// emitted but unused (WGSL accepts unused locals).
+    /// Emit `fn rye_scene_sdf_4d(p: vec4<f32>) -> f32`. Used by future full-4D ray-march
+    /// renderers; the hyperslice path uses [`Self::to_hyperslice_wgsl`]. Kind-tracking bindings
+    /// are emitted but unused (WGSL accepts unused locals).
     pub fn to_wgsl_4d(&self) -> String {
         let mut helpers = String::new();
         let mut body = String::new();
@@ -146,11 +135,10 @@ impl Scene4 {
     /// (thin wrapper), and `rye_scene_max_t(ro, rd) -> f32` (analytical
     /// far-clip from HalfSpace4D leaves).
     ///
-    /// `w_slice_expr` is the WGSL expression for the slicing w-coord;
-    /// typically `"u.w_slice"`.
+    /// `w_slice_expr` is the WGSL expression for the slicing w-coord; typically `"u.w_slice"`.
     ///
-    /// Kind tracking: union picks the closer leaf, intersection picks
-    /// the farther (boundary) leaf, difference returns `RYE_PRIM_OTHER`.
+    /// Kind tracking: union picks the closer leaf, intersection picks the farther (boundary)
+    /// leaf, difference returns `RYE_PRIM_OTHER`.
     pub fn to_hyperslice_wgsl(&self, w_slice_expr: &str) -> String {
         let mut helpers = String::new();
         let mut body = String::new();
@@ -158,12 +146,10 @@ impl Scene4 {
         let (d_root, k_root) = emit_node_4d(&self.root, &mut counter, &mut helpers, &mut body);
         let kind_consts = SCENE_KIND_CONSTANTS;
         let max_t_body = emit_max_t_body(&self.root);
-        // Use a distinct parameter name `p3` and an inner `let p`
-        // for the 4D point. WGSL forbids declaring a `let` with the
-        // same name as the function parameter (no shadowing); naming
-        // the parameter `p3` keeps the helper-emit convention (which
-        // calls `sdfN_pK(p)`) intact while sidestepping the
-        // collision.
+        // Use a distinct parameter name `p3` and an inner `let p` for the 4D point. WGSL
+        // forbids declaring a `let` with the same name as the function parameter (no shadowing);
+        // naming the parameter `p3` keeps the helper-emit convention (which calls `sdfN_pK(p)`)
+        // intact while sidestepping the collision.
         format!(
             "// ---- rye-sdf scene4 (hyperslice at w = {w_slice_expr}) ----\n\
              {kind_consts}\
@@ -199,18 +185,16 @@ impl Scene4 {
     }
 }
 
-/// WGSL constant block emitted at the top of every Scene4 module.
-/// Pinned so kind comparisons in the kernel and tests reference the
-/// same numeric values.
+/// WGSL constant block emitted at the top of every Scene4 module. Pinned so kind comparisons
+/// in the kernel and tests reference the same numeric values.
 const SCENE_KIND_CONSTANTS: &str = "\
 const RYE_PRIM_HYPERSPHERE4D: u32 = 0u;\n\
 const RYE_PRIM_HALFSPACE4D: u32 = 1u;\n\
 const RYE_PRIM_OTHER: u32 = 255u;\n";
 
-/// Emit the body of `rye_scene_max_t`: ray-plane intersection check
-/// for each `HalfSpace4D` leaf. Only the 3D part of the normal is
-/// used (the slice fixes `p.w`). Combinator-agnostic: visit every
-/// leaf, fold into `t_max` via `min` to get a conservative bound.
+/// Emit the body of `rye_scene_max_t`: ray-plane intersection check for each `HalfSpace4D`
+/// leaf. Only the 3D part of the normal is used (the slice fixes `p.w`). Combinator-agnostic:
+/// visit every leaf, fold into `t_max` via `min` to get a conservative bound.
 fn emit_max_t_body(node: &SceneNode4) -> String {
     let mut body = String::new();
     walk_max_t(node, &mut body);
@@ -220,9 +204,8 @@ fn emit_max_t_body(node: &SceneNode4) -> String {
 fn walk_max_t(node: &SceneNode4, body: &mut String) {
     match node {
         SceneNode4::Leaf(Shape::HalfSpace4D { normal, offset }) => {
-            // t = (offset - dot(ro, n)) / dot(rd, n), guarded by
-            // dot(rd, n) < 0 so we only catch rays heading toward the
-            // plane's solid side.
+            // t = (offset - dot(ro, n)) / dot(rd, n), guarded by dot(rd, n) < 0 so we only
+            // catch rays heading toward the plane's solid side.
             body.push_str(&format!(
                 "\t{{\n\
                  \t\tlet n = vec3<f32>({nx:.6}, {ny:.6}, {nz:.6});\n\
@@ -255,9 +238,8 @@ fn primitive_kind_constant(shape: &Shape) -> &'static str {
     }
 }
 
-/// Walk the 4D scene tree, append helper functions to `helpers`
-/// and `let` bindings to `body`. Returns `(dist_var, kind_var)`,
-/// the WGSL identifiers holding this node's signed distance and
+/// Walk the 4D scene tree, append helper functions to `helpers` and `let` bindings to `body`.
+/// Returns `(dist_var, kind_var)`, the WGSL identifiers holding this node's signed distance and
 /// closest-primitive kind.
 fn emit_node_4d(
     node: &SceneNode4,
@@ -308,10 +290,9 @@ fn emit_node_4d(
             let d_var = format!("d{idx}");
             let k_var = format!("k{idx}");
             body.push_str(&format!("\tlet {d_var} = max({ld}, -({rd}));\n"));
-            // Per the to_hyperslice_wgsl docstring: difference's active
-            // surface alternates between left's outside and right's
-            // inside, no clean per-region kind. Sentinel until a caller
-            // needs it.
+            // Per the to_hyperslice_wgsl docstring: difference's active surface alternates
+            // between left's outside and right's inside, no clean per-region kind. Sentinel
+            // until a caller needs it.
             body.push_str(&format!("\tlet {k_var}: u32 = RYE_PRIM_OTHER;\n"));
             (d_var, k_var)
         }
@@ -335,13 +316,12 @@ mod tests {
     fn hyperslice_wraps_4d_with_w_slice() {
         let scene = Scene4::new(SceneNode4::hypersphere(Vec4::ZERO, 0.5));
         let wgsl = scene.to_hyperslice_wgsl("u.w_slice");
-        // Parameter is `p3` to avoid colliding with the inner `let
-        // p` 4D point, WGSL doesn't allow declaring a let with the
-        // same name as a function parameter.
+        // Parameter is `p3` to avoid colliding with the inner `let p` 4D point; WGSL doesn't
+        // allow declaring a let with the same name as a function parameter.
         assert!(wgsl.contains("fn rye_scene_sdf(p3: vec3<f32>) -> f32"));
         assert!(wgsl.contains("let p = vec4<f32>(p3, u.w_slice)"));
-        // The hyperslice emit reuses the 4D SDF helpers, so the
-        // sphere's `length(p - ...)` body is still present.
+        // The hyperslice emit reuses the 4D SDF helpers, so the sphere's `length(p - ...)` body
+        // is still present.
         assert!(wgsl.contains("length(p"));
     }
 
@@ -386,9 +366,8 @@ mod tests {
         assert_eq!(scene.to_wgsl_4d(), recovered.to_wgsl_4d());
     }
 
-    /// Polytope leaves still emit (their helper returns the
-    /// sentinel today). The combinator path doesn't break on
-    /// polytope leaves; it just produces a far-away surface.
+    /// Polytope leaves still emit (their helper returns the sentinel today). The combinator
+    /// path doesn't break on polytope leaves; it just produces a far-away surface.
     #[test]
     fn polytope_leaf_emits_sentinel_helper() {
         let scene = Scene4::new(SceneNode4::polytope(vec![Vec4::ZERO; 5]));
@@ -397,10 +376,9 @@ mod tests {
         assert!(wgsl.contains("return 1e9"));
     }
 
-    /// `to_hyperslice_wgsl` emits the per-primitive identity layer:
-    /// kind constants, a `RyeSceneHit` struct, and `rye_scene_at`
-    /// returning both `dist` and `kind`. The hyperslice marcher uses
-    /// `kind` for floor classification (see the kernel's
+    /// `to_hyperslice_wgsl` emits the per-primitive identity layer: kind constants, a
+    /// `RyeSceneHit` struct, and `rye_scene_at` returning both `dist` and `kind`. The
+    /// hyperslice marcher uses `kind` for floor classification (see the kernel's
     /// `kernel_has_expected_entry_points` test).
     #[test]
     fn hyperslice_emits_per_primitive_identity_layer() {
@@ -423,11 +401,9 @@ mod tests {
         assert!(wgsl.contains("<="));
     }
 
-    /// Difference's kind tracking is intentionally undefined (the
-    /// active surface alternates between left's outside and right's
-    /// inside). It emits `RYE_PRIM_OTHER` as a sentinel; pinning that
-    /// here so the choice is explicit and a future tightening fails
-    /// loudly.
+    /// Difference's kind tracking is intentionally undefined (the active surface alternates
+    /// between left's outside and right's inside). It emits `RYE_PRIM_OTHER` as a sentinel;
+    /// pinning that here so the choice is explicit and a future tightening fails loudly.
     #[test]
     fn hyperslice_difference_emits_kind_sentinel() {
         let scene = Scene4::new(

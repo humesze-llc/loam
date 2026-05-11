@@ -1,14 +1,13 @@
 //! Typed scene tree that assembles SDF primitives into `rye_scene_sdf`.
 //!
-//! Build a [`Scene`] from [`SceneNode`] combinators, then call
-//! [`Scene::to_wgsl`] with a Space to get the complete WGSL scene module.
+//! Build a [`Scene`] from [`SceneNode`] combinators, then call [`Scene::to_wgsl`] with a Space
+//! to get the complete WGSL scene module.
 //!
 //! # Emission strategy
 //!
-//! Each leaf emits a named WGSL helper function (`sdf_p{n}`). Each combinator
-//! emits a `let` binding in the body of `rye_scene_sdf`. The walk is
-//! depth-first; children always appear before their parent in the emitted body,
-//! so variables are always in scope when referenced.
+//! Each leaf emits a named WGSL helper function (`sdf_p{n}`). Each combinator emits a `let`
+//! binding in the body of `rye_scene_sdf`. The walk is depth-first; children always appear before
+//! their parent in the emitted body, so variables are always in scope when referenced.
 //!
 //! # Example
 //!
@@ -37,9 +36,9 @@ pub use rye_shape::Shape as PrimitiveKind;
 
 /// A node in the typed SDF scene tree.
 ///
-/// Leaf nodes hold a concrete primitive; interior nodes combine two children
-/// using a boolean or smooth operation. Build trees with the fluent combinator
-/// methods and wrap in a [`Scene`] to emit WGSL.
+/// Leaf nodes hold a concrete primitive; interior nodes combine two children using a boolean or
+/// smooth operation. Build trees with the fluent combinator methods and wrap in a [`Scene`] to
+/// emit WGSL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SceneNode {
     Leaf(PrimitiveKind),
@@ -62,13 +61,11 @@ impl SceneNode {
         SceneNode::Leaf(PrimitiveKind::Sphere { center, radius })
     }
 
-    /// Half-space leaf. SDF emission depends on the Space the
-    /// scene is later compiled against (per
-    /// [`Primitive`]'s `HalfSpace` arm): chart-coord `dot(p, n) - d`
-    /// in flat charts (E³), `+1e9` sentinel in curved charts (H³ /
-    /// S³) until closed-form geodesic-plane SDFs land. The shape
-    /// itself is canonical, also used by `rye-physics` for
-    /// collision walls regardless of the rendering side.
+    /// Half-space leaf. SDF emission depends on the Space the scene is later compiled against
+    /// (per [`Primitive`]'s `HalfSpace` arm): chart-coord `dot(p, n) - d` in flat charts (E³),
+    /// `+1e9` sentinel in curved charts (H³ / S³) until closed-form geodesic-plane SDFs land.
+    /// The shape itself is canonical, also used by `rye-physics` for collision walls regardless
+    /// of the rendering side.
     pub fn plane(normal: Vec3, offset: f32) -> Self {
         SceneNode::Leaf(PrimitiveKind::HalfSpace { normal, offset })
     }
@@ -123,9 +120,9 @@ impl Scene {
 
     /// Emit the complete WGSL scene module for the given Space.
     ///
-    /// The output includes all named helper functions and the required
-    /// `rye_scene_sdf` entry point. Prepend this to the Space prelude and
-    /// the user shader to get a complete shader source.
+    /// The output includes all named helper functions and the required `rye_scene_sdf` entry
+    /// point. Prepend this to the Space prelude and the user shader to get a complete shader
+    /// source.
     pub fn to_wgsl<S: WgslSpace>(&self, space: &S) -> String {
         let mut helpers = String::new();
         let mut body = String::new();
@@ -156,9 +153,8 @@ impl Scene {
 
 // ---- Recursive emitter ------------------------------------------------------
 
-/// Walk `node` depth-first, appending helper function definitions to `helpers`
-/// and `let` bindings to `body`. Returns the WGSL variable name holding the
-/// signed distance for this node.
+/// Walk `node` depth-first, appending helper function definitions to `helpers` and `let` bindings to
+/// `body`. Returns the WGSL variable name holding the signed distance for this node.
 fn emit_node<S: WgslSpace>(
     node: &SceneNode,
     space: &S,

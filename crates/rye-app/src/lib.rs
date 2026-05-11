@@ -1,38 +1,33 @@
-//! `rye-app`: thin App trait + event-loop runner that extracts
-//! the winit boilerplate every Rye example currently rewrites.
+//! `rye-app`: thin App trait + event-loop runner that extracts the winit boilerplate
+//! every Rye example currently rewrites.
 //!
 //! ## What this crate is, and isn't
 //!
-//! This is a *small framework*. Apps implement [`App`] on a struct
-//! that owns their state, and the runner [`run`] (or
-//! [`run_with_config`]) handles:
+//! This is a *small framework*. Apps implement [`App`] on a struct that owns their state,
+//! and the runner [`run`] (or [`run_with_config`]) handles:
 //!
 //! - Window creation and the winit `ApplicationHandler` impl.
 //! - [`RenderDevice`] construction and surface-error recovery.
 //! - [`ShaderDb`] + [`AssetWatcher`] for shader hot-reload.
-//! - [`InputState`] event routing -> drained `FrameInput` per
-//!   redraw.
+//! - [`InputState`] event routing -> drained `FrameInput` per redraw.
 //! - [`FixedTimestep`] driving `App::tick` at the fixed-rate.
 //! - FPS bookkeeping and rate-limited title updates.
 //!
 //! It is **explicitly not**:
 //!
 //! - An ECS or scene graph. Apps own their state directly.
-//! - A render-graph orchestrator. Apps own their `RenderNode`s and
-//!   compose them inside [`App::render`].
-//! - A camera framework. The user owns [`Camera<S>`] and a
-//!   [`CameraController<S>`] in their `App` struct, advanced from
-//!   inside `App::update`. The framework only hands them the
-//!   drained input.
-//! - A frame-capture pipeline. Use OBS or another external screen
-//!   recorder. (TODO: revisit if a built-in capture knob becomes
-//!   load-bearing for CI / regression-image generation. The future
-//!   shape: GIF-preferred output, separate from any rotation flag.
-//!   Capture and auto-rotate are independent concerns and coupling
-//!   them was a 2026-04-28 mistake; see issue tracker.)
+//! - A render-graph orchestrator. Apps own their `RenderNode`s and compose them inside
+//!   [`App::render`].
+//! - A camera framework. The user owns [`Camera<S>`] and a [`CameraController<S>`] in
+//!   their `App` struct, advanced from inside `App::update`. The framework only hands
+//!   them the drained input.
+//! - A frame-capture pipeline. Use OBS or another external screen recorder. (TODO:
+//!   revisit if a built-in capture knob becomes load-bearing for CI / regression-image
+//!   generation. The future shape: GIF-preferred output, separate from any rotation
+//!   flag. Capture and auto-rotate are independent concerns and coupling them was a
+//!   2026-04-28 mistake; see issue tracker.)
 //!
-//! Designed for a small ergonomic gain; explicitly not an ECS or
-//! scene graph.
+//! Designed for a small ergonomic gain; explicitly not an ECS or scene graph.
 //!
 //! ## Lifecycle
 //!
@@ -99,95 +94,82 @@ pub use rye_egui::{egui, world_to_screen, BottomOverlay, LinearIndicator};
 // App trait
 // ---------------------------------------------------------------------------
 
-/// The framework calls back into your App through this trait. All
-/// methods except [`App::setup`], [`App::space`], and
-/// [`App::render`] have default impls; override only what you need.
+/// The framework calls back into your App through this trait. All methods except
+/// [`App::setup`], [`App::space`], and [`App::render`] have default impls; override
+/// only what you need.
 ///
-/// `Self::Space` is the ambient geometry. The user's app owns an
-/// instance of it (typically as a struct field) so that hot-reload
-/// can re-emit shader preludes against the same instance the
-/// renderer is using.
+/// `Self::Space` is the ambient geometry. The user's app owns an instance of it
+/// (typically as a struct field) so that hot-reload can re-emit shader preludes against
+/// the same instance the renderer is using.
 pub trait App: Sized + 'static {
-    /// **Shader-prelude** geometry. The framework runs
-    /// `ShaderDb::apply_events` against this instance during
-    /// hot-reload, so `rye_distance` / `rye_log` / `rye_exp` etc.
-    /// in WGSL evaluate under this metric. Apps that don't care
-    /// about geometry use `EuclideanR3`.
+    /// **Shader-prelude** geometry. The framework runs `ShaderDb::apply_events` against
+    /// this instance during hot-reload, so `rye_distance` / `rye_log` / `rye_exp` etc.
+    /// in WGSL evaluate under this metric. Apps that don't care about geometry use
+    /// `EuclideanR3`.
     ///
-    /// **This is not a commitment about the camera, the player,
-    /// or the scene.** Those are user-owned types and may use a
-    /// different Space, or no Space at all. Two valid patterns:
+    /// **This is not a commitment about the camera, the player, or the scene.** Those
+    /// are user-owned types and may use a different Space, or no Space at all. Two
+    /// valid patterns:
     ///
-    /// - **All-in geometry**: scene, camera, player, and shader
-    ///   prelude all share one Space. e.g.
-    ///   `App::Space = HyperbolicH3` + `Camera<HyperbolicH3>`. The
-    ///   camera orbits along honest H³ geodesics, the player moves
-    ///   along honest H³ geodesics, the shader applies H³ to
-    ///   distance / fog math.
-    /// - **Hybrid** (fractal-demo-style): scene is Cartesian, camera
-    ///   orbits in flat Euclidean space, but the shader prelude is
-    ///   non-Euclidean to apply a geodesic-fog metric. e.g.
-    ///   `App::Space = HyperbolicH3` + `Camera<EuclideanR3>`. The
-    ///   camera math is Cartesian; the shader applies H³ only to
-    ///   the fog distance.
+    /// - **All-in geometry**: scene, camera, player, and shader prelude all share one
+    ///   Space. e.g. `App::Space = HyperbolicH3` + `Camera<HyperbolicH3>`. The camera
+    ///   orbits along honest H³ geodesics, the player moves along honest H³ geodesics,
+    ///   the shader applies H³ to distance / fog math.
+    /// - **Hybrid** (fractal-demo-style): scene is Cartesian, camera orbits in flat
+    ///   Euclidean space, but the shader prelude is non-Euclidean to apply a
+    ///   geodesic-fog metric. e.g. `App::Space = HyperbolicH3` + `Camera<EuclideanR3>`.
+    ///   The camera math is Cartesian; the shader applies H³ only to the fog distance.
     ///
-    /// The conflation hazard: if you write `Camera<Self::Space>`
-    /// without thinking, you commit your scene to live in that
-    /// Space's coordinates. For H³ that means the Poincaré ball;
-    /// orbit distances inherited from a Euclidean default
-    /// (`OrbitController::default()` -> `distance ≈ 3.55`) will
-    /// `exp_target` into a tangent vector that lands at
-    /// `tanh(1.78) ≈ 0.94` of the way to the ideal boundary, where
-    /// the metric explodes. If your scene's geometry isn't actually
-    /// in H³, use `Camera<EuclideanR3>` and treat `App::Space`
-    /// purely as the shader-prelude axis.
+    /// The conflation hazard: if you write `Camera<Self::Space>` without thinking, you
+    /// commit your scene to live in that Space's coordinates. For H³ that means the
+    /// Poincaré ball; orbit distances inherited from a Euclidean default
+    /// (`OrbitController::default()` -> `distance ≈ 3.55`) will `exp_target` into a
+    /// tangent vector that lands at `tanh(1.78) ≈ 0.94` of the way to the ideal
+    /// boundary, where the metric explodes. If your scene's geometry isn't actually in
+    /// H³, use `Camera<EuclideanR3>` and treat `App::Space` purely as the
+    /// shader-prelude axis.
     type Space: WgslSpace + 'static;
 
-    /// One-shot construction after `RenderDevice` and `ShaderDb`
-    /// are ready. Build render nodes, load shaders, allocate
-    /// gameplay state, and store everything (including
-    /// `Self::Space` and any `Camera<S>` / `CameraController<S>`)
-    /// inside the returned `Self`.
+    /// One-shot construction after `RenderDevice` and `ShaderDb` are ready. Build
+    /// render nodes, load shaders, allocate gameplay state, and store everything
+    /// (including `Self::Space` and any `Camera<S>` / `CameraController<S>`) inside
+    /// the returned `Self`.
     fn setup(ctx: &mut SetupCtx<'_>) -> anyhow::Result<Self>;
 
-    /// Borrow the user-owned `Self::Space` so the framework can
-    /// pass it to `ShaderDb::apply_events` on hot-reload.
+    /// Borrow the user-owned `Self::Space` so the framework can pass it to
+    /// `ShaderDb::apply_events` on hot-reload.
     fn space(&self) -> &Self::Space;
 
-    /// Per-tick simulation step at the fixed-timestep rate (60 Hz
-    /// by default; configurable via [`RunConfig::fixed_hz`]). `n`
-    /// is usually 0 or 1 per frame; can spike up to
-    /// [`RunConfig::max_ticks_per_frame`] if the renderer stalled.
+    /// Per-tick simulation step at the fixed-timestep rate (60 Hz by default;
+    /// configurable via [`RunConfig::fixed_hz`]). `n` is usually 0 or 1 per frame;
+    /// can spike up to [`RunConfig::max_ticks_per_frame`] if the renderer stalled.
     fn tick(&mut self, _dt: f32, _ctx: &mut TickCtx) {}
 
-    /// Per-frame update: input drained, ready for the app to
-    /// advance its camera controller, recompute uniforms, etc.
-    /// Runs *after* all the frame's ticks.
+    /// Per-frame update: input drained, ready for the app to advance its camera
+    /// controller, recompute uniforms, etc. Runs *after* all the frame's ticks.
     fn update(&mut self, _ctx: &mut FrameCtx<'_>) {}
 
-    /// Custom `WindowEvent` handling beyond the input routing the
-    /// framework runs first. Most apps don't need this; useful
-    /// for keyboard-driven mode toggles, drag-and-drop, etc.
+    /// Custom `WindowEvent` handling beyond the input routing the framework runs first.
+    /// Most apps don't need this; useful for keyboard-driven mode toggles,
+    /// drag-and-drop, etc.
     fn on_event(&mut self, _ev: &WindowEvent, _ctx: &mut FrameCtx<'_>) {}
 
-    /// Hot-reload notification: the framework polled
-    /// `AssetWatcher`, applied events to `ShaderDb` against
-    /// `self.space()`, and any consumer pipelines you built may
-    /// be stale. Rebuild what you care about.
+    /// Hot-reload notification: the framework polled `AssetWatcher`, applied events to
+    /// `ShaderDb` against `self.space()`, and any consumer pipelines you built may be
+    /// stale. Rebuild what you care about.
     fn on_shader_reload(&mut self, _ctx: &mut SetupCtx<'_>) {}
 
-    /// Render this frame. The framework has begun a frame and
-    /// hands you the surface view; do whatever rendering you
-    /// like. The framework calls `frame.present` after this
-    /// returns.
+    /// Render this frame. The framework has begun a frame and hands you the surface
+    /// view; do whatever rendering you like. The framework calls `frame.present` after
+    /// this returns.
     fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> anyhow::Result<()>;
 
-    /// Build this frame's egui UI. Called after [`App::update`] and
-    /// before [`App::render`]; the framework paints the resulting
-    /// widgets as a 2D overlay on the surface view.
+    /// Build this frame's egui UI. Called after [`App::update`] and before
+    /// [`App::render`]; the framework paints the resulting widgets as a 2D overlay on
+    /// the surface view.
     ///
-    /// Default impl is a no-op; apps that want UI override this with
-    /// immediate-mode egui code:
+    /// Default impl is a no-op; apps that want UI override this with immediate-mode
+    /// egui code:
     ///
     /// ```ignore
     /// fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
@@ -198,18 +180,15 @@ pub trait App: Sized + 'static {
     /// }
     /// ```
     ///
-    /// Gameplay code that reads input should gate on
-    /// [`FrameCtx::ui_has_focus`] so a player typing into a settings
-    /// field doesn't also fire WASD movement.
+    /// Gameplay code that reads input should gate on [`FrameCtx::ui_has_focus`] so a
+    /// player typing into a settings field doesn't also fire WASD movement.
     ///
-    /// For "egui label that follows a 3D object," use
-    /// [`world_to_screen`] to project the world point and place an
-    /// `egui::Area` at the resulting pixel.
+    /// For "egui label that follows a 3D object," use [`world_to_screen`] to project
+    /// the world point and place an `egui::Area` at the resulting pixel.
     fn ui(&mut self, _ctx: &egui::Context, _frame: &mut FrameCtx<'_>) {}
 
-    /// Title bar text. Default returns the static name
-    /// `"rye app"`. Override for live FPS / state readouts; the
-    /// framework rate-limits the actual `set_title` call to
+    /// Title bar text. Default returns the static name `"rye app"`. Override for live
+    /// FPS / state readouts; the framework rate-limits the actual `set_title` call to
     /// roughly once a second.
     fn title(&self, _fps: f32) -> Cow<'static, str> {
         Cow::Borrowed("rye app")
@@ -220,30 +199,27 @@ pub trait App: Sized + 'static {
 // Context structs
 // ---------------------------------------------------------------------------
 
-/// Setup-phase context. Available during [`App::setup`] and
-/// [`App::on_shader_reload`].
+/// Setup-phase context. Available during [`App::setup`] and [`App::on_shader_reload`].
 pub struct SetupCtx<'a> {
     pub rd: &'a RenderDevice,
     pub shader_db: &'a mut ShaderDb,
-    /// `None` when filesystem watching failed to initialise (e.g.
-    /// no inotify on the running system); apps can still load
-    /// shaders, but won't get hot-reload.
+    /// `None` when filesystem watching failed to initialise (e.g. no inotify on the
+    /// running system); apps can still load shaders, but won't get hot-reload.
     pub watcher: Option<&'a mut AssetWatcher>,
-    /// Wall-clock seconds since `run` was called. Always 0 in
-    /// `setup`, non-zero on subsequent `on_shader_reload` calls.
+    /// Wall-clock seconds since `run` was called. Always 0 in `setup`, non-zero on
+    /// subsequent `on_shader_reload` calls.
     pub time: f32,
 }
 
-/// Per-tick context. Visible to [`App::tick`]. Deliberately
-/// GPU-free so sim code stays bit-deterministic.
+/// Per-tick context. Visible to [`App::tick`]. Deliberately GPU-free so sim code stays
+/// bit-deterministic.
 pub struct TickCtx {
     pub time: f32,
     pub tick: u64,
 }
 
-/// Per-frame context. Visible to [`App::update`] and
-/// [`App::on_event`]. Carries the drained input, FPS readout, and
-/// the count of ticks the framework just executed.
+/// Per-frame context. Visible to [`App::update`] and [`App::on_event`]. Carries the
+/// drained input, FPS readout, and the count of ticks the framework just executed.
 pub struct FrameCtx<'a> {
     pub rd: &'a RenderDevice,
     pub input: FrameInput,
@@ -251,14 +227,13 @@ pub struct FrameCtx<'a> {
     pub fps: f32,
     pub n_ticks: usize,
     pub tick: u64,
-    /// `true` if egui is consuming pointer or keyboard input this
-    /// frame (a widget is hovered, focused, or accepting text).
-    /// Gameplay code should gate movement / mouselook on
-    /// `!ctx.ui_has_focus` so typing into a settings field doesn't
-    /// also fire WASD or rotate the camera.
+    /// `true` if egui is consuming pointer or keyboard input this frame (a widget is
+    /// hovered, focused, or accepting text). Gameplay code should gate movement /
+    /// mouselook on `!ctx.ui_has_focus` so typing into a settings field doesn't also
+    /// fire WASD or rotate the camera.
     pub ui_has_focus: bool,
-    /// Phantom for forward-compat: future fields here mustn't
-    /// silently break code that pattern-matches on the struct.
+    /// Phantom for forward-compat: future fields here mustn't silently break code that
+    /// pattern-matches on the struct.
     _non_exhaustive: PhantomData<()>,
 }
 
@@ -266,27 +241,30 @@ pub struct FrameCtx<'a> {
 // RunConfig
 // ---------------------------------------------------------------------------
 
-/// Runtime knobs. New fields land with defaults so adding
-/// configuration is non-breaking.
+/// Runtime knobs. New fields land with defaults so adding configuration is non-breaking.
 pub struct RunConfig {
     pub window: WindowAttributes,
     pub fixed_hz: u32,
     pub max_ticks_per_frame: usize,
-    /// `EnvFilter`-style log filter. `None` means keep whatever
-    /// `tracing-subscriber` was already configured with (or the
-    /// `RUST_LOG` env var); `Some` installs a new global default
-    /// subscriber.
+    /// `EnvFilter`-style log filter. `None` means keep whatever `tracing-subscriber`
+    /// was already configured with (or the `RUST_LOG` env var); `Some` installs a new
+    /// global default subscriber.
     pub log_filter: Option<String>,
-    /// When true (default) the framework exits the event loop on
-    /// `Esc`. Apps that bind `Esc` to a gameplay action (pause,
-    /// menu, modal dismiss) set this to false and handle the key
-    /// inside [`App::on_event`].
+    /// When true (default) the framework exits the event loop on `Esc`. Apps that bind
+    /// `Esc` to a gameplay action (pause, menu, modal dismiss) set this to false and
+    /// handle the key inside [`App::on_event`].
     pub esc_exits: bool,
-    /// Bail out after this many consecutive [`App::render`] errors.
-    /// The last error surfaces back through [`run_with_config`]'s
-    /// `Result` instead of looping forever on a wedged GPU. Reset to
-    /// zero on any successful frame. `0` disables the budget.
+    /// Bail out after this many consecutive [`App::render`] errors. The last error
+    /// surfaces back through [`run_with_config`]'s `Result` instead of looping forever
+    /// on a wedged GPU. Reset to zero on any successful frame. `0` disables the budget.
     pub render_error_budget: u32,
+    /// MSAA sample count requested for the scene + UI render target. `1` disables
+    /// MSAA. `4` is the conventional default (good quality / cost tradeoff, supported
+    /// on every consumer GPU). Higher counts (8, 16) cost more and yield diminishing
+    /// returns on edge antialiasing. The runtime negotiates with the adapter; if the
+    /// requested count isn't supported on the chosen surface format, [`RenderDevice`]
+    /// falls back to the highest supported lower count and logs a warning.
+    pub msaa_samples: u32,
 }
 
 impl Default for RunConfig {
@@ -300,6 +278,7 @@ impl Default for RunConfig {
             log_filter: None,
             esc_exits: true,
             render_error_budget: 8,
+            msaa_samples: 1,
         }
     }
 }
@@ -365,12 +344,11 @@ struct Runner<A: App> {
     fps: f32,
 
     tick_index: u64,
-    /// Consecutive `App::render` failures since the last successful
-    /// frame. Compared against `RunConfig::render_error_budget`.
+    /// Consecutive `App::render` failures since the last successful frame. Compared
+    /// against `RunConfig::render_error_budget`.
     render_error_streak: u32,
-    /// Surfaced to the user via `finish()` if the runner exited
-    /// because of a setup or render error, so callers can
-    /// propagate it from `main`.
+    /// Surfaced to the user via `finish()` if the runner exited because of a setup or
+    /// render error, so callers can propagate it from `main`.
     deferred_error: Option<anyhow::Error>,
 }
 
@@ -398,9 +376,9 @@ impl<A: App> Runner<A> {
         }
     }
 
-    /// Drain any error that the runner deferred during the event
-    /// loop (setup or render failures cause `elwt.exit()` so the
-    /// loop returns `Ok`; we surface the real error here).
+    /// Drain any error that the runner deferred during the event loop (setup or render
+    /// failures cause `elwt.exit()` so the loop returns `Ok`; we surface the real error
+    /// here).
     fn finish(self) -> anyhow::Result<()> {
         match self.deferred_error {
             Some(err) => Err(err),
@@ -424,7 +402,8 @@ impl<A: App> ApplicationHandler for Runner<A> {
             }
         };
 
-        let rd = match pollster::block_on(RenderDevice::new(win.clone())) {
+        let rd = match pollster::block_on(RenderDevice::new(win.clone(), self.config.msaa_samples))
+        {
             Ok(r) => r,
             Err(e) => {
                 self.deferred_error = Some(anyhow::anyhow!("RenderDevice::new: {e:#}"));
@@ -432,6 +411,8 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 return;
             }
         };
+        // for debugging negotiated MSAA count; the actual count is in `rd.sample_count()`
+        // tracing::info!("scale_factor: {}, msaa: {}x", win.scale_factor(), rd.sample_count());
 
         let mut shader_db = ShaderDb::new(rd.device.clone());
 
@@ -460,12 +441,17 @@ impl<A: App> ApplicationHandler for Runner<A> {
             }
         };
 
-        // 1 sample = no MSAA on the egui pass. Tracks the surface's
-        // own sample count, which is also 1 today (Rye doesn't
-        // configure MSAA on the swapchain). If a future render path
-        // enables MSAA on the main scene, this needs to bump in
-        // lockstep so egui paints into the same multisample target.
-        let ui = UiIntegration::new(&rd.device, &win, rd.surface_bundle.config.format, 1);
+        // egui pipelines must be built with the same sample count as
+        // the multisampled scene attachment, since both passes write
+        // into the same color attachment and the deferred MSAA
+        // resolve happens at the end of the egui paint pass. See
+        // [`UiIntegration::paint`]'s `resolve_target` parameter.
+        let ui = UiIntegration::new(
+            &rd.device,
+            &win,
+            rd.surface_bundle.config.format,
+            rd.sample_count(),
+        );
 
         self.window = Some(win.clone());
         self.rd = Some(rd);
@@ -661,18 +647,24 @@ impl<A: App> Runner<A> {
         }
 
         // 5. Render: scene (App::render) then UI overlay.
+        //
+        // When MSAA is enabled, both passes write into the
+        // multisampled color attachment (`rd.msaa_view()`) and the
+        // egui pass attaches the swapchain view as `resolve_target`
+        // so the deferred MSAA resolve happens at the end of the
+        // egui pass. When MSAA is disabled, both passes write
+        // directly into the swapchain view and `resolve_target` is
+        // `None`.
         match rd.begin_frame() {
-            Ok((frame, view)) => {
+            Ok((frame, swap_view)) => {
                 let mut last_err: Option<anyhow::Error> = None;
+                let render_view = rd.msaa_view().unwrap_or(&swap_view);
                 if let Some(app) = self.app.as_mut() {
-                    if let Err(e) = app.render(rd, &view) {
+                    if let Err(e) = app.render(rd, render_view) {
                         tracing::error!("App::render error: {e:#}");
                         last_err = Some(e);
                     }
                 }
-                // Paint egui on top of whatever the app rendered.
-                // Uses `LoadOp::Load` internally so the scene shows
-                // through where no widgets cover it.
                 if let Some(ui) = self.ui.as_mut() {
                     let mut encoder =
                         rd.device
@@ -680,11 +672,13 @@ impl<A: App> Runner<A> {
                                 label: Some("rye-app::ui-paint"),
                             });
                     let viewport = (rd.surface_bundle.size.width, rd.surface_bundle.size.height);
+                    let resolve_target = (rd.sample_count() > 1).then_some(&swap_view);
                     ui.paint(
                         &rd.device,
                         &rd.queue,
                         &mut encoder,
-                        &view,
+                        render_view,
+                        resolve_target,
                         win.as_ref(),
                         viewport,
                     );

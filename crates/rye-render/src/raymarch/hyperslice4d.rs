@@ -1,51 +1,42 @@
-//! [`Hyperslice4DNode`], render node for 4D scenes via
-//! hyperslicing.
+//! [`Hyperslice4DNode`], render node for 4D scenes via hyperslicing.
 //!
-//! Designed to pair with `rye_sdf::Scene4` but takes a
-//! pre-compiled [`wgpu::ShaderModule`] rather than depending on
-//! `rye-sdf` directly (matches the existing
-//! [`crate::raymarch::RayMarchNode`] / [`crate::raymarch::GeodesicRayMarchNode`]
-//! pattern; keeps `rye-render`'s deps minimal).
+//! Designed to pair with `rye_sdf::Scene4` but takes a pre-compiled [`wgpu::ShaderModule`]
+//! rather than depending on `rye-sdf` directly (matches the existing
+//! [`crate::raymarch::RayMarchNode`] / [`crate::raymarch::GeodesicRayMarchNode`] pattern;
+//! keeps `rye-render`'s deps minimal).
 //!
 //! The user assembles the WGSL by concatenating:
 //!
-//! 1. [`HYPERSLICE_KERNEL_WGSL`], uniform layout, fullscreen-
-//!    triangle vertex stage, ray-march fragment stage. Calls
-//!    `rye_scene_sdf` from the scene module.
-//! 2. `Scene4::to_hyperslice_wgsl("u.w_slice")`, defines
-//!    `rye_scene_sdf` as `4D_SDF(vec4(p, u.w_slice))`.
+//! 1. [`HYPERSLICE_KERNEL_WGSL`], uniform layout, fullscreen-triangle vertex stage, ray-march
+//!    fragment stage. Calls `rye_scene_sdf` from the scene module.
+//! 2. `Scene4::to_hyperslice_wgsl("u.w_slice")`, defines `rye_scene_sdf` as
+//!    `4D_SDF(vec4(p, u.w_slice))`.
 //!
 //! ```ignore
 //! let kernel = rye_render::raymarch::HYPERSLICE_KERNEL_WGSL;
 //! let scene_wgsl = scene.to_hyperslice_wgsl("u.w_slice");
 //! let source = format!("{kernel}\n{scene_wgsl}");
 //! let module = device.create_shader_module(...);
-//! let node = Hyperslice4DNode::new(device, format, &module);
+//! let node = Hyperslice4DNode::new(device, format, &module, sample_count);
 //! ```
 //!
 //! ## What it renders
 //!
-//! - **Static scene primitives** via `Scene4`: hyperspheres at
-//!   fixed centres, half-spaces, etc. The `Scene4` is captured at
-//!   construction; its primitive parameters become WGSL constants.
-//! - **Dynamic bodies** via the [`BodyUniform`] array on
-//!   [`Hyperslice4DUniforms`]. Up to 32 bodies per frame; each
-//!   slot is a discriminated record covering both
-//!   `HyperSphere4D`-shaped bodies (kind = 0) and
-//!   `ConvexPolytope4D`-shaped bodies (kind = 1, lands in the
-//!   polytope-rendering chunk after this one). Per-frame updates
-//!   come through [`Hyperslice4DNode::set_bodies`] /
-//!   [`Hyperslice4DNode::set_body_count`] without recompiling the
-//!   shader.
-//! - **Hyperslice only.** Native 4D ray-march (full 4D camera) is
-//!   a separate node, deferred per `4D_RENDERING.md`.
+//! - **Static scene primitives** via `Scene4`: hyperspheres at fixed centres, half-spaces, etc.
+//!   The `Scene4` is captured at construction; its primitive parameters become WGSL constants.
+//! - **Dynamic bodies** via the [`BodyUniform`] array on [`Hyperslice4DUniforms`]. Up to 32
+//!   bodies per frame; each slot is a discriminated record covering both `HyperSphere4D`-shaped
+//!   bodies (kind = 0) and `ConvexPolytope4D`-shaped bodies (kind = 1, lands in the
+//!   polytope-rendering chunk after this one). Per-frame updates come through
+//!   [`Hyperslice4DNode::set_bodies`] / [`Hyperslice4DNode::set_body_count`] without
+//!   recompiling the shader.
+//! - **Hyperslice only.** Native 4D ray-march (full 4D camera) is a separate node, deferred per
+//!   `4D_RENDERING.md`.
 //!
-//! The kernel sums the static-scene SDF (`rye_scene_sdf`, defined
-//! by the user's `Scene4` emit) and the dynamic-body SDF
-//! (`rye_dynamic_bodies_sdf`, defined in the kernel itself) via
-//! `min`. So a typical scene composes a static floor (`Scene4`
-//! `HalfSpace4D`) plus N moving hyperspheres uploaded each frame
-//! through the body array.
+//! The kernel sums the static-scene SDF (`rye_scene_sdf`, defined by the user's `Scene4` emit)
+//! and the dynamic-body SDF (`rye_dynamic_bodies_sdf`, defined in the kernel itself) via `min`.
+//! So a typical scene composes a static floor (`Scene4` `HalfSpace4D`) plus N moving
+//! hyperspheres uploaded each frame through the body array.
 
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
@@ -55,18 +46,16 @@ use wgpu::*;
 use crate::device::RenderDevice;
 use crate::graph::RenderNode;
 
-/// Maximum number of dynamic bodies a single frame can render.
-/// Hard cap because the uniform layout is fixed-size; raising it
-/// is a recompile, not a runtime knob. 32 is generous for the
-/// demos we know about (`hypersphere`'s `-n N` is already capped
-/// at 32; pentatope-pile scenes top out around 20 active
-/// polytopes).
+/// Maximum number of dynamic bodies a single frame can render. Hard cap because the uniform
+/// layout is fixed-size; raising it is a recompile, not a runtime knob. 32 is generous for the
+/// demos we know about (`hypersphere`'s `-n N` is already capped at 32; pentatope-pile scenes top
+/// out around 20 active polytopes).
 pub const MAX_BODIES: usize = 32;
 
 /// Shape table indices for `BodyKind::Polytope` bodies. Stored in
-/// [`BodyUniform::radius_or_shape`] (cast through `f32`); read by
-/// the kernel's `body_polytope_sdf_4d` dispatch chain. Mirrored as
-/// `SHAPE_*` constants in [`HYPERSLICE_KERNEL_WGSL`]; keep in sync.
+/// [`BodyUniform::radius_or_shape`] (cast through `f32`); read by the kernel's
+/// `body_polytope_sdf_4d` dispatch chain. Mirrored as `SHAPE_*` constants in
+/// [`HYPERSLICE_KERNEL_WGSL`]; keep in sync.
 pub const SHAPE_PENTATOPE: u32 = 0;
 pub const SHAPE_TESSERACT: u32 = 1;
 pub const SHAPE_16CELL: u32 = 2;
@@ -78,9 +67,8 @@ pub const SHAPE_DUOCYLINDER: u32 = 7;
 pub const SHAPE_CLIFFORD_TORUS: u32 = 8;
 pub const SHAPE_SPHERINDER: u32 = 9;
 
-/// One dynamic-body slot. Discriminated record covering both
-/// hypersphere and polytope cases, `kind` selects which fields
-/// are read by the shader.
+/// One dynamic-body slot. Discriminated record covering both hypersphere and polytope cases,
+/// `kind` selects which fields are read by the shader.
 ///
 /// Layout (std140-aligned, 80 bytes total):
 ///
@@ -95,12 +83,11 @@ pub const SHAPE_SPHERINDER: u32 = 9;
 /// | 44 |  4 | `_pad1` |
 /// | 48 | 32 | `rotor` (8 × f32packed as 2 × `vec4<f32>`, `rotor_lo` then `rotor_hi`; Rotor4 ordering: scalar, xy, xz, xw, yz, yw, zw, pseudoscalar) |
 ///
-/// The rotor lives in two `vec4<f32>` slots in the WGSL struct so
-/// the std140 alignment matches Rust's tightly-packed `[f32; 8]`
-/// (an `array<f32, 8>` in a uniform buffer would pad each element
-/// to 16 bytes, blowing the slot to 128 bytes). The `rotor` slot is
-/// identity-valued for sphere bodies; it's loaded from the body's
-/// `RigidBody::orientation.rotation` for polytope bodies.
+/// The rotor lives in two `vec4<f32>` slots in the WGSL struct so the std140 alignment matches
+/// Rust's tightly-packed `[f32; 8]` (an `array<f32, 8>` in a uniform buffer would pad each
+/// element to 16 bytes, blowing the slot to 128 bytes). The `rotor` slot is identity-valued
+/// for sphere bodies; it's loaded from the body's `RigidBody::orientation.rotation` for
+/// polytope bodies.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct BodyUniform {
@@ -116,9 +103,8 @@ pub struct BodyUniform {
 
 impl Default for BodyUniform {
     fn default() -> Self {
-        // `Invalid` has no kernel dispatch branch; the SDF accumulator
-        // stays at its 1e9 initial value for this slot rather than
-        // collapsing to a zero-radius sphere at the origin.
+        // `Invalid` has no kernel dispatch branch; the SDF accumulator stays at its 1e9 initial
+        // value for this slot rather than collapsing to a zero-radius sphere at the origin.
         Self {
             position: [0.0; 4],
             kind: BodyKind::Invalid as i32 as f32,
@@ -133,35 +119,31 @@ impl Default for BodyUniform {
     }
 }
 
-/// `BodyUniform::kind` discriminator. Cast to `f32` when writing
-/// the uniform; the shader reads it back as `u32`-via-`f32`.
+/// `BodyUniform::kind` discriminator. Cast to `f32` when writing the uniform; the shader reads
+/// it back as `u32`-via-`f32`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BodyKind {
-    /// `HyperSphere4D`. Reads `position` (4D centre) and
-    /// `radius_or_shape` (sphere radius). Ignores `rotor`.
+    /// `HyperSphere4D`. Reads `position` (4D centre) and `radius_or_shape` (sphere radius).
+    /// Ignores `rotor`.
     Sphere = 0,
-    /// `ConvexPolytope4D`. Reads `position` (body origin in 4D),
-    /// `rotor` (orientation), and `radius_or_shape` (shape table
-    /// index, 0 = pentatope, 1 = tesseract, etc.). Lands in the
+    /// `ConvexPolytope4D`. Reads `position` (body origin in 4D), `rotor` (orientation), and
+    /// `radius_or_shape` (shape table index, 0 = pentatope, 1 = tesseract, etc.). Lands in the
     /// polytope-rendering chunk.
     Polytope = 1,
-    /// Sentinel for slots the kernel must skip. The dispatch chain in
-    /// `rye_dynamic_bodies_sdf` matches neither sphere nor polytope
-    /// branches, so the SDF accumulator keeps its 1e9 initial value
-    /// for this slot. `BodyUniform::default()` produces this kind so
-    /// uninitialised slots in `Hyperslice4DUniforms::bodies` are inert.
+    /// Sentinel for slots the kernel must skip. The dispatch chain in `rye_dynamic_bodies_sdf`
+    /// matches neither sphere nor polytope branches, so the SDF accumulator keeps its 1e9
+    /// initial value for this slot. `BodyUniform::default()` produces this kind so uninitialised
+    /// slots in `Hyperslice4DUniforms::bodies` are inert.
     ///
-    /// `255` is chosen as `u8::MAX`: a value that's both far outside
-    /// the live discriminator range (today {0, 1}) and that round-trips
-    /// cleanly through the `f32`-typed `BodyUniform::kind` field
-    /// (every integer in `[-2^24, 2^24]` is exactly representable).
+    /// `255` is chosen as `u8::MAX`: a value that's both far outside the live discriminator range
+    /// (today {0, 1}) and that round-trips cleanly through the `f32`-typed `BodyUniform::kind`
+    /// field (every integer in `[-2^24, 2^24]` is exactly representable).
     Invalid = 255,
 }
 
 impl BodyUniform {
-    /// Build a sphere body. `position` is the world-space 4D
-    /// centre, `radius` is the 4-ball radius, `color` is the
-    /// per-body hue.
+    /// Build a sphere body. `position` is the world-space 4D centre, `radius` is the 4-ball
+    /// radius, `color` is the per-body hue.
     pub fn sphere(position: [f32; 4], radius: f32, color: [f32; 3]) -> Self {
         Self {
             position,
@@ -172,14 +154,11 @@ impl BodyUniform {
         }
     }
 
-    /// Build a polytope body. `shape_index` references the kernel's
-    /// shape table (0 = pentatope, 1 = tesseract, ...). `size` is
-    /// the polytope's circumradius in world coords. `rotor` is the
-    /// body's Rotor4 orientation packed as
-    /// `[s, b_xy, b_xz, b_xw, b_yz, b_yw, b_zw, ps]`; the same
-    /// order produced by `<[f32; 8]>::from(Rotor4)`. Prefer
-    /// [`Self::polytope_with_rotor`] when the caller already has a
-    /// [`Rotor4`].
+    /// Build a polytope body. `shape_index` references the kernel's shape table (0 = pentatope,
+    /// 1 = tesseract, ...). `size` is the polytope's circumradius in world coords. `rotor` is
+    /// the body's Rotor4 orientation packed as `[s, b_xy, b_xz, b_xw, b_yz, b_yw, b_zw, ps]`;
+    /// the same order produced by `<[f32; 8]>::from(Rotor4)`. Prefer
+    /// [`Self::polytope_with_rotor`] when the caller already has a [`Rotor4`].
     pub fn polytope(
         position: [f32; 4],
         shape_index: u32,
@@ -198,10 +177,9 @@ impl BodyUniform {
         }
     }
 
-    /// Same as [`Self::polytope`] but takes a [`Rotor4`] directly,
-    /// using rye-math's canonical `[f32; 8]` packing. Use this from
-    /// app / example code so the GPU rotor field order isn't spelled
-    /// out by hand at the call site.
+    /// Same as [`Self::polytope`] but takes a [`Rotor4`] directly, using rye-math's canonical
+    /// `[f32; 8]` packing. Use this from app / example code so the GPU rotor field order isn't
+    /// spelled out by hand at the call site.
     pub fn polytope_with_rotor(
         position: [f32; 4],
         shape_index: u32,
@@ -213,9 +191,8 @@ impl BodyUniform {
     }
 }
 
-/// Uniform buffer for [`Hyperslice4DNode`]. Bind group 0,
-/// binding 0. `std140`-compatible layout matching the kernel's
-/// `Uniforms` struct.
+/// Uniform buffer for [`Hyperslice4DNode`]. Bind group 0, binding 0. `std140`-compatible
+/// layout matching the kernel's `Uniforms` struct.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Hyperslice4DUniforms {
@@ -230,25 +207,23 @@ pub struct Hyperslice4DUniforms {
     pub resolution: [f32; 2],
     pub time: f32,
     pub tick: f32,
-    /// The slicing hyperplane's `w` coordinate. `Scene4`'s
-    /// hyperslice emit reads `u.w_slice` directly.
+    /// The slicing hyperplane's `w` coordinate. `Scene4`'s hyperslice emit reads `u.w_slice`
+    /// directly.
     pub w_slice: f32,
-    /// Number of active body slots. Cast from `u32` to `f32` for
-    /// std140 alignment (the kernel rounds back to integer).
+    /// Number of active body slots. Cast from `u32` to `f32` for std140 alignment (the kernel
+    /// rounds back to integer).
     pub body_count: f32,
-    /// Pixel offset of the viewport's top-left corner within the
-    /// framebuffer. Lets the fragment shader convert `frag_pos.xy`
-    /// (always framebuffer-space) into normalised viewport
-    /// coordinates: `uv = (frag_pos.xy - viewport_origin) /
-    /// resolution`. Both axes are zero when the scene fills the
-    /// full framebuffer; the side-panel case sets `viewport_origin =
-    /// [panel_width, 0]` and `resolution` to the carved-out region.
+    /// Pixel offset of the viewport's top-left corner within the framebuffer. Lets the fragment
+    /// shader convert `frag_pos.xy` (always framebuffer-space) into normalised viewport
+    /// coordinates: `uv = (frag_pos.xy - viewport_origin) / resolution`. Both axes are zero
+    /// when the scene fills the full framebuffer; the side-panel case sets
+    /// `viewport_origin = [panel_width, 0]` and `resolution` to the carved-out region.
     pub viewport_origin: [f32; 2],
-    /// Four scalar knobs for user-shader-side parameters. Same
-    /// shape as `RayMarchUniforms::params` for symmetry.
+    /// Four scalar knobs for user-shader-side parameters. Same shape as
+    /// `RayMarchUniforms::params` for symmetry.
     pub params: [f32; 4],
-    /// Dynamic body slots. Slots `>= body_count` are unread by
-    /// the shader. See [`BodyUniform`] for the per-slot layout.
+    /// Dynamic body slots. Slots `>= body_count` are unread by the shader. See [`BodyUniform`]
+    /// for the per-slot layout.
     pub bodies: [BodyUniform; MAX_BODIES],
 }
 
@@ -275,11 +250,9 @@ impl Default for Hyperslice4DUniforms {
     }
 }
 
-/// Hyperslice ray-march kernel. Defines `Uniforms`, the
-/// fullscreen triangle, and the ray-march loop. The user's
-/// `Scene4` emit fills in `rye_scene_sdf(p: vec3<f32>) -> f32`.
-/// Public so callers can build the full shader source themselves
-/// (kernel + scene emit).
+/// Hyperslice ray-march kernel. Defines `Uniforms`, the fullscreen triangle, and the ray-march
+/// loop. The user's `Scene4` emit fills in `rye_scene_sdf(p: vec3<f32>) -> f32`. Public so
+/// callers can build the full shader source themselves (kernel + scene emit).
 pub const HYPERSLICE_KERNEL_WGSL: &str = r#"
 // ---- Hyperslice4DNode kernel ----
 
@@ -513,8 +486,8 @@ fn duocylinder_sdf_local(p: vec4<f32>) -> f32 {
 }
 
 // Clifford torus, "filled" as a 4-D tube of radius `tube`
-// around the 2-D torus surface `length(p.xy) = r1, length(p.zw)
-// = r2`. The center curve is codimension 2, so the SDF takes a
+// around the 2-D torus surface `length(p.xy) = r1, length(p.zw) = r2`. The center curve is
+// codimension 2, so the SDF takes a
 // vec2 length in the (q1, q2) normal plane and subtracts the
 // tube radius. Numbers chosen so the bounding 4-ball is unit.
 fn clifford_torus_sdf_local(p: vec4<f32>) -> f32 {
@@ -784,8 +757,8 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Render node that ray-marches the 3D cross-section of a 4D
-/// scene at `u.w_slice`. Pairs with `rye_sdf::Scene4`.
+/// Render node that ray-marches the 3D cross-section of a 4D scene at `u.w_slice`. Pairs with
+/// `rye_sdf::Scene4`.
 pub struct Hyperslice4DNode {
     pipeline: RenderPipeline,
     uniforms: Hyperslice4DUniforms,
@@ -795,11 +768,18 @@ pub struct Hyperslice4DNode {
 }
 
 impl Hyperslice4DNode {
-    /// Build the node from a pre-compiled [`ShaderModule`]. The
-    /// caller is responsible for producing it from the kernel
-    /// ([`HYPERSLICE_KERNEL_WGSL`]) + their scene's hyperslice
-    /// WGSL emit. See the module-level docs for an example.
-    pub fn new(device: &Device, surface_format: TextureFormat, module: &ShaderModule) -> Self {
+    /// Build the node from a pre-compiled [`ShaderModule`]. The caller is responsible for
+    /// producing it from the kernel ([`HYPERSLICE_KERNEL_WGSL`]) + their scene's hyperslice WGSL
+    /// emit. See the module-level docs for an example.
+    /// Construct the hyperslice4d pipeline. `sample_count` must match the color attachment's
+    /// sample count at draw time (use [`crate::device::RenderDevice::sample_count`] in app code;
+    /// pass 1 in tests / headless contexts).
+    pub fn new(
+        device: &Device,
+        surface_format: TextureFormat,
+        module: &ShaderModule,
+        sample_count: u32,
+    ) -> Self {
         let uniform_buf = device.create_buffer(&BufferDescriptor {
             label: Some("hyperslice4d uniforms"),
             size: std::mem::size_of::<Hyperslice4DUniforms>() as u64,
@@ -860,7 +840,10 @@ impl Hyperslice4DNode {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: MultisampleState::default(),
+            multisample: MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -894,19 +877,17 @@ impl Hyperslice4DNode {
         self.clear_color = color;
     }
 
-    /// Replace the active body slots with `bodies` and set the
-    /// active count. Bodies past `bodies.len()` keep their previous
-    /// values but aren't read by the shader. Caller-managed: this
-    /// doesn't auto-flush; pair with [`Self::flush_uniforms`].
+    /// Replace the active body slots with `bodies` and set the active count. Bodies past
+    /// `bodies.len()` keep their previous values but aren't read by the shader. Caller-managed:
+    /// this doesn't auto-flush; pair with [`Self::flush_uniforms`].
     pub fn set_bodies(&mut self, bodies: &[BodyUniform]) {
         let n = bodies.len().min(MAX_BODIES);
         self.uniforms.bodies[..n].copy_from_slice(&bodies[..n]);
         self.uniforms.body_count = n as f32;
     }
 
-    /// Update one body slot in-place. Useful for per-frame body
-    /// updates where you've already populated the slots in
-    /// [`Self::set_bodies`] and only their positions change.
+    /// Update one body slot in-place. Useful for per-frame body updates where you've already
+    /// populated the slots in [`Self::set_bodies`] and only their positions change.
     pub fn set_body(&mut self, index: usize, body: BodyUniform) {
         if index < MAX_BODIES {
             self.uniforms.bodies[index] = body;
@@ -920,14 +901,12 @@ impl Hyperslice4DNode {
 }
 
 impl Hyperslice4DNode {
-    /// Like [`RenderNode::execute`] but draws into a sub-region of the
-    /// framebuffer instead of fullscreen. The clear still covers the
-    /// whole attached area; only the fragment shader is restricted to
-    /// the viewport. Use this when an egui side-panel occludes part
-    /// of the window: pass the panel-aware viewport (typically
-    /// [`crate::Viewport::right_of_left_panel`]) and update the
-    /// scene's `u.resolution` to match so the camera aspect stays
-    /// correct.
+    /// Like [`RenderNode::execute`] but draws into a sub-region of the framebuffer instead of
+    /// fullscreen. The clear still covers the whole attached area; only the fragment shader is
+    /// restricted to the viewport. Use this when an egui side-panel occludes part of the window:
+    /// pass the panel-aware viewport (typically
+    /// [`crate::Viewport::right_of_left_panel`]) and update the scene's `u.resolution` to match
+    /// so the camera aspect stays correct.
     pub fn execute_in_viewport(
         &mut self,
         rd: &RenderDevice,
@@ -962,22 +941,17 @@ impl Hyperslice4DNode {
         Ok(())
     }
 
-    /// Render a "strip" of N independent slices into one texture,
-    /// each cell at a different `w_slice` value. Useful for the
-    /// multi-slice filmstrip view of a 4D shape: a row of N
-    /// thumbnails at evenly-spaced `w` shows the whole 4D extent
-    /// without scrubbing.
+    /// Render a "strip" of N independent slices into one texture, each cell at a different
+    /// `w_slice` value. Useful for the multi-slice filmstrip view of a 4D shape: a row of N
+    /// thumbnails at evenly-spaced `w` shows the whole 4D extent without scrubbing.
     ///
-    /// Each cell gets its own pass with `LoadOp::Load` (except the
-    /// first, which clears) so the underlying texture is built up
-    /// cell-by-cell. The uniform buffer is rewritten per cell to
-    /// switch `w_slice` and `resolution`; callers must NOT rely on
-    /// `self.uniforms()` to reflect the post-call state, the last
-    /// cell's `w_slice` is what's left in the buffer.
+    /// Each cell gets its own pass with `LoadOp::Load` (except the first, which clears) so the
+    /// underlying texture is built up cell-by-cell. The uniform buffer is rewritten per cell to
+    /// switch `w_slice` and `resolution`; callers must NOT rely on `self.uniforms()` to reflect
+    /// the post-call state, the last cell's `w_slice` is what's left in the buffer.
     ///
-    /// Cells where `viewport.width == 0` are skipped (degenerate
-    /// strip layouts when the available area is narrower than the
-    /// requested cell count).
+    /// Cells where `viewport.width == 0` are skipped (degenerate strip layouts when the
+    /// available area is narrower than the requested cell count).
     pub fn execute_strip(
         &mut self,
         rd: &RenderDevice,
@@ -988,15 +962,12 @@ impl Hyperslice4DNode {
             if viewport.width == 0 || viewport.height == 0 {
                 continue;
             }
-            // Per-cell body lets the caller swap in a different
-            // rotor (or shape, color, position) per cell. The
-            // 2D w/t grid uses this to render different rotors
-            // along the t axis: `body.rotor_*` carries
-            // `exp(omega * t_cell)`.
+            // Per-cell body lets the caller swap in a different rotor (or shape, color, position)
+            // per cell. The 2D w/t grid uses this to render different rotors along the t axis:
+            // `body.rotor_*` carries `exp(omega * t_cell)`.
             self.set_bodies(&[*body]);
-            // Update per-cell uniforms: w_slice + the resolution
-            // for this cell so the kernel's UV math (camera aspect,
-            // viewport-origin subtraction) lands inside the cell.
+            // Update per-cell uniforms: w_slice + the resolution for this cell so the kernel's
+            // UV math (camera aspect, viewport-origin subtraction) lands inside the cell.
             self.uniforms_mut().w_slice = *w_slice;
             self.uniforms_mut().resolution = viewport.resolution_f32();
             self.uniforms_mut().viewport_origin = [viewport.x as f32, viewport.y as f32];
@@ -1075,11 +1046,9 @@ impl RenderNode for Hyperslice4DNode {
 mod tests {
     use super::*;
 
-    /// The kernel exposes the expected entry points and uniform
-    /// layout. Full naga validation happens at the call site when
-    /// the user assembles `kernel + scene_emit` and constructs a
-    /// real `ShaderModule`; here we only sanity-check the textual
-    /// kernel.
+    /// The kernel exposes the expected entry points and uniform layout. Full naga validation
+    /// happens at the call site when the user assembles `kernel + scene_emit` and constructs a
+    /// real `ShaderModule`; here we only sanity-check the textual kernel.
     #[test]
     fn kernel_has_expected_entry_points() {
         assert!(HYPERSLICE_KERNEL_WGSL.contains("@vertex"));
@@ -1088,8 +1057,8 @@ mod tests {
         assert!(HYPERSLICE_KERNEL_WGSL.contains("fn fs_main"));
         assert!(HYPERSLICE_KERNEL_WGSL.contains("struct Uniforms"));
         assert!(HYPERSLICE_KERNEL_WGSL.contains("@group(0) @binding(0)"));
-        // The scene's `rye_scene_sdf` is the contract the kernel
-        // expects, the scene module must define it.
+        // The scene's `rye_scene_sdf` is the contract the kernel expects, the scene module must
+        // define it.
         assert!(HYPERSLICE_KERNEL_WGSL.contains("rye_scene_sdf("));
         // Dynamic-body machinery.
         assert!(HYPERSLICE_KERNEL_WGSL.contains("BodyUniform"));
@@ -1121,9 +1090,8 @@ mod tests {
         assert!(HYPERSLICE_KERNEL_WGSL.contains("rye_scene_max_t(ro, rd)"));
     }
 
-    /// `BodyUniform` is exactly 80 bytes, the std140-aligned
-    /// layout the kernel's `BodyUniform` struct expects. Off-by-
-    /// padding bugs would surface here as a different size.
+    /// `BodyUniform` is exactly 80 bytes, the std140-aligned layout the kernel's `BodyUniform`
+    /// struct expects. Off-by-padding bugs would surface here as a different size.
     #[test]
     fn body_uniform_is_80_bytes() {
         assert_eq!(std::mem::size_of::<BodyUniform>(), 80);
@@ -1145,10 +1113,9 @@ mod tests {
         assert_eq!(p.polytope_size, 1.0);
     }
 
-    /// Default body is inert (`kind = Invalid`) so an unused slot
-    /// in `Hyperslice4DUniforms::bodies` can't accidentally render.
-    /// Also pins the identity-rotor initialization so a future
-    /// refactor that zeros the whole rotor array is caught.
+    /// Default body is inert (`kind = Invalid`) so an unused slot in
+    /// `Hyperslice4DUniforms::bodies` can't accidentally render. Also pins the identity-rotor
+    /// initialization so a future refactor that zeros the whole rotor array is caught.
     #[test]
     fn default_body_is_inert_invalid_kind() {
         let b = BodyUniform::default();
@@ -1156,12 +1123,10 @@ mod tests {
         assert_eq!(b.rotor, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
-    /// Naga-validate the full kernel concatenated with a minimal
-    /// Naga parse + validate the kernel against a minimal scene stub.
-    /// Catches WGSL syntax / type / binding errors the string-presence
-    /// tests can't see. Stub mirrors `Scene4::to_hyperslice_wgsl`'s
-    /// contract minimally: kind constants, `rye_scene_at`,
-    /// `rye_scene_sdf`, `rye_scene_max_t`.
+    /// Naga-validate the full kernel concatenated with a minimal Naga parse + validate the kernel
+    /// against a minimal scene stub. Catches WGSL syntax / type / binding errors the
+    /// string-presence tests can't see. Stub mirrors `Scene4::to_hyperslice_wgsl`'s contract
+    /// minimally: kind constants, `rye_scene_at`, `rye_scene_sdf`, `rye_scene_max_t`.
     #[test]
     fn kernel_validates_with_minimal_scene() {
         const SCENE_STUB: &str = r#"
@@ -1179,9 +1144,9 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
     return 1.0e9;
 }
 "#;
-        // The kernel's body_polytope_sdf_4d dispatch references
-        // cell120_sdf_local and cell600_sdf_local, defined in the
-        // polytope_data emit. Append it so naga validation succeeds.
+        // The kernel's body_polytope_sdf_4d dispatch references cell120_sdf_local and
+        // cell600_sdf_local, defined in the polytope_data emit. Append it so naga validation
+        // succeeds.
         let polytope = super::super::polytope_data::polytope_extended_sdfs_wgsl();
         let source = format!("{HYPERSLICE_KERNEL_WGSL}\n{polytope}\n{SCENE_STUB}");
         let module = naga::front::wgsl::parse_str(&source)
@@ -1193,11 +1158,10 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
             .expect("hyperslice4d kernel + scene stub should validate");
     }
 
-    /// Take a real `Scene4` (union of hyperspheres + halfspace),
-    /// emit its hyperslice WGSL, splice against the kernel, and
-    /// validate via naga. Catches drift between
-    /// `Scene4::to_hyperslice_wgsl` and the kernel's expectations
-    /// at the `rye_scene_sdf` / `rye_scene_at` boundary.
+    /// Take a real `Scene4` (union of hyperspheres + halfspace), emit its hyperslice WGSL, splice
+    /// against the kernel, and validate via naga. Catches drift between
+    /// `Scene4::to_hyperslice_wgsl` and the kernel's expectations at the `rye_scene_sdf` /
+    /// `rye_scene_at` boundary.
     #[test]
     fn kernel_validates_with_real_scene_union() {
         use glam::Vec4;
@@ -1221,11 +1185,10 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
             .expect("hyperslice4d kernel + Scene4 emit should validate");
     }
 
-    /// `BODY_KIND_INVALID` must not appear in either dispatch chain.
-    /// The whole point of the sentinel is that no branch matches it,
-    /// so the SDF accumulator passes through unchanged. If a future
-    /// edit adds a comparison against `BODY_KIND_INVALID` (in either
-    /// operand order), the "inert default" guarantee is broken.
+    /// `BODY_KIND_INVALID` must not appear in either dispatch chain. The whole point of the
+    /// sentinel is that no branch matches it, so the SDF accumulator passes through unchanged. If
+    /// a future edit adds a comparison against `BODY_KIND_INVALID` (in either operand order),
+    /// the "inert default" guarantee is broken.
     #[test]
     fn invalid_kind_has_no_kernel_dispatch_branch() {
         for forbidden in ["kind == BODY_KIND_INVALID", "BODY_KIND_INVALID == kind"] {
@@ -1239,20 +1202,19 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
 
     // ---- Polytope SDF parity (CPU port vs WGSL formula) -----------------
     //
-    // Each `*_sdf_local_cpu` here is a 1:1 port of the matching WGSL
-    // function in `HYPERSLICE_KERNEL_WGSL`. The parity tests below
-    // assert the *geometry* the SDF is meant to represent (vertex
-    // positions, inradius, sign at sample points), so a port that
-    // silently diverges from the WGSL fails the test even though the
-    // CPU<->WGSL formulas are textually parallel.
+    // Each `*_sdf_local_cpu` here is a 1:1 port of the matching WGSL function in
+    // `HYPERSLICE_KERNEL_WGSL`. The parity tests below assert the *geometry* the SDF is meant to
+    // represent (vertex positions, inradius, sign at sample points), so a port that
+    // silently diverges from the WGSL fails the test even though the CPU<->WGSL formulas
+    // are textually parallel.
 
     use glam::Vec4;
 
     fn pentatope_sdf_local_cpu(p: Vec4) -> f32 {
         // Mirror of `pentatope_sdf_local` in HYPERSLICE_KERNEL_WGSL.
-        // t = sqrt(15) / (4 * sqrt(3)) = sqrt(5) / 4. WGSL stores the
-        // 11-digit truncation 0.55901699437; the CPU side reconstructs
-        // from the closed form so float precision is f32-clean.
+        // t = sqrt(15) / (4 * sqrt(3)) = sqrt(5) / 4. WGSL stores the 11-digit truncation
+        // 0.55901699437; the CPU side reconstructs from the closed form so float precision is
+        // f32-clean.
         let t = 5.0_f32.sqrt() * 0.25;
         let r = 0.25_f32;
         let normals = [
@@ -1281,9 +1243,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
     }
 
     fn cell24_sdf_local_cpu(p: Vec4) -> f32 {
-        // WGSL stores 8-digit truncations (0.70710678 and 1.41421356);
-        // the CPU side uses the standard library constants for
-        // f32-clean values. Tolerance in the test absorbs the
+        // WGSL stores 8-digit truncations (0.70710678 and 1.41421356); the CPU side uses the
+        // standard library constants for f32-clean values. Tolerance in the test absorbs the
         // CPU-vs-WGSL precision delta.
         let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
         let sqrt2 = std::f32::consts::SQRT_2;
@@ -1296,8 +1257,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
     // ---- Inline vertex generators (mirror rye_physics::euclidean_r4) ----
 
     fn pentatope_vertices() -> Vec<Vec4> {
-        // Apex plus regular tetrahedron in the w = -1/4 hyperplane;
-        // matches `rye_physics::euclidean_r4::pentatope_vertices(1.0)`.
+        // Apex plus regular tetrahedron in the w = -1/4 hyperplane; matches
+        // `rye_physics::euclidean_r4::pentatope_vertices(1.0)`.
         let base_w = -0.25_f32;
         let base_r = 15.0_f32.sqrt() / 4.0;
         let t = base_r / 3.0_f32.sqrt();
@@ -1356,9 +1317,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         v
     }
 
-    /// Shared parity assertions: every vertex on the surface, origin
-    /// at -inradius, scaled-out point clearly outside, scaled-in point
-    /// clearly inside.
+    /// Shared parity assertions: every vertex on the surface, origin at -inradius, scaled-out
+    /// point clearly outside, scaled-in point clearly inside.
     fn assert_polytope_geometry(
         name: &str,
         sdf: impl Fn(Vec4) -> f32,
@@ -1395,16 +1355,15 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
 
     #[test]
     fn pentatope_cpu_port_matches_geometry() {
-        // Inradius for an n-simplex at unit circumradius is R/n; for
-        // the pentatope (n=4) that's 0.25.
+        // Inradius for an n-simplex at unit circumradius is R/n; for the pentatope (n=4) that's
+        // 0.25.
         assert_polytope_geometry(
             "pentatope",
             pentatope_sdf_local_cpu,
             &pentatope_vertices(),
             0.25,
-            // Pentatope normals carry sqrt(15)/(4 sqrt(3)) ~ 0.559;
-            // truncated to 11 digits in the WGSL constant. Per-vertex
-            // residual is dominated by that truncation, ~5e-7 in
+            // Pentatope normals carry sqrt(15)/(4 sqrt(3)) ~ 0.559; truncated to 11 digits in
+            // the WGSL constant. Per-vertex residual is dominated by that truncation, ~5e-7 in
             // measurement.
             5e-6,
         );
@@ -1412,23 +1371,23 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
 
     #[test]
     fn tesseract_cpu_port_matches_geometry() {
-        // Tesseract at circumradius 1 has half-edge a = 0.5;
-        // inradius (perpendicular distance to a cubic cell) = 0.5.
+        // Tesseract at circumradius 1 has half-edge a = 0.5; inradius (perpendicular distance to a
+        // cubic cell) = 0.5.
         assert_polytope_geometry(
             "tesseract",
             tesseract_sdf_local_cpu,
             &tesseract_vertices(),
             0.5,
-            // Tesseract SDF is built from `abs` and `min`/`max`; the
-            // vertex residual is bit-exact for the half-extent 0.5.
+            // Tesseract SDF is built from `abs` and `min`/`max`; the vertex residual is bit-exact
+            // for the half-extent 0.5.
             1e-7,
         );
     }
 
     #[test]
     fn cell16_cpu_port_matches_geometry() {
-        // 16-cell at circumradius 1: faces are (+/-, +/-, +/-, +/-)/2
-        // hyperplanes at perpendicular distance 0.5.
+        // 16-cell at circumradius 1: faces are (+/-, +/-, +/-, +/-)/2 hyperplanes at
+        // perpendicular distance 0.5.
         assert_polytope_geometry(
             "16-cell",
             cell16_sdf_local_cpu,
@@ -1440,25 +1399,22 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
 
     #[test]
     fn cell24_cpu_port_matches_geometry() {
-        // 24-cell vertices land at distance 1 from the origin (set by
-        // construction). Inradius is 1/sqrt(2) ~ 0.7071: the
-        // intersection of tesseract(1/sqrt(2)) and 16-cell(sqrt(2))
+        // 24-cell vertices land at distance 1 from the origin (set by construction). Inradius is
+        // 1/sqrt(2) ~ 0.7071: the intersection of tesseract(1/sqrt(2)) and 16-cell(sqrt(2))
         // yields equidistant faces at that radius.
         assert_polytope_geometry(
             "24-cell",
             cell24_sdf_local_cpu,
             &cell24_vertices(),
             std::f32::consts::FRAC_1_SQRT_2,
-            // CPU port uses f32 standard-library consts; WGSL ships
-            // 8-digit truncations of the same values. The vertex
-            // residual is dominated by that delta.
+            // CPU port uses f32 standard-library consts; WGSL ships 8-digit truncations of the
+            // same values. The vertex residual is dominated by that delta.
             5e-7,
         );
     }
 
-    /// The CPU SDF ports above must remain textual mirrors of the
-    /// WGSL formulas. This guards against drift by re-checking the
-    /// load-bearing literals appear in the kernel source.
+    /// The CPU SDF ports above must remain textual mirrors of the WGSL formulas. This guards
+    /// against drift by re-checking the load-bearing literals appear in the kernel source.
     #[test]
     fn polytope_sdf_constants_match_kernel_source() {
         // Pentatope: t = 0.55901699437 and r = 0.25.
@@ -1468,10 +1424,9 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         assert!(HYPERSLICE_KERNEL_WGSL.contains("1.41421356"));
     }
 
-    /// `polytope_with_rotor` must produce the same uniform bytes as
-    /// `polytope` when the latter is fed the canonical `[f32; 8]`
-    /// packing of the same `Rotor4`. Catches a future drift where
-    /// either side reorders the rotor fields without the other.
+    /// `polytope_with_rotor` must produce the same uniform bytes as `polytope` when the latter
+    /// is fed the canonical `[f32; 8]` packing of the same `Rotor4`. Catches a future drift
+    /// where either side reorders the rotor fields without the other.
     #[test]
     fn polytope_with_rotor_matches_manual_packing() {
         let rotor = Rotor4 {
@@ -1501,9 +1456,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         assert_eq!(bytemuck::bytes_of(&manual), bytemuck::bytes_of(&helper));
     }
 
-    /// `BodyUniform::polytope(shape_index, ..)` writes the same numeric
-    /// table the kernel branches on. Catches the failure mode where one
-    /// side renumbers without the other.
+    /// `BodyUniform::polytope(shape_index, ..)` writes the same numeric table the kernel branches
+    /// on. Catches the failure mode where one side renumbers without the other.
     #[test]
     fn shape_constants_mirror_kernel_table() {
         for (rust_const, wgsl_decl) in [
@@ -1529,8 +1483,7 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
     }
 
     // ---- CPU port of the hyperslice marcher -----------------------------
-    // 1:1 mirror of `fs_main`'s sphere-trace loop. Constants must
-    // match the kernel.
+    // 1:1 mirror of `fs_main`'s sphere-trace loop. Constants must match the kernel.
 
     use glam::Vec3;
 
@@ -1567,8 +1520,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         None
     }
 
-    /// Test scene: three hyperspheres at `w = 0` plus a `y = 0` floor.
-    /// All hits attribute to static scene (`body_idx = MAX_BODIES`).
+    /// Test scene: three hyperspheres at `w = 0` plus a `y = 0` floor. All hits attribute to
+    /// static scene (`body_idx = MAX_BODIES`).
     fn overlapping_sdfs_scene(p: Vec3, w_slice: f32) -> (f32, u32) {
         use glam::Vec4;
         let p4 = Vec4::new(p.x, p.y, p.z, w_slice);
@@ -1584,9 +1537,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
     }
 
     // ---- Integration tests against the CPU port -------------------------
-    // Exercise step calculus + SDF composition + hit attribution
-    // against the test scene. Each test pins one geometric property of
-    // the issue #17 fix.
+    // Exercise step calculus + SDF composition + hit attribution against the test scene. Each test
+    // pins one geometric property of the issue #17 fix.
 
     /// Ray straight down through solo sphere centre hits its top.
     #[test]
@@ -1596,9 +1548,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         let hit = march_hyperslice_cpu(ro, rd, |p| overlapping_sdfs_scene(p, 0.0))
             .expect("ray pointing at solo sphere should hit something");
         assert_eq!(hit.body_idx, MAX_BODIES as u32, "static-scene hit");
-        // Solo sphere at (0, 1, 1.5) r=1; top at y=2.0. Hit registers
-        // when SDF < hit_eps = 0.001; under-step factor + min_step
-        // bound the residual at < 5e-3.
+        // Solo sphere at (0, 1, 1.5) r=1; top at y=2.0. Hit registers when SDF < hit_eps =
+        // 0.001; under-step factor + min_step bound the residual at < 5e-3.
         assert!(
             (hit.hit_pos.y - 2.0).abs() < 5e-3,
             "hit y {} should be near 2.0 (sphere top)",
@@ -1606,9 +1557,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         );
     }
 
-    /// Ray straight down between spheres hits floor at y ≈ 0. Pins
-    /// the no-dimple property: `min(spheres, floor)` returns the
-    /// floor's distance when no sphere covers the path.
+    /// Ray straight down between spheres hits floor at y ≈ 0. Pins the no-dimple property:
+    /// `min(spheres, floor)` returns the floor's distance when no sphere covers the path.
     #[test]
     fn cpu_march_hits_floor_in_gap_between_spheres() {
         let ro = Vec3::new(0.0, 5.0, -3.5);
@@ -1624,9 +1574,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         );
     }
 
-    /// Ray at the twin-pair overlap (x=0, z=-1.5) hits a sphere top,
-    /// not the floor. Pins `min(sphere_l, sphere_r, floor)` at a point
-    /// where both sphere SDFs are small.
+    /// Ray at the twin-pair overlap (x=0, z=-1.5) hits a sphere top, not the floor. Pins
+    /// `min(sphere_l, sphere_r, floor)` at a point where both sphere SDFs are small.
     #[test]
     fn cpu_march_hits_twin_overlap_top_not_floor() {
         let ro = Vec3::new(0.0, 5.0, -1.5);
@@ -1634,10 +1583,9 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         let hit = march_hyperslice_cpu(ro, rd, |p| overlapping_sdfs_scene(p, 0.0))
             .expect("ray pointing at twin overlap should hit");
         assert_eq!(hit.body_idx, MAX_BODIES as u32);
-        // Twin spheres at (+/-0.6, 0.7, -1.5) r=0.7. At x=z=-1.5, the
-        // intersection of the twin tops along the y-axis is at y where
-        // both spheres touch: solving (0.6)^2 + (y-0.7)^2 = 0.7^2 gives
-        // (y-0.7)^2 = 0.13, y ≈ 0.7 + 0.36 = 1.06 (the twin-saddle top).
+        // Twin spheres at (+/-0.6, 0.7, -1.5) r=0.7. At x=z=-1.5, the intersection of the twin
+        // tops along the y-axis is at y where both spheres touch: solving (0.6)^2 + (y-0.7)^2
+        // = 0.7^2 gives (y-0.7)^2 = 0.13, y ≈ 0.7 + 0.36 = 1.06 (the twin-saddle top).
         // Hit must be above the floor by clearly more than hit_eps.
         assert!(
             hit.hit_pos.y > 0.5,
@@ -1646,8 +1594,8 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         );
     }
 
-    /// Shallow ray with clear path to floor converges within budget.
-    /// Pins the iteration-cap fix (192 -> 384).
+    /// Shallow ray with clear path to floor converges within budget. Pins the iteration-cap fix
+    /// (192 -> 384).
     #[test]
     fn cpu_march_converges_on_shallow_ray_to_floor() {
         let ro = Vec3::new(0.0, 2.5, 5.0);
@@ -1658,8 +1606,7 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
         assert!(hit.hit_pos.y.abs() < 5e-3);
     }
 
-    /// Ray straight up into empty sky misses. Pins the iter-cap and
-    /// `max_t` exit paths.
+    /// Ray straight up into empty sky misses. Pins the iter-cap and `max_t` exit paths.
     #[test]
     fn cpu_march_misses_into_empty_sky() {
         let ro = Vec3::new(0.0, 5.0, 0.0);

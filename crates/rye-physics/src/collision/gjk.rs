@@ -1,36 +1,30 @@
 //! GJK containment test for convex shapes.
 //!
 //! The algorithm, briefly:
-//! - The *Minkowski difference* `A ⊖ B = { a − b : a ∈ A, b ∈ B }`
-//!   contains the origin if and only if `A ∩ B` is non-empty. GJK tests
-//!   exactly this origin-containment property.
-//! - A *support function* `s(d)` returns the point of the shape farthest
-//!   along direction `d`. The Minkowski difference has an easy support:
-//!   `s_{A⊖B}(d) = s_A(d) − s_B(−d)`.
-//! - GJK maintains a simplex of such support points inside `A ⊖ B` and
-//!   iteratively refines it, always moving toward the origin, until it
-//!   either encloses the origin (-> intersection) or finds a direction
-//!   where no new support point makes progress (-> separation).
+//! - The *Minkowski difference* `A ⊖ B = { a − b : a ∈ A, b ∈ B }` contains the origin if and
+//!   only if `A ∩ B` is non-empty. GJK tests exactly this origin-containment property.
+//! - A *support function* `s(d)` returns the point of the shape farthest along direction `d`.
+//!   The Minkowski difference has an easy support: `s_{A⊖B}(d) = s_A(d) − s_B(−d)`.
+//! - GJK maintains a simplex of such support points inside `A ⊖ B` and iteratively refines it,
+//!   always moving toward the origin, until it either encloses the origin (-> intersection) or
+//!   finds a direction where no new support point makes progress (-> separation).
 //!
-//! This module is the 3D specialization: a simplex can be at most a
-//! tetrahedron (4 points). The Voronoi-region logic for the
-//! line -> triangle -> tetrahedron cases is hand-written. The support-
-//! function side is generic over `VectorOps`, so when 4D lands,
-//! only the simplex-case logic needs a 4D cousin (pentachoron = 5
-//! points); the support-function path, the iteration loop, and all
-//! the numerics are shared.
+//! This module is the 3D specialization: a simplex can be at most a tetrahedron (4 points). The
+//! Voronoi-region logic for the line -> triangle -> tetrahedron cases is hand-written. The
+//! support-function side is generic over `VectorOps`, so when 4D lands, only the simplex-case
+//! logic needs a 4D cousin (pentachoron = 5 points); the support-function path, the iteration
+//! loop, and all the numerics are shared.
 
 use glam::Vec3;
 
-/// Shape-side abstraction GJK operates on: a function from direction
-/// to the farthest-point of the shape in world coordinates.
+/// Shape-side abstraction GJK operates on: a function from direction to the farthest point of
+/// the shape in world coordinates.
 pub trait SupportFn {
     fn support(&self, direction: Vec3) -> Vec3;
 }
 
-/// Convex hull of a finite vertex set in world coordinates. Used as
-/// the concrete support for polytope colliders (caller transforms
-/// vertices to world space before constructing).
+/// Convex hull of a finite vertex set in world coordinates. Used as the concrete support for
+/// polytope colliders (caller transforms vertices to world space before constructing).
 pub struct ConvexHull<'a> {
     pub vertices: &'a [Vec3],
 }
@@ -63,10 +57,9 @@ impl SupportFn for Sphere {
     }
 }
 
-/// Support point on the Minkowski difference `A ⊖ B` along `d`,
-/// along with the contributing points on each original shape. The
-/// originating points are cached because EPA later needs them to
-/// reconstruct contact positions on the original shapes.
+/// Support point on the Minkowski difference `A ⊖ B` along `d`, along with the contributing
+/// points on each original shape. The originating points are cached because EPA later needs them
+/// to reconstruct contact positions on the original shapes.
 #[derive(Clone, Copy, Debug)]
 pub struct MinkowskiPoint {
     pub point: Vec3,
@@ -88,10 +81,9 @@ pub fn minkowski_support<A: SupportFn, B: SupportFn>(
     }
 }
 
-/// Result of [`gjk_intersect`]. Either the shapes overlap (with the
-/// final tetrahedron simplex, handed to EPA for penetration depth),
-/// or they don't (with the last search direction, useful for closest-
-/// point queries but currently unused downstream).
+/// Result of [`gjk_intersect`]. Either the shapes overlap (with the final tetrahedron simplex,
+/// handed to EPA for penetration depth), or they don't (with the last search direction, useful
+/// for closest-point queries but currently unused downstream).
 #[derive(Debug)]
 pub enum GjkResult {
     Intersecting { simplex: [MinkowskiPoint; 4] },
@@ -101,17 +93,15 @@ pub enum GjkResult {
 const GJK_MAX_ITERATIONS: u32 = 32;
 const GJK_EPS: f32 = 1e-6;
 
-/// Test whether shapes `a` and `b` overlap. Returns the final enclosing
-/// tetrahedron simplex on intersection for EPA, or `Separated` when a
-/// separating direction is found.
+/// Test whether shapes `a` and `b` overlap. Returns the final enclosing tetrahedron simplex on
+/// intersection for EPA, or `Separated` when a separating direction is found.
 pub fn gjk_intersect<A: SupportFn, B: SupportFn>(
     a: &A,
     b: &B,
     initial_direction: Vec3,
 ) -> GjkResult {
-    // First support point, seeded with the caller's initial direction
-    // (typically `b.center − a.center`). If that vector is zero we fall
-    // back to `+x`.
+    // First support point, seeded with the caller's initial direction (typically
+    // `b.center − a.center`). If that vector is zero we fall back to `+x`.
     let mut dir = if initial_direction.length_squared() > GJK_EPS {
         initial_direction
     } else {
@@ -123,15 +113,15 @@ pub fn gjk_intersect<A: SupportFn, B: SupportFn>(
         sa: Vec3::ZERO,
         sb: Vec3::ZERO,
     }; 4];
-    // Seed the simplex with the first support and start searching from
-    // the side of that point opposite the origin.
+    // Seed the simplex with the first support and start searching from the side of that point
+    // opposite the origin.
     simplex[0] = minkowski_support(a, b, dir);
     let mut n = 1usize;
     dir = -simplex[0].point;
 
     for _ in 0..GJK_MAX_ITERATIONS {
-        // Reject if the new support doesn't cross the origin, the
-        // shapes are fully separated along `dir`.
+        // Reject if the new support doesn't cross the origin, the shapes are fully separated
+        // along `dir`.
         let new_point = minkowski_support(a, b, dir);
         if new_point.point.dot(dir) < 0.0 {
             return GjkResult::Separated;
@@ -146,12 +136,10 @@ pub fn gjk_intersect<A: SupportFn, B: SupportFn>(
             return GjkResult::Intersecting { simplex };
         }
         if new_dir.length_squared() < GJK_EPS {
-            // Degenerate: origin sits on a boundary face / edge, or
-            // the simplex collapsed. Only return Intersecting if we
-            // have a full 4-point tetrahedron, EPA can't operate on
-            // anything less. Otherwise report Separated; missing a
-            // grazing touch is much safer than crashing EPA with a
-            // degenerate simplex.
+            // Degenerate: origin sits on a boundary face/edge, or the simplex collapsed. Only
+            // return Intersecting if we have a full 4-point tetrahedron — EPA can't operate on
+            // anything less. Otherwise report Separated; missing a grazing touch is much safer
+            // than crashing EPA with a degenerate simplex.
             if n >= 4 {
                 return GjkResult::Intersecting { simplex };
             }
@@ -160,22 +148,19 @@ pub fn gjk_intersect<A: SupportFn, B: SupportFn>(
         dir = new_dir;
     }
 
-    // Iteration cap hit without convergence. This is almost always
-    // numerical thrashing at a tangent boundary; the simplex probably
-    // doesn't genuinely enclose the origin. Report Separated, better
-    // to lose a marginal contact than to feed EPA a bad tetrahedron.
+    // Iteration cap hit without convergence. This is almost always numerical thrashing at a
+    // tangent boundary; the simplex probably doesn't genuinely enclose the origin. Report
+    // Separated — better to lose a marginal contact than to feed EPA a bad tetrahedron.
     GjkResult::Separated
 }
 
-/// Voronoi-region simplex logic. Reduces the simplex to the feature
-/// (vertex / edge / face / volume) closest to the origin and returns a
-/// new search direction pointing *from that feature toward the
-/// origin*. Also returns `true` if the simplex encloses the origin
-/// (only possible with 4 points in 3D).
+/// Voronoi-region simplex logic. Reduces the simplex to the feature (vertex / edge / face /
+/// volume) closest to the origin and returns a new search direction pointing *from that feature
+/// toward the origin*. Also returns `true` if the simplex encloses the origin (only possible
+/// with 4 points in 3D).
 ///
-/// On entry `simplex[0..n]` holds `n` points with the most recently
-/// added at index `n-1`. On exit `simplex[0..new_n]` holds the
-/// surviving points.
+/// On entry `simplex[0..n]` holds `n` points with the most recently added at index `n-1`. On
+/// exit `simplex[0..new_n]` holds the surviving points.
 fn do_simplex(simplex: &mut [MinkowskiPoint; 4], n: usize) -> (bool, usize, Vec3) {
     match n {
         2 => do_line(simplex),
@@ -185,9 +170,8 @@ fn do_simplex(simplex: &mut [MinkowskiPoint; 4], n: usize) -> (bool, usize, Vec3
     }
 }
 
-/// Line case: simplex is [b, a] with `a` most recent. Decide whether
-/// origin is in the AB edge region or past A (past B is impossible
-/// because `a` was chosen along `-b`).
+/// Line case: simplex is [b, a] with `a` most recent. Decide whether origin is in the AB edge
+/// region or past A (past B is impossible because `a` was chosen along `-b`).
 fn do_line(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
     let a = simplex[1].point;
     let b = simplex[0].point;
@@ -195,16 +179,13 @@ fn do_line(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
     let ao = -a;
 
     if ab.dot(ao) > 0.0 {
-        // Origin is between A and B (or past B, but that's ruled out
-        // by how `a` was produced). Next search direction is
-        // perpendicular to AB, pointing toward origin.
+        // Origin is between A and B (or past B, but that's ruled out by how `a` was produced).
+        // Next search direction is perpendicular to AB, pointing toward origin.
         let dir = triple_product(ab, ao, ab);
         if dir.length_squared() < 1e-10 {
-            // Degenerate: origin lies on the line A-B. Pick any vector
-            // perpendicular to AB and recurse along that; the next
-            // support will either exit the line (and grow the simplex
-            // to a triangle) or confirm containment along a different
-            // axis.
+            // Degenerate: origin lies on the line A-B. Pick any vector perpendicular to AB and
+            // recurse along that; the next support will either exit the line (and grow the
+            // simplex to a triangle) or confirm containment along a different axis.
             (false, 2, any_perpendicular(ab))
         } else {
             (false, 2, dir)
@@ -216,9 +197,8 @@ fn do_line(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
     }
 }
 
-/// An arbitrary unit-ish vector perpendicular to `v`. Used to escape
-/// collinear degeneracies in GJK. The axis chosen depends on `v`'s
-/// dominant component to avoid near-zero cross products.
+/// An arbitrary unit-ish vector perpendicular to `v`. Used to escape collinear degeneracies in
+/// GJK. The axis chosen depends on `v`'s dominant component to avoid near-zero cross products.
 fn any_perpendicular(v: Vec3) -> Vec3 {
     // Cross with whichever cardinal axis `v` is *least* aligned with.
     if v.x.abs() <= v.y.abs() && v.x.abs() <= v.z.abs() {
@@ -230,18 +210,17 @@ fn any_perpendicular(v: Vec3) -> Vec3 {
     }
 }
 
-/// Discard C from a triangle simplex, keep A and B, recurse into the
-/// line case on `[B, A]`. Extracted so `do_triangle` can call it in
-/// multiple branches without nested-fn scope issues.
+/// Discard C from a triangle simplex, keep A and B, recurse into the line case on `[B, A]`.
+/// Extracted so `do_triangle` can call it in multiple branches without nested-fn scope issues.
 fn fall_back_to_ab(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
     simplex[0] = simplex[1];
     simplex[1] = simplex[2];
     do_line(simplex)
 }
 
-/// Triangle case: [c, b, a] with `a` most recent. Determine whether
-/// origin is in a vertex region, an edge region, or the triangle's
-/// Voronoi face region (above or below the triangle plane).
+/// Triangle case: [c, b, a] with `a` most recent. Determine whether origin is in a vertex
+/// region, an edge region, or the triangle's Voronoi face region (above or below the triangle
+/// plane).
 fn do_triangle(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
     let a = simplex[2].point;
     let b = simplex[1].point;
@@ -270,29 +249,25 @@ fn do_triangle(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
 
     // Above or below the triangle.
     if abc.dot(ao) > 0.0 {
-        // Origin is on the "abc" side, keep winding [c, b, a],
-        // search normal is +abc.
+        // Origin is on the "abc" side, keep winding [c, b, a], search normal is +abc.
         (false, 3, abc)
     } else {
-        // Origin is on the other side, flip winding by swapping b
-        // and c, search normal is -abc.
+        // Origin is on the other side, flip winding by swapping b and c, search normal is -abc.
         simplex.swap(0, 1);
         (false, 3, -abc)
     }
 }
 
-/// Tetrahedron case: [d, c, b, a] with `a` most recent. Either the
-/// origin is inside (intersection!) or it lies in the Voronoi region
-/// of one of the three faces adjacent to `a` (ABC / ACD / ADB).
+/// Tetrahedron case: [d, c, b, a] with `a` most recent. Either the origin is inside
+/// (intersection!) or it lies in the Voronoi region of one of the three faces adjacent to `a`
+/// (ABC / ACD / ADB).
 ///
-/// Textbook formulations of this step assume the simplex winding is
-/// such that the bare cross products `ab×ac`, `ac×ad`, `ad×ab` are
-/// already outward normals. That assumption doesn't hold for every
-/// path through `do_triangle` (specifically the swap branch produces
-/// an inverted winding). Rather than patch the winding invariant
-/// everywhere, we explicitly orient each face normal using the
-/// opposite vertex of the tetrahedron, pointing away from that
-/// vertex is always outward.
+/// Textbook formulations of this step assume the simplex winding is such that the bare cross
+/// products `ab×ac`, `ac×ad`, `ad×ab` are already outward normals. That assumption doesn't hold
+/// for every path through `do_triangle` (specifically the swap branch produces an inverted
+/// winding). Rather than patch the winding invariant everywhere, we explicitly orient each face
+/// normal using the opposite vertex of the tetrahedron; pointing away from that vertex is always
+/// outward.
 fn do_tetrahedron(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
     let a = simplex[3].point;
     let b = simplex[2].point;
@@ -341,16 +316,14 @@ fn do_tetrahedron(simplex: &mut [MinkowskiPoint; 4]) -> (bool, usize, Vec3) {
         return do_triangle(simplex);
     }
 
-    // Origin is on the inward side of all three adjacent faces
-    // (opposite-d face is implicitly the 4th face; origin's being
-    // inside the tetrahedron is exactly these three checks).
+    // Origin is on the inward side of all three adjacent faces (opposite-d face is implicitly
+    // the 4th face; origin's being inside the tetrahedron is exactly these three checks).
     (true, 4, Vec3::ZERO)
 }
 
-/// Vector triple product `(a × b) × c`, appears repeatedly in the
-/// edge-region search direction formulas. In 3D this simplifies to
-/// `b·(a·c) − a·(b·c)` (the "BAC-CAB" identity) but the direct form
-/// reads more clearly here.
+/// Vector triple product `(a × b) × c`, appears repeatedly in the edge-region search direction
+/// formulas. In 3D this simplifies to `b·(a·c) − a·(b·c)` (the "BAC-CAB" identity) but the
+/// direct form reads more clearly here.
 fn triple_product(a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     a.cross(b).cross(c)
 }
@@ -400,8 +373,8 @@ mod tests {
 
     #[test]
     fn touching_boxes_report_intersection() {
-        // Boundaries exactly meeting count as intersecting (GJK finds
-        // the origin on the boundary of the Minkowski difference).
+        // Boundaries exactly meeting count as intersecting (GJK finds the origin on the boundary
+        // of the Minkowski difference).
         let va = box_vertices(Vec3::ZERO, Vec3::ONE);
         let vb = box_vertices(Vec3::new(2.0, 0.0, 0.0), Vec3::ONE);
         let a = ConvexHull { vertices: &va };
@@ -452,9 +425,8 @@ mod tests {
 
     #[test]
     fn box_vs_sphere_corner_contact() {
-        // Unit box with corner at (1,1,1). Sphere at (1+d, 1+d, 1+d)
-        // reaches the corner when d·√3 ≤ r, i.e. d ≤ r/√3.
-        // For r=0.5: threshold d ≈ 0.2887.
+        // Unit box with corner at (1,1,1). Sphere at (1+d, 1+d, 1+d) reaches the corner when
+        // d·√3 ≤ r, i.e. d ≤ r/√3. For r=0.5: threshold d ≈ 0.2887.
         //   d = 0.35 -> distance 0.606 > 0.5 -> no overlap
         //   d = 0.20 -> distance 0.346 < 0.5 -> overlap
         let vb = box_vertices(Vec3::ZERO, Vec3::ONE);
@@ -481,10 +453,9 @@ mod tests {
 
     #[test]
     fn rotated_boxes_separate_as_axes_allow() {
-        // Two unit boxes, one rotated 45° about Z. Axis-aligned box
-        // extends x∈[-1,1]; the diamond (rotated box) has x-extent of
-        // ±√2 ≈ ±1.414. At centre distance 2.5 they separate; at 2.2
-        // they barely overlap.
+        // Two unit boxes, one rotated 45° about Z. Axis-aligned box extends x∈[-1,1]; the
+        // diamond (rotated box) has x-extent of ±√2 ≈ ±1.414. At centre distance 2.5 they
+        // separate; at 2.2 they barely overlap.
         use glam::Quat;
         let va = box_vertices(Vec3::ZERO, Vec3::ONE);
         let rot = Quat::from_rotation_z(std::f32::consts::FRAC_PI_4);

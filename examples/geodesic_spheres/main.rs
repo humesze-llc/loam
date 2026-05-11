@@ -87,6 +87,7 @@ impl<S: SphereKnobs> App for SpheresApp<S> {
             &ctx.rd.device,
             ctx.rd.surface_bundle.config.format,
             ctx.shader_db.module(shader_id),
+            ctx.rd.sample_count(),
         );
 
         if let Some(watcher) = ctx.watcher.as_mut() {
@@ -147,6 +148,7 @@ impl<S: SphereKnobs> App for SpheresApp<S> {
                 &ctx.rd.device,
                 ctx.rd.surface_bundle.config.format,
                 ctx.shader_db.module(self.shader_id),
+                ctx.rd.sample_count(),
             );
         }
     }
