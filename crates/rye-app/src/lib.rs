@@ -418,6 +418,7 @@ fn capture_consume(
     rd: &RenderDevice,
     texture: &wgpu::Texture,
     is_pre: bool,
+    captured_at: Instant,
 ) {
     let img = match capture::read_texture_rgba(
         &rd.device,
@@ -433,7 +434,7 @@ fn capture_consume(
             return;
         }
     };
-    if let Err(e) = capture.consume_frame(is_pre, img.rgba, img.width, img.height) {
+    if let Err(e) = capture.consume_frame(is_pre, img.rgba, img.width, img.height, captured_at) {
         tracing::error!("capture: write failed: {e:#}");
     }
 }
@@ -759,7 +760,7 @@ impl<A: App> Runner<A> {
                              set RunConfig::msaa_samples = 1 for diagnostic capture"
                         );
                     } else {
-                        capture_consume(&mut self.capture, rd, &frame.texture, true);
+                        capture_consume(&mut self.capture, rd, &frame.texture, true, capture_now);
                     }
                 }
 
@@ -786,7 +787,7 @@ impl<A: App> Runner<A> {
                 // Post-egui capture tap. Always valid: swapchain has final composite.
                 #[cfg(feature = "capture")]
                 if do_capture && self.capture.wants_post() {
-                    capture_consume(&mut self.capture, rd, &frame.texture, false);
+                    capture_consume(&mut self.capture, rd, &frame.texture, false, capture_now);
                 }
                 #[cfg(feature = "capture")]
                 if do_capture {

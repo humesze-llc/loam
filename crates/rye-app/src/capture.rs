@@ -246,8 +246,9 @@ enum SequenceWriter {
     Gif {
         worker: GifWorker,
         path: PathBuf,
-        /// Pre-computed delay in centiseconds, from the sequence's target fps.
-        delay_cs: u16,
+        /// Delay for the first frame, in centiseconds. Subsequent frames use
+        /// wall-clock-derived delays (see `GifFrame::captured_at`).
+        default_delay_cs: u16,
         /// Optional output width in pixels. Lanczos3 resample on the worker thread
         /// before NeuQuant; aspect ratio preserved.
         scale: Option<u32>,
@@ -269,7 +270,16 @@ struct GifFrame {
     rgba: Vec<u8>,
     src_width: u32,
     src_height: u32,
-    delay_cs: u16,
+    /// Wall-clock time when this frame was captured. The worker computes each
+    /// frame's GIF delay as `captured_at - last_encoded_captured_at`, so when
+    /// frames are dropped under backpressure the next encoded frame gets a
+    /// proportionally longer delay and total playback duration matches recording
+    /// duration. Constant-delay encoding (the previous behavior) caused dropped
+    /// frames to compress wall time, producing visibly fast playback.
+    captured_at: Instant,
+    /// Fallback delay for the very first frame (no previous timestamp to diff
+    /// against). Derived from the user's target fps at sequence start.
+    default_delay_cs: u16,
     scale: Option<u32>,
 }
 
@@ -344,8 +354,13 @@ impl Drop for GifWorker {
 
 fn gif_encoder_loop(path: PathBuf, rx: Receiver<GifFrame>) {
     let mut encoder: Option<gif::Encoder<BufWriter<File>>> = None;
+    // Wall-clock timestamp of the previous successfully-encoded frame. Each new
+    // frame's GIF delay is computed as the elapsed centiseconds between this and
+    // the current frame's `captured_at`. First frame falls back to the configured
+    // default delay (derived from the user's target fps).
+    let mut last_captured_at: Option<Instant> = None;
     for frame in rx {
-        if let Err(e) = encode_one_frame(&path, &mut encoder, frame) {
+        if let Err(e) = encode_one_frame(&path, &mut encoder, &mut last_captured_at, frame) {
             tracing::error!("capture: gif encode error: {e:#}");
             return;
         }
@@ -367,6 +382,7 @@ fn gif_encoder_loop(path: PathBuf, rx: Receiver<GifFrame>) {
 fn encode_one_frame(
     path: &Path,
     encoder: &mut Option<gif::Encoder<BufWriter<File>>>,
+    last_captured_at: &mut Option<Instant>,
     frame: GifFrame,
 ) -> Result<()> {
     let (out_w, out_h) = scaled_dims(frame.src_width, frame.src_height, frame.scale)?;
@@ -382,21 +398,36 @@ fn encode_one_frame(
                 .context("init gif encoder")?;
             e.set_repeat(gif::Repeat::Infinite).context("gif repeat")?;
             tracing::info!(
-                "capture: gif encoder opened {}x{} delay={}cs ({}ms/frame, {} fps)",
+                "capture: gif encoder opened {}x{} target {}cs/frame ({} fps); \
+                 actual delays computed from wall-clock per-frame",
                 w_u16,
                 h_u16,
-                frame.delay_cs,
-                frame.delay_cs as u32 * 10,
-                if frame.delay_cs == 0 {
+                frame.default_delay_cs,
+                if frame.default_delay_cs == 0 {
                     0
                 } else {
-                    100 / frame.delay_cs as u32
+                    100 / frame.default_delay_cs as u32
                 }
             );
             *encoder = Some(e);
             encoder.as_mut().unwrap()
         }
     };
+
+    // Per-frame delay = elapsed wall-clock time since the previous successfully
+    // encoded frame. When backpressure drops frames, the next surviving frame
+    // gets a longer delay so total playback duration matches recording duration.
+    // First frame has no previous timestamp; use the configured target delay.
+    let delay_cs = match *last_captured_at {
+        None => frame.default_delay_cs,
+        Some(prev) => {
+            let ms = frame.captured_at.duration_since(prev).as_millis() as u64;
+            // Round to nearest centisecond, clamp to >= 1 (gif minimum) and <= u16::MAX.
+            let cs = (ms + 5) / 10;
+            cs.clamp(1, u16::MAX as u64) as u16
+        }
+    };
+    *last_captured_at = Some(frame.captured_at);
 
     // Lanczos3 downscale (when requested) before quantization. Per-frame NeuQuant
     // then runs on the resampled pixels.
@@ -424,7 +455,7 @@ fn encode_one_frame(
     // palette so similar-looking consecutive frames produce more similar palettes,
     // reducing visible flicker.
     let mut gif_frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 1);
-    gif_frame.delay = frame.delay_cs;
+    gif_frame.delay = delay_cs;
     // Force decoders to clear to background between frames rather than relying on
     // the gif crate's unspecified default (`DisposalMethod::Any`), which different
     // viewers interpret inconsistently and can produce ghost overlays on the floor.
@@ -542,12 +573,12 @@ impl Capture {
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("create gif parent dir {}", parent.display()))?;
                 }
-                let delay_cs = fps_to_centiseconds(fps.unwrap_or(30));
+                let default_delay_cs = fps_to_centiseconds(fps.unwrap_or(30));
                 let worker = GifWorker::spawn(path.clone());
                 SequenceWriter::Gif {
                     worker,
                     path,
-                    delay_cs,
+                    default_delay_cs,
                     scale,
                 }
             }
@@ -670,13 +701,17 @@ impl Capture {
     }
 
     /// Hand one stage's pixels to the active writer. Logs and swallows encode errors so
-    /// a transient failure doesn't tear down the render loop.
+    /// a transient failure doesn't tear down the render loop. `captured_at` is the
+    /// wall-clock instant the frame was sampled; the GIF worker uses it to compute
+    /// per-frame delays so playback duration matches recording duration even when
+    /// frames are dropped under backpressure.
     pub(crate) fn consume_frame(
         &mut self,
         is_pre: bool,
         rgba: Vec<u8>,
         width: u32,
         height: u32,
+        captured_at: Instant,
     ) -> Result<()> {
         match &mut self.state {
             CaptureState::Idle => Ok(()),
@@ -699,7 +734,7 @@ impl Capture {
                 writer,
                 frame_count,
                 ..
-            } => writer.write_frame(is_pre, *frame_count, &rgba, width, height),
+            } => writer.write_frame(is_pre, *frame_count, &rgba, width, height, captured_at),
         }
     }
 
@@ -755,6 +790,7 @@ impl SequenceWriter {
         rgba: &[u8],
         width: u32,
         height: u32,
+        captured_at: Instant,
     ) -> Result<()> {
         match self {
             SequenceWriter::Png { dir } => {
@@ -765,19 +801,22 @@ impl SequenceWriter {
             }
             SequenceWriter::Gif {
                 worker,
-                delay_cs,
+                default_delay_cs,
                 scale,
                 ..
             } => {
-                // Hand the raw RGBA to the encoder thread. NeuQuant + resample + LZW
-                // all run there; the main thread only owns the Vec move + try_send,
-                // which is cheap (~microseconds). Backpressure: a full channel drops
-                // the frame rather than stalling the renderer.
+                // Hand the raw RGBA + timestamp to the encoder thread. NeuQuant +
+                // resample + LZW all run there; the main thread only owns the Vec
+                // move + try_send, which is cheap (~microseconds). Backpressure: a
+                // full channel drops the frame rather than stalling the renderer;
+                // the next surviving frame absorbs the dropped frame's wall-clock
+                // duration via its per-frame delay (computed worker-side).
                 worker.try_send(GifFrame {
                     rgba: rgba.to_vec(),
                     src_width: width,
                     src_height: height,
-                    delay_cs: *delay_cs,
+                    captured_at,
+                    default_delay_cs: *default_delay_cs,
                     scale: *scale,
                 });
                 Ok(())
