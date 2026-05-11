@@ -209,6 +209,11 @@ fn toggle_panel_global() -> bool {
 pub(crate) struct Capture {
     default_dir: PathBuf,
     state: CaptureState,
+    /// Detached GIF-encoder threads that are still flushing buffered frames after
+    /// the user `stop`ed. Joined at runner shutdown so trailers finish even when
+    /// the encode outlives the recording session. Finished handles are reaped
+    /// opportunistically on each new stop to keep the vec from growing unbounded.
+    pending: Vec<JoinHandle<()>>,
 }
 
 enum CaptureState {
@@ -288,6 +293,16 @@ impl GifWorker {
         }
     }
 
+    /// Close the input channel and hand back the worker's `JoinHandle` without
+    /// waiting. The worker keeps draining the buffered frames in the background and
+    /// exits naturally when the channel is empty; the caller parks the handle so
+    /// it can be joined at app shutdown (the GIF trailer is flushed when the worker
+    /// thread's encoder drops).
+    fn detach(mut self) -> JoinHandle<()> {
+        self.tx.take();
+        self.handle.take().expect("worker handle present")
+    }
+
     /// Non-blocking enqueue. If the channel is full, increments the dropped counter
     /// and returns; the renderer never stalls on a slow encoder.
     fn try_send(&self, frame: GifFrame) {
@@ -315,10 +330,11 @@ impl GifWorker {
 
 impl Drop for GifWorker {
     fn drop(&mut self) {
-        // Closing the sender drains the channel; the worker writes the GIF trailer when
-        // its receive loop exits and the file handle drops. We join so the trailer
-        // is flushed before this thread returns (otherwise a fast program exit can
-        // truncate the file).
+        // Fallback path for the case where the worker was never detached (e.g., a
+        // panic unwinds through the Capture). Closing the channel and joining keeps
+        // the GIF trailer correct. The `Capture::stop` path always calls `detach`
+        // before this, so the normal flow leaves both `tx` and `handle` already
+        // `None`-d here and this is a no-op.
         self.tx.take();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -334,7 +350,10 @@ fn gif_encoder_loop(path: PathBuf, rx: Receiver<GifFrame>) {
             return;
         }
     }
-    // `encoder` drops here, flushing the GIF trailer.
+    // Encoder drops here, flushing the GIF trailer; log so the user knows the
+    // background encode completed.
+    drop(encoder);
+    tracing::info!("capture: gif file finalised at {}", path.display());
 }
 
 /// Per-frame palette encode. NeuQuant runs over each frame independently, picks
@@ -362,6 +381,18 @@ fn encode_one_frame(
             let mut e = gif::Encoder::new(BufWriter::new(file), w_u16, h_u16, &[])
                 .context("init gif encoder")?;
             e.set_repeat(gif::Repeat::Infinite).context("gif repeat")?;
+            tracing::info!(
+                "capture: gif encoder opened {}x{} delay={}cs ({}ms/frame, {} fps)",
+                w_u16,
+                h_u16,
+                frame.delay_cs,
+                frame.delay_cs as u32 * 10,
+                if frame.delay_cs == 0 {
+                    0
+                } else {
+                    100 / frame.delay_cs as u32
+                }
+            );
             *encoder = Some(e);
             encoder.as_mut().unwrap()
         }
@@ -407,7 +438,22 @@ impl Capture {
         Self {
             default_dir: PathBuf::from("captures"),
             state: CaptureState::Idle,
+            pending: Vec::new(),
         }
+    }
+
+    /// Reap any background GIF workers that have already finished, so the pool
+    /// doesn't grow unbounded across many stop/start cycles.
+    fn reap_finished(&mut self) {
+        let mut still_running = Vec::with_capacity(self.pending.len());
+        for h in self.pending.drain(..) {
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                still_running.push(h);
+            }
+        }
+        self.pending = still_running;
     }
 
     pub(crate) fn apply_requests(&mut self, requests: Vec<CaptureRequest>) -> Vec<String> {
@@ -523,37 +569,39 @@ impl Capture {
     }
 
     fn stop(&mut self, log: &mut Vec<String>) {
+        self.reap_finished();
         let state = std::mem::replace(&mut self.state, CaptureState::Idle);
         match state {
             CaptureState::Sequence {
                 writer,
                 frame_count,
                 ..
-            } => {
-                match writer {
-                    SequenceWriter::Png { dir } => {
-                        log.push(format!(
-                            "capture: PNG sequence stopped, {frame_count} frame(s) at {}",
-                            dir.display()
-                        ));
-                    }
-                    SequenceWriter::Gif { worker, path, .. } => {
-                        let dropped = worker.dropped();
-                        // Dropping the worker closes the channel + joins the thread,
-                        // ensuring the GIF trailer is flushed before we report stopped.
-                        drop(worker);
-                        let drop_note = if dropped > 0 {
-                            format!(", {dropped} dropped under backpressure")
-                        } else {
-                            String::new()
-                        };
-                        log.push(format!(
-                            "capture: GIF stream stopped, {frame_count} frame(s){drop_note} at {}",
-                            path.display()
-                        ));
-                    }
+            } => match writer {
+                SequenceWriter::Png { dir } => {
+                    log.push(format!(
+                        "capture: PNG sequence stopped, {frame_count} frame(s) at {}",
+                        dir.display()
+                    ));
                 }
-            }
+                SequenceWriter::Gif { worker, path, .. } => {
+                    let dropped = worker.dropped();
+                    // Detach: close the input channel and park the worker's handle in
+                    // the pending pool. The worker keeps encoding its buffered frames
+                    // in the background while the main thread returns immediately.
+                    let handle = worker.detach();
+                    self.pending.push(handle);
+                    let drop_note = if dropped > 0 {
+                        format!(", {dropped} dropped under backpressure")
+                    } else {
+                        String::new()
+                    };
+                    log.push(format!(
+                        "capture: GIF stream stopped, {frame_count} frame(s){drop_note} \
+                         encoding in background -> {}",
+                        path.display()
+                    ));
+                }
+            },
             CaptureState::OneShot { .. } => {
                 log.push("capture: pending one-shot cancelled".into());
             }
@@ -655,6 +703,15 @@ impl Capture {
         }
     }
 
+    /// Block until all detached GIF workers finish flushing. Called from `Capture`'s
+    /// Drop impl so any background encodes that outlived the recording session still
+    /// produce a complete file when the runner exits.
+    fn join_pending(&mut self) {
+        for h in self.pending.drain(..) {
+            let _ = h.join();
+        }
+    }
+
     /// Mark the current frame as written. One-shot transitions to Idle when both
     /// requested stages have been consumed; sequence increments the frame counter and
     /// updates the FPS clock.
@@ -678,6 +735,15 @@ impl Capture {
             }
             CaptureState::Idle => {}
         }
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        // Wait on any still-encoding background GIF workers so their files have
+        // valid trailers before the process exits. Worst case at app close: a brief
+        // pause while the last few buffered frames finish encoding.
+        self.join_pending();
     }
 }
 
