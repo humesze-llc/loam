@@ -950,12 +950,16 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
         cmd("capture", capture_help(), |args, _ctx: &mut Ctx, out| {
             run_capture(args, out)
         })
-        // Positional arg-choice grammar drives tab-completion + ghost preview.
-        // Subcommand at index 0, stage at index 1; output dir is intentionally
-        // undeclared (no filesystem completion).
+        // Positional arg-choice grammar drives tab-completion + ghost preview. The
+        // `fps=` / `scale=` prefixes appear at args 1+ so the user can Tab onto
+        // them and discover the knobs without reading `help capture` first. They
+        // accept arbitrary numeric values after the `=`, which tab-completion
+        // can't enumerate — discovery via Tab, value typed by the user.
         .with_args(&[
             &["png", "frames", "gif", "toggle", "stop", "panel"],
-            &["pre", "post", "both"],
+            &["both", "fps=", "post", "pre", "scale="],
+            &["fps=", "scale="],
+            &["fps=", "scale="],
         ]),
     );
 }
