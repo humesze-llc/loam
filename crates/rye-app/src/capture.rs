@@ -511,6 +511,30 @@ impl Capture {
         }
     }
 
+    /// Compact status string for display in the window title or a UI widget. `None`
+    /// when idle; otherwise a terse line like `REC 42` or `REC 42 (3 dropped)`.
+    pub(crate) fn status(&self) -> Option<String> {
+        match &self.state {
+            CaptureState::Idle => None,
+            CaptureState::OneShot { .. } => Some("snap".into()),
+            CaptureState::Sequence {
+                writer,
+                frame_count,
+                ..
+            } => {
+                let dropped = match writer {
+                    SequenceWriter::Png { .. } => 0,
+                    SequenceWriter::Gif { worker, .. } => worker.dropped(),
+                };
+                if dropped > 0 {
+                    Some(format!("REC {frame_count} ({dropped} dropped)"))
+                } else {
+                    Some(format!("REC {frame_count}"))
+                }
+            }
+        }
+    }
+
     pub(crate) fn wants_pre(&self) -> bool {
         match &self.state {
             CaptureState::Idle => false,

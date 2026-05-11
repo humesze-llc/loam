@@ -682,6 +682,14 @@ impl<A: App> Runner<A> {
             self.last_fps_update = Instant::now();
             if let Some(app) = self.app.as_ref() {
                 let title = app.title(self.fps);
+                // Append capture status when active. 1 Hz refresh matches the title
+                // update cadence and gives the user a visible recording counter without
+                // wiring it through the demo's UI.
+                #[cfg(feature = "capture")]
+                let title = match self.capture.status() {
+                    Some(status) => format!("{title} [{status}]").into(),
+                    None => title,
+                };
                 win.set_title(&title);
             }
         }
