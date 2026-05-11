@@ -16,9 +16,17 @@
 //! Console commands push [`CaptureRequest`]s onto a global queue via [`enqueue`]. The
 //! [`Runner`](crate::Runner) drains the queue once per frame, mutates the [`Capture`]
 //! state machine, and issues GPU copies at the two tap points in the render loop.
-//! Encoding (PNG write, GIF palette + write) happens synchronously on the main thread.
-//! A capture frame is allowed to stutter render rate; async encoding is a Phase 3
-//! target if real-time recording becomes important.
+//!
+//! Encoding splits by format:
+//!
+//! - **PNG (one-shot + sequence)**: synchronous on the main thread. PNG compression is
+//!   fast enough that the per-frame cost is dominated by GPU readback. Diagnostic
+//!   capture wants every frame written; no drops.
+//! - **GIF stream**: encoded on a background worker thread ([`GifWorker`]). The main
+//!   thread sends raw RGBA over a bounded channel; the worker runs NeuQuant + Lanczos
+//!   resample + LZW + disk write. If the worker can't keep up, the main thread drops
+//!   the frame rather than stalling the renderer; the dropped count is surfaced when
+//!   the sequence stops.
 //!
 //! ## Pre-egui tap and MSAA
 //!
@@ -52,7 +60,10 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context as _, Result};
@@ -187,21 +198,156 @@ enum CaptureState {
 
 /// Per-sequence-format incremental writer.
 enum SequenceWriter {
-    /// PNG sequence: one independent file per frame, stage-labelled.
+    /// PNG sequence: one independent file per frame, stage-labelled. Encoded on the
+    /// main thread; PNG compression is fast enough that the per-frame cost is dominated
+    /// by GPU readback, not encoding.
     Png { dir: PathBuf },
-    /// Animated GIF: a streaming `gif::Encoder` writing frames to a single file as they
-    /// arrive. The encoder requires width + height up front (the LSD is fixed for the
-    /// whole stream), so it stays `None` until the first frame establishes the
-    /// dimensions. Dropping the encoder flushes the GIF trailer.
+    /// Animated GIF: encoded on a background worker thread to keep NeuQuant +
+    /// Lanczos resample + LZW off the render loop. Frames cross a bounded channel;
+    /// when the worker can't keep up, the main thread drops the incoming frame rather
+    /// than stalling the renderer. The user sees the dropped count on stop.
     Gif {
-        encoder: Option<gif::Encoder<BufWriter<File>>>,
+        worker: GifWorker,
         path: PathBuf,
         /// Pre-computed delay in centiseconds, from the sequence's target fps.
         delay_cs: u16,
-        /// Optional output width in pixels. Frames are Lanczos3-resampled before
-        /// palette quantization; aspect ratio is preserved.
+        /// Optional output width in pixels. Lanczos3 resample on the worker thread
+        /// before NeuQuant; aspect ratio preserved.
         scale: Option<u32>,
     },
+}
+
+/// Owns the GIF encoder thread and the SPSC channel feeding it. The main thread calls
+/// [`GifWorker::try_send`] with each captured frame; the worker drains the channel,
+/// runs NeuQuant + Lanczos resample + LZW, and writes to disk. Dropping the worker
+/// closes the channel and joins the thread, guaranteeing the GIF trailer is flushed.
+pub(crate) struct GifWorker {
+    tx: Option<SyncSender<GifFrame>>,
+    handle: Option<JoinHandle<()>>,
+    dropped: Arc<AtomicU32>,
+}
+
+/// One frame's worth of work for the GIF encoder thread.
+struct GifFrame {
+    rgba: Vec<u8>,
+    src_width: u32,
+    src_height: u32,
+    delay_cs: u16,
+    scale: Option<u32>,
+}
+
+/// Channel capacity. Sized at ~8 frames so a small encode-time spike doesn't
+/// immediately drop frames, but the worker can't drift more than ~270 ms behind the
+/// renderer at 30 fps. Higher capacities trade smoothness for latency.
+const GIF_CHANNEL_CAPACITY: usize = 8;
+
+impl GifWorker {
+    fn spawn(path: PathBuf) -> Self {
+        let (tx, rx) = sync_channel::<GifFrame>(GIF_CHANNEL_CAPACITY);
+        let dropped = Arc::new(AtomicU32::new(0));
+        let handle = thread::Builder::new()
+            .name("rye-app::gif-encoder".into())
+            .spawn(move || gif_encoder_loop(path, rx))
+            .expect("spawn gif encoder thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            dropped,
+        }
+    }
+
+    /// Non-blocking enqueue. If the channel is full, increments the dropped counter
+    /// and returns; the renderer never stalls on a slow encoder.
+    fn try_send(&self, frame: GifFrame) {
+        let Some(tx) = self.tx.as_ref() else { return };
+        match tx.try_send(frame) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let count = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if count.is_power_of_two() {
+                    tracing::warn!(
+                        "capture: GIF encoder queue full; dropped {count} frame(s) so far"
+                    );
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::error!("capture: GIF encoder thread exited unexpectedly");
+            }
+        }
+    }
+
+    fn dropped(&self) -> u32 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for GifWorker {
+    fn drop(&mut self) {
+        // Closing the sender drains the channel; the worker writes the GIF trailer when
+        // its receive loop exits and the file handle drops. We join so the trailer
+        // is flushed before this thread returns (otherwise a fast program exit can
+        // truncate the file).
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn gif_encoder_loop(path: PathBuf, rx: Receiver<GifFrame>) {
+    let mut encoder: Option<gif::Encoder<BufWriter<File>>> = None;
+    for frame in rx {
+        if let Err(e) = encode_one_frame(&path, &mut encoder, frame) {
+            tracing::error!("capture: gif encode error: {e:#}");
+            return;
+        }
+    }
+    // `encoder` drops here, flushing the trailer.
+}
+
+fn encode_one_frame(
+    path: &Path,
+    encoder: &mut Option<gif::Encoder<BufWriter<File>>>,
+    frame: GifFrame,
+) -> Result<()> {
+    let (out_w, out_h) = scaled_dims(frame.src_width, frame.src_height, frame.scale)?;
+    let w_u16: u16 = out_w.try_into().context("gif width > 65535")?;
+    let h_u16: u16 = out_h.try_into().context("gif height > 65535")?;
+
+    let enc = match encoder {
+        Some(e) => e,
+        None => {
+            let file = File::create(path)
+                .with_context(|| format!("create gif output {}", path.display()))?;
+            let mut e = gif::Encoder::new(BufWriter::new(file), w_u16, h_u16, &[])
+                .context("init gif encoder")?;
+            e.set_repeat(gif::Repeat::Infinite).context("gif repeat")?;
+            *encoder = Some(e);
+            encoder.as_mut().unwrap()
+        }
+    };
+
+    let mut buf: Vec<u8> = if frame.scale.is_some() {
+        let src: ::image::RgbaImage =
+            ::image::ImageBuffer::from_raw(frame.src_width, frame.src_height, frame.rgba)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "RGBA size mismatch at {}x{}",
+                        frame.src_width,
+                        frame.src_height
+                    )
+                })?;
+        let dst =
+            ::image::imageops::resize(&src, out_w, out_h, ::image::imageops::FilterType::Lanczos3);
+        dst.into_raw()
+    } else {
+        frame.rgba
+    };
+
+    let mut gif_frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 10);
+    gif_frame.delay = frame.delay_cs;
+    enc.write_frame(&gif_frame).context("gif encode")?;
+    Ok(())
 }
 
 impl Capture {
@@ -299,8 +445,9 @@ impl Capture {
                         .with_context(|| format!("create gif parent dir {}", parent.display()))?;
                 }
                 let delay_cs = fps_to_centiseconds(fps.unwrap_or(30));
+                let worker = GifWorker::spawn(path.clone());
                 SequenceWriter::Gif {
-                    encoder: None,
+                    worker,
                     path,
                     delay_cs,
                     scale,
@@ -331,16 +478,29 @@ impl Capture {
                 frame_count,
                 ..
             } => {
-                let path = match &writer {
-                    SequenceWriter::Png { dir } => dir.clone(),
-                    SequenceWriter::Gif { path, .. } => path.clone(),
-                };
-                // Dropping `writer` (and its encoder) flushes any pending GIF trailer.
-                drop(writer);
-                log.push(format!(
-                    "capture: sequence stopped, {frame_count} frame(s) at {}",
-                    path.display()
-                ));
+                match writer {
+                    SequenceWriter::Png { dir } => {
+                        log.push(format!(
+                            "capture: PNG sequence stopped, {frame_count} frame(s) at {}",
+                            dir.display()
+                        ));
+                    }
+                    SequenceWriter::Gif { worker, path, .. } => {
+                        let dropped = worker.dropped();
+                        // Dropping the worker closes the channel + joins the thread,
+                        // ensuring the GIF trailer is flushed before we report stopped.
+                        drop(worker);
+                        let drop_note = if dropped > 0 {
+                            format!(", {dropped} dropped under backpressure")
+                        } else {
+                            String::new()
+                        };
+                        log.push(format!(
+                            "capture: GIF stream stopped, {frame_count} frame(s){drop_note} at {}",
+                            path.display()
+                        ));
+                    }
+                }
             }
             CaptureState::OneShot { .. } => {
                 log.push("capture: pending one-shot cancelled".into());
@@ -462,57 +622,22 @@ impl SequenceWriter {
                 Ok(())
             }
             SequenceWriter::Gif {
-                encoder,
-                path,
+                worker,
                 delay_cs,
                 scale,
+                ..
             } => {
-                let (out_w, out_h) = scaled_dims(width, height, *scale)?;
-                let w_u16: u16 = out_w.try_into().context("gif width > 65535")?;
-                let h_u16: u16 = out_h.try_into().context("gif height > 65535")?;
-
-                // Lazily build the encoder against the first frame's output dimensions.
-                // The LSD (Logical Screen Descriptor) is fixed for the whole stream, so
-                // we can't accept a resize mid-capture; it's pinned to the first frame.
-                let enc = match encoder {
-                    Some(e) => e,
-                    None => {
-                        let file = File::create(&*path)
-                            .with_context(|| format!("create gif output {}", path.display()))?;
-                        let mut e = gif::Encoder::new(BufWriter::new(file), w_u16, h_u16, &[])
-                            .context("init gif encoder")?;
-                        e.set_repeat(gif::Repeat::Infinite).context("gif repeat")?;
-                        *encoder = Some(e);
-                        encoder.as_mut().unwrap()
-                    }
-                };
-
-                // Downscale before NeuQuant if requested; smaller buffers also encode
-                // faster per frame. Lanczos3 picks up edges and gradients better than
-                // Triangle / Nearest, at moderate extra cost.
-                let mut buf: Vec<u8> = if scale.is_some() {
-                    let src: ::image::RgbaImage =
-                        ::image::ImageBuffer::from_raw(width, height, rgba.to_vec())
-                            .ok_or_else(|| anyhow!("RGBA size mismatch at {width}x{height}"))?;
-                    let dst = ::image::imageops::resize(
-                        &src,
-                        out_w,
-                        out_h,
-                        ::image::imageops::FilterType::Lanczos3,
-                    );
-                    dst.into_raw()
-                } else {
-                    rgba.to_vec()
-                };
-
-                // `gif::Frame::from_rgba_speed` mutates the pixel buffer in place
-                // (NeuQuant runs over it). Speed 10 is the gif crate's default: a
-                // reasonable quality / latency balance. Lower (1-5) is better quality
-                // but encode time can dominate; higher (20-30) is visibly worse on
-                // gradients.
-                let mut frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 10);
-                frame.delay = *delay_cs;
-                enc.write_frame(&frame).context("gif encode")?;
+                // Hand the raw RGBA to the encoder thread. NeuQuant + resample + LZW
+                // all run there; the main thread only owns the Vec move + try_send,
+                // which is cheap (~microseconds). Backpressure: a full channel drops
+                // the frame rather than stalling the renderer.
+                worker.try_send(GifFrame {
+                    rgba: rgba.to_vec(),
+                    src_width: width,
+                    src_height: height,
+                    delay_cs: *delay_cs,
+                    scale: *scale,
+                });
                 Ok(())
             }
         }
