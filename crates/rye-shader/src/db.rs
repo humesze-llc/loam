@@ -427,8 +427,7 @@ fn main() {
     fn blended_e3_h3_prelude_validates_against_abi_probe() {
         let bs = BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-2.0, 2.0));
         let src = assemble_source(&bs.wgsl_impl(), ABI_PROBE);
-        validate_wgsl(&src)
-            .expect("BlendedSpace<E3,H3,LinearBlendX> WGSL prelude should validate");
+        validate_wgsl(&src).expect("BlendedSpace<E3,H3,LinearBlendX> WGSL prelude should validate");
     }
 
     #[test]

@@ -367,10 +367,8 @@ fn contact_from_face(polytope: &Polytope4, face: Face4) -> Option<ContactInfo4> 
     );
     let weights = &proj.weights;
 
-    let point_a =
-        v0.sa * weights[0] + v1.sa * weights[1] + v2.sa * weights[2] + v3.sa * weights[3];
-    let point_b =
-        v0.sb * weights[0] + v1.sb * weights[1] + v2.sb * weights[2] + v3.sb * weights[3];
+    let point_a = v0.sa * weights[0] + v1.sa * weights[1] + v2.sa * weights[2] + v3.sa * weights[3];
+    let point_b = v0.sb * weights[0] + v1.sb * weights[1] + v2.sb * weights[2] + v3.sb * weights[3];
 
     Some(ContactInfo4 {
         normal: face.normal,

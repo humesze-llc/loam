@@ -18,8 +18,7 @@ use crate::response::Contact;
 
 /// A narrowphase collision function. Returns `Some(contact)` if bodies `a` and `b` overlap,
 /// `None` otherwise. Always called with `a.kind()` matching the key's first component.
-pub type NarrowphaseFn<S> =
-    fn(a: &RigidBody<S>, b: &RigidBody<S>, space: &S) -> Option<Contact<S>>;
+pub type NarrowphaseFn<S> = fn(a: &RigidBody<S>, b: &RigidBody<S>, space: &S) -> Option<Contact<S>>;
 
 /// Registry of narrowphase functions, keyed by the collider kinds of both bodies.
 pub struct Narrowphase<S: PhysicsSpace> {

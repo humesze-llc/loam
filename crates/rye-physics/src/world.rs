@@ -176,8 +176,7 @@ impl<S: PhysicsSpace> World<S> {
                 };
 
                 let baumgarte_bias = if dt > 0.0 {
-                    let target =
-                        (cp.penetration - PENETRATION_SLOP).max(0.0) * BAUMGARTE_BETA / dt;
+                    let target = (cp.penetration - PENETRATION_SLOP).max(0.0) * BAUMGARTE_BETA / dt;
                     -target.min(MAX_LINEAR_CORRECTION / dt)
                 } else {
                     0.0
