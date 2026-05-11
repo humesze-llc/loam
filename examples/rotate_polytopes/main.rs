@@ -634,6 +634,14 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
+
+        // Framework-provided capture: `capture png [pre|post|both] [dir]`,
+        // `capture frames [pre|post|both] [dir]`, `capture stop`. Bound to F12 (one-shot)
+        // and F9 (sequence start; use `capture stop` to end). Requests push to a global
+        // queue; the runner drains and processes them at the render-loop's two taps.
+        rye_app::capture::register_commands(&mut c);
+        rye_app::capture::bind_default_hotkeys(&mut c);
+
         c
     }
 }

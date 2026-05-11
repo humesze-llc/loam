@@ -64,6 +64,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(feature = "capture")]
+pub mod capture;
+
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
@@ -350,6 +353,9 @@ struct Runner<A: App> {
     /// Surfaced to the user via `finish()` if the runner exited because of a setup or
     /// render error, so callers can propagate it from `main`.
     deferred_error: Option<anyhow::Error>,
+
+    #[cfg(feature = "capture")]
+    capture: capture::Capture,
 }
 
 impl<A: App> Runner<A> {
@@ -373,6 +379,9 @@ impl<A: App> Runner<A> {
             tick_index: 0,
             render_error_streak: 0,
             deferred_error: None,
+
+            #[cfg(feature = "capture")]
+            capture: capture::Capture::new(),
         }
     }
 
@@ -388,6 +397,25 @@ impl<A: App> Runner<A> {
 
     fn time(&self) -> f32 {
         self.start.elapsed().as_secs_f32()
+    }
+
+    /// Read back `texture` and write it as PNG to `path`. Logs and swallows errors so a
+    /// transient capture failure doesn't abort the render loop.
+    #[cfg(feature = "capture")]
+    fn capture_to(&self, path: &std::path::Path, rd: &RenderDevice, texture: &wgpu::Texture) {
+        let result = capture::read_texture_rgba(
+            &rd.device,
+            &rd.queue,
+            texture,
+            rd.surface_bundle.size.width,
+            rd.surface_bundle.size.height,
+            rd.surface_bundle.config.format,
+        )
+        .and_then(|img| capture::write_png(path, &img));
+        match result {
+            Ok(()) => tracing::info!("capture: wrote {}", path.display()),
+            Err(e) => tracing::error!("capture: failed to write {}: {e:#}", path.display()),
+        }
     }
 }
 
@@ -646,7 +674,21 @@ impl<A: App> Runner<A> {
             }
         }
 
-        // 5. Render: scene (App::render) then UI overlay.
+        // 5. Drain any queued capture requests + update the state machine BEFORE the
+        // render pass. Requests come from console commands and hotkey binds; they're
+        // applied here so this frame can honor them.
+        #[cfg(feature = "capture")]
+        {
+            let requests = capture::drain_requests();
+            if !requests.is_empty() {
+                let log = self.capture.apply_requests(requests);
+                for line in log {
+                    tracing::info!("{line}");
+                }
+            }
+        }
+
+        // 6. Render: scene (App::render) then UI overlay.
         //
         // When MSAA is enabled, both passes write into the
         // multisampled color attachment (`rd.msaa_view()`) and the
@@ -655,6 +697,14 @@ impl<A: App> Runner<A> {
         // egui pass. When MSAA is disabled, both passes write
         // directly into the swapchain view and `resolve_target` is
         // `None`.
+        //
+        // Capture taps:
+        //   - `pre`-egui:  after App::render, before ui.paint. MSAA must be off (the
+        //     multisampled attachment isn't directly copyable). The pre tap reads the
+        //     swapchain view, which at this point contains just the 3D pass output.
+        //   - `post`-egui: after ui.paint, before frame.present. Reads the swapchain
+        //     view, which contains the final composite (and the MSAA resolve target
+        //     when MSAA is on). This is what DWM receives.
         match rd.begin_frame() {
             Ok((frame, swap_view)) => {
                 let mut last_err: Option<anyhow::Error> = None;
@@ -665,6 +715,23 @@ impl<A: App> Runner<A> {
                         last_err = Some(e);
                     }
                 }
+
+                // Pre-egui capture tap. Only valid with MSAA off (see above).
+                #[cfg(feature = "capture")]
+                if self.capture.wants_pre() {
+                    let (path_pre, _) = self.capture.frame_paths();
+                    if let Some(path) = path_pre {
+                        if rd.sample_count() > 1 {
+                            tracing::warn!(
+                                "capture: `pre` stage skipped because MSAA is on; \
+                                 set RunConfig::msaa_samples = 1 for diagnostic capture"
+                            );
+                        } else {
+                            self.capture_to(&path, rd, &frame.texture);
+                        }
+                    }
+                }
+
                 if let Some(ui) = self.ui.as_mut() {
                     let mut encoder =
                         rd.device
@@ -684,6 +751,18 @@ impl<A: App> Runner<A> {
                     );
                     rd.queue.submit(Some(encoder.finish()));
                 }
+
+                // Post-egui capture tap. Always valid: swapchain has final composite.
+                #[cfg(feature = "capture")]
+                if self.capture.wants_post() {
+                    let (_, path_post) = self.capture.frame_paths();
+                    if let Some(path) = path_post {
+                        self.capture_to(&path, rd, &frame.texture);
+                    }
+                }
+                #[cfg(feature = "capture")]
+                self.capture.advance_frame();
+
                 frame.present();
                 if let Some(err) = last_err {
                     self.render_error_streak = self.render_error_streak.saturating_add(1);

@@ -7,6 +7,13 @@ authors.workspace = true
 repository.workspace = true
 description = "Rye App: thin trait + event-loop runner that extracts the winit boilerplate every example rewrites."
 
+[features]
+default = ["capture"]
+# Frame-capture: PNG single-shot + PNG sequence writers wired into the render loop,
+# plus the console commands and hotkeys that drive them. Disable for lean builds
+# that don't need the diagnostic plumbing.
+capture = ["dep:image"]
+
 [dependencies]
 anyhow.workspace = true
 glam.workspace = true
@@ -15,6 +22,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 rye-asset  = { path = "../rye-asset" }
 rye-camera = { path = "../rye-camera" }
