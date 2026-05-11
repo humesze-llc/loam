@@ -82,6 +82,15 @@ use catalog::{parse_row_from_args, SHAPE_CATALOG};
 use consts::{BODY_SIZE, BODY_Y, T_SCRUB_RATE, T_SLIDER_INITIAL, W_RANGE, W_SCRUB_RATE};
 use state::{body_position, Demo, RotationMode, ViewMode};
 
+#[cfg(test)]
+use catalog::{parse_shape_name, ShapeEntry, DEFAULT_ROW};
+#[cfg(test)]
+use consts::{CONTROL_H, CONTROL_W, SHAPE_CARD_WIDTH};
+#[cfg(test)]
+use rye_egui::dnd::{drag_source_collapsing as dnd_drag_source_collapsing, make_room_gap};
+#[cfg(test)]
+use rye_egui::media::add_button;
+
 impl Demo {
     pub(crate) fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
         let row = parse_row_from_args()?;
