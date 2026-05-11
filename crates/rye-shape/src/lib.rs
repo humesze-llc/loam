@@ -19,10 +19,9 @@
 //!   [`Shape::Sphere`], which carries a `center` field so SDF scenes can place spheres
 //!   without a transform combinator. Physics ignores that field (it always uses the
 //!   body's position), the physics sphere constructors set `center = Vec3::ZERO`.
-//! - **No behavior.** This crate only defines the data. Rendering emission lives in
-//!   `rye-sdf`; collision support lives in `rye-physics`. That keeps the dependency
-//!   graph a tree (both consumers depend on `rye-shape`, `rye-shape` depends on nothing
-//!   application-level).
+//! - **No behavior.** This crate only defines the data. Rendering emission lives in `rye-sdf`;
+//!   collision support lives in `rye-physics`. That keeps the dependency graph a tree (both
+//!   consumers depend on `rye-shape`, `rye-shape` depends on nothing application-level).
 
 use glam::{Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
@@ -32,9 +31,9 @@ use serde::{Deserialize, Serialize};
 /// crate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Shape {
-    /// Sphere with a local center and radius. In SDF scenes `center` is the geodesic
-    /// center; in physics `center` is ignored (body position is the center) and
-    /// conventionally set to [`Vec3::ZERO`].
+    /// Sphere with a local center and radius. In SDF scenes `center` is the geodesic center;
+    /// in physics `center` is ignored (body position is the center) and conventionally set to
+    /// [`Vec3::ZERO`].
     Sphere { center: Vec3, radius: f32 },
 
     /// A half-space `{ p : dot(p, normal) − offset ≤ 0 }`, equivalent to a
@@ -42,9 +41,9 @@ pub enum Shape {
     /// SDF's `Plane` and physics's `HalfSpace`.
     HalfSpace { normal: Vec3, offset: f32 },
 
-    /// 4D half-space: same convention as [`Shape::HalfSpace`] but with a `Vec4` normal,
-    /// used by the 4D physics ground in the pentatope-falls demo. Only meaningful on a
-    /// static body (`inv_mass = 0`); a dynamic half-space isn't physically sensible.
+    /// 4D half-space: same convention as [`Shape::HalfSpace`] but with a `Vec4` normal, used by
+    /// the 4D physics ground in the pentatope-falls demo. Only meaningful on a static body
+    /// (`inv_mass = 0`); a dynamic half-space isn't physically sensible.
     HalfSpace4D { normal: Vec4, offset: f32 },
 
     /// Axis-aligned 3D box, centered at the origin of its local frame. SDF emits the
@@ -52,8 +51,8 @@ pub enum Shape {
     /// [`Shape::ConvexPolytope3D`] today but may grow a dedicated narrowphase later.
     Box3 { half_extents: Vec3 },
 
-    /// Convex 2D polygon, counter-clockwise vertices in the local
-    /// frame. Physics 2D narrowphase uses SAT on this.
+    /// Convex 2D polygon, counter-clockwise vertices in the local frame. Physics 2D narrowphase
+    /// uses SAT on this.
     Polygon2D { vertices: Vec<Vec2> },
 
     /// Convex 3D polytope, arbitrary vertex list, assumed convex. Physics 3D narrowphase
@@ -73,8 +72,8 @@ pub enum Shape {
 }
 
 impl Shape {
-    /// Runtime discriminant, used by physics narrowphase dispatch and by any consumer
-    /// that needs to route on shape type without pattern-matching on the enum.
+    /// Runtime discriminant, used by physics narrowphase dispatch and by any consumer that
+    /// needs to route on shape type without pattern-matching on the enum.
     pub fn kind(&self) -> ShapeKind {
         match self {
             Shape::Sphere { .. } => ShapeKind::Sphere,
@@ -173,9 +172,9 @@ mod tests {
 
     #[test]
     fn ron_roundtrip_preserves_shape() {
-        // Sanity: the derived serde impls work on every variant. Scenes and pair-cache
-        // files lean on this. Covers all 8 variants so adding a new one without thinking
-        // about serde surfaces here, not at runtime when the scene file fails to parse.
+        // Sanity: the derived serde impls work on every variant. Scenes and pair-cache files
+        // lean on this. Covers all 8 variants so adding a new one without thinking about serde
+        // surfaces here, not at runtime when the scene file fails to parse.
         for original in [
             Shape::sphere_at_origin(0.5),
             Shape::sphere_at(Vec3::new(1.0, 2.0, 3.0), 0.25),

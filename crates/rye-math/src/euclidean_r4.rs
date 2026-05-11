@@ -4,9 +4,9 @@
 //! [`Vec4`] tangent vectors, and an `Iso4Flat` that carries a `Rotor4` rotation + `Vec4`
 //! translation.
 //!
-//! Intentionally distinct from [`crate::spherical::Iso4`], that type is an SO(4) matrix used to
-//! embed `S³` in 4D ambient space. The flat Iso here is for rigid motions of `R⁴` itself, the
-//! setting in which 4D physics simulations live.
+//! Intentionally distinct from [`crate::spherical::Iso4`], that type is an SO(4) matrix used
+//! to embed `S³` in 4D ambient space. The flat Iso here is for rigid motions of `R⁴` itself,
+//! the setting in which 4D physics simulations live.
 
 use std::borrow::Cow;
 

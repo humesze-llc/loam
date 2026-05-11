@@ -4,8 +4,8 @@
 //! are function pointers. When a broadphase candidate pair is tested, the narrowphase looks up
 //! the entry for the bodies' collider kinds and calls it.
 //!
-//! This is the core extension point for adding new collider types, new spaces, or new collision
-//! algorithms without modifying existing code. To add H³ horosphere colliders: define
+//! This is the core extension point for adding new collider types, new spaces, or new
+//! collision algorithms without modifying existing code. To add H³ horosphere colliders: define
 //! `Collider::Horosphere`, add `ColliderKind::Horosphere`, and register `sphere_horosphere` /
 //! `horosphere_horosphere` functions. Nothing else changes.
 

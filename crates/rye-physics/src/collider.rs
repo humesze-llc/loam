@@ -1,7 +1,8 @@
-//! Collider types. Re-exports from [`rye_shape`], `Collider` is just an alias for the canonical
-//! [`rye_shape::Shape`] enum, and `ColliderKind` aliases [`rye_shape::ShapeKind`]. This is the
-//! consolidation that resolves the "`rye-sdf::PrimitiveKind` and `rye-physics::Collider` are
-//! parallel hierarchies that must be kept in sync by hand" duplication.
+//! Collider types. Re-exports from [`rye_shape`], `Collider` is just an alias for the
+//! canonical [`rye_shape::Shape`] enum, and `ColliderKind` aliases [`rye_shape::ShapeKind`].
+//! This is the consolidation that resolves the "`rye-sdf::PrimitiveKind` and
+//! `rye-physics::Collider` are parallel hierarchies that must be kept in sync by hand"
+//! duplication.
 //!
 //! New collider types are added by:
 //! 1. Adding a variant to [`rye_shape::Shape`] and [`rye_shape::ShapeKind`].

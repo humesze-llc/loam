@@ -1,9 +1,8 @@
 //! Euclidean R², the 2D flat-space [`Space`] impl.
 //!
-//! Parallel to [`EuclideanR3`](crate::euclidean::EuclideanR3), but with
-//! `Point = Vec2` and orientation represented by [`Rotor2`] (a unit complex
-//! number) rather than a quaternion. Used by 2D physics demos and any
-//! drop-in 2D simulation.
+//! Parallel to [`EuclideanR3`](crate::euclidean::EuclideanR3), but with `Point = Vec2` and
+//! orientation represented by [`Rotor2`] (a unit complex number) rather than a quaternion.
+//! Used by 2D physics demos and any drop-in 2D simulation.
 
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
@@ -45,8 +44,8 @@ impl Default for Iso2 {
     }
 }
 
-// Rotor2 needs Serialize/Deserialize for Iso2's derive. Add a thin impl
-// that piggybacks on serde via a plain pair.
+// Rotor2 needs Serialize/Deserialize for Iso2's derive. Add a thin impl that piggybacks on
+// serde via a plain pair.
 impl Serialize for Rotor2 {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         (self.a, self.b).serialize(s)

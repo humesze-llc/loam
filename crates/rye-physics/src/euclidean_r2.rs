@@ -19,8 +19,8 @@ fn cross2d(u: Vec2, v: Vec2) -> f32 {
     u.x * v.y - u.y * v.x
 }
 
-/// Inverse moment-of-inertia, treating static or zero-inertia bodies as having infinite inertia
-/// (returns 0).
+/// Inverse moment-of-inertia, treating static or zero-inertia bodies as having infinite
+/// inertia (returns 0).
 fn inv_inertia(body: &RigidBody<EuclideanR2>) -> f32 {
     if body.inv_mass > 0.0 && body.inertia > 0.0 {
         1.0 / body.inertia
@@ -163,8 +163,8 @@ fn sphere_sphere_r2(
     let normal = if len > 1e-8 { log / len } else { Vec2::Y };
 
     // Contact point: midpoint of the two surface points along the line between centers. For
-    // equal-radius spheres this is just the midpoint; for unequal radii it's biased toward
-    // the smaller one, which is what impulse response wants.
+    // equal-radius spheres this is just the midpoint; for unequal radii it's biased toward the
+    // smaller one, which is what impulse response wants.
     let surface_a = a.position + normal * ra;
     let surface_b = b.position - normal * rb;
     let point = (surface_a + surface_b) * 0.5;
@@ -277,11 +277,11 @@ fn polygon_polygon_r2(
     }
 
     // Contact-point heuristic: find the deepest-penetrating vertex of each polygon (projected
-    // along the contact normal), then pick whichever actually lies inside the other polygon. In
-    // a vertex-face contact only one side has a penetrating vertex, and that vertex IS the
-    // contact point. For edge-edge (both inside) or grazing (neither strictly inside), fall back
-    // to the midpoint of the two candidates. Imperfect; replace with a full Sutherland-Hodgman
-    // manifold when stability demands it.
+    // along the contact normal), then pick whichever actually lies inside the other polygon.
+    // In a vertex-face contact only one side has a penetrating vertex, and that vertex IS the
+    // contact point. For edge-edge (both inside) or grazing (neither strictly inside), fall
+    // back to the midpoint of the two candidates. Imperfect; replace with a full
+    // Sutherland-Hodgman manifold when stability demands it.
     let mut deepest_a = va[0];
     let mut max_proj = va[0].dot(normal);
     for &v in &va[1..] {
@@ -378,9 +378,9 @@ fn sphere_polygon_r2(
 
     if point_in_convex_ccw(&vb, center) {
         // Sphere center is inside the polygon, maximal penetration. Push the sphere out along
-        // (center - closest) toward the nearest edge. Normal A->B is from sphere toward
-        // polygon = (closest - center) direction, but since the center is inside we flip to
-        // push it out.
+        // (center - closest) toward the nearest edge. Normal A->B is from sphere toward polygon
+        // = (closest - center) direction, but since the center is inside we flip to push it
+        // out.
         let dir = (center - closest).try_normalize().unwrap_or(Vec2::Y);
         return Some(Contact {
             normal: -dir, // from sphere (A) toward polygon (B)
@@ -424,8 +424,8 @@ pub fn regular_polygon_vertices(n: u32, r: f32) -> Vec<Vec2> {
         .collect()
 }
 
-/// Moment of inertia of a solid regular n-gon of mass `m` and circumradius `r` about its
-/// centroid:
+/// Moment of inertia of a solid regular n-gon of mass `m` and circumradius `r`
+/// about its centroid:
 ///
 /// `I = (m·r²/6) · (1 + 2·cos²(π/n))`
 ///
@@ -456,8 +456,8 @@ pub fn polygon_body(
     )
 }
 
-/// CCW-wound corners of an axis-aligned rectangle centered at origin.
-/// Matches the winding `polygon_polygon_r2` / `sphere_polygon_r2` expect.
+/// CCW-wound corners of an axis-aligned rectangle centered at origin. Matches the winding
+/// `polygon_polygon_r2` / `sphere_polygon_r2` expect.
 fn rectangle_vertices(half_extents: Vec2) -> Vec<Vec2> {
     let (hx, hy) = (half_extents.x, half_extents.y);
     vec![
@@ -523,8 +523,8 @@ mod tests {
         let body = &world.bodies[id];
         // After one tick: v_y ≈ −9.8/60 ≈ −0.163.
         assert!(body.velocity.y < -0.1 && body.velocity.y > -0.2);
-        // Position moved down by v·dt (velocity sampled post-gravity):
-        // y ≈ 5 + (−0.163)·(1/60) ≈ 4.9973.
+        // Position moved down by v·dt (velocity sampled post-gravity): y ≈ 5 +
+        // (−0.163)·(1/60) ≈ 4.9973.
         assert!(body.position.y < 5.0 && body.position.y > 4.99);
     }
 
@@ -593,8 +593,8 @@ mod tests {
         let mut np = Narrowphase::<EuclideanR2>::new();
         register_default_narrowphase(&mut np);
 
-        // Two axis-aligned unit squares (half-extent 1), centers 1.5 apart along X -> x-extents
-        // overlap by 0.5.
+        // Two axis-aligned unit squares (half-extent 1), centers 1.5 apart along X ->
+        // x-extents overlap by 0.5.
         let a = aa_box(Vec2::ZERO, Vec2::ONE, 1.0);
         let b = aa_box(Vec2::new(1.5, 0.0), Vec2::ONE, 1.0);
 
@@ -656,8 +656,8 @@ mod tests {
         let mut np = Narrowphase::<EuclideanR2>::new();
         register_default_narrowphase(&mut np);
 
-        // Square circumradius 1 at origin. Its right edge is at x=1. Sphere radius 0.5 at (1.3,
-        // 0) -> distance from center to edge is 0.3, penetration = 0.5−0.3 = 0.2.
+        // Square circumradius 1 at origin. Its right edge is at x=1. Sphere radius 0.5 at
+        // (1.3, 0) -> distance from center to edge is 0.3, penetration = 0.5−0.3 = 0.2.
         let square = polygon_body(Vec2::ZERO, Vec2::ZERO, 4, 1.0, 1.0);
         let sphere = sphere_body(Vec2::new(1.3, 0.0), Vec2::ZERO, 0.5, 1.0);
 
@@ -704,9 +704,8 @@ mod tests {
     #[test]
     fn off_center_impact_produces_angular_velocity() {
         // A stationary square hit by a sphere falling onto its top-right corner should acquire
-        // clockwise (negative) angular velocity. This is the core bug the angular-response
-        // fix addresses: without torque from off-center contact, the square would just
-        // translate.
+        // clockwise (negative) angular velocity. This is the core bug the angular-response fix
+        // addresses: without torque from off-center contact, the square would just translate.
         let mut world = World::new(EuclideanR2);
         register_default_narrowphase(&mut world.narrowphase);
 
@@ -823,7 +822,8 @@ mod tests {
             world.step(1.0 / 60.0);
         }
 
-        // Velocities should have their sign reversed in the x direction for an elastic-ish bounce.
+        // Velocities should have their sign reversed in the x direction for an elastic-ish
+        // bounce.
         assert!(
             world.bodies[0].velocity.x < 0.0,
             "body 0 should bounce back"
@@ -838,17 +838,17 @@ mod tests {
     fn box_stack_settles_to_rest() {
         // Stack three unit boxes vertically on a static floor and run long enough for them to
         // come to rest. Without persistent manifolds + iterative PGS this stack jitters
-        // indefinitely: single-contact-per-pair single-pass resolution can't satisfy the
-        // bottom box's two simultaneous constraints (floor below, box above) in one impulse
+        // indefinitely: single-contact-per-pair single-pass resolution can't satisfy the bottom
+        // box's two simultaneous constraints (floor below, box above) in one impulse
         // application. With manifolds + PGS, both constraints are visible to the solver each
         // iteration and the stack settles to rest.
         //
         // Capped at 3 because tall polygon stacks need SAT manifold clipping
         // (Sutherland-Hodgman edge-to-face) to produce two corner contacts per pair per frame,
         // which is what gives a stack torque resistance against tipping. Today's narrowphase
-        // returns one contact per pair per frame; persistent manifolds accumulate corner contacts
-        // over frames as the stack settles, but for fast-loading tall stacks the top boxes
-        // can drift off before manifolds populate. SAT clipping (Sutherland-Hodgman
+        // returns one contact per pair per frame; persistent manifolds accumulate corner
+        // contacts over frames as the stack settles, but for fast-loading tall stacks the top
+        // boxes can drift off before manifolds populate. SAT clipping (Sutherland-Hodgman
         // edge-to-face) is on the follow-up list.
         let mut world = World::new(EuclideanR2);
         register_default_narrowphase(&mut world.narrowphase);

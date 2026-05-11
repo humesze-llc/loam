@@ -3,8 +3,8 @@
 //! ## Dual representation
 //!
 //! Points live in the **Poincaré ball** model: `Vec3` constrained to `|p| < 1`. The model is
-//! conformal (angles render correctly), cheap to interpolate, and shader-compatible with existing
-//! `vec3<f32>` plumbing.
+//! conformal (angles render correctly), cheap to interpolate, and shader-compatible with
+//! existing `vec3<f32>` plumbing.
 //!
 //! Isometries live as 4×4 Lorentz matrices acting on the **hyperboloid** model, composition is
 //! matmul, which the GPU and existing transform graphs are already good at. See [`Iso3H`].
@@ -14,16 +14,16 @@
 //!
 //! ## Curvature
 //!
-//! Fixed at `K = -1` for v0. A scalar `curvature` field can be added later without breaking the
-//! API: formulas pick up factors of `1/sqrt(-K)` in known places.
+//! Fixed at `K = -1` for v0. A scalar `curvature` field can be added later without breaking
+//! the API: formulas pick up factors of `1/sqrt(-K)` in known places.
 //!
 //! ## Domain constraint
 //!
 //! Poincaré points must satisfy `|p| < 1`. The boundary sphere is the "point at infinity",
 //! geodesic distances diverge there. Methods do not panic on out-of-domain input; they clamp
-//! internally and return degraded-but-finite results. Callers are responsible for keeping points
-//! interior. The fractal example's `--hyperbolic` mode rescales the scene so the camera orbit
-//! fits inside the ball.
+//! internally and return degraded-but-finite results. Callers are responsible for keeping
+//! points interior. The fractal example's `--hyperbolic` mode rescales the scene so the camera
+//! orbit fits inside the ball.
 
 use std::borrow::Cow;
 
@@ -32,9 +32,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::space::{Space, WgslSpace};
 
-/// Closest a Poincaré coordinate is allowed to the unit sphere before formulas
-/// saturate. At `|p|² = 1` the conformal factor `λ = 2/(1-|p|²)` blows up;
-/// `1 - 1e-7` keeps `λ ≲ 2 × 10⁷`, which is well inside f32 dynamic range.
+/// Closest a Poincaré coordinate is allowed to the unit sphere before formulas saturate.
+/// At `|p|² = 1` the conformal factor `λ = 2/(1-|p|²)` blows up; `1 - 1e-7` keeps
+/// `λ ≲ 2 × 10⁷`, which is well inside f32 dynamic range.
 const POINCARE_R2_MAX: f32 = 1.0 - 1e-7;
 
 /// Project a possibly-out-of-domain point back to the largest interior shell the rest of this
@@ -84,11 +84,11 @@ impl Iso3H {
         }
     }
 
-    /// Hyperbolic translation (a Lorentz boost) that maps the origin
-    /// of the Poincaré ball to `target`.
+    /// Hyperbolic translation (a Lorentz boost) that maps the origin of the Poincaré ball to
+    /// `target`.
     ///
-    /// `target` must lie strictly inside the unit ball. Out-of-domain targets are
-    /// clamped to a finite rapidity rather than producing NaN-laden matrices.
+    /// `target` must lie strictly inside the unit ball. Out-of-domain targets are clamped to a
+    /// finite rapidity rather than producing NaN-laden matrices.
     pub fn from_translation(target: Vec3) -> Self {
         let r2 = target.length_squared();
         if r2 < 1e-14 {
@@ -132,9 +132,9 @@ impl Space for HyperbolicH3 {
 
     fn distance(&self, a: Vec3, b: Vec3) -> f32 {
         // Use the Möbius (artanh) form rather than the acosh form. They are mathematically
-        // equivalent, but acosh of `1 + δ` for tiny δ collapses to f32's representable gap near
-        // 1.0, small distances quantize visibly. Möbius is well-conditioned at both ends inside
-        // the ball.
+        // equivalent, but acosh of `1 + δ` for tiny δ collapses to f32's representable gap
+        // near 1.0, small distances quantize visibly. Möbius is well-conditioned at both ends
+        // inside the ball.
         let a = clamp_to_ball(a);
         let b = clamp_to_ball(b);
         let n = mobius_add(-a, b).length();
@@ -191,8 +191,8 @@ impl Space for HyperbolicH3 {
     fn iso_inverse(&self, a: Iso3H) -> Iso3H {
         // For Lorentz matrices preserving J = diag(−1, −1, −1, +1):
         //   M⁻¹ = J · Mᵀ · J
-        // which flips signs on the (spatial, time) and (time, spatial) blocks while leaving the
-        // diagonal blocks alone.
+        // which flips signs on the (spatial, time) and (time, spatial) blocks while leaving
+        // the diagonal blocks alone.
         let mt = a.matrix.transpose().to_cols_array_2d();
         let mut out = [[0.0f32; 4]; 4];
         for col in 0..4 {
@@ -229,10 +229,9 @@ impl WgslSpace for HyperbolicH3 {
     }
 }
 
-// TODO(rye-shader): distance / exp / log / parallel_transport are the
-// v0 WGSL ABI. Iso3H layout is still deliberately absent; Lorentz
-// matrices need a uniform-buffer binding decision before they can be
-// passed into shaders for `iso_apply`.
+// TODO(rye-shader): distance / exp / log / parallel_transport are the v0 WGSL ABI. Iso3H
+// layout is still deliberately absent; Lorentz matrices need a uniform-buffer binding decision
+// before they can be passed into shaders for `iso_apply`.
 const WGSL_IMPL: &str = r#"
 // rye-math :: HyperbolicH3 (v0 Space WGSL ABI)
 const RYE_MAX_ARC: f32 = 1e9;
@@ -498,8 +497,8 @@ mod tests {
 
     #[test]
     fn small_scale_distance_matches_euclidean_via_metric_factor() {
-        // At the origin, ds_hyp = 2 · ds_euc. So for tiny offsets, d_hyp(0, p) -> 2 · |p|. This
-        // is the small-scale "flat limit" up to the constant conformal factor.
+        // At the origin, ds_hyp = 2 · ds_euc. So for tiny offsets, d_hyp(0, p) -> 2 · |p|.
+        // This is the small-scale "flat limit" up to the constant conformal factor.
         let s = h3();
         let eps = 1e-3;
         let p = Vec3::new(eps, 0.0, 0.0);

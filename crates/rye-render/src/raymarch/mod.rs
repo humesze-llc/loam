@@ -51,8 +51,8 @@ pub struct RayMarchUniforms {
     pub time: f32,
     /// Current sim tick as f32 (for shader-side animation).
     pub tick: f32,
-    /// Four scalar knobs exposed to the shader; semantics are up to the
-    /// user shader. Handy for live-tuning fractal parameters.
+    /// Four scalar knobs exposed to the shader; semantics are up to the user shader. Handy for
+    /// live-tuning fractal parameters.
     pub params: [f32; 4],
 }
 
@@ -75,8 +75,8 @@ impl Default for RayMarchUniforms {
     }
 }
 
-/// A render node that draws a fullscreen triangle using a user-provided
-/// fragment shader, with a single UBO of [`RayMarchUniforms`].
+/// A render node that draws a fullscreen triangle using a user-provided fragment shader, with a
+/// single UBO of [`RayMarchUniforms`].
 pub struct RayMarchNode {
     pipeline: RenderPipeline,
     uniforms: RayMarchUniforms,

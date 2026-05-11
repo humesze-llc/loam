@@ -1,8 +1,8 @@
 //! Linear render-graph harness. Owns a [`Vec<Box<dyn RenderNode>>`] and runs each node's
 //! `execute` in order against a single view.
 //!
-//! No dependency tracking, no cross-node resource sharing, no parallel execution. The trait
-//! is intentionally a one-method `execute(rd, view)`: complex apps that need scheduling or
+//! No dependency tracking, no cross-node resource sharing, no parallel execution. The trait is
+//! intentionally a one-method `execute(rd, view)`: complex apps that need scheduling or
 //! aliasing should compose nodes manually rather than waiting for this graph to grow features.
 
 use crate::device::RenderDevice;
