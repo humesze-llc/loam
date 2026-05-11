@@ -421,11 +421,18 @@ pub(crate) fn write_png(path: &Path, image: &RawImage) -> Result<()> {
 /// - `capture toggle [pre|post|both] [dir]`: start if idle, stop if recording
 /// - `capture stop`: stop sequence (or cancel a pending one-shot)
 pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
-    console.register(cmd(
-        "capture",
-        capture_help(),
-        |args, _ctx: &mut Ctx, out| run_capture(args, out),
-    ));
+    console.register(
+        cmd("capture", capture_help(), |args, _ctx: &mut Ctx, out| {
+            run_capture(args, out)
+        })
+        // Positional arg-choice grammar drives tab-completion + ghost preview. Arg 2 is
+        // a free-form output dir, intentionally left undeclared so the console doesn't
+        // try to complete filesystem paths.
+        .with_args(&[
+            &["png", "frames", "toggle", "stop"],
+            &["pre", "post", "both"],
+        ]),
+    );
 }
 
 fn capture_help() -> &'static str {
