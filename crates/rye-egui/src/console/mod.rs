@@ -571,10 +571,14 @@ impl<Ctx: 'static> Console<Ctx> {
                 return;
             }
         }
-        // Fresh completion: build context from current input.
-        let Some(ctx) = self.completion_context() else {
-            return;
-        };
+        // Fresh completion: build context from current input, falling back to the
+        // empty-prefix command list so Tab on a blank prompt cycles through commands
+        // (matches what the ghost preview shows).
+        let ctx = self
+            .completion_context()
+            .unwrap_or(CompletionContext::Command {
+                prefix: String::new(),
+            });
         let matches = self.completion_matches(&ctx);
         if matches.is_empty() {
             return;
@@ -665,24 +669,24 @@ impl<Ctx: 'static> Console<Ctx> {
         }
     }
 
-    /// Suffix of the longest common prefix of all completions that match the current
-    /// input. The panel paints this as dim ghost text after the cursor so the user sees
-    /// what `Tab` would insert.
+    /// Suffix of the *first* (sort-order) completion that matches the current input.
+    /// The panel paints this as dim ghost text after the cursor so the user sees
+    /// exactly what `Tab` will insert on the next press.
     ///
-    /// Works for both command names and positional argument choices (whichever the user
-    /// is currently typing). Returns `None` when input is empty, when nothing matches,
-    /// or when the input already covers the full common prefix of the matches (multiple
-    /// completions diverge from the next character).
+    /// Works for both command names and positional argument choices, including the
+    /// empty-input case where the first command alphabetically is previewed. Returns
+    /// `None` only when no completion matches at all.
     pub fn tab_preview(&self) -> Option<String> {
-        let ctx = self.completion_context()?;
+        let ctx = self
+            .completion_context()
+            .unwrap_or(CompletionContext::Command {
+                prefix: String::new(),
+            });
         let matches = self.completion_matches(&ctx);
-        if matches.is_empty() {
-            return None;
-        }
-        let lcp = longest_common_prefix(&matches);
+        let first = matches.first()?;
         let prefix_len = ctx.prefix().len();
-        if lcp.len() > prefix_len {
-            Some(lcp[prefix_len..].to_string())
+        if first.len() > prefix_len {
+            Some(first[prefix_len..].to_string())
         } else {
             None
         }
@@ -905,14 +909,14 @@ mod tests {
     }
 
     #[test]
-    fn tab_preview_returns_lcp_suffix() {
+    fn tab_preview_shows_first_match_suffix() {
         // Use the four built-in commands: clear, detach, dock, help. No additional
-        // registrations needed.
+        // registrations needed. Sort order: clear < detach < dock < help.
         let mut c = Console::<Ctx>::new();
 
-        // Empty input -> no preview.
+        // Empty input -> previews the first command alphabetically.
         c.input = String::new();
-        assert_eq!(c.tab_preview(), None);
+        assert_eq!(c.tab_preview().as_deref(), Some("clear"));
 
         // Single match -> preview is the rest of that command.
         c.input = "de".into();
@@ -927,9 +931,10 @@ mod tests {
         c.input = "h".into();
         assert_eq!(c.tab_preview().as_deref(), Some("elp"));
 
-        // Multiple matches whose LCP equals the input -> no preview.
+        // Multiple matches sharing only a prefix -> previews the first by sort order.
+        // `d` matches `detach` and `dock`; alphabetically `detach` is first.
         c.input = "d".into();
-        assert_eq!(c.tab_preview(), None);
+        assert_eq!(c.tab_preview().as_deref(), Some("etach"));
 
         // No match -> no preview.
         c.input = "zzz".into();
@@ -953,10 +958,10 @@ mod tests {
         c.input = "capture t".into();
         assert_eq!(c.tab_preview().as_deref(), Some("oggle"));
 
-        // Trailing whitespace = starting next arg. arg_1 choices share no prefix, so
-        // no ghost (user must type a char or press Tab to cycle).
+        // Trailing whitespace = starting next arg. Previews the first arg-1 choice
+        // alphabetically (`both` < `post` < `pre`).
         c.input = "capture png ".into();
-        assert_eq!(c.tab_preview(), None);
+        assert_eq!(c.tab_preview().as_deref(), Some("both"));
 
         // Mid-arg-1: `po` -> `post`.
         c.input = "capture png po".into();
