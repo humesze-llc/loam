@@ -60,7 +60,7 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -167,6 +167,38 @@ pub fn enqueue(req: CaptureRequest) {
 
 pub(crate) fn drain_requests() -> Vec<CaptureRequest> {
     std::mem::take(&mut *QUEUE.lock().expect("capture queue poisoned"))
+}
+
+// ---------------------------------------------------------------------------
+// Status broadcast
+// ---------------------------------------------------------------------------
+
+/// The runner publishes the current [`Capture::status`] here once per frame so UI code
+/// (the panel, optional console title text, etc.) can read it without owning a
+/// reference to the runner.
+static STATUS: Mutex<Option<String>> = Mutex::new(None);
+
+/// Compact one-line status string set by the runner each frame. `None` when idle.
+/// Currently surfaced in the window title; the panel UI reads it via this function.
+pub fn current_status() -> Option<String> {
+    STATUS.lock().ok().and_then(|g| g.clone())
+}
+
+pub(crate) fn publish_status(status: Option<String>) {
+    if let Ok(mut g) = STATUS.lock() {
+        *g = status;
+    }
+}
+
+/// Console-driven toggle for the capture panel. The `capture panel` subcommand flips
+/// this; [`CapturePanel::show`] mirrors it so the panel opens/closes without per-demo
+/// plumbing.
+static PANEL_OPEN: AtomicBool = AtomicBool::new(false);
+
+fn toggle_panel_global() -> bool {
+    let now_open = !PANEL_OPEN.load(Ordering::Relaxed);
+    PANEL_OPEN.store(now_open, Ordering::Relaxed);
+    now_open
 }
 
 // ---------------------------------------------------------------------------
@@ -836,14 +868,14 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
         // Subcommand at index 0, stage at index 1; output dir is intentionally
         // undeclared (no filesystem completion).
         .with_args(&[
-            &["png", "frames", "gif", "toggle", "stop"],
+            &["png", "frames", "gif", "toggle", "stop", "panel"],
             &["pre", "post", "both"],
         ]),
     );
 }
 
 fn capture_help() -> &'static str {
-    "capture <png|frames|gif|toggle|stop> [pre|post|both] [dir] [fps=N] [scale=W]"
+    "capture <png|frames|gif|toggle|stop|panel> [pre|post|both] [dir] [fps=N] [scale=W]"
 }
 
 fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
@@ -893,6 +925,14 @@ fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
         "stop" => {
             enqueue(CaptureRequest::Stop);
             out.line("stop queued");
+        }
+        "panel" => {
+            let now_open = toggle_panel_global();
+            out.line(if now_open {
+                "panel opened"
+            } else {
+                "panel closed"
+            });
         }
         "toggle" => {
             let (format, after_format) = parse_format(rest);
@@ -973,9 +1013,179 @@ fn parse_format<'a>(args: &'a [&'a str]) -> (CaptureFormat, &'a [&'a str]) {
 /// Bind the default capture hotkeys on the given console:
 /// - `F12`: `capture png post` (one-shot screenshot)
 /// - `F9`:  `capture toggle gif post` (press to start a GIF, again to stop)
+/// - `F11`: `capture panel` (toggle the parameters UI)
 pub fn bind_default_hotkeys<Ctx: 'static>(console: &mut Console<Ctx>) {
     console.bind(rye_egui::egui::Key::F12, "capture png post");
     console.bind(rye_egui::egui::Key::F9, "capture toggle gif post");
+    console.bind(rye_egui::egui::Key::F11, "capture panel");
+}
+
+// ---------------------------------------------------------------------------
+// Panel UI
+// ---------------------------------------------------------------------------
+
+/// Egui widget for setting capture parameters (format, output dir, fps, scale) and
+/// driving start / stop / one-shot via buttons.
+///
+/// The panel owns its own widget state (text edits, slider values, etc.); pushing the
+/// `Start`/`Screenshot` buttons synthesises a [`CaptureRequest`] and pushes it onto the
+/// global queue. Visibility is driven by [`CapturePanel::open`] *or* by the global
+/// toggle the `capture panel` console subcommand flips, whichever changed last.
+///
+/// Wire it in your demo with two calls (state + per-frame show):
+///
+/// ```ignore
+/// // setup:
+/// let capture_panel = rye_app::capture::CapturePanel::new();
+///
+/// // each frame in App::ui:
+/// self.capture_panel.show(egui_ctx);
+/// ```
+pub struct CapturePanel {
+    /// Visible? Toggle via [`CapturePanel::toggle`] or the console `capture panel`
+    /// subcommand (which flips a global the panel mirrors each frame).
+    pub open: bool,
+    output_dir: String,
+    name: String,
+    format: CaptureFormat,
+    stage: CaptureStage,
+    fps: u16,
+    scale_enabled: bool,
+    scale_width: u32,
+}
+
+impl Default for CapturePanel {
+    fn default() -> Self {
+        Self {
+            open: false,
+            output_dir: "captures".into(),
+            name: String::new(),
+            format: CaptureFormat::Gif,
+            stage: CaptureStage::Post,
+            fps: 30,
+            scale_enabled: false,
+            scale_width: 720,
+        }
+    }
+}
+
+impl CapturePanel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+        PANEL_OPEN.store(self.open, Ordering::Relaxed);
+    }
+
+    /// Per-frame entry point. Mirrors the global console-driven toggle into
+    /// `self.open`, then renders the egui window when open.
+    pub fn show(&mut self, ctx: &rye_egui::egui::Context) {
+        let global = PANEL_OPEN.load(Ordering::Relaxed);
+        if global != self.open {
+            self.open = global;
+        }
+        if !self.open {
+            return;
+        }
+        let mut open_flag = self.open;
+        rye_egui::egui::Window::new("capture")
+            .open(&mut open_flag)
+            .resizable(true)
+            .default_width(280.0)
+            .show(ctx, |ui| self.body(ui));
+        if open_flag != self.open {
+            self.open = open_flag;
+            PANEL_OPEN.store(self.open, Ordering::Relaxed);
+        }
+    }
+
+    fn body(&mut self, ui: &mut rye_egui::egui::Ui) {
+        let recording_status = current_status();
+        let recording = recording_status.is_some();
+
+        ui.label(format!(
+            "Status: {}",
+            recording_status.as_deref().unwrap_or("Idle")
+        ));
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("Dir:");
+            ui.add(rye_egui::egui::TextEdit::singleline(&mut self.output_dir).desired_width(180.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            ui.add(rye_egui::egui::TextEdit::singleline(&mut self.name).desired_width(160.0));
+            if self.name.is_empty() {
+                ui.weak("(auto)");
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Format:");
+            ui.radio_value(&mut self.format, CaptureFormat::Png, "PNG");
+            ui.radio_value(&mut self.format, CaptureFormat::Gif, "GIF");
+        });
+
+        // Stage radio: only PNG sequences support pre/both; GIF is forced to Post on
+        // request so the radio is read-only there.
+        let stage_enabled = self.format == CaptureFormat::Png;
+        ui.add_enabled_ui(stage_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Stage:");
+                ui.radio_value(&mut self.stage, CaptureStage::Pre, "pre");
+                ui.radio_value(&mut self.stage, CaptureStage::Post, "post");
+                ui.radio_value(&mut self.stage, CaptureStage::Both, "both");
+            });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("FPS:");
+            ui.add(rye_egui::egui::Slider::new(&mut self.fps, 1..=60));
+        });
+
+        // Scale is GIF-only; the LSD is locked at the first frame so we don't expose
+        // mid-stream resize. For PNG, every frame is a separate file and downscale
+        // would defeat the diagnostic goal.
+        ui.add_enabled_ui(self.format == CaptureFormat::Gif, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.scale_enabled, "Scale:");
+                ui.add_enabled(
+                    self.scale_enabled,
+                    rye_egui::egui::Slider::new(&mut self.scale_width, 240..=2160).suffix(" px"),
+                );
+            });
+        });
+
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            if ui.button("Screenshot").clicked() {
+                enqueue(CaptureRequest::OneShot {
+                    stage: CaptureStage::Both,
+                    dir: Some(PathBuf::from(&self.output_dir)),
+                    name: (!self.name.is_empty()).then(|| self.name.clone()),
+                });
+            }
+            let label = if recording { "Stop" } else { "Start" };
+            if ui.button(label).clicked() {
+                if recording {
+                    enqueue(CaptureRequest::Stop);
+                } else {
+                    enqueue(CaptureRequest::StartSequence {
+                        format: self.format,
+                        stage: self.stage,
+                        dir: Some(PathBuf::from(&self.output_dir)),
+                        name: (!self.name.is_empty()).then(|| self.name.clone()),
+                        fps: Some(self.fps),
+                        scale: self.scale_enabled.then_some(self.scale_width),
+                    });
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]

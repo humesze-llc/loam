@@ -785,6 +785,10 @@ impl<A: App> Runner<A> {
                 if do_capture {
                     self.capture.advance_frame(capture_now);
                 }
+                // Publish status every frame so the panel + window title stay current
+                // even when do_capture is false (FPS-gated idle frames between writes).
+                #[cfg(feature = "capture")]
+                capture::publish_status(self.capture.status());
 
                 frame.present();
                 if let Some(err) = last_err {

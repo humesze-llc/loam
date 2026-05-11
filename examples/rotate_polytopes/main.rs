@@ -597,6 +597,9 @@ struct RotatePolytopesApp {
     /// like Space / R / arrows: when egui wants the keyboard,
     /// the demo's hotkeys must NOT fire on top.
     last_egui_keyboard: bool,
+    /// Capture parameters panel (output dir, format, fps, scale, start/stop).
+    /// Toggled via the `capture panel` console command or the F11 default bind.
+    capture_panel: rye_app::capture::CapturePanel,
 }
 
 impl RotatePolytopesApp {
@@ -656,6 +659,7 @@ impl App for RotatePolytopesApp {
             demo,
             console,
             last_egui_keyboard: false,
+            capture_panel: rye_app::capture::CapturePanel::new(),
         })
     }
 
@@ -669,6 +673,7 @@ impl App for RotatePolytopesApp {
 
     fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
         self.demo.ui(ctx, frame);
+        self.capture_panel.show(ctx);
         self.console.ui(ctx, &mut self.demo);
         // Stash for next frame's `on_event` to gate hotkey routing.
         // Captured AFTER the console renders so a freshly-focused
