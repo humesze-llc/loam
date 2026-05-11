@@ -858,27 +858,6 @@ fn apply_completion(input: &str, ctx: &CompletionContext, choice: &str) -> Strin
     }
 }
 
-/// Longest common byte prefix shared by every string in `strs`. Returns an empty string
-/// when `strs` is empty. Operates on bytes, which is safe for ASCII command names; if
-/// commands grow multi-byte UTF-8 names we'll need a char-boundary fix.
-fn longest_common_prefix(strs: &[String]) -> String {
-    let Some(first) = strs.first() else {
-        return String::new();
-    };
-    let mut end = first.len();
-    for s in &strs[1..] {
-        let limit = end.min(s.len());
-        let mut i = 0;
-        while i < limit && first.as_bytes()[i] == s.as_bytes()[i] {
-            i += 1;
-        }
-        end = i;
-        if end == 0 {
-            break;
-        }
-    }
-    first[..end].to_string()
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -991,16 +970,6 @@ mod tests {
         assert_eq!(c.input, "capture png post");
         c.tab_complete();
         assert_eq!(c.input, "capture png pre");
-    }
-
-    #[test]
-    fn longest_common_prefix_basic_cases() {
-        let v = |s: &[&str]| -> Vec<String> { s.iter().map(|x| x.to_string()).collect() };
-        assert_eq!(longest_common_prefix(&v(&[])), "");
-        assert_eq!(longest_common_prefix(&v(&["foo"])), "foo");
-        assert_eq!(longest_common_prefix(&v(&["foobar", "foobaz"])), "fooba");
-        assert_eq!(longest_common_prefix(&v(&["foo", "bar"])), "");
-        assert_eq!(longest_common_prefix(&v(&["", "foo"])), "");
     }
 
     #[test]
