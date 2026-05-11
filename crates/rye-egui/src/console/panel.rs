@@ -54,8 +54,6 @@ const ROW_INPUT_HEIGHT: f32 = 24.0;
 /// has remembered.
 const DETACHED_DEFAULT_W: f32 = 520.0;
 const DETACHED_DEFAULT_H: f32 = 320.0;
-const DETACHED_MIN_W: f32 = 280.0;
-const DETACHED_MIN_H: f32 = 120.0;
 
 pub(super) fn draw<Ctx: 'static>(
     console: &mut Console<Ctx>,
@@ -134,6 +132,11 @@ fn draw_detached<Ctx: 'static>(console: &mut Console<Ctx>, ctx: &egui::Context, 
         .inner_margin(Margin::same(0))
         .corner_radius(egui::CornerRadius::same(4));
 
+    // No explicit min_width / min_height: egui's Window resize logic + an enforced
+    // minimum together produce a sideways-drift bug when the user pulls the left
+    // edge below the minimum (mouse drag tracks left, window stays at minimum
+    // width, content separators shrink to chase the dragged origin). Letting the
+    // window go arbitrarily small avoids the bug; the user can resize back up.
     egui::Window::new("rye_console_window")
         .id(egui::Id::new("rye_console_window"))
         .title_bar(false)
@@ -142,8 +145,6 @@ fn draw_detached<Ctx: 'static>(console: &mut Console<Ctx>, ctx: &egui::Context, 
         .movable(true)
         .default_pos(default_pos)
         .default_size(egui::vec2(DETACHED_DEFAULT_W, DETACHED_DEFAULT_H))
-        .min_width(DETACHED_MIN_W)
-        .min_height(DETACHED_MIN_H)
         .frame(frame)
         .show(ctx, |ui| {
             // Tight vertical layout: drop inter-item spacing between title, separators,
