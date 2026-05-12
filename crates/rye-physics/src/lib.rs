@@ -33,6 +33,7 @@ pub mod collision;
 pub mod euclidean_r2;
 pub mod euclidean_r3;
 pub mod euclidean_r4;
+pub mod polytope;
 
 pub use body::RigidBody;
 pub use collider::{Collider, ColliderKind};
