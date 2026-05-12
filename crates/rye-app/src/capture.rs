@@ -115,8 +115,14 @@ pub enum CaptureFormat {
     /// FPS unlimited by default (every render frame); pass an explicit fps to throttle.
     Png,
     /// Single animated GIF, palette-quantized via NeuQuant, infinite loop. Single
-    /// stage only (pre OR post, not both). Default fps 30.
+    /// stage only (pre OR post, not both). Default fps 30. Has a quality ceiling for
+    /// continuous-tone content; see module docs.
     Gif,
+    /// Single animated PNG (APNG): lossless 24-bit-per-frame, infinite loop. Single
+    /// stage only. Default fps 30. Recommended for shareable clips of raymarched
+    /// content. Worker buffers all frames in memory until stop, so practical
+    /// recording length is bounded by available RAM (~5 s at 1080p).
+    Apng,
 }
 
 /// How GIF frames are palette-quantized.
@@ -144,11 +150,13 @@ impl CaptureFormat {
     fn default_fps(self) -> Option<u16> {
         match self {
             CaptureFormat::Png => None, // unlimited; every frame
-            CaptureFormat::Gif => Some(30),
+            CaptureFormat::Gif | CaptureFormat::Apng => Some(30),
         }
     }
 
     fn supports_both_stages(self) -> bool {
+        // Only PNG sequences write two parallel files; the single-file animated
+        // formats can only carry one stream.
         matches!(self, CaptureFormat::Png)
     }
 }
@@ -300,6 +308,18 @@ enum SequenceWriter {
         /// Cloned into every emitted GifFrame so the worker uses the same palette
         /// for indexing each frame.
         global_palette: Option<Arc<color_quant::NeuQuant>>,
+    },
+    /// Animated PNG: lossless 24-bit-per-frame, infinite loop. The worker buffers
+    /// every captured frame in memory until stop, then writes the assembled APNG
+    /// in one pass (APNG's `acTL` chunk needs the frame count up front). Memory
+    /// cost = `frames * width * height * 4` bytes; cap recordings to a few seconds
+    /// at 1080p to avoid pressure.
+    Apng {
+        worker: ApngWorker,
+        path: PathBuf,
+        /// Optional output width in pixels. Lanczos3 resample on the worker thread;
+        /// aspect ratio preserved.
+        scale: Option<u32>,
     },
 }
 
@@ -577,6 +597,162 @@ fn encode_one_frame(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// APNG worker
+// ---------------------------------------------------------------------------
+
+/// Owns the APNG encoder thread. Unlike the GIF worker, APNG can't stream a
+/// frame at a time because the `acTL` chunk (which carries the total frame
+/// count) must be written before the first frame data. So the worker buffers
+/// every received frame in memory; on stop, the channel closes and the loop
+/// assembles + writes the full APNG file.
+pub(crate) struct ApngWorker {
+    tx: Option<SyncSender<ApngFrame>>,
+    handle: Option<JoinHandle<()>>,
+    /// Updated by the worker as it receives frames. Surfaced to the user as
+    /// part of the recording status so they can see the buffer growing.
+    frame_count: Arc<AtomicU32>,
+}
+
+struct ApngFrame {
+    rgba: Vec<u8>,
+    src_width: u32,
+    src_height: u32,
+    captured_at: Instant,
+    scale: Option<u32>,
+}
+
+/// Capacity of the main-thread -> worker channel. The worker accumulates
+/// without bound once it pulls a frame off the channel, so this is just the
+/// in-flight buffer; the actual memory ceiling is the worker's internal Vec.
+const APNG_CHANNEL_CAPACITY: usize = 16;
+
+impl ApngWorker {
+    fn spawn(path: PathBuf) -> Self {
+        let (tx, rx) = sync_channel::<ApngFrame>(APNG_CHANNEL_CAPACITY);
+        let frame_count = Arc::new(AtomicU32::new(0));
+        let frame_count_for_worker = frame_count.clone();
+        let handle = thread::Builder::new()
+            .name("rye-app::apng-encoder".into())
+            .spawn(move || apng_encoder_loop(path, rx, frame_count_for_worker))
+            .expect("spawn apng encoder thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            frame_count,
+        }
+    }
+
+    /// Non-blocking enqueue. If the channel is full the frame is dropped (the
+    /// worker is presumably moving them into its internal buffer just fine; a
+    /// full channel means the worker is unusually slow).
+    fn try_send(&self, frame: ApngFrame) {
+        let Some(tx) = self.tx.as_ref() else { return };
+        if let Err(TrySendError::Disconnected(_)) = tx.try_send(frame) {
+            tracing::error!("capture: apng encoder thread exited unexpectedly");
+        }
+    }
+
+    fn frame_count(&self) -> u32 {
+        self.frame_count.load(Ordering::Relaxed)
+    }
+
+    /// Close the input channel and hand back the worker's `JoinHandle`. The
+    /// worker drains the channel into its in-memory buffer, then assembles
+    /// and writes the APNG when the channel closes. Mirrors `GifWorker::detach`.
+    fn detach(mut self) -> JoinHandle<()> {
+        self.tx.take();
+        self.handle.take().expect("worker handle present")
+    }
+}
+
+impl Drop for ApngWorker {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn apng_encoder_loop(path: PathBuf, rx: Receiver<ApngFrame>, frame_count: Arc<AtomicU32>) {
+    let mut frames: Vec<ApngFrame> = Vec::new();
+    for frame in rx {
+        frames.push(frame);
+        frame_count.store(frames.len() as u32, Ordering::Relaxed);
+    }
+    if frames.is_empty() {
+        tracing::info!("capture: apng stopped before any frames captured; no file written");
+        return;
+    }
+    if let Err(e) = write_apng(&path, frames) {
+        tracing::error!("capture: apng write failed: {e:#}");
+        return;
+    }
+    tracing::info!("capture: apng file finalised at {}", path.display());
+}
+
+fn write_apng(path: &Path, frames: Vec<ApngFrame>) -> Result<()> {
+    // First frame's dimensions become the APNG's fixed canvas size.
+    let (out_w, out_h) = scaled_dims(frames[0].src_width, frames[0].src_height, frames[0].scale)?;
+    let file =
+        File::create(path).with_context(|| format!("create apng output {}", path.display()))?;
+    let mut encoder = png::Encoder::new(BufWriter::new(file), out_w, out_h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    // `set_animated(num_frames, num_plays)`; num_plays=0 loops infinitely.
+    encoder
+        .set_animated(frames.len() as u32, 0)
+        .context("apng set_animated")?;
+    let mut writer = encoder.write_header().context("apng write_header")?;
+
+    let mut last_captured_at: Option<Instant> = None;
+    for frame in frames {
+        let (fw, fh) = scaled_dims(frame.src_width, frame.src_height, frame.scale)?;
+        if fw != out_w || fh != out_h {
+            return Err(anyhow!(
+                "apng frame dims {fw}x{fh} != first frame {out_w}x{out_h}"
+            ));
+        }
+        let rgba = if frame.scale.is_some() {
+            let src: ::image::RgbaImage =
+                ::image::ImageBuffer::from_raw(frame.src_width, frame.src_height, frame.rgba)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "RGBA size mismatch at {}x{}",
+                            frame.src_width,
+                            frame.src_height
+                        )
+                    })?;
+            ::image::imageops::resize(&src, out_w, out_h, ::image::imageops::FilterType::Lanczos3)
+                .into_raw()
+        } else {
+            frame.rgba
+        };
+
+        // Per-frame delay: wall-clock elapsed since previous frame, as `ms / 1000`.
+        // Clamped to >= 1 ms so the encoder doesn't reject zero. First frame uses
+        // a default of 33 ms (~30 fps) since no previous timestamp exists.
+        let delay_ms = match last_captured_at {
+            None => 33u16,
+            Some(prev) => {
+                let ms = frame.captured_at.duration_since(prev).as_millis();
+                ms.min(u16::MAX as u128).max(1) as u16
+            }
+        };
+        last_captured_at = Some(frame.captured_at);
+
+        writer
+            .set_frame_delay(delay_ms, 1000)
+            .context("apng set_frame_delay")?;
+        writer
+            .write_image_data(&rgba)
+            .context("apng write_image_data")?;
+    }
+    writer.finish().context("apng finish")?;
+    Ok(())
+}
+
 impl Capture {
     pub(crate) fn new() -> Self {
         Self {
@@ -708,6 +884,19 @@ impl Capture {
                     global_palette: None,
                 }
             }
+            CaptureFormat::Apng => {
+                let path = dir.join(format!("{name}.apng"));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create apng parent dir {}", parent.display()))?;
+                }
+                let worker = ApngWorker::spawn(path.clone());
+                SequenceWriter::Apng {
+                    worker,
+                    path,
+                    scale,
+                }
+            }
         };
 
         let fps_interval = fps.map(|f| Duration::from_secs_f64(1.0 / f.max(1) as f64));
@@ -789,6 +978,16 @@ impl Capture {
                         path.display()
                     ));
                 }
+                SequenceWriter::Apng { worker, path, .. } => {
+                    let buffered = worker.frame_count();
+                    let handle = worker.detach();
+                    self.pending.push(handle);
+                    log.push(format!(
+                        "capture: APNG stream stopped, {buffered} frame(s) buffered; \
+                         assembling and writing in background -> {}",
+                        path.display()
+                    ));
+                }
             },
             CaptureState::OneShot { .. } => {
                 log.push("capture: pending one-shot cancelled".into());
@@ -821,6 +1020,7 @@ impl Capture {
                 let dropped = match writer {
                     SequenceWriter::Png { .. } => 0,
                     SequenceWriter::Gif { worker, .. } => worker.dropped(),
+                    SequenceWriter::Apng { .. } => 0,
                 };
                 if dropped > 0 {
                     Some(format!("REC {frame_count} ({dropped} dropped)"))
@@ -1041,6 +1241,17 @@ impl SequenceWriter {
                 }
                 Ok(())
             }
+            SequenceWriter::Apng { worker, scale, .. } => {
+                // APNG worker buffers in memory; just hand the raw RGBA over.
+                worker.try_send(ApngFrame {
+                    rgba: rgba.to_vec(),
+                    src_width: width,
+                    src_height: height,
+                    captured_at,
+                    scale: *scale,
+                });
+                Ok(())
+            }
         }
     }
 }
@@ -1238,7 +1449,7 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
         // `fps=` and `scale=` have no value choices (free-form numeric input)
         // so completion stops at the bare key.
         .with_args(&[
-            &["png", "frames", "gif", "toggle", "stop", "panel"],
+            &["png", "frames", "gif", "apng", "toggle", "stop", "panel"],
             &["both", "fps=", "palette=", "post", "pre", "scale="],
             &["fps=", "palette=", "scale="],
             &["fps=", "palette=", "scale="],
@@ -1248,7 +1459,8 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
 }
 
 fn capture_help() -> &'static str {
-    "capture <png|frames|gif|toggle|stop|panel> [pre|post|both] [dir] [fps=N] [scale=W]"
+    "capture <png|frames|gif|apng|toggle|stop|panel> [pre|post|both] [dir] [fps=N] \
+     [scale=W] [palette=local|global]"
 }
 
 fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
@@ -1296,6 +1508,24 @@ fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
                 p.fps.map_or("default".into(), |f| f.to_string()),
                 p.scale.map_or("native".into(), |s| s.to_string()),
                 p.palette,
+            ));
+        }
+        "apng" => {
+            let p = parse_capture_args(rest);
+            enqueue(CaptureRequest::StartSequence {
+                format: CaptureFormat::Apng,
+                stage: p.stage,
+                dir: p.dir,
+                name: None,
+                fps: p.fps,
+                scale: p.scale,
+                palette: PaletteMode::default(),
+            });
+            out.line(format!(
+                "started APNG stream ({:?}, fps={}, scale={})",
+                p.stage,
+                p.fps.map_or("default".into(), |f| f.to_string()),
+                p.scale.map_or("native".into(), |s| s.to_string()),
             ));
         }
         "stop" => {
@@ -1391,6 +1621,7 @@ fn parse_format<'a>(args: &'a [&'a str]) -> (CaptureFormat, &'a [&'a str]) {
     match args.split_first() {
         Some((&"png", rest)) | Some((&"frames", rest)) => (CaptureFormat::Png, rest),
         Some((&"gif", rest)) => (CaptureFormat::Gif, rest),
+        Some((&"apng", rest)) => (CaptureFormat::Apng, rest),
         // No format keyword recognised; treat the whole list as stage/dir args and use
         // the default streaming format (gif, the "share this clip" shape).
         _ => (CaptureFormat::Gif, args),
@@ -1516,6 +1747,7 @@ impl CapturePanel {
             ui.label("Format:");
             ui.radio_value(&mut self.format, CaptureFormat::Png, "PNG");
             ui.radio_value(&mut self.format, CaptureFormat::Gif, "GIF");
+            ui.radio_value(&mut self.format, CaptureFormat::Apng, "APNG");
         });
 
         // Stage radio: only PNG sequences support pre/both; GIF is forced to Post on
@@ -1538,7 +1770,8 @@ impl CapturePanel {
         // Scale is GIF-only; the LSD is locked at the first frame so we don't expose
         // mid-stream resize. For PNG, every frame is a separate file and downscale
         // would defeat the diagnostic goal.
-        ui.add_enabled_ui(self.format == CaptureFormat::Gif, |ui| {
+        let scale_supported = matches!(self.format, CaptureFormat::Gif | CaptureFormat::Apng);
+        ui.add_enabled_ui(scale_supported, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.scale_enabled, "Scale:");
                 ui.add_enabled(
@@ -1550,7 +1783,7 @@ impl CapturePanel {
 
         // Palette mode: GIF-only. Local = per-frame NeuQuant (current default, may
         // flicker); Global = warmup-trained shared palette (no flicker after the
-        // first ~1 s warmup).
+        // first ~1 s warmup). PNG and APNG don't use a palette (24-bit per frame).
         ui.add_enabled_ui(self.format == CaptureFormat::Gif, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Palette:");
