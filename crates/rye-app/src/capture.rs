@@ -1493,6 +1493,33 @@ fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
         }
         "gif" => {
             let p = parse_capture_args(rest);
+            // Always surface the GIF quality caveat. Raymarched continuous-tone
+            // content fights the 256-color palette and produces visible flicker.
+            out.error(
+                "GIF: per-frame NeuQuant flickers on raymarched content. Prefer \
+                 `capture apng` for shareable clips, or `capture frames` + ffmpeg \
+                 palettegen for high-quality post-processed GIFs.",
+            );
+            tracing::warn!(
+                "capture: GIF quality is limited for raymarched content (per-frame \
+                 palette regeneration causes flicker); prefer apng or PNG sequence"
+            );
+            // `palette=global` is the more experimental path (warmup buffer, shared
+            // NeuQuant, training-data bias if anything is visible during warmup).
+            // Stack a second warning so the extra caveats are surfaced.
+            if p.palette == PaletteMode::Global {
+                out.error(
+                    "GIF palette=global: palette is trained from the first ~1s of \
+                     captures; anything on screen during that window (the console, \
+                     transient overlays) biases the palette toward those colors and \
+                     the rest of the recording looks desaturated. Capture pre-egui \
+                     (`capture gif pre palette=global`) to avoid.",
+                );
+                tracing::warn!(
+                    "capture: GIF palette=global trains on the warmup buffer; ensure \
+                     no transient UI is visible during the first ~1s of capture"
+                );
+            }
             enqueue(CaptureRequest::StartSequence {
                 format: CaptureFormat::Gif,
                 stage: p.stage,
