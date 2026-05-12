@@ -457,10 +457,11 @@ fn encode_one_frame(
     // + ffmpeg for high-quality clips).
     let mut gif_frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 10);
     gif_frame.delay = delay_cs;
-    // Force decoders to clear to background between frames rather than relying on
-    // the gif crate's unspecified default (`DisposalMethod::Any`), which different
-    // viewers interpret inconsistently and can produce ghost overlays on the floor.
-    gif_frame.dispose = gif::DisposalMethod::Background;
+    // `DisposalMethod::Any` (the gif crate default) leaves disposal unspecified so
+    // decoders pick whatever they normally do for full-frame opaque content (~Keep).
+    // An earlier attempt to force `Background` caused a perceptible inter-frame
+    // flash on full-frame content, which read as worse flicker.
+    gif_frame.dispose = gif::DisposalMethod::Any;
     enc.write_frame(&gif_frame).context("gif encode")?;
     Ok(())
 }
