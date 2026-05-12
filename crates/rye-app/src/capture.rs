@@ -58,16 +58,26 @@
 //!
 //! `dir` defaults to `./captures/`; `name` defaults to `{example}_{unix_secs}`.
 //!
-//! ## Converting a captured GIF to WebP (for README embeds)
+//! ## Post-processing with ffmpeg
 //!
-//! GIF is the streaming output we ship. For smaller / higher-quality WebP, post-process
-//! with ffmpeg (one pass handles format conversion + downscale + fps cap):
+//! `capture frames` is the master format. From a PNG sequence at `./captures/clip/`,
+//! ffmpeg produces clean output in any container; in particular `palettegen +
+//! paletteuse` gives a flicker-free GIF (global palette computed from a full
+//! pre-pass over all frames, then dithered):
 //!
 //! ```text
-//! ffmpeg -i in.gif \
-//!   -vf "fps=30,scale=720:-1:flags=lanczos" \
-//!   -loop 0 -lossless 0 -q:v 75 \
-//!   out.webp
+//! # Clean GIF (global palette, dithered)
+//! ffmpeg -framerate 30 -i ./captures/clip/post_%06d.png \
+//!   -vf "split[s0][s1];[s0]palettegen=stats_mode=full[p];[s1][p]paletteuse=dither=bayer" \
+//!   out.gif
+//!
+//! # WebP (animated, inline-renders on GitHub, smaller than GIF)
+//! ffmpeg -framerate 30 -i ./captures/clip/post_%06d.png \
+//!   -vcodec libwebp -lossless 0 -q:v 80 -loop 0 out.webp
+//!
+//! # MP4 (best quality, Discord/Twitter inline; GitHub via <video>)
+//! ffmpeg -framerate 30 -i ./captures/clip/post_%06d.png \
+//!   -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p out.mp4
 //! ```
 
 use std::fs::File;
