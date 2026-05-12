@@ -1218,32 +1218,19 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
             run_capture(args, out)
         })
         // Positional arg-choice grammar drives tab-completion + ghost preview.
-        //
-        // Two flavors of kv args here:
-        // - `fps=` / `scale=`: free-form numeric values; only the prefix is in
-        //   the choices list. Tab inserts `fps=` and the user types the number.
-        // - `palette=local` / `palette=global`: enumerable values; both full
-        //   strings are in the choices list. Tab cycles through them, ghost
-        //   shows the next valid suffix.
-        //
-        // The deduplication filter (in completion_matches) ensures that once a
-        // `key=` prefix appears in the typed args, all choices with that prefix
-        // are suppressed so the user doesn't see `palette=*` after they've
-        // already typed `palette=global`.
+        // All kv keys appear at the arg level (`fps=`, `palette=`, `scale=`); the
+        // *values* for `palette=` are declared separately via
+        // `with_value_choices` so the console can do two-step completion: first
+        // Tab lands on `palette=`, then ghost/Tab cycles `global`/`local`.
+        // `fps=` and `scale=` have no value choices (free-form numeric input)
+        // so completion stops at the bare key.
         .with_args(&[
             &["png", "frames", "gif", "toggle", "stop", "panel"],
-            &[
-                "both",
-                "fps=",
-                "palette=global",
-                "palette=local",
-                "post",
-                "pre",
-                "scale=",
-            ],
-            &["fps=", "palette=global", "palette=local", "scale="],
-            &["fps=", "palette=global", "palette=local", "scale="],
-        ]),
+            &["both", "fps=", "palette=", "post", "pre", "scale="],
+            &["fps=", "palette=", "scale="],
+            &["fps=", "palette=", "scale="],
+        ])
+        .with_value_choices("palette", &["local", "global"]),
     );
 }
 

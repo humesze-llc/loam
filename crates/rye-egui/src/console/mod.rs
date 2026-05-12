@@ -152,9 +152,20 @@ pub trait Command<Ctx>: 'static {
 
     /// Tab-completion choices for the `arg_index`-th positional argument. Default is
     /// empty (no completion / free-form arg like a path or number). Override via
-    /// [`FnCommand::with_args`] when an arg is a fixed enum like `pre|post|both`.
+    /// [`FnCommand::with_args`] when an arg is a fixed enum like `pre|post|both`,
+    /// or include a `key=` entry to declare a key-value arg whose values are
+    /// supplied separately by [`Command::arg_value_choices`].
     fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
         let _ = arg_index;
+        &[]
+    }
+
+    /// Enumerable values for a `key=value` arg at `arg_index` whose key is `key`
+    /// (no trailing `=`). Enables two-step tab completion: the user first Tabs
+    /// onto the `key=` prefix, then a second Tab cycles through these values. An
+    /// empty return means free-form (the user types whatever after the `=`).
+    fn arg_value_choices(&self, arg_index: usize, key: &str) -> &[&'static str] {
+        let _ = (arg_index, key);
         &[]
     }
 
@@ -169,6 +180,9 @@ pub struct FnCommand<F> {
     name: &'static str,
     help: &'static str,
     arg_choices: Vec<Vec<&'static str>>,
+    /// Per-key value choices for `key=value` args, applied across every arg
+    /// position the key appears at. Keyed by the bare key name (no `=`).
+    value_choices: HashMap<&'static str, Vec<&'static str>>,
     f: F,
 }
 
@@ -186,6 +200,21 @@ impl<F> FnCommand<F> {
     /// ```
     pub fn with_args(mut self, choices: &[&[&'static str]]) -> Self {
         self.arg_choices = choices.iter().map(|s| s.to_vec()).collect();
+        self
+    }
+
+    /// Declare enumerable values for a `key=value` arg. The first Tab completes
+    /// the user's key prefix to `key=`; once `=` is in the input, subsequent
+    /// completions cycle through these values. Free-form numeric args (`fps=N`)
+    /// simply don't call this and only the bare `key=` shows up in tab cycling.
+    ///
+    /// ```ignore
+    /// cmd("capture", "...", |a, c, o| ...)
+    ///     .with_args(&[&["png", "gif"], &["fps=", "palette="]])
+    ///     .with_value_choices("palette", &["local", "global"])
+    /// ```
+    pub fn with_value_choices(mut self, key: &'static str, values: &[&'static str]) -> Self {
+        self.value_choices.insert(key, values.to_vec());
         self
     }
 }
@@ -209,6 +238,7 @@ where
         name,
         help,
         arg_choices: Vec::new(),
+        value_choices: HashMap::new(),
         f,
     }
 }
@@ -226,6 +256,12 @@ where
     fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
         self.arg_choices
             .get(arg_index)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+    fn arg_value_choices(&self, _arg_index: usize, key: &str) -> &[&'static str] {
+        self.value_choices
+            .get(key)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -665,6 +701,23 @@ impl<Ctx: 'static> Console<Ctx> {
                     return Vec::new();
                 };
 
+                // Mid-`key=` value completion: if the partial token already
+                // contains an `=`, we're past the key and completing its value.
+                // Look up the enumerable values declared via `with_value_choices`
+                // and return them prefixed with `key=`.
+                if let Some(eq) = prefix.find('=') {
+                    let key = &prefix[..eq];
+                    let value_prefix = &prefix[eq + 1..];
+                    let mut matches: Vec<String> = cmd
+                        .arg_value_choices(*arg_index, key)
+                        .iter()
+                        .filter(|v| v.starts_with(value_prefix))
+                        .map(|v| format!("{key}={v}"))
+                        .collect();
+                    matches.sort();
+                    return matches;
+                }
+
                 // Identify key=value args already provided in earlier positions
                 // (e.g. `fps=30`, `palette=global`) so we don't suggest a choice
                 // that shares the same `key=` prefix. Skips the partial last
@@ -986,6 +1039,38 @@ mod tests {
 
         // Past the declared arg list: no completion.
         c.input = "capture png post extra ".into();
+        assert_eq!(c.tab_preview(), None);
+    }
+
+    #[test]
+    fn two_step_kv_value_completion() {
+        let mut c = Console::<Ctx>::new();
+        c.register(
+            cmd("capture", "", |_, _, _| Ok(()))
+                .with_args(&[&["fps=", "palette="]])
+                .with_value_choices("palette", &["local", "global"]),
+        );
+
+        // Step 1: typing the key prefix completes to `key=` (no value yet).
+        c.input = "capture pal".into();
+        assert_eq!(c.tab_preview().as_deref(), Some("ette="));
+        c.tab_complete();
+        assert_eq!(c.input, "capture palette=");
+
+        // Step 2: at the trailing `=`, completion now suggests values.
+        // Alphabetical: global < local; first match wins.
+        let ctx = c.completion_context().unwrap();
+        let matches = c.completion_matches(&ctx);
+        assert_eq!(matches, vec!["palette=global", "palette=local"]);
+
+        // Free-form key (no value choices) stops at the bare prefix.
+        c.input = "capture fps=".into();
+        let ctx = c.completion_context().unwrap();
+        let matches = c.completion_matches(&ctx);
+        assert!(
+            matches.is_empty(),
+            "fps= should suggest no values; got {matches:?}"
+        );
         assert_eq!(c.tab_preview(), None);
     }
 
