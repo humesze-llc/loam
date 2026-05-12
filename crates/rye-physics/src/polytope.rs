@@ -22,12 +22,20 @@
 //!   downstream renderers (line rasterizer for wireframes, future triangle
 //!   rasterizer for hyperslice meshes) and CPU-side analysis.
 //!
-//! ## Phase status
+//! ## How the tables are derived
 //!
-//! Phase 1: vertex tables for all six polytopes.
-//! Phase 2 (this commit): edge tables, derived from all-pairs vertex distance
-//! against the canonical edge length per polytope.
-//! Phase 3 (later): cell tables.
+//! - Vertices come from the [`crate::euclidean_r4`] generators at unit
+//!   circumradius, leaked into `&'static` slices on first access.
+//! - Edges are derived by all-pairs distance: a vertex pair forms an edge iff
+//!   its Euclidean distance matches the canonical edge length within
+//!   tolerance.
+//! - Cells are derived by local 3-flat fitting against the polytope's own
+//!   edge graph. For each vertex and each triple of its edge-neighbors we
+//!   compute the 3-flat through `{v_0, n_a, n_b, n_c}` and count polytope
+//!   vertices on it; only triples whose 3-flat picks up exactly the cell's
+//!   expected vertex count survive. This avoids dependence on an external
+//!   "dual" polytope, whose vertex generator may not be rotation-aligned
+//!   with this one (see the cell-cache section for details).
 //!
 //! See `docs/devlog/POLYTOPE_TOPOLOGY.md` (gitignored) for the full spec.
 //!
@@ -87,9 +95,9 @@ pub struct Polytope4Topology {
     /// order is deterministic.
     pub edges: &'static [[u32; 2]],
     /// Cells as variable-length vertex-index lists. Each inner slice is one
-    /// 3-cell's vertices (e.g., 4 indices for a tetrahedral cell, 8 for a
-    /// cubic cell, 20 for a dodecahedral cell). Vertex order within a cell
-    /// is arbitrary. Empty until Phase 3 lands.
+    /// 3-cell's vertices: 4 for tetrahedral cells (pentatope, 16-cell,
+    /// 600-cell), 8 for cubical (tesseract), 6 for octahedral (24-cell), 20
+    /// for dodecahedral (120-cell). Vertex order within a cell is arbitrary.
     pub cells: &'static [&'static [u32]],
 }
 
@@ -225,6 +233,186 @@ static CELL600_EDGES: LazyLock<&'static [[u32; 2]]> =
     LazyLock::new(|| cache_edges(*CELL600_VERTICES, canonical_edge_length(Polytope4::Cell600)));
 
 // ---------------------------------------------------------------------------
+// Per-polytope cell caches
+// ---------------------------------------------------------------------------
+//
+// Cells are derived by hyperplane fitting against the polytope's *own* edge
+// graph, with no reference to an external "dual" polytope. The 600-cell and
+// 120-cell vertex generators in [`crate::euclidean_r4`] are not in mutually-
+// dual orientation: they share the 24-cell sub-orbit (axes + tesseract
+// corners) but the 96 golden-ratio vertices are oriented differently, so the
+// 600-cell's golden-ratio vertices are *not* face normals of the 120-cell.
+// Fitting from local vertex figures avoids that misalignment entirely.
+
+/// Tolerance for membership of a vertex in a cell's hyperplane (a 3-flat in
+/// 4D). f32 noise on `Vec4::dot` is bounded at ~5e-7 absolute, so 1e-4
+/// leaves ~100× margin while still rejecting vertices on an adjacent cell's
+/// hyperplane (the spread of `n · v` across non-cell vertices is order 0.1
+/// even for the 120-cell, where it is tightest).
+const CELL_TOLERANCE: f32 = 1e-4;
+
+/// Vertex-count expected per cell, by polytope. Used as a sanity filter when
+/// we trial a candidate 3-flat fit: a non-cell 3-flat through 4 of the
+/// polytope's points generically contains only those 4 points, while a true
+/// cell's 3-flat contains the full cell.
+fn cell_vertex_count(p: Polytope4) -> usize {
+    match p {
+        Polytope4::Pentatope => 4,
+        Polytope4::Tesseract => 8,
+        Polytope4::Cell16 => 4,
+        Polytope4::Cell24 => 6,
+        Polytope4::Cell120 => 20,
+        Polytope4::Cell600 => 4,
+    }
+}
+
+/// 4D cross product: given three vectors `a`, `b`, `c` in 4D, returns a
+/// vector orthogonal to all three. Implemented as the cofactor expansion
+/// `n_i = (-1)^i · det(M_i)` where `M_i` is the 3×3 minor of the 3×4 matrix
+/// `[a; b; c]` with column `i` removed.
+fn cross4(a: Vec4, b: Vec4, c: Vec4) -> Vec4 {
+    let det3 = |p: f32, q: f32, r: f32, s: f32, t: f32, u: f32, x: f32, y: f32, z: f32| -> f32 {
+        p * (t * z - u * y) - q * (s * z - u * x) + r * (s * y - t * x)
+    };
+    Vec4::new(
+        det3(a.y, a.z, a.w, b.y, b.z, b.w, c.y, c.z, c.w),
+        -det3(a.x, a.z, a.w, b.x, b.z, b.w, c.x, c.z, c.w),
+        det3(a.x, a.y, a.w, b.x, b.y, b.w, c.x, c.y, c.w),
+        -det3(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z),
+    )
+}
+
+/// Adjacency list from the edge table. `adj[i]` lists the indices of every
+/// vertex sharing an edge with vertex `i`. Order within each entry is
+/// insertion order, which matches the lexicographic edge order: it is
+/// deterministic but otherwise meaningless.
+fn adjacency(num_vertices: usize, edges: &[[u32; 2]]) -> Vec<Vec<u32>> {
+    let mut adj = vec![Vec::new(); num_vertices];
+    for &[i, j] in edges {
+        adj[i as usize].push(j);
+        adj[j as usize].push(i);
+    }
+    adj
+}
+
+/// Derive the cell list by local 3-flat fitting.
+///
+/// Strategy: each cell of a regular 4-polytope is a regular 3-polyhedron
+/// whose vertex set lies on a unique 3-flat in 4D. The cells incident to a
+/// vertex `v_0` are in bijection with the faces of `v_0`'s vertex figure;
+/// each such face corresponds to a subset of `v_0`'s edge-neighbors that
+/// span the cell's 3-flat together with `v_0`.
+///
+/// We don't bother enumerating vertex-figure faces explicitly. Instead, for
+/// every vertex `v_0` and every 3-subset of its edge-neighbors, we fit the
+/// 3-flat through `{v_0, n_a, n_b, n_c}` via the 4D cross product, count
+/// polytope vertices on that flat, and accept the result only if the count
+/// matches `cell_vertex_count(p)`. Non-cell triples produce 3-flats that
+/// either pick up the wrong number of vertices or coincide with a separate
+/// cell already found.
+///
+/// Returns one `Vec<u32>` per cell with vertex indices in ascending order.
+/// The outer `Vec` is ordered lexicographically by cell vertex list, which
+/// is deterministic across runs.
+fn derive_cells(vertices: &[Vec4], edges: &[[u32; 2]], cell_size: usize) -> Vec<Vec<u32>> {
+    use std::collections::BTreeSet;
+
+    let adj = adjacency(vertices.len(), edges);
+    let mut cells_set: BTreeSet<Vec<u32>> = BTreeSet::new();
+    for v_idx in 0..vertices.len() {
+        let v_0 = vertices[v_idx];
+        let neighbors = &adj[v_idx];
+        for i in 0..neighbors.len() {
+            for j in (i + 1)..neighbors.len() {
+                for k in (j + 1)..neighbors.len() {
+                    let n_a = vertices[neighbors[i] as usize];
+                    let n_b = vertices[neighbors[j] as usize];
+                    let n_c = vertices[neighbors[k] as usize];
+                    let normal = cross4(n_a - v_0, n_b - v_0, n_c - v_0);
+                    let mag = normal.length();
+                    if mag < 1e-4 {
+                        // The three difference vectors are nearly coplanar in
+                        // a 2-flat; no well-defined 3-flat normal exists.
+                        continue;
+                    }
+                    let n = normal / mag;
+                    let offset = v_0.dot(n);
+                    let on_plane: Vec<u32> = (0..vertices.len() as u32)
+                        .filter(|&p| (vertices[p as usize].dot(n) - offset).abs() < CELL_TOLERANCE)
+                        .collect();
+                    if on_plane.len() == cell_size {
+                        cells_set.insert(on_plane);
+                    }
+                }
+            }
+        }
+    }
+    cells_set.into_iter().collect()
+}
+
+/// Materialise the cell incidence list as a leaked, two-level `&'static`
+/// slice. The outer slice has one entry per cell; the inner slices hold the
+/// vertex indices that belong to that cell.
+///
+/// Like [`cache_edges`], this takes the data slices directly rather than a
+/// [`Polytope4`] so it cannot recursively re-enter the same [`LazyLock`]
+/// during init.
+fn cache_cells(
+    vertices: &'static [Vec4],
+    edges: &'static [[u32; 2]],
+    cell_size: usize,
+) -> &'static [&'static [u32]] {
+    let cells: Vec<&'static [u32]> = derive_cells(vertices, edges, cell_size)
+        .into_iter()
+        .map(|c| &*Box::leak(c.into_boxed_slice()))
+        .collect();
+    Box::leak(cells.into_boxed_slice())
+}
+
+static PENTATOPE_CELLS: LazyLock<&'static [&'static [u32]]> = LazyLock::new(|| {
+    cache_cells(
+        *PENTATOPE_VERTICES,
+        *PENTATOPE_EDGES,
+        cell_vertex_count(Polytope4::Pentatope),
+    )
+});
+static TESSERACT_CELLS: LazyLock<&'static [&'static [u32]]> = LazyLock::new(|| {
+    cache_cells(
+        *TESSERACT_VERTICES,
+        *TESSERACT_EDGES,
+        cell_vertex_count(Polytope4::Tesseract),
+    )
+});
+static CELL16_CELLS: LazyLock<&'static [&'static [u32]]> = LazyLock::new(|| {
+    cache_cells(
+        *CELL16_VERTICES,
+        *CELL16_EDGES,
+        cell_vertex_count(Polytope4::Cell16),
+    )
+});
+static CELL24_CELLS: LazyLock<&'static [&'static [u32]]> = LazyLock::new(|| {
+    cache_cells(
+        *CELL24_VERTICES,
+        *CELL24_EDGES,
+        cell_vertex_count(Polytope4::Cell24),
+    )
+});
+static CELL120_CELLS: LazyLock<&'static [&'static [u32]]> = LazyLock::new(|| {
+    cache_cells(
+        *CELL120_VERTICES,
+        *CELL120_EDGES,
+        cell_vertex_count(Polytope4::Cell120),
+    )
+});
+static CELL600_CELLS: LazyLock<&'static [&'static [u32]]> = LazyLock::new(|| {
+    cache_cells(
+        *CELL600_VERTICES,
+        *CELL600_EDGES,
+        cell_vertex_count(Polytope4::Cell600),
+    )
+});
+
+// ---------------------------------------------------------------------------
 // Per-polytope topology assemblies
 // ---------------------------------------------------------------------------
 //
@@ -232,37 +420,35 @@ static CELL600_EDGES: LazyLock<&'static [[u32; 2]]> =
 // borrow from the per-polytope vertex / edge / cell caches above; both layers
 // of `LazyLock` ensure the data outlives any caller.
 
-const EMPTY_CELLS: &[&[u32]] = &[];
-
 static PENTATOPE_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *PENTATOPE_VERTICES,
     edges: *PENTATOPE_EDGES,
-    cells: EMPTY_CELLS,
+    cells: *PENTATOPE_CELLS,
 });
 static TESSERACT_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *TESSERACT_VERTICES,
     edges: *TESSERACT_EDGES,
-    cells: EMPTY_CELLS,
+    cells: *TESSERACT_CELLS,
 });
 static CELL16_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *CELL16_VERTICES,
     edges: *CELL16_EDGES,
-    cells: EMPTY_CELLS,
+    cells: *CELL16_CELLS,
 });
 static CELL24_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *CELL24_VERTICES,
     edges: *CELL24_EDGES,
-    cells: EMPTY_CELLS,
+    cells: *CELL24_CELLS,
 });
 static CELL120_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *CELL120_VERTICES,
     edges: *CELL120_EDGES,
-    cells: EMPTY_CELLS,
+    cells: *CELL120_CELLS,
 });
 static CELL600_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *CELL600_VERTICES,
     edges: *CELL600_EDGES,
-    cells: EMPTY_CELLS,
+    cells: *CELL600_CELLS,
 });
 
 #[cfg(test)]
@@ -429,9 +615,50 @@ mod tests {
         }
     }
 
-    /// Cell tables stay empty until Phase 3 lands.
+    /// Cell counts per f-vector (Coxeter Table I).
     #[test]
-    fn phase_3_cells_are_empty_placeholders() {
+    fn cell_counts_match_f_vector() {
+        assert_eq!(Polytope4::Pentatope.cell_count(), 5);
+        assert_eq!(Polytope4::Tesseract.cell_count(), 8);
+        assert_eq!(Polytope4::Cell16.cell_count(), 16);
+        assert_eq!(Polytope4::Cell24.cell_count(), 24);
+        assert_eq!(Polytope4::Cell120.cell_count(), 120);
+        assert_eq!(Polytope4::Cell600.cell_count(), 600);
+    }
+
+    /// Each cell has the vertex count of its 3D shape: pentatope cells are
+    /// tetrahedral (4), tesseract cubical (8), 16-cell tetrahedral (4),
+    /// 24-cell octahedral (6), 120-cell dodecahedral (20), 600-cell
+    /// tetrahedral (4).
+    #[test]
+    fn cell_vertex_counts_match_shape() {
+        let cases: &[(Polytope4, usize)] = &[
+            (Polytope4::Pentatope, 4),
+            (Polytope4::Tesseract, 8),
+            (Polytope4::Cell16, 4),
+            (Polytope4::Cell24, 6),
+            (Polytope4::Cell120, 20),
+            (Polytope4::Cell600, 4),
+        ];
+        for &(p, expected) in cases {
+            for (i, cell) in p.topology().cells.iter().enumerate() {
+                assert_eq!(
+                    cell.len(),
+                    expected,
+                    "{p:?} cell {i} has {} vertices, expected {expected}",
+                    cell.len()
+                );
+            }
+        }
+    }
+
+    /// All vertices of a cell lie on a common 3-flat. Operationally: their
+    /// projections onto the cell's centroid direction agree within
+    /// tolerance. True by construction (the derivation explicitly fits a
+    /// 3-flat), but the test guards against future refactors swapping in a
+    /// derivation that loses this property.
+    #[test]
+    fn cells_lie_on_common_hyperplane() {
         for p in [
             Polytope4::Pentatope,
             Polytope4::Tesseract,
@@ -440,7 +667,89 @@ mod tests {
             Polytope4::Cell120,
             Polytope4::Cell600,
         ] {
-            assert_eq!(p.cell_count(), 0);
+            let topo = p.topology();
+            for (idx, cell) in topo.cells.iter().enumerate() {
+                let centroid: Vec4 = cell
+                    .iter()
+                    .map(|&i| topo.vertices[i as usize])
+                    .fold(Vec4::ZERO, |acc, v| acc + v)
+                    / cell.len() as f32;
+                let dots: Vec<f32> = cell
+                    .iter()
+                    .map(|&i| topo.vertices[i as usize].dot(centroid))
+                    .collect();
+                let lo = dots.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = dots.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                assert!(
+                    hi - lo < CELL_TOLERANCE,
+                    "{p:?} cell {idx} centroid-projection spread {} > {CELL_TOLERANCE}",
+                    hi - lo
+                );
+            }
+        }
+    }
+
+    /// Within each cell, the number of vertex pairs at canonical edge length
+    /// equals the edge count of the cell's 3D shape: tetrahedron 6, cube 12,
+    /// octahedron 12, dodecahedron 30. Catches a cell whose vertices are
+    /// merely coplanar but don't form the expected regular polytope.
+    #[test]
+    fn cell_internal_edge_counts_match_shape() {
+        let cases: &[(Polytope4, usize)] = &[
+            (Polytope4::Pentatope, 6),
+            (Polytope4::Tesseract, 12),
+            (Polytope4::Cell16, 6),
+            (Polytope4::Cell24, 12),
+            (Polytope4::Cell120, 30),
+            (Polytope4::Cell600, 6),
+        ];
+        for &(p, expected) in cases {
+            let topo = p.topology();
+            let edge_len = canonical_edge_length(p);
+            for (idx, cell) in topo.cells.iter().enumerate() {
+                let mut count = 0;
+                for i in 0..cell.len() {
+                    for j in (i + 1)..cell.len() {
+                        let a = topo.vertices[cell[i] as usize];
+                        let b = topo.vertices[cell[j] as usize];
+                        if ((a - b).length() - edge_len).abs() < EDGE_TOLERANCE {
+                            count += 1;
+                        }
+                    }
+                }
+                assert_eq!(
+                    count, expected,
+                    "{p:?} cell {idx} has {count} internal edges, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// Every edge of the polytope appears as a vertex pair in at least one
+    /// cell. (For a closed polytope every edge is shared by ≥ 2 cells; the
+    /// weaker "≥ 1" form is enough to catch a derivation that drops an edge
+    /// or builds the wrong cell list.)
+    #[test]
+    fn every_edge_lies_in_some_cell() {
+        for p in [
+            Polytope4::Pentatope,
+            Polytope4::Tesseract,
+            Polytope4::Cell16,
+            Polytope4::Cell24,
+            Polytope4::Cell120,
+            Polytope4::Cell600,
+        ] {
+            let topo = p.topology();
+            for &[i, j] in topo.edges {
+                let covered = topo
+                    .cells
+                    .iter()
+                    .any(|cell| cell.contains(&i) && cell.contains(&j));
+                assert!(
+                    covered,
+                    "{p:?} edge ({i}, {j}) is not contained in any cell"
+                );
+            }
         }
     }
 }
