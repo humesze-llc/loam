@@ -239,15 +239,10 @@ enum SequenceWriter {
     /// main thread; PNG compression is fast enough that the per-frame cost is dominated
     /// by GPU readback, not encoding.
     Png { dir: PathBuf },
-    /// Animated GIF: oversampled capture + temporal averaging into per-emit frames,
-    /// then encoded on a background worker thread (NeuQuant + Lanczos3 + LZW).
-    ///
-    /// Every captured render frame between emits is summed into the accumulator;
-    /// the per-emit AVERAGE is what the encoder palette-quantizes. Smoothed inputs
-    /// produce more similar palettes between consecutive emits, partially absorbing
-    /// the per-frame palette regeneration that drives GIF flicker. The averaging
-    /// also reduces the worker thread's input rate to the user-configured fps,
-    /// eliminating backpressure drops at samplefac=10.
+    /// Animated GIF: encoded on a background worker thread to keep NeuQuant +
+    /// Lanczos resample + LZW off the render loop. Frames cross a bounded channel;
+    /// when the worker can't keep up, the main thread drops the incoming frame rather
+    /// than stalling the renderer. The user sees the dropped count on stop.
     Gif {
         worker: GifWorker,
         path: PathBuf,
@@ -257,65 +252,8 @@ enum SequenceWriter {
         /// Optional output width in pixels. Lanczos3 resample on the worker thread
         /// before NeuQuant; aspect ratio preserved.
         scale: Option<u32>,
-        /// How often to emit an averaged frame to the encoder. Derived from the
-        /// user's target fps at sequence start.
-        target_interval: Duration,
-        /// Pixel-sum accumulator. Lazily allocated to match the swapchain dims;
-        /// reset after each emit, flushed on stop if it has unemitted samples.
-        accumulator: Option<FrameAccumulator>,
-        /// Wall-clock time of the last emit. `None` until the first emit fires.
-        last_emit_time: Option<Instant>,
     },
 }
-
-/// Per-channel pixel sum used to average oversampled captures into one emitted
-/// frame. `u32` widths the per-pixel accumulator so 256 8-bit samples can be summed
-/// without overflow (we never run with that many; capacity is `GIF_OVERSAMPLE`).
-struct FrameAccumulator {
-    sum: Vec<u32>,
-    count: u32,
-    width: u32,
-    height: u32,
-    most_recent_capture: Option<Instant>,
-}
-
-impl FrameAccumulator {
-    fn new(width: u32, height: u32) -> Self {
-        let elements = (width as usize) * (height as usize) * 4;
-        Self {
-            sum: vec![0u32; elements],
-            count: 0,
-            width,
-            height,
-            most_recent_capture: None,
-        }
-    }
-
-    fn add(&mut self, rgba: &[u8], at: Instant) {
-        debug_assert_eq!(rgba.len(), self.sum.len());
-        for (s, &p) in self.sum.iter_mut().zip(rgba.iter()) {
-            *s += p as u32;
-        }
-        self.count = self.count.saturating_add(1);
-        self.most_recent_capture = Some(at);
-    }
-
-    fn average(&self) -> Vec<u8> {
-        let denom = self.count.max(1);
-        self.sum.iter().map(|s| (s / denom) as u8).collect()
-    }
-
-    fn reset(&mut self) {
-        self.sum.fill(0);
-        self.count = 0;
-        self.most_recent_capture = None;
-    }
-}
-
-/// How many captures fold into each emitted GIF frame. Higher = smoother / less
-/// flicker but more GPU-readback overhead on the main thread. 4 is a moderate
-/// default (~120 Hz capture for a 30 fps GIF target on a 240 Hz display).
-const GIF_OVERSAMPLE: u32 = 4;
 
 /// Owns the GIF encoder thread and the SPSC channel feeding it. The main thread calls
 /// [`GifWorker::try_send`] with each captured frame; the worker drains the channel,
@@ -636,18 +574,13 @@ impl Capture {
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("create gif parent dir {}", parent.display()))?;
                 }
-                let target_fps = fps.unwrap_or(30);
-                let default_delay_cs = fps_to_centiseconds(target_fps);
-                let target_interval = Duration::from_secs_f64(1.0 / target_fps.max(1) as f64);
+                let default_delay_cs = fps_to_centiseconds(fps.unwrap_or(30));
                 let worker = GifWorker::spawn(path.clone());
                 SequenceWriter::Gif {
                     worker,
                     path,
                     default_delay_cs,
                     scale,
-                    target_interval,
-                    accumulator: None,
-                    last_emit_time: None,
                 }
             }
         };
@@ -682,30 +615,7 @@ impl Capture {
                         dir.display()
                     ));
                 }
-                SequenceWriter::Gif {
-                    worker,
-                    path,
-                    default_delay_cs,
-                    scale,
-                    accumulator,
-                    ..
-                } => {
-                    // Flush the trailing accumulator so the final partial window of
-                    // captures isn't lost. Uses the most-recent capture's timestamp.
-                    if let Some(acc) = accumulator {
-                        if acc.count > 0 {
-                            if let Some(captured_at) = acc.most_recent_capture {
-                                worker.try_send(GifFrame {
-                                    rgba: acc.average(),
-                                    src_width: acc.width,
-                                    src_height: acc.height,
-                                    captured_at,
-                                    default_delay_cs,
-                                    scale,
-                                });
-                            }
-                        }
-                    }
+                SequenceWriter::Gif { worker, path, .. } => {
                     let dropped = worker.dropped();
                     // Detach: close the input channel and park the worker's handle in
                     // the pending pool. The worker keeps encoding its buffered frames
@@ -774,9 +684,7 @@ impl Capture {
     }
 
     /// Should we capture this frame? FPS-gated for streaming sequences; always true for
-    /// one-shots and unlimited PNG sequences. GIF sequences capture at
-    /// `GIF_OVERSAMPLE × target` rate so each emitted frame is the temporal average
-    /// of multiple source captures (the flicker mitigation).
+    /// one-shots and unlimited PNG sequences.
     pub(crate) fn should_capture(&self, now: Instant) -> bool {
         match &self.state {
             CaptureState::Idle => false,
@@ -784,19 +692,12 @@ impl Capture {
             CaptureState::Sequence {
                 fps_interval,
                 last_capture_time,
-                writer,
                 ..
-            } => {
-                let effective_interval = match (fps_interval, writer) {
-                    (Some(t), SequenceWriter::Gif { .. }) => *t / GIF_OVERSAMPLE,
-                    (Some(t), _) => *t,
-                    (None, _) => Duration::ZERO,
-                };
-                match last_capture_time {
-                    None => true,
-                    Some(last) => now.duration_since(*last) >= effective_interval,
-                }
-            }
+            } => match (fps_interval, last_capture_time) {
+                (None, _) => true,
+                (Some(_), None) => true,
+                (Some(interval), Some(last)) => now.duration_since(*last) >= *interval,
+            },
         }
     }
 
@@ -903,40 +804,22 @@ impl SequenceWriter {
                 worker,
                 default_delay_cs,
                 scale,
-                target_interval,
-                accumulator,
-                last_emit_time,
                 ..
             } => {
-                // Lazy-allocate or rebuild the accumulator if dims changed.
-                let needs_reset = accumulator
-                    .as_ref()
-                    .is_none_or(|a| a.width != width || a.height != height);
-                if needs_reset {
-                    *accumulator = Some(FrameAccumulator::new(width, height));
-                }
-                let acc = accumulator.as_mut().expect("accumulator set above");
-                acc.add(rgba, captured_at);
-
-                // Emit one averaged frame every `target_interval` of wall-clock.
-                // First emit fires immediately so the GIF starts at t=0.
-                let should_emit = match last_emit_time {
-                    None => true,
-                    Some(prev) => captured_at.duration_since(*prev) >= *target_interval,
-                };
-                if should_emit {
-                    let averaged = acc.average();
-                    worker.try_send(GifFrame {
-                        rgba: averaged,
-                        src_width: width,
-                        src_height: height,
-                        captured_at,
-                        default_delay_cs: *default_delay_cs,
-                        scale: *scale,
-                    });
-                    acc.reset();
-                    *last_emit_time = Some(captured_at);
-                }
+                // Hand the raw RGBA + timestamp to the encoder thread. NeuQuant +
+                // resample + LZW all run there; the main thread only owns the Vec
+                // move + try_send, which is cheap (~microseconds). Backpressure: a
+                // full channel drops the frame rather than stalling the renderer;
+                // the next surviving frame absorbs the dropped frame's wall-clock
+                // duration via its per-frame delay (computed worker-side).
+                worker.try_send(GifFrame {
+                    rgba: rgba.to_vec(),
+                    src_width: width,
+                    src_height: height,
+                    captured_at,
+                    default_delay_cs: *default_delay_cs,
+                    scale: *scale,
+                });
                 Ok(())
             }
         }
