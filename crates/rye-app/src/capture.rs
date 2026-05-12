@@ -106,6 +106,27 @@ pub enum CaptureFormat {
     Gif,
 }
 
+/// How GIF frames are palette-quantized.
+///
+/// NeuQuant (Anthony Dekker, 1994) is the quantization algorithm: a self-organizing
+/// map that picks 256 representative colors (palette "neurons") from the input
+/// pixels. The mode controls *what* it trains on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum PaletteMode {
+    /// Per-frame NeuQuant. Each frame gets its own optimal 256-color palette.
+    /// Fast and high quality per-frame, but consecutive frames pick slightly
+    /// different palettes so smooth gradients shimmer (the classic GIF flicker).
+    #[default]
+    Local,
+    /// One global NeuQuant palette trained on a warmup window of the first
+    /// ~`GIF_WARMUP_FRAMES` captures, then reused for every frame via `index_of`.
+    /// Eliminates the per-frame palette wobble at the cost of slightly worse
+    /// fidelity (the palette has to cover all colors in the recording, not just
+    /// the current frame). The warmup buffer also avoids training on transient
+    /// overlays (e.g., the console showing when you typed the start command).
+    Global,
+}
+
 impl CaptureFormat {
     fn default_fps(self) -> Option<u16> {
         match self {
@@ -143,6 +164,10 @@ pub enum CaptureRequest {
         /// aspect ratio. `None` captures at native swapchain resolution. GIF-only;
         /// PNG sequences ignore this for diagnostic fidelity.
         scale: Option<u32>,
+        /// GIF palette strategy. `Local` (default) does per-frame NeuQuant; `Global`
+        /// trains one NeuQuant during a warmup buffer and reuses it. Ignored for
+        /// PNG sequences.
+        palette: PaletteMode,
     },
     /// Stop the current sequence, if any. No-op when idle.
     Stop,
@@ -155,6 +180,7 @@ pub enum CaptureRequest {
         name: Option<String>,
         fps: Option<u16>,
         scale: Option<u32>,
+        palette: PaletteMode,
     },
 }
 
@@ -252,8 +278,39 @@ enum SequenceWriter {
         /// Optional output width in pixels. Lanczos3 resample on the worker thread
         /// before NeuQuant; aspect ratio preserved.
         scale: Option<u32>,
+        /// Per-frame vs shared-palette quantization.
+        palette_mode: PaletteMode,
+        /// Some during the warmup buffer for `Global` mode; `None` for `Local`
+        /// mode and after the warmup buffer has been drained.
+        warming: Option<WarmingState>,
+        /// Trained global palette (Some after warmup completes in `Global` mode).
+        /// Cloned into every emitted GifFrame so the worker uses the same palette
+        /// for indexing each frame.
+        global_palette: Option<Arc<color_quant::NeuQuant>>,
     },
 }
+
+/// Warmup buffer for global-palette mode. Caches the first
+/// [`GIF_WARMUP_FRAMES`] captures so the palette is trained on representative
+/// content rather than whatever happens to be on screen at the moment recording
+/// starts (which often includes the console overlay used to start it).
+struct WarmingState {
+    buffer: Vec<WarmupFrame>,
+    target_frames: u32,
+}
+
+struct WarmupFrame {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    captured_at: Instant,
+}
+
+/// Number of captures buffered before training the global palette. At ~30 fps
+/// capture this is ~1 second of warmup, enough for the console to close and the
+/// scene to stabilise. Memory: `frames × width × height × 4` bytes; at 800x600
+/// this is ~57 MB during warmup, released after training.
+const GIF_WARMUP_FRAMES: u32 = 30;
 
 /// Owns the GIF encoder thread and the SPSC channel feeding it. The main thread calls
 /// [`GifWorker::try_send`] with each captured frame; the worker drains the channel,
@@ -281,6 +338,11 @@ struct GifFrame {
     /// against). Derived from the user's target fps at sequence start.
     default_delay_cs: u16,
     scale: Option<u32>,
+    /// When `Some`, the worker indexes pixels against this shared NeuQuant and
+    /// writes each frame with `palette: None` so they all reference the global
+    /// color table opened on the first frame. When `None`, the worker runs
+    /// per-frame NeuQuant via `Frame::from_rgba_speed` (local palette per frame).
+    global_palette: Option<Arc<color_quant::NeuQuant>>,
 }
 
 /// Channel capacity. Sized at ~8 frames so a small encode-time spike doesn't
@@ -389,17 +451,26 @@ fn encode_one_frame(
     let w_u16: u16 = out_w.try_into().context("gif width > 65535")?;
     let h_u16: u16 = out_h.try_into().context("gif height > 65535")?;
 
+    // Open the encoder on first frame. In global-palette mode the LSD gets the
+    // shared palette so subsequent frames can write `palette: None`; in local mode
+    // we pass an empty global palette and every frame writes its own local table.
     let enc = match encoder {
         Some(e) => e,
         None => {
             let file = File::create(path)
                 .with_context(|| format!("create gif output {}", path.display()))?;
-            let mut e = gif::Encoder::new(BufWriter::new(file), w_u16, h_u16, &[])
-                .context("init gif encoder")?;
+            let global_palette_bytes: Vec<u8> = frame
+                .global_palette
+                .as_ref()
+                .map(|nq| nq.color_map_rgb())
+                .unwrap_or_default();
+            let mut e =
+                gif::Encoder::new(BufWriter::new(file), w_u16, h_u16, &global_palette_bytes)
+                    .context("init gif encoder")?;
             e.set_repeat(gif::Repeat::Infinite).context("gif repeat")?;
             tracing::info!(
                 "capture: gif encoder opened {}x{} target {}cs/frame ({} fps); \
-                 actual delays computed from wall-clock per-frame",
+                 palette={}; actual delays computed from wall-clock per-frame",
                 w_u16,
                 h_u16,
                 frame.default_delay_cs,
@@ -407,6 +478,11 @@ fn encode_one_frame(
                     0
                 } else {
                     100 / frame.default_delay_cs as u32
+                },
+                if frame.global_palette.is_some() {
+                    "global (shared NeuQuant)"
+                } else {
+                    "per-frame"
                 }
             );
             *encoder = Some(e);
@@ -448,14 +524,36 @@ fn encode_one_frame(
         frame.rgba
     };
 
-    // `from_rgba_speed` handles alpha normalization, NeuQuant training, and index
-    // mapping in one pass. Speed 10 is the gif crate's default and matches the rate
-    // the encoder thread can actually sustain (~30 fps at 800x600); pushing to
-    // samplefac=1 trades palette stability for sluggish playback because the
-    // backpressure drops dominate. Flicker from per-frame palette regeneration is
-    // the accepted tradeoff (filed as a known issue; the workaround is PNG sequence
-    // + ffmpeg for high-quality clips).
-    let mut gif_frame = gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 10);
+    // Build the frame. Global mode indexes against the shared NeuQuant and emits
+    // `palette: None` to use the global color table; local mode runs `from_rgba_speed`
+    // which trains a NeuQuant per frame and attaches it as a local table.
+    let mut gif_frame = if let Some(nq) = &frame.global_palette {
+        // Alpha normalization for index_of consistency with how the palette was
+        // trained (`train_global_palette` normalizes too).
+        for px in buf.chunks_exact_mut(4) {
+            if px[3] != 0 {
+                px[3] = 0xFF;
+            }
+        }
+        let mut indices = Vec::with_capacity((out_w as usize) * (out_h as usize));
+        for px in buf.chunks_exact(4) {
+            indices.push(nq.index_of(px) as u8);
+        }
+        gif::Frame {
+            width: w_u16,
+            height: h_u16,
+            buffer: std::borrow::Cow::Owned(indices),
+            // `palette: None` -> use the global color table the encoder was opened with.
+            palette: None,
+            ..gif::Frame::default()
+        }
+    } else {
+        // Per-frame NeuQuant. Speed 10 is the gif crate's default and matches the
+        // rate the encoder thread can actually sustain (~30 fps at 800x600);
+        // samplefac=1 trades palette stability for sluggish playback because the
+        // backpressure drops dominate.
+        gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 10)
+    };
     gif_frame.delay = delay_cs;
     // `DisposalMethod::Any` (the gif crate default) leaves disposal unspecified so
     // decoders pick whatever they normally do for full-frame opaque content (~Keep).
@@ -515,7 +613,8 @@ impl Capture {
                     name,
                     fps,
                     scale,
-                } => match self.start_sequence(format, stage, dir, name, fps, scale) {
+                    palette,
+                } => match self.start_sequence(format, stage, dir, name, fps, scale, palette) {
                     Ok(msg) => log.push(msg),
                     Err(e) => log.push(format!("capture: failed to start sequence: {e:#}")),
                 },
@@ -527,11 +626,12 @@ impl Capture {
                     name,
                     fps,
                     scale,
+                    palette,
                 } => {
                     if matches!(self.state, CaptureState::Sequence { .. }) {
                         self.stop(&mut log);
                     } else {
-                        match self.start_sequence(format, stage, dir, name, fps, scale) {
+                        match self.start_sequence(format, stage, dir, name, fps, scale, palette) {
                             Ok(msg) => log.push(msg),
                             Err(e) => log.push(format!("capture: failed to start sequence: {e:#}")),
                         }
@@ -550,6 +650,7 @@ impl Capture {
         name: Option<String>,
         fps: Option<u16>,
         scale: Option<u32>,
+        palette: PaletteMode,
     ) -> Result<String> {
         let dir = dir.unwrap_or_else(|| self.default_dir.clone());
         let name = name.unwrap_or_else(default_name);
@@ -577,11 +678,21 @@ impl Capture {
                 }
                 let default_delay_cs = fps_to_centiseconds(fps.unwrap_or(30));
                 let worker = GifWorker::spawn(path.clone());
+                let warming = match palette {
+                    PaletteMode::Local => None,
+                    PaletteMode::Global => Some(WarmingState {
+                        buffer: Vec::with_capacity(GIF_WARMUP_FRAMES as usize),
+                        target_frames: GIF_WARMUP_FRAMES,
+                    }),
+                };
                 SequenceWriter::Gif {
                     worker,
                     path,
                     default_delay_cs,
                     scale,
+                    palette_mode: palette,
+                    warming,
+                    global_palette: None,
                 }
             }
         };
@@ -595,7 +706,7 @@ impl Capture {
             frame_count: 0,
         };
         Ok(format!(
-            "capture: sequence started ({format:?}, {stage:?}, fps={})",
+            "capture: sequence started ({format:?}, {stage:?}, fps={}, palette={palette:?})",
             fps.map(|f| f.to_string())
                 .unwrap_or_else(|| "unlimited".into())
         ))
@@ -616,7 +727,38 @@ impl Capture {
                         dir.display()
                     ));
                 }
-                SequenceWriter::Gif { worker, path, .. } => {
+                SequenceWriter::Gif {
+                    worker,
+                    path,
+                    default_delay_cs,
+                    scale,
+                    warming,
+                    ..
+                } => {
+                    // If we stopped during warmup, train a palette on whatever
+                    // captures we have and flush them to the worker so the user
+                    // still gets a (short) GIF instead of an empty file.
+                    if let Some(mut w) = warming {
+                        if !w.buffer.is_empty() {
+                            tracing::info!(
+                                "capture: stopped during warmup ({} frame(s)); \
+                                 training palette on partial buffer",
+                                w.buffer.len()
+                            );
+                            let nq = Arc::new(train_global_palette(&w.buffer));
+                            for f in w.buffer.drain(..) {
+                                worker.try_send(GifFrame {
+                                    rgba: f.rgba,
+                                    src_width: f.width,
+                                    src_height: f.height,
+                                    captured_at: f.captured_at,
+                                    default_delay_cs,
+                                    scale,
+                                    global_palette: Some(nq.clone()),
+                                });
+                            }
+                        }
+                    }
                     let dropped = worker.dropped();
                     // Detach: close the input channel and park the worker's handle in
                     // the pending pool. The worker keeps encoding its buffered frames
@@ -655,6 +797,14 @@ impl Capture {
                 frame_count,
                 ..
             } => {
+                // During GIF global-palette warmup, surface the progress so the
+                // user knows recording hasn't started writing yet.
+                if let SequenceWriter::Gif {
+                    warming: Some(w), ..
+                } = writer
+                {
+                    return Some(format!("WARMING {}/{}", w.buffer.len(), w.target_frames));
+                }
                 let dropped = match writer {
                     SequenceWriter::Png { .. } => 0,
                     SequenceWriter::Gif { worker, .. } => worker.dropped(),
@@ -805,26 +955,102 @@ impl SequenceWriter {
                 worker,
                 default_delay_cs,
                 scale,
+                palette_mode,
+                warming,
+                global_palette,
                 ..
             } => {
-                // Hand the raw RGBA + timestamp to the encoder thread. NeuQuant +
-                // resample + LZW all run there; the main thread only owns the Vec
-                // move + try_send, which is cheap (~microseconds). Backpressure: a
-                // full channel drops the frame rather than stalling the renderer;
-                // the next surviving frame absorbs the dropped frame's wall-clock
-                // duration via its per-frame delay (computed worker-side).
-                worker.try_send(GifFrame {
-                    rgba: rgba.to_vec(),
-                    src_width: width,
-                    src_height: height,
-                    captured_at,
-                    default_delay_cs: *default_delay_cs,
-                    scale: *scale,
-                });
+                match *palette_mode {
+                    // Local-palette mode: pass RGBA straight to the worker, which
+                    // runs per-frame NeuQuant via `Frame::from_rgba_speed`.
+                    PaletteMode::Local => {
+                        worker.try_send(GifFrame {
+                            rgba: rgba.to_vec(),
+                            src_width: width,
+                            src_height: height,
+                            captured_at,
+                            default_delay_cs: *default_delay_cs,
+                            scale: *scale,
+                            global_palette: None,
+                        });
+                    }
+                    PaletteMode::Global => {
+                        if let Some(w) = warming.as_mut() {
+                            // Warming: buffer the frame.
+                            w.buffer.push(WarmupFrame {
+                                rgba: rgba.to_vec(),
+                                width,
+                                height,
+                                captured_at,
+                            });
+                            if w.buffer.len() as u32 >= w.target_frames {
+                                // Train the global palette on the concatenated
+                                // buffer and start emitting. One-time main-thread
+                                // pause (~50-100 ms at 800x600).
+                                let nq = Arc::new(train_global_palette(&w.buffer));
+                                tracing::info!(
+                                    "capture: gif global palette trained from {} frames",
+                                    w.buffer.len()
+                                );
+                                // Drain the buffer through the worker first so the
+                                // first ~1 s of recording isn't lost.
+                                for f in w.buffer.drain(..) {
+                                    worker.try_send(GifFrame {
+                                        rgba: f.rgba,
+                                        src_width: f.width,
+                                        src_height: f.height,
+                                        captured_at: f.captured_at,
+                                        default_delay_cs: *default_delay_cs,
+                                        scale: *scale,
+                                        global_palette: Some(nq.clone()),
+                                    });
+                                }
+                                *global_palette = Some(nq);
+                                *warming = None;
+                            }
+                        } else if let Some(nq) = global_palette.as_ref() {
+                            // Post-warmup: send with the shared palette.
+                            worker.try_send(GifFrame {
+                                rgba: rgba.to_vec(),
+                                src_width: width,
+                                src_height: height,
+                                captured_at,
+                                default_delay_cs: *default_delay_cs,
+                                scale: *scale,
+                                global_palette: Some(nq.clone()),
+                            });
+                        } else {
+                            tracing::error!(
+                                "capture: gif global mode lost palette state (frame dropped)"
+                            );
+                        }
+                    }
+                }
                 Ok(())
             }
         }
     }
+}
+
+/// Train a NeuQuant on a sparse sample of pixels drawn from every warmup frame, so
+/// the palette captures color variation across the recording rather than just one
+/// instant. Sparse sampling (every Nth pixel) keeps the training buffer bounded:
+/// at 800x600 with 30 warmup frames and stride 16, we feed NeuQuant ~110 K
+/// samples, which is plenty for a 256-color palette.
+fn train_global_palette(buffer: &[WarmupFrame]) -> color_quant::NeuQuant {
+    const STRIDE: usize = 16;
+    let mut samples: Vec<u8> = Vec::new();
+    for frame in buffer {
+        for px in frame.rgba.chunks_exact(4).step_by(STRIDE) {
+            // Match `Frame::from_rgba_speed`: normalize alpha for opaque pixels so
+            // NeuQuant's 4D distance metric isn't biased by varying alpha.
+            samples.push(px[0]);
+            samples.push(px[1]);
+            samples.push(px[2]);
+            samples.push(if px[3] != 0 { 0xFF } else { 0 });
+        }
+    }
+    color_quant::NeuQuant::new(10, 256, &samples)
 }
 
 /// Compute the output dimensions for a captured frame given an optional target width.
@@ -992,15 +1218,15 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
             run_capture(args, out)
         })
         // Positional arg-choice grammar drives tab-completion + ghost preview. The
-        // `fps=` / `scale=` prefixes appear at args 1+ so the user can Tab onto
-        // them and discover the knobs without reading `help capture` first. They
-        // accept arbitrary numeric values after the `=`, which tab-completion
-        // can't enumerate — discovery via Tab, value typed by the user.
+        // `fps=` / `scale=` / `palette=` prefixes appear at args 1+ so the user can
+        // Tab onto them and discover the knobs without reading `help capture` first.
+        // Numeric values for fps=/scale= aren't enumerable; palette= takes
+        // `local|global` which the user types after the `=`.
         .with_args(&[
             &["png", "frames", "gif", "toggle", "stop", "panel"],
-            &["both", "fps=", "post", "pre", "scale="],
-            &["fps=", "scale="],
-            &["fps=", "scale="],
+            &["both", "fps=", "palette=", "post", "pre", "scale="],
+            &["fps=", "palette=", "scale="],
+            &["fps=", "palette=", "scale="],
         ]),
     );
 }
@@ -1033,6 +1259,7 @@ fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
                 name: None,
                 fps: p.fps,
                 scale: None,
+                palette: PaletteMode::default(),
             });
             out.line(format!("started PNG sequence ({:?})", p.stage));
         }
@@ -1045,12 +1272,14 @@ fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
                 name: None,
                 fps: p.fps,
                 scale: p.scale,
+                palette: p.palette,
             });
             out.line(format!(
-                "started GIF stream ({:?}, fps={}, scale={})",
+                "started GIF stream ({:?}, fps={}, scale={}, palette={:?})",
                 p.stage,
                 p.fps.map_or("default".into(), |f| f.to_string()),
                 p.scale.map_or("native".into(), |s| s.to_string()),
+                p.palette,
             ));
         }
         "stop" => {
@@ -1075,6 +1304,7 @@ fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
                 name: None,
                 fps: p.fps,
                 scale: p.scale,
+                palette: p.palette,
             });
             out.line(format!("toggle queued ({format:?}, {:?})", p.stage));
         }
@@ -1090,6 +1320,7 @@ struct ParsedCaptureArgs {
     dir: Option<PathBuf>,
     fps: Option<u16>,
     scale: Option<u32>,
+    palette: PaletteMode,
 }
 
 impl Default for ParsedCaptureArgs {
@@ -1099,15 +1330,18 @@ impl Default for ParsedCaptureArgs {
             dir: None,
             fps: None,
             scale: None,
+            palette: PaletteMode::default(),
         }
     }
 }
 
 /// Tokenise post-format positional args:
-/// - `pre|post|both` => stage
-/// - `fps=N`         => target frame rate
-/// - `scale=N`       => output width in pixels (GIF only)
-/// - anything else   => treat as output directory
+/// - `pre|post|both`     => stage
+/// - `fps=N`             => target frame rate
+/// - `scale=N`           => output width in pixels (GIF only)
+/// - `palette=local`     => per-frame NeuQuant (GIF only)
+/// - `palette=global`    => warmup-trained global NeuQuant (GIF only)
+/// - anything else       => treat as output directory
 fn parse_capture_args(args: &[&str]) -> ParsedCaptureArgs {
     let mut p = ParsedCaptureArgs::default();
     for arg in args {
@@ -1118,6 +1352,12 @@ fn parse_capture_args(args: &[&str]) -> ParsedCaptureArgs {
         } else if let Some(v) = arg.strip_prefix("scale=") {
             if let Ok(n) = v.parse::<u32>() {
                 p.scale = Some(n);
+            }
+        } else if let Some(v) = arg.strip_prefix("palette=") {
+            match v {
+                "local" => p.palette = PaletteMode::Local,
+                "global" => p.palette = PaletteMode::Global,
+                _ => {}
             }
         } else {
             match *arg {
@@ -1183,6 +1423,7 @@ pub struct CapturePanel {
     fps: u16,
     scale_enabled: bool,
     scale_width: u32,
+    palette_mode: PaletteMode,
 }
 
 impl Default for CapturePanel {
@@ -1196,6 +1437,7 @@ impl Default for CapturePanel {
             fps: 30,
             scale_enabled: false,
             scale_width: 720,
+            palette_mode: PaletteMode::default(),
         }
     }
 }
@@ -1290,6 +1532,17 @@ impl CapturePanel {
             });
         });
 
+        // Palette mode: GIF-only. Local = per-frame NeuQuant (current default, may
+        // flicker); Global = warmup-trained shared palette (no flicker after the
+        // first ~1 s warmup).
+        ui.add_enabled_ui(self.format == CaptureFormat::Gif, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Palette:");
+                ui.radio_value(&mut self.palette_mode, PaletteMode::Local, "local");
+                ui.radio_value(&mut self.palette_mode, PaletteMode::Global, "global");
+            });
+        });
+
         ui.separator();
 
         ui.horizontal(|ui| {
@@ -1312,6 +1565,7 @@ impl CapturePanel {
                         name: (!self.name.is_empty()).then(|| self.name.clone()),
                         fps: Some(self.fps),
                         scale: self.scale_enabled.then_some(self.scale_width),
+                        palette: self.palette_mode,
                     });
                 }
             }
