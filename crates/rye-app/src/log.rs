@@ -2,7 +2,7 @@
 //! app emits gets formatted and pushed into a bounded ring buffer. A console command
 //! (`log on|off|toggle`) controls whether the buffer mirrors into scrollback each
 //! frame. The buffer is always filling regardless of mirror state, so toggling on
-//! shows whatever events were emitted since startup (capped at [`BUFFER_CAP`]).
+//! shows whatever events were emitted since startup (capped at `BUFFER_CAP`).
 //!
 //! ## What this does NOT capture
 //!

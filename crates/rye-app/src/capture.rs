@@ -27,15 +27,15 @@
 //! ## How requests flow
 //!
 //! Console commands push [`CaptureRequest`]s onto a global queue via [`enqueue`]. The
-//! [`Runner`](crate::Runner) drains the queue once per frame, mutates the [`Capture`]
-//! state machine, and issues GPU copies at the two tap points in the render loop.
+//! runner drains the queue once per frame, mutates the internal `Capture` state
+//! machine, and issues GPU copies at the two tap points in the render loop.
 //!
 //! Encoding splits by format:
 //!
 //! - **PNG (one-shot + sequence)**: synchronous on the main thread. PNG compression is
 //!   fast enough that the per-frame cost is dominated by GPU readback. Diagnostic
 //!   capture wants every frame written; no drops.
-//! - **GIF stream**: encoded on a background worker thread ([`GifWorker`]). The main
+//! - **GIF stream**: encoded on a background worker thread. The main
 //!   thread sends raw RGBA over a bounded channel; the worker runs NeuQuant + Lanczos
 //!   resample + LZW + disk write. If the worker can't keep up, the main thread drops
 //!   the frame rather than stalling the renderer; the dropped count is surfaced when
@@ -179,7 +179,7 @@ pub enum CaptureRequest {
         dir: Option<PathBuf>,
         name: Option<String>,
         /// Capture rate cap in frames per second. `None` means "every render frame";
-        /// for GIF the runner uses [`CaptureFormat::default_fps`] when `None`.
+        /// for GIF and APNG the runner falls back to a 30 fps default when `None`.
         fps: Option<u16>,
         /// Output width in pixels for downscaled streams. Height computed to preserve
         /// aspect ratio. `None` captures at native swapchain resolution. GIF-only;
