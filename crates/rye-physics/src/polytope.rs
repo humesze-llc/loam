@@ -24,9 +24,10 @@
 //!
 //! ## Phase status
 //!
-//! Phase 1 (this commit): vertex tables for all six polytopes. Edges and cells
-//! land in follow-on commits; the corresponding fields are currently empty
-//! slices and the f-vector accessors return 0 for them.
+//! Phase 1: vertex tables for all six polytopes.
+//! Phase 2 (this commit): edge tables, derived from all-pairs vertex distance
+//! against the canonical edge length per polytope.
+//! Phase 3 (later): cell tables.
 //!
 //! See `docs/devlog/POLYTOPE_TOPOLOGY.md` (gitignored) for the full spec.
 //!
@@ -81,7 +82,9 @@ pub struct Polytope4Topology {
     /// indices used by `edges` and `cells` are positions into this slice.
     pub vertices: &'static [Vec4],
     /// Edges as pairs of vertex indices. Vertex order within a pair is
-    /// arbitrary (the edge is undirected). Empty until Phase 2 lands.
+    /// arbitrary (the edge is undirected). The pairs themselves are listed in
+    /// `(min, max)` index order and sorted lexicographically so the iteration
+    /// order is deterministic.
     pub edges: &'static [[u32; 2]],
     /// Cells as variable-length vertex-index lists. Each inner slice is one
     /// 3-cell's vertices (e.g., 4 indices for a tetrahedral cell, 8 for a
@@ -142,6 +145,86 @@ static CELL600_VERTICES: LazyLock<&'static [Vec4]> =
     LazyLock::new(|| Box::leak(cell600_vertices(1.0).into_boxed_slice()));
 
 // ---------------------------------------------------------------------------
+// Per-polytope edge caches
+// ---------------------------------------------------------------------------
+
+/// Canonical edge length at unit circumradius. Sourced from Coxeter,
+/// *Regular Polytopes*, Table I, and cross-checked against Wikipedia plus the
+/// empirical minimum pairwise distance over each polytope's vertex set.
+///
+/// The 120-cell value warrants explanation: Wikipedia gives the edge length as
+/// `3 − √5` at circumradius `2√2` (the "natural" coordinate convention also
+/// used by [`crate::euclidean_r4::cell120_vertices`]). Rescaling to unit
+/// circumradius divides by `2√2`, giving `(3 − √5)/(2√2) = 1/(φ²·√2)`. A
+/// common mistake (and a stale note in early drafts of the topology spec) is
+/// to drop the `√2`, which is the cell-edge-length identity for the 600-cell
+/// dual but not the 120-cell itself.
+fn canonical_edge_length(p: Polytope4) -> f32 {
+    let phi = (1.0 + 5.0_f32.sqrt()) * 0.5;
+    let sqrt2 = 2.0_f32.sqrt();
+    match p {
+        Polytope4::Pentatope => (5.0_f32 / 2.0).sqrt(),
+        Polytope4::Tesseract => 1.0,
+        Polytope4::Cell16 => sqrt2,
+        Polytope4::Cell24 => 1.0,
+        Polytope4::Cell120 => 1.0 / (phi * phi * sqrt2),
+        Polytope4::Cell600 => 1.0 / phi,
+    }
+}
+
+/// All-pairs distance check. A pair `(i, j)` with `i < j` forms an edge iff
+/// `|v_i − v_j|` matches the canonical edge length within `EDGE_TOLERANCE`.
+///
+/// Tolerance set empirically: needs to absorb f32 accumulation across `Vec4`
+/// subtraction + dot + sqrt (~1e-5 at unit scale), and be much smaller than the
+/// gap to the next-shortest inter-vertex chord. The tightest gap is on the
+/// 120-cell (edge 0.382, next-shortest chord ~0.627), so 1e-4 leaves a 4× gap
+/// either side.
+const EDGE_TOLERANCE: f32 = 1e-4;
+
+fn derive_edges(vertices: &[Vec4], edge_length: f32) -> Vec<[u32; 2]> {
+    let mut edges = Vec::new();
+    for i in 0..vertices.len() {
+        for j in (i + 1)..vertices.len() {
+            let d = (vertices[i] - vertices[j]).length();
+            if (d - edge_length).abs() < EDGE_TOLERANCE {
+                edges.push([i as u32, j as u32]);
+            }
+        }
+    }
+    edges
+}
+
+/// `cache_edges` is parameterised on the vertex slice rather than the
+/// `Polytope4` enum to avoid a deadlock: the `EDGES` LazyLock would otherwise
+/// recursively read `TOPOLOGY` (which it transitively initialises), or vice
+/// versa. Taking `vertices` directly breaks the cycle.
+fn cache_edges(vertices: &'static [Vec4], edge_length: f32) -> &'static [[u32; 2]] {
+    Box::leak(derive_edges(vertices, edge_length).into_boxed_slice())
+}
+
+static PENTATOPE_EDGES: LazyLock<&'static [[u32; 2]]> = LazyLock::new(|| {
+    cache_edges(
+        *PENTATOPE_VERTICES,
+        canonical_edge_length(Polytope4::Pentatope),
+    )
+});
+static TESSERACT_EDGES: LazyLock<&'static [[u32; 2]]> = LazyLock::new(|| {
+    cache_edges(
+        *TESSERACT_VERTICES,
+        canonical_edge_length(Polytope4::Tesseract),
+    )
+});
+static CELL16_EDGES: LazyLock<&'static [[u32; 2]]> =
+    LazyLock::new(|| cache_edges(*CELL16_VERTICES, canonical_edge_length(Polytope4::Cell16)));
+static CELL24_EDGES: LazyLock<&'static [[u32; 2]]> =
+    LazyLock::new(|| cache_edges(*CELL24_VERTICES, canonical_edge_length(Polytope4::Cell24)));
+static CELL120_EDGES: LazyLock<&'static [[u32; 2]]> =
+    LazyLock::new(|| cache_edges(*CELL120_VERTICES, canonical_edge_length(Polytope4::Cell120)));
+static CELL600_EDGES: LazyLock<&'static [[u32; 2]]> =
+    LazyLock::new(|| cache_edges(*CELL600_VERTICES, canonical_edge_length(Polytope4::Cell600)));
+
+// ---------------------------------------------------------------------------
 // Per-polytope topology assemblies
 // ---------------------------------------------------------------------------
 //
@@ -149,37 +232,36 @@ static CELL600_VERTICES: LazyLock<&'static [Vec4]> =
 // borrow from the per-polytope vertex / edge / cell caches above; both layers
 // of `LazyLock` ensure the data outlives any caller.
 
-const EMPTY_EDGES: &[[u32; 2]] = &[];
 const EMPTY_CELLS: &[&[u32]] = &[];
 
 static PENTATOPE_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *PENTATOPE_VERTICES,
-    edges: EMPTY_EDGES,
+    edges: *PENTATOPE_EDGES,
     cells: EMPTY_CELLS,
 });
 static TESSERACT_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *TESSERACT_VERTICES,
-    edges: EMPTY_EDGES,
+    edges: *TESSERACT_EDGES,
     cells: EMPTY_CELLS,
 });
 static CELL16_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *CELL16_VERTICES,
-    edges: EMPTY_EDGES,
+    edges: *CELL16_EDGES,
     cells: EMPTY_CELLS,
 });
 static CELL24_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *CELL24_VERTICES,
-    edges: EMPTY_EDGES,
+    edges: *CELL24_EDGES,
     cells: EMPTY_CELLS,
 });
 static CELL120_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *CELL120_VERTICES,
-    edges: EMPTY_EDGES,
+    edges: *CELL120_EDGES,
     cells: EMPTY_CELLS,
 });
 static CELL600_TOPOLOGY: LazyLock<Polytope4Topology> = LazyLock::new(|| Polytope4Topology {
     vertices: *CELL600_VERTICES,
-    edges: EMPTY_EDGES,
+    edges: *CELL600_EDGES,
     cells: EMPTY_CELLS,
 });
 
@@ -238,9 +320,23 @@ mod tests {
         assert_eq!(Polytope4::Cell600 as u32, 5);
     }
 
-    /// Edge / cell tables are empty until Phase 2 / Phase 3 land.
+    /// Edge counts per f-vector (Coxeter Table I).
     #[test]
-    fn phase_1_edges_and_cells_are_empty_placeholders() {
+    fn edge_counts_match_f_vector() {
+        assert_eq!(Polytope4::Pentatope.edge_count(), 10);
+        assert_eq!(Polytope4::Tesseract.edge_count(), 32);
+        assert_eq!(Polytope4::Cell16.edge_count(), 24);
+        assert_eq!(Polytope4::Cell24.edge_count(), 96);
+        assert_eq!(Polytope4::Cell120.edge_count(), 1200);
+        assert_eq!(Polytope4::Cell600.edge_count(), 720);
+    }
+
+    /// Every edge has length matching the canonical edge length within the same
+    /// tolerance used during derivation. (Trivially true by construction, but
+    /// the test catches a misuse where someone hand-edits an edge list and
+    /// forgets to check.)
+    #[test]
+    fn edge_lengths_match_canonical() {
         for p in [
             Polytope4::Pentatope,
             Polytope4::Tesseract,
@@ -249,7 +345,101 @@ mod tests {
             Polytope4::Cell120,
             Polytope4::Cell600,
         ] {
-            assert_eq!(p.edge_count(), 0);
+            let expected = canonical_edge_length(p);
+            let t = p.topology();
+            for &[i, j] in t.edges {
+                let d = (t.vertices[i as usize] - t.vertices[j as usize]).length();
+                assert!(
+                    (d - expected).abs() < EDGE_TOLERANCE,
+                    "{p:?} edge ({i}, {j}) length = {d}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// Each edge index pair is in `(min, max)` order (the construction
+    /// guarantees this since the inner loop runs `j > i`).
+    #[test]
+    fn edge_pairs_in_min_max_order() {
+        for p in [
+            Polytope4::Pentatope,
+            Polytope4::Tesseract,
+            Polytope4::Cell16,
+            Polytope4::Cell24,
+            Polytope4::Cell120,
+            Polytope4::Cell600,
+        ] {
+            for &[i, j] in p.topology().edges {
+                assert!(i < j, "{p:?} edge ({i}, {j}) not in (min, max) order");
+            }
+        }
+    }
+
+    /// No duplicate edges, and `(j, i)` never appears as a separate entry from
+    /// `(i, j)`. Catches accidental double-insertion in the derivation.
+    #[test]
+    fn edges_are_unique() {
+        for p in [
+            Polytope4::Pentatope,
+            Polytope4::Tesseract,
+            Polytope4::Cell16,
+            Polytope4::Cell24,
+            Polytope4::Cell120,
+            Polytope4::Cell600,
+        ] {
+            let edges = p.topology().edges;
+            let mut seen = std::collections::HashSet::new();
+            for &[i, j] in edges {
+                let key = (i.min(j), i.max(j));
+                assert!(seen.insert(key), "{p:?} edge ({i}, {j}) duplicated");
+            }
+        }
+    }
+
+    /// The canonical edge length equals the actual minimum pairwise distance
+    /// among the vertices, within tolerance. Catches drift between the
+    /// theoretical value (used to derive edges) and the vertex set produced by
+    /// `euclidean_r4`. If `cell120_vertices` is rescaled or the literature
+    /// convention shifts, this test fires before any silent edge-set breakage.
+    #[test]
+    fn canonical_edge_length_matches_empirical_min() {
+        for p in [
+            Polytope4::Pentatope,
+            Polytope4::Tesseract,
+            Polytope4::Cell16,
+            Polytope4::Cell24,
+            Polytope4::Cell120,
+            Polytope4::Cell600,
+        ] {
+            let vs = p.topology().vertices;
+            let mut min_d = f32::INFINITY;
+            for i in 0..vs.len() {
+                for j in (i + 1)..vs.len() {
+                    let d = (vs[i] - vs[j]).length();
+                    if d < min_d {
+                        min_d = d;
+                    }
+                }
+            }
+            let expected = canonical_edge_length(p);
+            assert!(
+                (min_d - expected).abs() < EDGE_TOLERANCE,
+                "{p:?}: empirical min pairwise distance {min_d} != canonical {expected}"
+            );
+        }
+    }
+
+    /// Cell tables stay empty until Phase 3 lands.
+    #[test]
+    fn phase_3_cells_are_empty_placeholders() {
+        for p in [
+            Polytope4::Pentatope,
+            Polytope4::Tesseract,
+            Polytope4::Cell16,
+            Polytope4::Cell24,
+            Polytope4::Cell120,
+            Polytope4::Cell600,
+        ] {
             assert_eq!(p.cell_count(), 0);
         }
     }
