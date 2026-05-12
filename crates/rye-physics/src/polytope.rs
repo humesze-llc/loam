@@ -341,9 +341,8 @@ const MIN_CROSS4_LENGTH: f32 = 1e-4;
 ///
 /// Cost is `O(V · D^3 · V)` for vertex count `V` and vertex-figure valence
 /// `D`. The dominant case is the 600-cell at `120 · 220 · 120 ≈ 3.2 M` plane
-/// scans, which runs in roughly 100 ms in `--release` and ~1 s in
-/// `--debug`. Cells are cached behind a [`LazyLock`], so the cost is paid
-/// once per polytope per process; do not call this in a hot loop.
+/// scans. Cells are cached behind a [`LazyLock`], so the cost is paid once
+/// per polytope per process; do not call this in a hot loop.
 fn derive_cells(vertices: &[Vec4], edges: &[[u32; 2]], cell_size: usize) -> Vec<Vec<u32>> {
     use std::collections::BTreeSet;
 
