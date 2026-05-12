@@ -672,11 +672,18 @@ impl<Ctx: 'static> Console<Ctx> {
         }
 
         // After whitespace: we're on an argument. `arg_index` is 0-based positional.
+        // The `else` arm is reached only when `parsed.len() >= 2` (the `len() == 1 &&
+        // !trailing_ws` case returned above), so `parsed.last()` is always `Some`;
+        // `unwrap_or_default` returns the empty-string fallback only in the impossible
+        // path, keeping library code free of `unwrap()`.
         let cmd_name = parsed[0].to_string();
         let (arg_index, prefix) = if trailing_ws {
             (parsed.len() - 1, String::new())
         } else {
-            (parsed.len() - 2, parsed.last().unwrap().to_string())
+            (
+                parsed.len() - 2,
+                parsed.last().copied().unwrap_or_default().to_string(),
+            )
         };
         Some(CompletionContext::Arg {
             cmd_name,
@@ -751,7 +758,7 @@ impl<Ctx: 'static> Console<Ctx> {
                             None => true,
                             Some(eq) => {
                                 let key = &choice[..=eq];
-                                !used_kv_prefixes.iter().any(|u| *u == key)
+                                !used_kv_prefixes.contains(&key)
                             }
                         }
                     })

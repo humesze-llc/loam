@@ -831,6 +831,9 @@ impl Capture {
         log
     }
 
+    // Each arg corresponds to a `CaptureRequest::StartSequence` field; bundling them
+    // into a struct would just rename the same set of values without buying clarity.
+    #[allow(clippy::too_many_arguments)]
     fn start_sequence(
         &mut self,
         format: CaptureFormat,
