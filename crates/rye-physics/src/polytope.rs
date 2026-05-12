@@ -102,6 +102,17 @@ pub struct Polytope4Topology {
 }
 
 impl Polytope4 {
+    /// All six variants, in `repr(u32)` discriminant order. Useful for
+    /// iteration without spelling each variant out at the call site.
+    pub const ALL: [Polytope4; 6] = [
+        Polytope4::Pentatope,
+        Polytope4::Tesseract,
+        Polytope4::Cell16,
+        Polytope4::Cell24,
+        Polytope4::Cell120,
+        Polytope4::Cell600,
+    ];
+
     /// Borrow this polytope's full topology. First access lazily computes the
     /// vertex / edge / cell tables and caches them for the rest of process
     /// lifetime; subsequent calls are a pointer dereference.
@@ -473,14 +484,7 @@ mod tests {
     /// (factor-of-2 errors would blow past).
     #[test]
     fn vertices_on_unit_circumradius() {
-        for p in [
-            Polytope4::Pentatope,
-            Polytope4::Tesseract,
-            Polytope4::Cell16,
-            Polytope4::Cell24,
-            Polytope4::Cell120,
-            Polytope4::Cell600,
-        ] {
+        for p in Polytope4::ALL {
             for v in p.topology().vertices {
                 let r = v.length();
                 assert!(
@@ -523,14 +527,7 @@ mod tests {
     /// forgets to check.)
     #[test]
     fn edge_lengths_match_canonical() {
-        for p in [
-            Polytope4::Pentatope,
-            Polytope4::Tesseract,
-            Polytope4::Cell16,
-            Polytope4::Cell24,
-            Polytope4::Cell120,
-            Polytope4::Cell600,
-        ] {
+        for p in Polytope4::ALL {
             let expected = canonical_edge_length(p);
             let t = p.topology();
             for &[i, j] in t.edges {
@@ -547,14 +544,7 @@ mod tests {
     /// guarantees this since the inner loop runs `j > i`).
     #[test]
     fn edge_pairs_in_min_max_order() {
-        for p in [
-            Polytope4::Pentatope,
-            Polytope4::Tesseract,
-            Polytope4::Cell16,
-            Polytope4::Cell24,
-            Polytope4::Cell120,
-            Polytope4::Cell600,
-        ] {
+        for p in Polytope4::ALL {
             for &[i, j] in p.topology().edges {
                 assert!(i < j, "{p:?} edge ({i}, {j}) not in (min, max) order");
             }
@@ -565,14 +555,7 @@ mod tests {
     /// `(i, j)`. Catches accidental double-insertion in the derivation.
     #[test]
     fn edges_are_unique() {
-        for p in [
-            Polytope4::Pentatope,
-            Polytope4::Tesseract,
-            Polytope4::Cell16,
-            Polytope4::Cell24,
-            Polytope4::Cell120,
-            Polytope4::Cell600,
-        ] {
+        for p in Polytope4::ALL {
             let edges = p.topology().edges;
             let mut seen = std::collections::HashSet::new();
             for &[i, j] in edges {
@@ -589,14 +572,7 @@ mod tests {
     /// convention shifts, this test fires before any silent edge-set breakage.
     #[test]
     fn canonical_edge_length_matches_empirical_min() {
-        for p in [
-            Polytope4::Pentatope,
-            Polytope4::Tesseract,
-            Polytope4::Cell16,
-            Polytope4::Cell24,
-            Polytope4::Cell120,
-            Polytope4::Cell600,
-        ] {
+        for p in Polytope4::ALL {
             let vs = p.topology().vertices;
             let mut min_d = f32::INFINITY;
             for i in 0..vs.len() {
@@ -659,14 +635,7 @@ mod tests {
     /// derivation that loses this property.
     #[test]
     fn cells_lie_on_common_hyperplane() {
-        for p in [
-            Polytope4::Pentatope,
-            Polytope4::Tesseract,
-            Polytope4::Cell16,
-            Polytope4::Cell24,
-            Polytope4::Cell120,
-            Polytope4::Cell600,
-        ] {
+        for p in Polytope4::ALL {
             let topo = p.topology();
             for (idx, cell) in topo.cells.iter().enumerate() {
                 let centroid: Vec4 = cell
@@ -731,14 +700,7 @@ mod tests {
     /// or builds the wrong cell list.)
     #[test]
     fn every_edge_lies_in_some_cell() {
-        for p in [
-            Polytope4::Pentatope,
-            Polytope4::Tesseract,
-            Polytope4::Cell16,
-            Polytope4::Cell24,
-            Polytope4::Cell120,
-            Polytope4::Cell600,
-        ] {
+        for p in Polytope4::ALL {
             let topo = p.topology();
             for &[i, j] in topo.edges {
                 let covered = topo
@@ -750,6 +712,36 @@ mod tests {
                     "{p:?} edge ({i}, {j}) is not contained in any cell"
                 );
             }
+        }
+    }
+
+    /// Euler-Poincaré relation for closed convex 4-polytopes:
+    /// `V - E + F - C = 0`.
+    ///
+    /// `V`, `E`, `C` are checked against the topology tables. `F` (the count
+    /// of 2-faces) is sourced from Coxeter, *Regular Polytopes*, Table I;
+    /// we don't expose 2-faces in the API since no planned visualization
+    /// needs them, but the count itself is a useful invariant test.
+    #[test]
+    fn euler_poincare_relation_holds() {
+        // (Polytope, F = number of 2-faces). V/E/C come from `.topology()`.
+        let face_counts: &[(Polytope4, i64)] = &[
+            (Polytope4::Pentatope, 10),
+            (Polytope4::Tesseract, 24),
+            (Polytope4::Cell16, 32),
+            (Polytope4::Cell24, 96),
+            (Polytope4::Cell120, 720),
+            (Polytope4::Cell600, 1200),
+        ];
+        for &(p, f) in face_counts {
+            let v = p.vertex_count() as i64;
+            let e = p.edge_count() as i64;
+            let c = p.cell_count() as i64;
+            assert_eq!(
+                v - e + f - c,
+                0,
+                "{p:?} Euler-Poincaré: V({v}) - E({e}) + F({f}) - C({c}) != 0"
+            );
         }
     }
 }
