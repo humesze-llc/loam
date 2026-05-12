@@ -21,11 +21,11 @@
 //! - A camera framework. The user owns [`Camera<S>`] and a [`CameraController<S>`] in
 //!   their `App` struct, advanced from inside `App::update`. The framework only hands
 //!   them the drained input.
-//! - A frame-capture pipeline. Use OBS or another external screen recorder. (TODO:
-//!   revisit if a built-in capture knob becomes load-bearing for CI / regression-image
-//!   generation. The future shape: GIF-preferred output, separate from any rotation
-//!   flag. Capture and auto-rotate are independent concerns and coupling them was a
-//!   2026-04-28 mistake; see issue tracker.)
+//!
+//! A frame-capture pipeline is included behind the `capture` feature (default-on); see
+//! [`capture`] for the console commands, hotkeys, and two-tap (pre-egui / post-egui)
+//! readback model. External screen recorders (OBS) remain the right tool for long
+//! recording sessions that need codec choice + audio + multi-source mixing.
 //!
 //! Designed for a small ergonomic gain; explicitly not an ECS or scene graph.
 //!
@@ -63,6 +63,10 @@ use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
+
+#[cfg(feature = "capture")]
+pub mod capture;
+pub mod log;
 
 use winit::{
     application::ApplicationHandler,
@@ -294,18 +298,24 @@ pub fn run<A: App>() -> anyhow::Result<()> {
 
 /// Run an app with custom config.
 pub fn run_with_config<A: App>(config: RunConfig) -> anyhow::Result<()> {
-    if let Some(filter) = &config.log_filter {
-        // Best-effort init; ignore "already initialised" errors so
-        // running tests / repeated `run` calls don't panic.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter.clone()))
-            .try_init();
-    } else {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "info".into()),
-            )
+    // Compose two tracing layers: the standard fmt layer (writes to stdout) and our
+    // ConsoleLayer (pushes events into the in-process ring buffer for the dev
+    // console). Both subscribe to the same EnvFilter so RUST_LOG / log_filter
+    // controls both outputs uniformly. `try_init` is best-effort: if a subscriber is
+    // already installed (tests, repeated calls) we silently no-op so the existing
+    // sink keeps working.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let filter = match &config.log_filter {
+            Some(s) => tracing_subscriber::EnvFilter::new(s.clone()),
+            None => tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        };
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(log::ConsoleLayer)
             .try_init();
     }
 
@@ -350,6 +360,9 @@ struct Runner<A: App> {
     /// Surfaced to the user via `finish()` if the runner exited because of a setup or
     /// render error, so callers can propagate it from `main`.
     deferred_error: Option<anyhow::Error>,
+
+    #[cfg(feature = "capture")]
+    capture: capture::Capture,
 }
 
 impl<A: App> Runner<A> {
@@ -373,6 +386,9 @@ impl<A: App> Runner<A> {
             tick_index: 0,
             render_error_streak: 0,
             deferred_error: None,
+
+            #[cfg(feature = "capture")]
+            capture: capture::Capture::new(),
         }
     }
 
@@ -388,6 +404,38 @@ impl<A: App> Runner<A> {
 
     fn time(&self) -> f32 {
         self.start.elapsed().as_secs_f32()
+    }
+}
+
+/// Read back `texture` and hand the pixels to the capture state machine, which
+/// dispatches to the active writer (one-shot PNG, sequence PNG, or GIF encoder).
+/// Logs and swallows errors so a transient capture failure doesn't abort the render
+/// loop. Free function (not a method on Runner) so the borrow checker can see that
+/// `&mut capture` and `&rd` are disjoint borrows.
+#[cfg(feature = "capture")]
+fn capture_consume(
+    capture: &mut capture::Capture,
+    rd: &RenderDevice,
+    texture: &wgpu::Texture,
+    is_pre: bool,
+    captured_at: Instant,
+) {
+    let img = match capture::read_texture_rgba(
+        &rd.device,
+        &rd.queue,
+        texture,
+        rd.surface_bundle.size.width,
+        rd.surface_bundle.size.height,
+        rd.surface_bundle.config.format,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::error!("capture: readback failed: {e:#}");
+            return;
+        }
+    };
+    if let Err(e) = capture.consume_frame(is_pre, img.rgba, img.width, img.height, captured_at) {
+        tracing::error!("capture: write failed: {e:#}");
     }
 }
 
@@ -642,11 +690,33 @@ impl<A: App> Runner<A> {
             self.last_fps_update = Instant::now();
             if let Some(app) = self.app.as_ref() {
                 let title = app.title(self.fps);
+                // Append capture status when active. 1 Hz refresh matches the title
+                // update cadence and gives the user a visible recording counter without
+                // wiring it through the demo's UI.
+                #[cfg(feature = "capture")]
+                let title = match self.capture.status() {
+                    Some(status) => format!("{title} [{status}]").into(),
+                    None => title,
+                };
                 win.set_title(&title);
             }
         }
 
-        // 5. Render: scene (App::render) then UI overlay.
+        // 5. Drain any queued capture requests + update the state machine BEFORE the
+        // render pass. Requests come from console commands and hotkey binds; they're
+        // applied here so this frame can honor them.
+        #[cfg(feature = "capture")]
+        {
+            let requests = capture::drain_requests();
+            if !requests.is_empty() {
+                let log = self.capture.apply_requests(requests);
+                for line in log {
+                    tracing::info!("{line}");
+                }
+            }
+        }
+
+        // 6. Render: scene (App::render) then UI overlay.
         //
         // When MSAA is enabled, both passes write into the
         // multisampled color attachment (`rd.msaa_view()`) and the
@@ -655,6 +725,21 @@ impl<A: App> Runner<A> {
         // egui pass. When MSAA is disabled, both passes write
         // directly into the swapchain view and `resolve_target` is
         // `None`.
+        //
+        // Capture taps:
+        //   - `pre`-egui:  after App::render, before ui.paint. MSAA must be off (the
+        //     multisampled attachment isn't directly copyable). The pre tap reads the
+        //     swapchain view, which at this point contains just the 3D pass output.
+        //   - `post`-egui: after ui.paint, before frame.present. Reads the swapchain
+        //     view, which contains the final composite (and the MSAA resolve target
+        //     when MSAA is on). This is what DWM receives.
+        // FPS-gate decides whether either tap fires this frame. Computed once before the
+        // render pass so the same `now` is used to schedule the next capture interval.
+        #[cfg(feature = "capture")]
+        let capture_now = Instant::now();
+        #[cfg(feature = "capture")]
+        let do_capture = self.capture.should_capture(capture_now);
+
         match rd.begin_frame() {
             Ok((frame, swap_view)) => {
                 let mut last_err: Option<anyhow::Error> = None;
@@ -665,6 +750,20 @@ impl<A: App> Runner<A> {
                         last_err = Some(e);
                     }
                 }
+
+                // Pre-egui capture tap. Only valid with MSAA off (see above).
+                #[cfg(feature = "capture")]
+                if do_capture && self.capture.wants_pre() {
+                    if rd.sample_count() > 1 {
+                        tracing::warn!(
+                            "capture: `pre` stage skipped because MSAA is on; \
+                             set RunConfig::msaa_samples = 1 for diagnostic capture"
+                        );
+                    } else {
+                        capture_consume(&mut self.capture, rd, &frame.texture, true, capture_now);
+                    }
+                }
+
                 if let Some(ui) = self.ui.as_mut() {
                     let mut encoder =
                         rd.device
@@ -684,6 +783,21 @@ impl<A: App> Runner<A> {
                     );
                     rd.queue.submit(Some(encoder.finish()));
                 }
+
+                // Post-egui capture tap. Always valid: swapchain has final composite.
+                #[cfg(feature = "capture")]
+                if do_capture && self.capture.wants_post() {
+                    capture_consume(&mut self.capture, rd, &frame.texture, false, capture_now);
+                }
+                #[cfg(feature = "capture")]
+                if do_capture {
+                    self.capture.advance_frame(capture_now);
+                }
+                // Publish status every frame so the panel + window title stay current
+                // even when do_capture is false (FPS-gated idle frames between writes).
+                #[cfg(feature = "capture")]
+                capture::publish_status(self.capture.status());
+
                 frame.present();
                 if let Some(err) = last_err {
                     self.render_error_streak = self.render_error_streak.saturating_add(1);

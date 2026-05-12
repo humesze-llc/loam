@@ -597,6 +597,9 @@ struct RotatePolytopesApp {
     /// like Space / R / arrows: when egui wants the keyboard,
     /// the demo's hotkeys must NOT fire on top.
     last_egui_keyboard: bool,
+    /// Capture parameters panel (output dir, format, fps, scale, start/stop).
+    /// Toggled via the `capture panel` console command or the F11 default bind.
+    capture_panel: rye_app::capture::CapturePanel,
 }
 
 impl RotatePolytopesApp {
@@ -634,6 +637,18 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
+
+        // Framework-provided capture: `capture png [pre|post|both] [dir]`,
+        // `capture frames [pre|post|both] [dir]`, `capture stop`. Bound to F12 (one-shot)
+        // and F9 (sequence start; use `capture stop` to end). Requests push to a global
+        // queue; the runner drains and processes them at the render-loop's two taps.
+        rye_app::capture::register_commands(&mut c);
+        rye_app::capture::bind_default_hotkeys(&mut c);
+
+        // Framework-provided log mirror: `log on|off|toggle` toggles whether
+        // `tracing::*` events show up in the console scrollback.
+        rye_app::log::register_command(&mut c);
+
         c
     }
 }
@@ -648,6 +663,7 @@ impl App for RotatePolytopesApp {
             demo,
             console,
             last_egui_keyboard: false,
+            capture_panel: rye_app::capture::CapturePanel::new(),
         })
     }
 
@@ -661,6 +677,10 @@ impl App for RotatePolytopesApp {
 
     fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
         self.demo.ui(ctx, frame);
+        self.capture_panel.show(ctx);
+        // Pump any pending tracing events into the console scrollback BEFORE rendering
+        // it, so the user sees mirrored log lines this frame instead of next.
+        rye_app::log::pump_into(&mut self.console);
         self.console.ui(ctx, &mut self.demo);
         // Stash for next frame's `on_event` to gate hotkey routing.
         // Captured AFTER the console renders so a freshly-focused

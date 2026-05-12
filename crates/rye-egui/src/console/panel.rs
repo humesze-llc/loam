@@ -42,6 +42,9 @@ const COLOR_SYSTEM: Color32 = Color32::from_rgb(140, 200, 220);
 const COLOR_PROMPT: Color32 = Color32::from_rgb(160, 200, 140);
 const COLOR_TITLE: Color32 = Color32::from_rgb(200, 200, 210);
 const COLOR_SEPARATOR: Color32 = Color32::from_rgb(60, 60, 70);
+/// Tab-completion preview text painted after the live input. Dim enough to read as a
+/// hint rather than committed input.
+const COLOR_GHOST: Color32 = Color32::from_rgb(110, 110, 120);
 const FONT_SIZE: f32 = 13.0;
 const ROW_TITLE_HEIGHT: f32 = 22.0;
 const ROW_INPUT_HEIGHT: f32 = 24.0;
@@ -51,8 +54,6 @@ const ROW_INPUT_HEIGHT: f32 = 24.0;
 /// has remembered.
 const DETACHED_DEFAULT_W: f32 = 520.0;
 const DETACHED_DEFAULT_H: f32 = 320.0;
-const DETACHED_MIN_W: f32 = 280.0;
-const DETACHED_MIN_H: f32 = 120.0;
 
 pub(super) fn draw<Ctx: 'static>(
     console: &mut Console<Ctx>,
@@ -131,6 +132,11 @@ fn draw_detached<Ctx: 'static>(console: &mut Console<Ctx>, ctx: &egui::Context, 
         .inner_margin(Margin::same(0))
         .corner_radius(egui::CornerRadius::same(4));
 
+    // No explicit min_width / min_height: egui's Window resize logic + an enforced
+    // minimum together produce a sideways-drift bug when the user pulls the left
+    // edge below the minimum (mouse drag tracks left, window stays at minimum
+    // width, content separators shrink to chase the dragged origin). Letting the
+    // window go arbitrarily small avoids the bug; the user can resize back up.
     egui::Window::new("rye_console_window")
         .id(egui::Id::new("rye_console_window"))
         .title_bar(false)
@@ -139,8 +145,6 @@ fn draw_detached<Ctx: 'static>(console: &mut Console<Ctx>, ctx: &egui::Context, 
         .movable(true)
         .default_pos(default_pos)
         .default_size(egui::vec2(DETACHED_DEFAULT_W, DETACHED_DEFAULT_H))
-        .min_width(DETACHED_MIN_W)
-        .min_height(DETACHED_MIN_H)
         .frame(frame)
         .show(ctx, |ui| {
             // Tight vertical layout: drop inter-item spacing between title, separators,
@@ -288,13 +292,42 @@ fn draw_input_row<Ctx: 'static>(
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
 
             let prev_input = console.input.clone();
-            let response = ui.add(
-                TextEdit::singleline(&mut console.input)
-                    .font(FontId::monospace(FONT_SIZE))
-                    .frame(false)
-                    .desired_width(width - 32.0)
-                    .text_color(COLOR_INPUT_ECHO),
-            );
+            let ghost = console.tab_preview();
+            // `TextEdit::show` returns the actual screen-space text origin + galley so
+            // the ghost paint lands exactly where the input ends; measuring the text
+            // with a separate `painter.layout_no_wrap` was off by a few pixels because
+            // the TextEdit has internal padding the painter doesn't see.
+            let output = TextEdit::singleline(&mut console.input)
+                .font(FontId::monospace(FONT_SIZE))
+                .frame(false)
+                .desired_width(width - 32.0)
+                .text_color(COLOR_INPUT_ECHO)
+                .show(ui);
+            let response = output.response;
+
+            if let Some(ghost) = ghost {
+                let ghost_pos = output.galley_pos + egui::vec2(output.galley.size().x, 0.0);
+                ui.painter().text(
+                    ghost_pos,
+                    egui::Align2::LEFT_TOP,
+                    ghost,
+                    FontId::monospace(FONT_SIZE),
+                    COLOR_GHOST,
+                );
+            }
+
+            // Snap the TextEdit cursor to the end of `console.input` when something
+            // outside the TextEdit (tab-complete, history nav) replaced the buffer.
+            // Without this, the cursor stays at byte 0 and the user has to End-key.
+            if console.pending_cursor_to_end {
+                let mut state = output.state;
+                let end = egui::text::CCursor::new(console.input.chars().count());
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                state.store(ui.ctx(), response.id);
+                console.pending_cursor_to_end = false;
+            }
 
             // Any input change outside of tab-cycling invalidates the tab-completion
             // state.
