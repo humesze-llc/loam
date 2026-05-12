@@ -665,11 +665,12 @@ impl<Ctx: 'static> Console<Ctx> {
                     return Vec::new();
                 };
 
-                // Identify key-value args already provided in earlier positions
-                // (e.g. `fps=30`) so we don't suggest the same key again. Skips the
-                // partial last token (that's what we're completing). Stage keywords
-                // and plain positionals aren't filtered: re-typing a positional may
-                // be intentional, and the parser would just overwrite an earlier
+                // Identify key=value args already provided in earlier positions
+                // (e.g. `fps=30`, `palette=global`) so we don't suggest a choice
+                // that shares the same `key=` prefix. Skips the partial last
+                // token (that's what we're completing). Stage keywords and plain
+                // positionals aren't filtered: re-typing a positional may be
+                // intentional, and the parser would just overwrite an earlier
                 // value.
                 let parsed: Vec<&str> = self.input.split_whitespace().collect();
                 let trailing_ws = self.input.ends_with(char::is_whitespace);
@@ -683,15 +684,23 @@ impl<Ctx: 'static> Console<Ctx> {
                     .filter_map(|t| t.find('=').map(|i| &t[..=i]))
                     .collect();
 
-                // Sort matches alphabetically so command authors can declare choices in
-                // any order (workflow, frequency, narrative) without affecting Tab
+                // Sort matches alphabetically so command authors can declare choices
+                // in any order (workflow, frequency, narrative) without affecting Tab
                 // cycling order. Matches the command-name path, which is also sorted.
                 let mut matches: Vec<String> = cmd
                     .arg_choices(*arg_index)
                     .iter()
                     .filter(|choice| choice.starts_with(prefix.as_str()))
                     .filter(|choice| {
-                        !choice.ends_with('=') || !used_kv_prefixes.iter().any(|u| *u == **choice)
+                        // Suppress any choice whose `key=` prefix was already used.
+                        // Choices without `=` (bare keywords) are never filtered.
+                        match choice.find('=') {
+                            None => true,
+                            Some(eq) => {
+                                let key = &choice[..=eq];
+                                !used_kv_prefixes.iter().any(|u| *u == key)
+                            }
+                        }
                     })
                     .map(|choice| (*choice).to_string())
                     .collect();
@@ -705,15 +714,12 @@ impl<Ctx: 'static> Console<Ctx> {
     /// The panel paints this as dim ghost text after the cursor so the user sees
     /// exactly what `Tab` will insert on the next press.
     ///
-    /// Works for both command names and positional argument choices, including the
-    /// empty-input case where the first command alphabetically is previewed. Returns
-    /// `None` only when no completion matches at all.
+    /// Works for command names and positional argument choices, with one carve-out:
+    /// empty input returns `None` so the bare prompt doesn't visually default to
+    /// the first registered command. Tab on empty still cycles through commands,
+    /// it just doesn't surface a hint until the user types a character.
     pub fn tab_preview(&self) -> Option<String> {
-        let ctx = self
-            .completion_context()
-            .unwrap_or(CompletionContext::Command {
-                prefix: String::new(),
-            });
+        let ctx = self.completion_context()?;
         let matches = self.completion_matches(&ctx);
         let first = matches.first()?;
         let prefix_len = ctx.prefix().len();
@@ -924,9 +930,10 @@ mod tests {
         // registrations needed. Sort order: clear < detach < dock < help.
         let mut c = Console::<Ctx>::new();
 
-        // Empty input -> previews the first command alphabetically.
+        // Empty input -> no ghost (don't visually default the bare prompt to the
+        // first command; the user hasn't typed anything yet). Tab still works.
         c.input = String::new();
-        assert_eq!(c.tab_preview().as_deref(), Some("clear"));
+        assert_eq!(c.tab_preview(), None);
 
         // Single match -> preview is the rest of that command.
         c.input = "de".into();

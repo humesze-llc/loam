@@ -1217,16 +1217,32 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
         cmd("capture", capture_help(), |args, _ctx: &mut Ctx, out| {
             run_capture(args, out)
         })
-        // Positional arg-choice grammar drives tab-completion + ghost preview. The
-        // `fps=` / `scale=` / `palette=` prefixes appear at args 1+ so the user can
-        // Tab onto them and discover the knobs without reading `help capture` first.
-        // Numeric values for fps=/scale= aren't enumerable; palette= takes
-        // `local|global` which the user types after the `=`.
+        // Positional arg-choice grammar drives tab-completion + ghost preview.
+        //
+        // Two flavors of kv args here:
+        // - `fps=` / `scale=`: free-form numeric values; only the prefix is in
+        //   the choices list. Tab inserts `fps=` and the user types the number.
+        // - `palette=local` / `palette=global`: enumerable values; both full
+        //   strings are in the choices list. Tab cycles through them, ghost
+        //   shows the next valid suffix.
+        //
+        // The deduplication filter (in completion_matches) ensures that once a
+        // `key=` prefix appears in the typed args, all choices with that prefix
+        // are suppressed so the user doesn't see `palette=*` after they've
+        // already typed `palette=global`.
         .with_args(&[
             &["png", "frames", "gif", "toggle", "stop", "panel"],
-            &["both", "fps=", "palette=", "post", "pre", "scale="],
-            &["fps=", "palette=", "scale="],
-            &["fps=", "palette=", "scale="],
+            &[
+                "both",
+                "fps=",
+                "palette=global",
+                "palette=local",
+                "post",
+                "pre",
+                "scale=",
+            ],
+            &["fps=", "palette=global", "palette=local", "scale="],
+            &["fps=", "palette=global", "palette=local", "scale="],
         ]),
     );
 }
