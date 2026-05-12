@@ -37,8 +37,6 @@
 //!   "dual" polytope, whose vertex generator may not be rotation-aligned
 //!   with this one (see the cell-cache section for details).
 //!
-//! See `docs/devlog/POLYTOPE_TOPOLOGY.md` (gitignored) for the full spec.
-//!
 //! ## Example
 //!
 //! ```
@@ -53,7 +51,7 @@
 //! ```
 use std::sync::LazyLock;
 
-use glam::Vec4;
+use glam::{Vec3, Vec4};
 
 use crate::euclidean_r4::{
     cell120_vertices, cell16_vertices, cell24_vertices, cell600_vertices, pentatope_vertices,
@@ -85,19 +83,23 @@ pub enum Polytope4 {
 /// Static lifetimes throughout: the data is allocated once per polytope on first
 /// access via [`std::sync::LazyLock`] and never mutated. Cheap to copy the
 /// reference around.
+#[derive(Debug)]
 pub struct Polytope4Topology {
     /// All vertices, in canonical (unit-circumradius) coordinates. Vertex
     /// indices used by `edges` and `cells` are positions into this slice.
     pub vertices: &'static [Vec4],
-    /// Edges as pairs of vertex indices. Vertex order within a pair is
-    /// arbitrary (the edge is undirected). The pairs themselves are listed in
-    /// `(min, max)` index order and sorted lexicographically so the iteration
-    /// order is deterministic.
+    /// Edges as pairs of vertex indices. Within each pair the lower index
+    /// comes first (`pair[0] < pair[1]`). The pairs themselves are sorted
+    /// lexicographically by `(pair[0], pair[1])`, so iteration order is
+    /// deterministic across runs.
     pub edges: &'static [[u32; 2]],
     /// Cells as variable-length vertex-index lists. Each inner slice is one
     /// 3-cell's vertices: 4 for tetrahedral cells (pentatope, 16-cell,
     /// 600-cell), 8 for cubical (tesseract), 6 for octahedral (24-cell), 20
-    /// for dodecahedral (120-cell). Vertex order within a cell is arbitrary.
+    /// for dodecahedral (120-cell). Within each cell the vertex indices are
+    /// in ascending order, and the cells themselves are sorted
+    /// lexicographically by their vertex list, so iteration order is
+    /// deterministic across runs.
     pub cells: &'static [&'static [u32]],
 }
 
@@ -266,7 +268,7 @@ const CELL_TOLERANCE: f32 = 1e-4;
 /// we trial a candidate 3-flat fit: a non-cell 3-flat through 4 of the
 /// polytope's points generically contains only those 4 points, while a true
 /// cell's 3-flat contains the full cell.
-fn cell_vertex_count(p: Polytope4) -> usize {
+const fn cell_vertex_count(p: Polytope4) -> usize {
     match p {
         Polytope4::Pentatope => 4,
         Polytope4::Tesseract => 8,
@@ -278,18 +280,21 @@ fn cell_vertex_count(p: Polytope4) -> usize {
 }
 
 /// 4D cross product: given three vectors `a`, `b`, `c` in 4D, returns a
-/// vector orthogonal to all three. Implemented as the cofactor expansion
-/// `n_i = (-1)^i · det(M_i)` where `M_i` is the 3×3 minor of the 3×4 matrix
-/// `[a; b; c]` with column `i` removed.
+/// vector orthogonal to all three. By cofactor expansion the `i`-th
+/// component is `(-1)^i · det(M_i)`, where `M_i` is the 3×3 minor of the
+/// 3×4 matrix `[a; b; c]` with column `i` dropped. Each 3×3 determinant is
+/// computed as the standard triple product `row_a · (row_b × row_c)` on
+/// the three surviving columns.
 fn cross4(a: Vec4, b: Vec4, c: Vec4) -> Vec4 {
-    let det3 = |p: f32, q: f32, r: f32, s: f32, t: f32, u: f32, x: f32, y: f32, z: f32| -> f32 {
-        p * (t * z - u * y) - q * (s * z - u * x) + r * (s * y - t * x)
-    };
+    let drop_x = |v: Vec4| Vec3::new(v.y, v.z, v.w);
+    let drop_y = |v: Vec4| Vec3::new(v.x, v.z, v.w);
+    let drop_z = |v: Vec4| Vec3::new(v.x, v.y, v.w);
+    let drop_w = |v: Vec4| Vec3::new(v.x, v.y, v.z);
     Vec4::new(
-        det3(a.y, a.z, a.w, b.y, b.z, b.w, c.y, c.z, c.w),
-        -det3(a.x, a.z, a.w, b.x, b.z, b.w, c.x, c.z, c.w),
-        det3(a.x, a.y, a.w, b.x, b.y, b.w, c.x, c.y, c.w),
-        -det3(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z),
+        drop_x(a).dot(drop_x(b).cross(drop_x(c))),
+        -drop_y(a).dot(drop_y(b).cross(drop_y(c))),
+        drop_z(a).dot(drop_z(b).cross(drop_z(c))),
+        -drop_w(a).dot(drop_w(b).cross(drop_w(c))),
     )
 }
 
@@ -305,6 +310,14 @@ fn adjacency(num_vertices: usize, edges: &[[u32; 2]]) -> Vec<Vec<u32>> {
     }
     adj
 }
+
+/// Minimum length of `cross4(n_a - v_0, n_b - v_0, n_c - v_0)` for which we
+/// trust the 3-flat normal. Below this, the three difference vectors are
+/// (nearly) linearly dependent and there is no well-defined 3-flat. Distinct
+/// from [`CELL_TOLERANCE`]: that one bounds *on-plane membership* in dot-
+/// product units, this one bounds *normal magnitude* in 4D vector-length
+/// units.
+const MIN_CROSS4_LENGTH: f32 = 1e-4;
 
 /// Derive the cell list by local 3-flat fitting.
 ///
@@ -325,6 +338,12 @@ fn adjacency(num_vertices: usize, edges: &[[u32; 2]]) -> Vec<Vec<u32>> {
 /// Returns one `Vec<u32>` per cell with vertex indices in ascending order.
 /// The outer `Vec` is ordered lexicographically by cell vertex list, which
 /// is deterministic across runs.
+///
+/// Cost is `O(V · D^3 · V)` for vertex count `V` and vertex-figure valence
+/// `D`. The dominant case is the 600-cell at `120 · 220 · 120 ≈ 3.2 M` plane
+/// scans, which runs in roughly 100 ms in `--release` and ~1 s in
+/// `--debug`. Cells are cached behind a [`LazyLock`], so the cost is paid
+/// once per polytope per process; do not call this in a hot loop.
 fn derive_cells(vertices: &[Vec4], edges: &[[u32; 2]], cell_size: usize) -> Vec<Vec<u32>> {
     use std::collections::BTreeSet;
 
@@ -341,9 +360,7 @@ fn derive_cells(vertices: &[Vec4], edges: &[[u32; 2]], cell_size: usize) -> Vec<
                     let n_c = vertices[neighbors[k] as usize];
                     let normal = cross4(n_a - v_0, n_b - v_0, n_c - v_0);
                     let mag = normal.length();
-                    if mag < 1e-4 {
-                        // The three difference vectors are nearly coplanar in
-                        // a 2-flat; no well-defined 3-flat normal exists.
+                    if mag < MIN_CROSS4_LENGTH {
                         continue;
                     }
                     let n = normal / mag;
@@ -694,25 +711,68 @@ mod tests {
         }
     }
 
-    /// Every edge of the polytope appears as a vertex pair in at least one
-    /// cell. (For a closed polytope every edge is shared by ≥ 2 cells; the
-    /// weaker "≥ 1" form is enough to catch a derivation that drops an edge
-    /// or builds the wrong cell list.)
+    /// Every edge of the polytope is shared by at least two cells. This is
+    /// the closed-polytope invariant: every (n-2)-face of a closed convex
+    /// n-polytope lies on the boundary between adjacent cells. The exact
+    /// per-polytope share count is 3 for pentatope/tesseract/24-cell/120-
+    /// cell, 4 for 16-cell, 5 for 600-cell, but the weak `>= 2` form is
+    /// enough to catch a derivation that drops an edge or fits the wrong
+    /// cell to it.
     #[test]
-    fn every_edge_lies_in_some_cell() {
+    fn every_edge_in_at_least_two_cells() {
         for p in Polytope4::ALL {
             let topo = p.topology();
             for &[i, j] in topo.edges {
-                let covered = topo
+                let count = topo
                     .cells
                     .iter()
-                    .any(|cell| cell.contains(&i) && cell.contains(&j));
+                    .filter(|cell| cell.contains(&i) && cell.contains(&j))
+                    .count();
                 assert!(
-                    covered,
-                    "{p:?} edge ({i}, {j}) is not contained in any cell"
+                    count >= 2,
+                    "{p:?} edge ({i}, {j}) is in only {count} cell(s), expected >= 2"
                 );
             }
         }
+    }
+
+    /// `cross4(a, b, c)` returns a non-zero vector orthogonal to each input
+    /// when the inputs are linearly independent.
+    #[test]
+    fn cross4_is_orthogonal_to_inputs() {
+        let a = Vec4::new(1.0, 0.5, -0.3, 0.7);
+        let b = Vec4::new(-0.2, 1.0, 0.4, -0.1);
+        let c = Vec4::new(0.6, -0.8, 1.0, 0.3);
+        let n = cross4(a, b, c);
+        assert!(
+            n.length() > 0.1,
+            "cross4 of linearly-independent inputs is near-zero (|n| = {})",
+            n.length()
+        );
+        for (label, v) in [("a", a), ("b", b), ("c", c)] {
+            assert!(
+                n.dot(v).abs() < 1e-5,
+                "cross4 result not orthogonal to {label}: n·{label} = {}",
+                n.dot(v)
+            );
+        }
+    }
+
+    /// `cross4` returns ~zero when its inputs span a 2-flat (one input is a
+    /// linear combination of the others), since no unique normal exists.
+    /// The derivation loop in [`derive_cells`] relies on this to skip
+    /// degenerate triples.
+    #[test]
+    fn cross4_zero_for_linearly_dependent_inputs() {
+        let a = Vec4::new(1.0, 0.0, 0.0, 0.0);
+        let b = Vec4::new(0.0, 1.0, 0.0, 0.0);
+        let c = a * 2.0 + b * 3.0;
+        let n = cross4(a, b, c);
+        assert!(
+            n.length() < 1e-5,
+            "cross4 of linearly-dependent inputs is not zero: {n:?} (|n| = {})",
+            n.length()
+        );
     }
 
     /// Euler-Poincaré relation for closed convex 4-polytopes:
