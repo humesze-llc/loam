@@ -1,4 +1,4 @@
-//! Tracing → console bridge: every `tracing::info!` / `warn!` / `error!` event the
+//! Tracing-to-console bridge: every `tracing::info!` / `warn!` / `error!` event the
 //! app emits gets formatted and pushed into a bounded ring buffer. A console command
 //! (`log on|off|toggle`) controls whether the buffer mirrors into scrollback each
 //! frame. The buffer is always filling regardless of mirror state, so toggling on
@@ -80,9 +80,9 @@ pub fn pump_into<Ctx: 'static>(console: &mut Console<Ctx>) {
 }
 
 /// Register the `log` console command on the given console:
-/// - `log` / `log toggle` — flip the mirror state
-/// - `log on` — enable mirroring
-/// - `log off` — disable mirroring
+/// - `log` / `log toggle`: flip the mirror state
+/// - `log on`: enable mirroring
+/// - `log off`: disable mirroring
 pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
     console.register(
         cmd(

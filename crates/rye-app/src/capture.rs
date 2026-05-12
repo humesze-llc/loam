@@ -46,9 +46,9 @@
 //! With MSAA off, the 3D pass writes directly to the swapchain view, so the pre-egui
 //! tap can copy it as-is. With MSAA on, the 3D content sits in the multisampled
 //! attachment and is only resolved into the swapchain at the end of the egui pass; a
-//! direct copy of multisamples isn't supported. Phase 1 skips pre-egui captures when
-//! MSAA is on; disable MSAA via [`RunConfig::msaa_samples`](crate::RunConfig) for
-//! diagnostic capture sessions.
+//! direct copy of multisamples isn't supported. The runner skips pre-egui captures
+//! when MSAA is on (logs a warning); disable MSAA via
+//! [`RunConfig::msaa_samples`](crate::RunConfig) for diagnostic capture sessions.
 //!
 //! ## Output layout
 //!
@@ -1321,8 +1321,8 @@ pub(crate) struct RawImage {
 }
 
 /// Synchronous swapchain-texture readback. Copies the texture into a tightly-packed
-/// RGBA8 byte buffer; the caller writes it out as PNG. Phase 1 is sync (poll-wait);
-/// a capture frame is allowed to stutter.
+/// RGBA8 byte buffer; the caller writes it out as PNG. The readback is sync
+/// (poll-wait on the buffer map), so a capture frame is allowed to stutter.
 pub(crate) fn read_texture_rgba(
     device: &Device,
     queue: &Queue,
