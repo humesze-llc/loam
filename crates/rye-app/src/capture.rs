@@ -1,15 +1,28 @@
-//! Frame capture: PNG single-shot snapshots, PNG sequences, and animated GIF streams,
-//! with two taps (`pre`-egui = pure 3D scene, `post`-egui = final composite as DWM
-//! receives it).
+//! Frame capture: PNG single-shot snapshots, PNG sequences, animated GIF streams,
+//! and animated PNG (APNG) streams, with two taps (`pre`-egui = pure 3D scene,
+//! `post`-egui = final composite as DWM receives it).
 //!
-//! The diagnostic priority. PNG sequences write one independent file per frame so an
-//! aliasing or compositor bug can be inspected pixel-by-pixel without inter-frame
-//! compression artifacts obscuring the signal. The `pre`/`post` split lets the caller
-//! attribute the artifact to the raymarcher, the egui paint stage, or DWM.
+//! ## Picking a format
 //!
-//! The sharing priority. GIF streams encode incrementally to a single file (palette-
-//! quantized via NeuQuant, looped infinitely) for social-media or Discord posts; the
-//! quality tradeoff vs PNG is acceptable for short demo clips.
+//! - **One-shot PNG** (`capture png`): lossless screenshot. Diagnostic / share /
+//!   anything.
+//! - **PNG sequence** (`capture frames`): one independent file per captured frame.
+//!   Lossless, the diagnostic priority; also the master format if you intend to
+//!   post-process with ffmpeg (palettegen GIF, libwebp WebP, libx264 MP4).
+//! - **APNG** (`capture apng`): animated PNG, lossless, 24-bit color per frame,
+//!   one file per recording. Renders inline on GitHub markdown. **Recommended for
+//!   shareable clips of raymarched / continuous-tone content.** Larger files than
+//!   GIF; memory cost during recording is roughly `frames * width * height * 4`
+//!   bytes (frames are buffered until stop). Practical limit ~5 s at 1080p.
+//! - **GIF** (`capture gif`): animated GIF, palette-quantized via NeuQuant, one
+//!   file per recording. Convenient (Discord pastes the file inline) but has a
+//!   **quality ceiling**: 256-color palette, per-frame palette regeneration
+//!   produces visible flicker on raymarched / continuous-tone content (the
+//!   palette wobbles between frames as NeuQuant picks slightly different 256-color
+//!   subsets, and per-pixel indices oscillate at palette-region boundaries as
+//!   rendering noise jitters). Acceptable for cartoon / UI / cell-shaded content;
+//!   for raymarched content, prefer APNG or `capture frames` + ffmpeg. The
+//!   `palette=global` flag mitigates but doesn't eliminate the flicker.
 //!
 //! ## How requests flow
 //!
