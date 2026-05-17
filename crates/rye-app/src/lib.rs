@@ -71,7 +71,7 @@ pub mod log;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, NamedKey},
     window::{Window, WindowAttributes},
 };
@@ -262,6 +262,14 @@ pub struct RunConfig {
     /// surfaces back through [`run_with_config`]'s `Result` instead of looping forever
     /// on a wedged GPU. Reset to zero on any successful frame. `0` disables the budget.
     pub render_error_budget: u32,
+    /// Bail out after this many consecutive `wgpu::SurfaceError` results from
+    /// `begin_frame`. Larger than [`Self::render_error_budget`] because a sleep /
+    /// resume cycle on Windows / DX12 routinely takes several frames to settle
+    /// (the surface returns `Outdated` or `Other` until the driver finishes
+    /// rebuilding the swapchain). Counts all error variants except
+    /// `OutOfMemory`, which exits immediately. Reset to zero on any successful
+    /// `begin_frame`. `0` disables the budget.
+    pub surface_error_budget: u32,
     /// MSAA sample count requested for the scene + UI render target. `1` disables
     /// MSAA. `4` is the conventional default (good quality / cost tradeoff, supported
     /// on every consumer GPU). Higher counts (8, 16) cost more and yield diminishing
@@ -282,6 +290,7 @@ impl Default for RunConfig {
             log_filter: None,
             esc_exits: true,
             render_error_budget: 8,
+            surface_error_budget: 32,
             msaa_samples: 1,
         }
     }
@@ -320,7 +329,7 @@ pub fn run_with_config<A: App>(config: RunConfig) -> anyhow::Result<()> {
     }
 
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut runner = Runner::<A>::new(config);
     event_loop.run_app(&mut runner)?;
@@ -357,6 +366,17 @@ struct Runner<A: App> {
     /// Consecutive `App::render` failures since the last successful frame. Compared
     /// against `RunConfig::render_error_budget`.
     render_error_streak: u32,
+    /// Consecutive `wgpu::SurfaceError` results from `begin_frame`, since the
+    /// last successful frame. Compared against `RunConfig::surface_error_budget`.
+    /// Sleep / resume on DX12 routinely produces several frames of `Outdated` or
+    /// `Other` before the swapchain rebuilds; the streak only matters if it
+    /// doesn't recover.
+    surface_error_streak: u32,
+    /// Wall-clock instant of the last surface-error log line. Used to rate-limit
+    /// the `tracing::error!` for `SurfaceError::Other` to ~1 Hz so a stuck
+    /// surface doesn't spew thousands of log lines (and the corresponding
+    /// allocations) per second.
+    last_surface_error_log: Option<Instant>,
     /// Surfaced to the user via `finish()` if the runner exited because of a setup or
     /// render error, so callers can propagate it from `main`.
     deferred_error: Option<anyhow::Error>,
@@ -385,6 +405,8 @@ impl<A: App> Runner<A> {
             fps: 0.0,
             tick_index: 0,
             render_error_streak: 0,
+            surface_error_streak: 0,
+            last_surface_error_log: None,
             deferred_error: None,
 
             #[cfg(feature = "capture")]
@@ -574,11 +596,36 @@ impl<A: App> ApplicationHandler for Runner<A> {
                 self.input.mouse_wheel(*delta);
             }
             WindowEvent::Resized(size) => {
+                let was_minimized = self.minimized;
                 self.minimized = size.width == 0 || size.height == 0;
-                if !self.minimized {
-                    if let Some(rd) = &mut self.rd {
-                        rd.resize(*size);
+                match (was_minimized, self.minimized) {
+                    // Just got minimized: park the event loop in `Wait` so we
+                    // stop burning CPU on poll iterations that have no work to
+                    // do. Without this the loop spins at 100% even though
+                    // `redraw` early-returns, which is what makes laptop fans
+                    // go nuts on a minimized demo window.
+                    (false, true) => elwt.set_control_flow(ControlFlow::Wait),
+                    // Just restored: switch back to `Poll` so the redraw loop
+                    // re-engages at vsync rate, reconfigure the swapchain at
+                    // the new size, and kick off the first redraw. The
+                    // `FixedTimestep` spiral cap will discard any accumulated
+                    // catch-up so we don't queue hours of ticks.
+                    (true, false) => {
+                        elwt.set_control_flow(ControlFlow::Poll);
+                        if let Some(rd) = &mut self.rd {
+                            rd.resize(*size);
+                        }
+                        win.request_redraw();
                     }
+                    // Visible-to-visible resize: just reconfigure the
+                    // swapchain. Minimized-to-minimized is impossible (winit
+                    // wouldn't emit it) but harmless.
+                    (false, false) => {
+                        if let Some(rd) = &mut self.rd {
+                            rd.resize(*size);
+                        }
+                    }
+                    (true, true) => {}
                 }
             }
             _ => {}
@@ -740,7 +787,12 @@ impl<A: App> Runner<A> {
         #[cfg(feature = "capture")]
         let do_capture = self.capture.should_capture(capture_now);
 
-        match rd.begin_frame() {
+        let begin_result = rd.begin_frame();
+        if begin_result.is_ok() {
+            self.surface_error_streak = 0;
+            self.last_surface_error_log = None;
+        }
+        match begin_result {
             Ok((frame, swap_view)) => {
                 let mut last_err: Option<anyhow::Error> = None;
                 let render_view = rd.msaa_view().unwrap_or(&swap_view);
@@ -814,24 +866,61 @@ impl<A: App> Runner<A> {
                 }
                 win.request_redraw();
             }
-            Err(err) => match err {
-                wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
-                    if let Some(rd) = &mut self.rd {
-                        let size = rd.surface_bundle.size;
-                        rd.resize(size);
-                    }
-                    win.request_redraw();
-                }
-                wgpu::SurfaceError::Timeout => win.request_redraw(),
-                wgpu::SurfaceError::OutOfMemory => {
+            Err(err) => {
+                // `OutOfMemory` is terminal; bail without budgeting (any retry
+                // would just allocate again and fail again, faster).
+                if matches!(err, wgpu::SurfaceError::OutOfMemory) {
                     self.deferred_error = Some(anyhow::anyhow!("wgpu surface out of memory"));
                     elwt.exit();
+                    return;
                 }
-                wgpu::SurfaceError::Other => {
-                    tracing::error!("surface error: {err:?}");
-                    win.request_redraw();
+
+                // Recovery: re-configure the swapchain at the current size for
+                // the `Lost`/`Outdated`/`Other` variants. `Other` is what DX12
+                // returns after sleep/resume when the swapchain is wedged;
+                // reconfiguring lets wgpu rebuild it. `Timeout` is transient
+                // (driver took too long for one frame) so don't reconfigure.
+                match err {
+                    wgpu::SurfaceError::Lost
+                    | wgpu::SurfaceError::Outdated
+                    | wgpu::SurfaceError::Other => {
+                        if let Some(rd) = &mut self.rd {
+                            let size = rd.surface_bundle.size;
+                            rd.resize(size);
+                        }
+                    }
+                    _ => {}
                 }
-            },
+
+                // Rate-limit the `Other` log to ~1 Hz so a persistently wedged
+                // surface doesn't spew thousands of lines/sec (and the
+                // corresponding tracing allocations). Other variants are rare
+                // enough that the unthrottled debug-level log is fine.
+                if matches!(err, wgpu::SurfaceError::Other) {
+                    let now = Instant::now();
+                    let should_log = self
+                        .last_surface_error_log
+                        .map(|t| now.duration_since(t).as_secs_f32() >= 1.0)
+                        .unwrap_or(true);
+                    if should_log {
+                        tracing::error!("surface error: {err:?}");
+                        self.last_surface_error_log = Some(now);
+                    }
+                } else {
+                    tracing::debug!("surface error: {err:?}");
+                }
+
+                self.surface_error_streak = self.surface_error_streak.saturating_add(1);
+                let budget = self.config.surface_error_budget;
+                if budget > 0 && self.surface_error_streak >= budget {
+                    self.deferred_error = Some(anyhow::anyhow!(
+                        "wgpu surface error persisted {budget} consecutive frames: {err:?}"
+                    ));
+                    elwt.exit();
+                    return;
+                }
+                win.request_redraw();
+            }
         }
     }
 }
