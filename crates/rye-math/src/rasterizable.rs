@@ -26,10 +26,10 @@
 //! rasterizer-pipeline changes required. The [`Projection<N>`] enum starts with
 //! [`Projection::Identity`] only; more variants land alongside their consuming impls.
 
-use glam::Vec3;
+use glam::{Vec3, Vec4};
 
 use crate::space::Space;
-use crate::EuclideanR3;
+use crate::{EuclideanR3, EuclideanR4};
 
 /// Projection from R^N to R³ for the rasterizer's screen-space transform.
 ///
@@ -38,20 +38,31 @@ use crate::EuclideanR3;
 /// a variant they don't support; new variants are added alongside their first consuming impl
 /// rather than speculatively.
 ///
-/// - [`Identity`](Self::Identity): "use the first 3 components, zero-pad if `N < 3`." Only
-///   sensible for `N == 3` today; R² and R⁴ extensions land with their respective
-///   `RasterizableSpace<N>` impls.
+/// - [`Identity`](Self::Identity): "use the first 3 components, zero-pad if `N < 3`, truncate
+///   if `N > 3`." Default; works for `N == 3` (bitwise identity) and as a "natural" R⁴ to R³
+///   view (drops `w`).
+/// - [`Orthographic`](Self::Orthographic): drop one axis by index. The natural R⁴ wireframe
+///   view is `Orthographic { drop_axis: 3 }` (drop `w`); other axis choices show alternative
+///   3-flat slices. For `N == 3` this can drop one axis to produce a 2D-looking projection
+///   (used later for Flatland-style reveals).
 ///
-/// Future variants under consideration: `Orthographic { drop_axis }` (used for "drop one axis"
-/// views like a Flatland-style 2D projection of R³ content), and the R⁴-specific `Schlegel`,
-/// `Stereographic`, and `Hyperslice` projections.
+/// Future variants under consideration: R⁴-specific `Schlegel`, `Stereographic`, `Hyperslice`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Projection<const N: usize> {
     /// Pass through: take the first 3 components, zero-pad if `N < 3`, truncate if `N > 3`.
-    /// For `N == 3` this is bitwise identity. Default variant; the only one the current
-    /// line-rasterizer pipeline actually exercises.
+    /// For `N == 3` this is bitwise identity. Default variant.
     #[default]
     Identity,
+
+    /// Drop one axis by index (0-based). The remaining `N - 1` components fill R³ in their
+    /// natural order, zero-padding if `N - 1 < 3`. For R⁴ with `drop_axis: 3` (the "drop-w"
+    /// case) this produces `(x, y, z)`, the standard R⁴-into-R³ viewing convention. For R³
+    /// with `drop_axis: 1` it produces `(x, z, 0)`, a 2D-looking projection in the XZ plane.
+    ///
+    /// Out-of-range `drop_axis` (>= `N`) returns `Vec3::ZERO`.
+    Orthographic {
+        drop_axis: usize,
+    },
 }
 
 /// A flat or curved space that can drive the rasterizer pipeline: provides projection from its
@@ -105,10 +116,49 @@ impl RasterizableSpace<3> for EuclideanR3 {
     fn project_point(point: Vec3, projection: &Projection<3>) -> Vec3 {
         match projection {
             Projection::Identity => point,
+            Projection::Orthographic { drop_axis } => match *drop_axis {
+                0 => Vec3::new(point.y, point.z, 0.0),
+                1 => Vec3::new(point.x, point.z, 0.0),
+                2 => Vec3::new(point.x, point.y, 0.0),
+                _ => Vec3::ZERO,
+            },
         }
     }
 
     fn tessellate_segment(p0: Vec3, p1: Vec3, samples: usize, out: &mut Vec<Vec3>) {
+        out.push(p0);
+        for i in 1..samples {
+            let t = i as f32 / samples as f32;
+            out.push(p0.lerp(p1, t));
+        }
+        out.push(p1);
+    }
+}
+
+impl RasterizableSpace<4> for EuclideanR4 {
+    fn point_to_array(p: Vec4) -> [f32; 4] {
+        p.to_array()
+    }
+
+    fn array_to_point(arr: [f32; 4]) -> Vec4 {
+        Vec4::from_array(arr)
+    }
+
+    fn project_point(point: Vec4, projection: &Projection<4>) -> Vec3 {
+        match projection {
+            // Identity on R⁴: truncate to the first three components. Equivalent to drop-w.
+            Projection::Identity => Vec3::new(point.x, point.y, point.z),
+            Projection::Orthographic { drop_axis } => match *drop_axis {
+                0 => Vec3::new(point.y, point.z, point.w),
+                1 => Vec3::new(point.x, point.z, point.w),
+                2 => Vec3::new(point.x, point.y, point.w),
+                3 => Vec3::new(point.x, point.y, point.z),
+                _ => Vec3::ZERO,
+            },
+        }
+    }
+
+    fn tessellate_segment(p0: Vec4, p1: Vec4, samples: usize, out: &mut Vec<Vec4>) {
         out.push(p0);
         for i in 1..samples {
             let t = i as f32 / samples as f32;
@@ -191,5 +241,77 @@ mod tests {
         assert_eq!(p3, Projection::Identity);
         let p4: Projection<4> = Projection::default();
         assert_eq!(p4, Projection::Identity);
+    }
+
+    /// `Orthographic { drop_axis: 1 }` on R³ produces the XZ plane embedded in R³ with Y
+    /// zeroed. The 2D-looking projection used by camera tweens that want to dramatize a
+    /// "flat to depth" reveal.
+    #[test]
+    fn r3_orthographic_drops_named_axis() {
+        let p = Vec3::new(1.0, 2.0, 3.0);
+        let pj = |drop_axis| {
+            <EuclideanR3 as RasterizableSpace<3>>::project_point(
+                p,
+                &Projection::Orthographic { drop_axis },
+            )
+        };
+        assert_eq!(pj(0), Vec3::new(2.0, 3.0, 0.0));
+        assert_eq!(pj(1), Vec3::new(1.0, 3.0, 0.0));
+        assert_eq!(pj(2), Vec3::new(1.0, 2.0, 0.0));
+        // Out-of-range falls back to zero per the doc contract.
+        assert_eq!(pj(3), Vec3::ZERO);
+        assert_eq!(pj(99), Vec3::ZERO);
+    }
+
+    /// `EuclideanR4` round-trips through point/array conversion for any input.
+    #[test]
+    fn r4_array_round_trip() {
+        let p = Vec4::new(1.0, -2.5, 0.7, 4.2);
+        let arr = <EuclideanR4 as RasterizableSpace<4>>::point_to_array(p);
+        let back = <EuclideanR4 as RasterizableSpace<4>>::array_to_point(arr);
+        assert_eq!(p, back);
+    }
+
+    /// `Projection::Identity` on R⁴ truncates `w` (equivalent to `Orthographic` with
+    /// `drop_axis = 3`). This is the "natural" 4D-to-3D viewing convention.
+    #[test]
+    fn r4_identity_drops_w() {
+        let p = Vec4::new(1.0, 2.0, 3.0, 4.0);
+        let projected =
+            <EuclideanR4 as RasterizableSpace<4>>::project_point(p, &Projection::Identity);
+        assert_eq!(projected, Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    /// `Orthographic { drop_axis }` on R⁴ for each of the four axis choices produces the
+    /// expected 3-flat view. drop_axis=3 (drop w) is the canonical wireframe-rendering case.
+    #[test]
+    fn r4_orthographic_drops_each_axis() {
+        let p = Vec4::new(1.0, 2.0, 3.0, 4.0);
+        let pj = |drop_axis| {
+            <EuclideanR4 as RasterizableSpace<4>>::project_point(
+                p,
+                &Projection::Orthographic { drop_axis },
+            )
+        };
+        assert_eq!(pj(0), Vec3::new(2.0, 3.0, 4.0));
+        assert_eq!(pj(1), Vec3::new(1.0, 3.0, 4.0));
+        assert_eq!(pj(2), Vec3::new(1.0, 2.0, 4.0));
+        assert_eq!(pj(3), Vec3::new(1.0, 2.0, 3.0));
+        // Out-of-range falls back to zero per the doc contract.
+        assert_eq!(pj(4), Vec3::ZERO);
+    }
+
+    /// `tessellate_segment` on R⁴ is plain lerp (since `EuclideanR4` is flat). Each sample
+    /// gives the expected linear interpolation across all four components.
+    #[test]
+    fn r4_tessellate_lerps_all_components() {
+        let p0 = Vec4::new(0.0, 0.0, 0.0, 0.0);
+        let p1 = Vec4::new(4.0, 8.0, 12.0, 16.0);
+        let mut out = Vec::new();
+        <EuclideanR4 as RasterizableSpace<4>>::tessellate_segment(p0, p1, 2, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], p0);
+        assert_eq!(out[1], Vec4::new(2.0, 4.0, 6.0, 8.0));
+        assert_eq!(out[2], p1);
     }
 }

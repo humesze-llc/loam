@@ -143,6 +143,85 @@ impl Polytope4 {
 }
 
 // ---------------------------------------------------------------------------
+// Visualizable<4> impl
+// ---------------------------------------------------------------------------
+
+/// Default styling for [`Polytope4::to_lines`]: white at 1.5 px width. The trait method
+/// returns geometry with a uniform style; consumers that want per-cell coloring, depth
+/// dimming, hover highlights, etc., should mutate the returned mesh or call a dedicated
+/// helper (see [`Polytope4::lines_colored_by_cell`]).
+const DEFAULT_LINE_COLOR: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
+const DEFAULT_LINE_WIDTH: f32 = 1.5;
+
+impl rye_shape::Visualizable<4> for Polytope4 {
+    fn to_lines(&self) -> Result<rye_shape::LineMesh<4>, rye_shape::NotVisualizable> {
+        let topo = self.topology();
+        let mut mesh = rye_shape::LineMesh::<4>::default();
+        mesh.segments.reserve(topo.edges.len());
+        mesh.colors.reserve(topo.edges.len());
+        mesh.widths.reserve(topo.edges.len());
+        for &[i, j] in topo.edges {
+            let a = topo.vertices[i as usize].to_array();
+            let b = topo.vertices[j as usize].to_array();
+            mesh.segments.push((a, b));
+            mesh.colors.push((DEFAULT_LINE_COLOR, DEFAULT_LINE_COLOR));
+            mesh.widths.push(DEFAULT_LINE_WIDTH);
+        }
+        Ok(mesh)
+    }
+
+    fn to_triangles(&self) -> Result<rye_shape::TriangleMesh<4>, rye_shape::NotVisualizable> {
+        // 2-face triangulation requires the 2-face topology we deliberately don't ship in
+        // the polytope module (Coxeter table I lists the counts but the incidence data
+        // hasn't been derived). When a real consumer needs filled-face polytope rendering
+        // we'll add it; until then there's nothing to draw.
+        Err(rye_shape::NotVisualizable::Degenerate)
+    }
+
+    fn to_points(&self) -> Result<rye_shape::PointMesh<4>, rye_shape::NotVisualizable> {
+        let topo = self.topology();
+        let mut mesh = rye_shape::PointMesh::<4>::default();
+        mesh.positions.reserve(topo.vertices.len());
+        mesh.colors.reserve(topo.vertices.len());
+        mesh.sizes.reserve(topo.vertices.len());
+        for v in topo.vertices {
+            mesh.positions.push(v.to_array());
+            mesh.colors.push(DEFAULT_LINE_COLOR);
+            mesh.sizes.push(4.0);
+        }
+        Ok(mesh)
+    }
+}
+
+impl Polytope4 {
+    /// Color each edge by the cell its endpoints share. `palette[k]` is the color used for
+    /// edges whose lower-index incident cell is cell `k`. Cells that exceed the palette wrap
+    /// around (`palette.len()` is mod'd against). Width stays at the default; mutate the
+    /// returned mesh directly if you need different per-segment styling.
+    pub fn lines_colored_by_cell(self, palette: &[[f32; 4]]) -> rye_shape::LineMesh<4> {
+        let topo = self.topology();
+        let mut mesh = rye_shape::LineMesh::<4>::default();
+        let n_palette = palette.len().max(1);
+        for &[i, j] in topo.edges {
+            // Find the lowest cell index that contains both vertices.
+            let cell_idx = topo
+                .cells
+                .iter()
+                .position(|cell| cell.contains(&i) && cell.contains(&j))
+                .unwrap_or(0);
+            let color = palette[cell_idx % n_palette];
+            mesh.segments.push((
+                topo.vertices[i as usize].to_array(),
+                topo.vertices[j as usize].to_array(),
+            ));
+            mesh.colors.push((color, color));
+            mesh.widths.push(DEFAULT_LINE_WIDTH);
+        }
+        mesh
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-polytope vertex caches
 // ---------------------------------------------------------------------------
 //
@@ -801,6 +880,88 @@ mod tests {
                 0,
                 "{p:?} Euler-Poincaré: V({v}) - E({e}) + F({f}) - C({c}) != 0"
             );
+        }
+    }
+
+    /// [`Visualizable<4>::to_lines`] returns one segment per topology edge, matching the
+    /// edge count for every regular polytope. Catches a future regression where the impl
+    /// accidentally drops edges (e.g., during a refactor that skips disconnected cells).
+    #[test]
+    fn visualizable_line_count_matches_edge_count() {
+        use rye_shape::Visualizable;
+        for p in Polytope4::ALL {
+            let mesh = <Polytope4 as Visualizable<4>>::to_lines(&p)
+                .expect("polytopes always produce line meshes");
+            assert_eq!(
+                mesh.segments.len(),
+                p.edge_count(),
+                "{p:?} line mesh has {} segments, expected {}",
+                mesh.segments.len(),
+                p.edge_count()
+            );
+            // Color + width arrays match segment count, per the LineMesh invariant.
+            assert_eq!(mesh.colors.len(), mesh.segments.len());
+            assert_eq!(mesh.widths.len(), mesh.segments.len());
+        }
+    }
+
+    /// [`Visualizable<4>::to_lines`] segments hit the actual polytope vertex coordinates.
+    /// Pins that the impl reads topology vertices directly, not some other vertex source.
+    #[test]
+    fn visualizable_line_endpoints_are_polytope_vertices() {
+        use rye_shape::Visualizable;
+        let topo = Polytope4::Tesseract.topology();
+        let mesh = <Polytope4 as Visualizable<4>>::to_lines(&Polytope4::Tesseract).unwrap();
+        for (i, &[vi, vj]) in topo.edges.iter().enumerate() {
+            let (a, b) = mesh.segments[i];
+            assert_eq!(a, topo.vertices[vi as usize].to_array());
+            assert_eq!(b, topo.vertices[vj as usize].to_array());
+        }
+    }
+
+    /// [`Visualizable<4>::to_points`] returns one point per topology vertex.
+    #[test]
+    fn visualizable_point_count_matches_vertex_count() {
+        use rye_shape::Visualizable;
+        for p in Polytope4::ALL {
+            let mesh = <Polytope4 as Visualizable<4>>::to_points(&p)
+                .expect("polytopes always produce point meshes");
+            assert_eq!(mesh.positions.len(), p.vertex_count());
+            assert_eq!(mesh.colors.len(), mesh.positions.len());
+            assert_eq!(mesh.sizes.len(), mesh.positions.len());
+        }
+    }
+
+    /// [`Visualizable<4>::to_triangles`] returns `Degenerate` until 2-face topology is
+    /// shipped. Pinned so a future "we have 2-faces now" change updates this test alongside
+    /// the impl rather than silently changing the visible behavior.
+    #[test]
+    fn visualizable_triangles_currently_not_visualizable() {
+        use rye_shape::Visualizable;
+        for p in Polytope4::ALL {
+            let result = <Polytope4 as Visualizable<4>>::to_triangles(&p);
+            assert!(matches!(
+                result,
+                Err(rye_shape::NotVisualizable::Degenerate)
+            ));
+        }
+    }
+
+    /// [`Polytope4::lines_colored_by_cell`] assigns each segment a palette color based on the
+    /// lowest-indexed cell that contains both endpoints. Pin that segment count is preserved
+    /// and all colors come from the palette (no defaults leak through).
+    #[test]
+    fn lines_colored_by_cell_uses_palette() {
+        let palette: &[[f32; 4]] = &[
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ];
+        let mesh = Polytope4::Tesseract.lines_colored_by_cell(palette);
+        assert_eq!(mesh.segments.len(), Polytope4::Tesseract.edge_count());
+        for (start_color, end_color) in &mesh.colors {
+            assert!(palette.contains(start_color));
+            assert!(palette.contains(end_color));
         }
     }
 }

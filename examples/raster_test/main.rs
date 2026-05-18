@@ -23,7 +23,11 @@
 //! - `samples N`: set per-segment tessellation density. `1` is the default and is correct for
 //!   flat-Euclidean impls; higher values exercise the writer-pattern path that curved-space
 //!   impls will use.
-//! - `reset`: restore all toggles to default and samples = 1.
+//! - `polytope <name|off>`: show an R⁴ polytope wireframe alongside the R³ scene. `<name>` is
+//!   one of `5cell`, `tesseract`, `16cell`, `24cell`, `120cell`, `600cell` (hyphenated aliases
+//!   accepted). The wireframe is projected to R³ via `Orthographic { drop_axis: 3 }` (drop-w)
+//!   and scaled 2.5x so it's visible alongside the unit cube.
+//! - `reset`: restore all toggles to default and samples = 1 and polytope off.
 
 use std::borrow::Cow;
 
@@ -31,10 +35,16 @@ use anyhow::Result;
 use glam::{Mat4, Vec2, Vec3};
 use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
 use rye_egui::{Console, ConsoleWriter};
-use rye_math::{EuclideanR3, Projection};
+use rye_math::{EuclideanR3, EuclideanR4, Projection};
+use rye_physics::polytope::Polytope4;
 use rye_render::{device::RenderDevice, LineRasterNode};
-use rye_shape::LineMesh;
+use rye_shape::{LineMesh, Visualizable};
 use winit::window::WindowAttributes;
+
+/// R⁴ scale factor for the polytope wireframe. Polytope vertices live on the unit
+/// 3-sphere; scaling up to 2.5 makes the wireframe comfortably visible alongside the R³
+/// test scene without overflowing the cube's ±1.5 extent.
+const POLYTOPE_SCALE: f32 = 2.5;
 
 /// Test-scene toggles. Each maps to a category in [`build_mesh`].
 #[derive(Clone, Copy, Debug)]
@@ -166,19 +176,32 @@ struct Demo {
     space: EuclideanR3,
     camera: Camera<EuclideanR3>,
     orbit: OrbitController<EuclideanR3>,
-    line_raster: LineRasterNode,
+    /// R³ rasterizer for the curated test scene (axes, cube, width sweep, etc.).
+    line_raster_r3: LineRasterNode,
+    /// R⁴ rasterizer for the optional polytope wireframe overlay. Separate from the R³ node
+    /// so both pipelines can render in sequence against the same color attachment.
+    line_raster_r4: LineRasterNode,
     toggles: Toggles,
+    /// Active R⁴ polytope. `None` disables the R⁴ overlay entirely; `Some(p)` uploads `p`'s
+    /// `Visualizable<4>` line mesh through the `Orthographic { drop_axis: 3 }` (drop-w)
+    /// projection.
+    polytope: Option<Polytope4>,
     /// Tessellation samples-per-segment. 1 for flat space (no interior subdivision); higher
     /// values exercise the writer-pattern path that geodesic-space impls will use later.
     samples: usize,
-    /// Set by console toggle / `samples` commands to re-upload the mesh on the next frame.
+    /// Set by console toggle / `samples` commands to re-upload meshes on the next frame.
     /// Persists across frames so multiple console mutations within one frame coalesce.
     dirty: bool,
 }
 
 impl Demo {
     fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
-        let line_raster = LineRasterNode::new(
+        let line_raster_r3 = LineRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            ctx.rd.sample_count(),
+        );
+        let line_raster_r4 = LineRasterNode::new(
             &ctx.rd.device,
             ctx.rd.surface_bundle.config.format,
             ctx.rd.sample_count(),
@@ -193,8 +216,10 @@ impl Demo {
             space: EuclideanR3,
             camera,
             orbit,
-            line_raster,
+            line_raster_r3,
+            line_raster_r4,
             toggles: Toggles::default(),
+            polytope: None,
             samples: 1,
             dirty: true,
         };
@@ -202,16 +227,49 @@ impl Demo {
         Ok(demo)
     }
 
-    /// Re-tessellate and re-upload the mesh. Called whenever toggles or `samples` change.
+    /// Re-tessellate and re-upload both R³ and R⁴ meshes. Called whenever toggles, the
+    /// active polytope, or `samples` change.
     fn reupload(&mut self, rd: &RenderDevice) {
-        let mesh = build_mesh(self.toggles);
-        self.line_raster.upload::<EuclideanR3, 3>(
+        let r3_mesh = build_mesh(self.toggles);
+        self.line_raster_r3.upload::<EuclideanR3, 3>(
             &rd.device,
             &rd.queue,
-            &mesh,
+            &r3_mesh,
             &Projection::Identity,
             self.samples,
         );
+
+        // R⁴ polytope wireframe (if enabled). The scale-up bakes into the mesh before
+        // upload so we don't have to thread a model matrix through the rasterizer; the
+        // wireframe ends up at ~2.5 unit world-space radius.
+        if let Some(p) = self.polytope {
+            let mut mesh = <Polytope4 as Visualizable<4>>::to_lines(&p)
+                .expect("polytopes always produce line meshes");
+            for (a, b) in mesh.segments.iter_mut() {
+                for k in 0..4 {
+                    a[k] *= POLYTOPE_SCALE;
+                    b[k] *= POLYTOPE_SCALE;
+                }
+            }
+            self.line_raster_r4.upload::<EuclideanR4, 4>(
+                &rd.device,
+                &rd.queue,
+                &mesh,
+                &Projection::Orthographic { drop_axis: 3 },
+                self.samples,
+            );
+        } else {
+            // Upload an empty mesh so the R⁴ pass becomes a no-op (zero instances).
+            let empty: LineMesh<4> = LineMesh::default();
+            self.line_raster_r4.upload::<EuclideanR4, 4>(
+                &rd.device,
+                &rd.queue,
+                &empty,
+                &Projection::Orthographic { drop_axis: 3 },
+                self.samples,
+            );
+        }
+
         self.dirty = false;
     }
 }
@@ -245,7 +303,8 @@ impl Demo {
         let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
         let view_proj = proj_mat * view_mat;
         let vp_size = Vec2::new(cfg.width as f32, cfg.height as f32);
-        self.line_raster.set_camera(&rd.queue, view_proj, vp_size);
+        self.line_raster_r3.set_camera(&rd.queue, view_proj, vp_size);
+        self.line_raster_r4.set_camera(&rd.queue, view_proj, vp_size);
 
         // Clear the framebuffer to a dark slate so the lines are visible. The rasterizer's
         // pass uses LoadOp::Load, so we need a prior pass to clear; do it inline here via a
@@ -281,7 +340,8 @@ impl Demo {
         }
         rd.queue.submit(Some(clear_encoder.finish()));
 
-        self.line_raster.execute(rd, view)?;
+        self.line_raster_r3.execute(rd, view)?;
+        self.line_raster_r4.execute(rd, view)?;
         Ok(())
     }
 }
@@ -341,11 +401,38 @@ impl RasterTestApp {
             },
         ));
         c.register(rye_egui::cmd(
+            "polytope",
+            "set R⁴ polytope wireframe overlay (5cell|tesseract|16cell|24cell|120cell|600cell|off)",
+            |args, demo: &mut Demo, _out: &mut ConsoleWriter| {
+                let name = args
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("usage: polytope <name|off>"))?;
+                demo.polytope = match name.to_ascii_lowercase().as_str() {
+                    "off" | "none" => None,
+                    "5cell" | "5-cell" | "pentatope" => Some(Polytope4::Pentatope),
+                    "8cell" | "8-cell" | "tesseract" => Some(Polytope4::Tesseract),
+                    "16cell" | "16-cell" => Some(Polytope4::Cell16),
+                    "24cell" | "24-cell" => Some(Polytope4::Cell24),
+                    "120cell" | "120-cell" => Some(Polytope4::Cell120),
+                    "600cell" | "600-cell" => Some(Polytope4::Cell600),
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "unknown polytope `{other}` (try 5cell, tesseract, 16cell, 24cell, \
+                             120cell, 600cell, or off)"
+                        ))
+                    }
+                };
+                demo.dirty = true;
+                Ok(())
+            },
+        ));
+        c.register(rye_egui::cmd(
             "reset",
-            "restore all toggles to default (everything on, samples = 1)",
+            "restore all toggles to default (everything on, samples = 1, no polytope)",
             |_args, demo: &mut Demo, _out: &mut ConsoleWriter| {
                 demo.toggles = Toggles::default();
                 demo.samples = 1;
+                demo.polytope = None;
                 demo.dirty = true;
                 Ok(())
             },
@@ -447,6 +534,16 @@ impl App for RasterTestApp {
                     }
                 ));
                 ui.separator();
+                let polytope_label = match self.demo.polytope {
+                    None => Cow::Borrowed("off"),
+                    Some(Polytope4::Pentatope) => Cow::Borrowed("5-cell"),
+                    Some(Polytope4::Tesseract) => Cow::Borrowed("tesseract"),
+                    Some(Polytope4::Cell16) => Cow::Borrowed("16-cell"),
+                    Some(Polytope4::Cell24) => Cow::Borrowed("24-cell"),
+                    Some(Polytope4::Cell120) => Cow::Borrowed("120-cell"),
+                    Some(Polytope4::Cell600) => Cow::Borrowed("600-cell"),
+                };
+                ui.label(format!("polytope (R⁴): {polytope_label}"));
                 ui.label(format!("samples: {}", self.demo.samples));
                 ui.label(format!("camera fps: {:.0}", frame.fps));
                 ui.separator();
