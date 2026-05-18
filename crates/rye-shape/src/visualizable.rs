@@ -1,22 +1,22 @@
 //! [`Visualizable`] trait + mesh data types for the rasterization tier.
 //!
 //! Symmetric to the [`Primitive`](../../rye_scene/index.html) (SDF role) and
-//! [`Collider`](../../rye_physics/index.html) (physics role) traits in their respective consumer
-//! crates: this trait carries the rasterization role. Implementations live downstream
+//! [`Collider`](../../rye_physics/index.html) (physics role) traits in their respective
+//! consumer crates: this trait carries the rasterization role. Implementations live downstream
 //! (`rye-scene` impls it for [`crate::Shape`] variants; `rye-physics` impls it for
 //! [`rye_physics::polytope::Polytope4`]).
 //!
 //! ## Why this trait + the mesh types live in `rye-shape`
 //!
-//! `rye-shape`'s charter is "data only, no behavior, dep-graph leaf." Defining a trait here would
-//! seem to violate that. The resolution: trait *definitions* are data-shape interfaces, not
-//! behavior. The trait says "if you can produce a `LineMesh<N>`, here is the function signature
-//! to do so" without any associated logic. Impls live in role crates (`rye-scene`, `rye-physics`)
-//! where they belong, alongside their respective behavior traits.
+//! `rye-shape`'s charter is "data only, no behavior, dep-graph leaf." Defining a trait here
+//! would seem to violate that. The resolution: trait *definitions* are data-shape interfaces,
+//! not behavior. The trait says "if you can produce a `LineMesh<N>`, here is the function
+//! signature to do so" without any associated logic. Impls live in role crates (`rye-scene`,
+//! `rye-physics`) where they belong, alongside their respective behavior traits.
 //!
-//! The mesh types ([`LineMesh<N>`], [`TriangleMesh<N>`], [`PointMesh<N>`]) are pure data: arrays
-//! of points + colors + sizes. They're returned from the trait method, so they have to live in
-//! a crate both impl sites can see, which means here.
+//! The mesh types ([`LineMesh<N>`], [`TriangleMesh<N>`], [`PointMesh<N>`]) are pure data:
+//! arrays of points + colors + sizes. They're returned from the trait method, so they have to
+//! live in a crate both impl sites can see, which means here.
 //!
 //! ## Const-generic dim
 //!
@@ -51,8 +51,8 @@ pub enum NotVisualizable {
     Unbounded,
 
     /// Shape's natural dimension doesn't match the requested `N`. For example, asking for
-    /// `Visualizable<3>` output on a [`Shape::HyperSphere4D`] (which is intrinsically 4D) returns
-    /// this variant. The caller should either pick a different `N` or project the shape first.
+    /// `Visualizable<3>` output on a [`Shape::HyperSphere4D`] (which is intrinsically 4D)
+    /// returns this variant. The caller should either pick a different `N` or project first.
     WrongDimension,
 
     /// Shape's parameters are degenerate: zero radius, empty vertex list, collinear polytope
@@ -63,8 +63,8 @@ pub enum NotVisualizable {
 /// Anything that can emit rasterizable geometry in N-dimensional space.
 ///
 /// Three orthogonal output flavors:
-/// - [`to_lines`](Self::to_lines): wireframe edges. Most common; works for polytopes, parametric
-///   grids on smooth shapes, debug gizmos.
+/// - [`to_lines`](Self::to_lines): wireframe edges. Most common; works for polytopes,
+///   parametric grids on smooth shapes, debug gizmos.
 /// - [`to_triangles`](Self::to_triangles): filled surfaces. For polytopes this means 2-face
 ///   triangulation; for smooth shapes it's parametric sampling. Optional; many shapes return
 ///   [`NotVisualizable::Unbounded`] or skip it.
@@ -87,10 +87,10 @@ pub trait Visualizable<const N: usize> {
 /// Line segments in RN. One entry per segment in [`segments`](Self::segments) /
 /// [`colors`](Self::colors) / [`widths`](Self::widths); array lengths must match.
 ///
-/// Per-segment width is scalar (constant along the segment). Varying-width lines are expressible
-/// as multiple segments at the change points; per-segment scalar keeps the GPU instance-buffer
-/// layout simple. Per-endpoint color allows gradient edges (depth-fade, cell-membership coloring,
-/// hover-highlight transitions).
+/// Per-segment width is scalar (constant along the segment). Varying-width lines are
+/// expressible as multiple segments at the change points; per-segment scalar keeps the GPU
+/// instance-buffer layout simple. Per-endpoint color allows gradient edges (depth-fade,
+/// cell-membership coloring, hover-highlight transitions).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "[f32; N]: Serialize",
@@ -109,8 +109,8 @@ pub struct LineMesh<const N: usize> {
 /// Filled triangles in RN. Vertices indexed by [`indices`](Self::indices); per-vertex color.
 ///
 /// Per-vertex normals are deliberately omitted at v1. Lighting an R⁴ triangle has no standard
-/// convention; v1 deliverables (Schlegel face fills, slice cross-sections) only need flat-shaded
-/// or color-only triangles. Add a `normals` field if a real consumer asks for it.
+/// convention; v1 deliverables (Schlegel face fills, slice cross-sections) only need
+/// flat-shaded or color-only triangles. Add a `normals` field if a real consumer asks for it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "[f32; N]: Serialize",

@@ -1,12 +1,12 @@
 //! Rasterization-pipeline development playground.
 //!
 //! Renders a curated test scene of line-segment primitives via
-//! [`rye_render::LineRasterNode`]: world-axes for depth perception, a unit cube wireframe,
-//! a width sweep (1 / 2 / 4 / 8 px) to visually check AA at different widths, a color-gradient
-//! line, and a fan of tilted lines to validate AA at all screen-space orientations.
-//!
-//! Pairs with the M1 first-ship work in [`docs/devlog/RASTERIZATION_TIER.md`]. Used to validate
-//! the rasterizer in isolation, before wiring it into a real demo (Polytope Playground, M2+).
+//! [`rye_render::LineRasterNode`]: world-axes for depth perception,
+//! a unit cube wireframe, a width sweep (1 / 2 / 4 / 8 px) to
+//! visually check AA at different widths, a color-gradient line, and
+//! a fan of tilted lines to validate AA at all screen-space
+//! orientations. Used to validate the rasterizer pipeline in
+//! isolation before wiring it into a scene-level demo.
 //!
 //! ## Controls
 //!
@@ -22,9 +22,11 @@
 //! - `widths on|off`: toggle the four horizontal width-sweep lines.
 //! - `gradient on|off`: toggle the rainbow gradient line.
 //! - `tilted on|off`: toggle the fan of tilted lines.
-//! - `samples N`: set per-segment tessellation density (1 for flat space; higher matters
-//!   only when curved-space impls land post-blog).
-//! - `reset`: restore all toggles to default (everything on, samples = 1).
+//! - `samples N`: set per-segment tessellation density. `1` is the
+//!   default and is correct for flat-Euclidean impls; higher values
+//!   exercise the writer-pattern path that curved-space impls will
+//!   use.
+//! - `reset`: restore all toggles to default and samples = 1.
 
 use std::borrow::Cow;
 
@@ -60,7 +62,7 @@ impl Default for Toggles {
 }
 
 /// Build the full test-scene [`LineMesh<3>`] from the current toggles. Re-runs when the
-/// console mutates toggles; the rasterizer re-uploads the result via [`LineRasterNode::upload`].
+/// console mutates toggles; the rasterizer re-uploads the result via the upload method.
 fn build_mesh(t: Toggles) -> LineMesh<3> {
     let mut mesh: LineMesh<3> = LineMesh::default();
 

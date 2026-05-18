@@ -18,15 +18,15 @@
 //! is identical for both, so geodesic-space wireframes drop in as additional impls without
 //! changing call sites.
 //!
-//! ## M1 scope
+//! ## Current scope
 //!
-//! v1 only ships `RasterizableSpace<3> for EuclideanR3`. R⁴ + R² impls land in M2 / M6
-//! respectively. Curved-space impls (`HyperbolicH3`, `SphericalS3`, `BlendedSpace`) ship
-//! post-blog. The [`Projection<N>`] enum is minimal at this milestone:
-//! [`Projection::Identity`] only. [`Orthographic`](Projection::Orthographic) and
-//! [`Perspective`](Projection::Perspective) land in M6 (Flatland reveal); the R⁴-specific
-//! [`Schlegel`](Projection::Schlegel) / [`Stereographic`](Projection::Stereographic) /
-//! [`Hyperslice`](Projection::Hyperslice) variants land in M4 (alternative projections).
+//! Ships `RasterizableSpace<3> for EuclideanR3`. Other dimensions
+//! (`EuclideanR2`, `EuclideanR4`) and curved spaces (`HyperbolicH3`,
+//! `SphericalS3`, `BlendedSpace`) are additive extensions: add an
+//! `impl RasterizableSpace<N> for ...` block, no rasterizer-pipeline
+//! changes required. The [`Projection<N>`] enum starts with
+//! [`Projection::Identity`] only; more variants land alongside their
+//! consuming impls.
 
 use glam::Vec3;
 
@@ -35,22 +35,27 @@ use crate::EuclideanR3;
 
 /// Projection from R^N to R³ for rasterizer screen-space transform.
 ///
-/// All variants are dimension-generic in the type system, but each variant only makes sense
-/// for specific `N`: the `match` arm for an unsupported variant in a given impl returns
-/// `Vec3::ZERO` and emits a debug-time warning rather than panicking. New variants are added
-/// per-milestone:
+/// All variants are dimension-generic in the type system, but each
+/// variant only makes sense for specific `N`. Impls are expected to
+/// return `Vec3::ZERO` rather than panic when they receive a variant
+/// they don't support; new variants are added alongside their first
+/// consuming impl rather than speculatively.
 ///
-/// - M1: [`Identity`](Self::Identity). R^N to R³ via "use the first 3 components, zero-pad if
-///   N < 3." Only sensible for `N == 3` at M1; R² + R⁴ extensions land with their respective
-///   impl milestones.
+/// - [`Identity`](Self::Identity): "use the first 3 components, zero-
+///   pad if `N < 3`." Only sensible for `N == 3` today; R² and R⁴
+///   extensions land with their respective `RasterizableSpace<N>`
+///   impls.
 ///
-/// M6 will add `Orthographic { drop_axis }` (used by the Flatland reveal in R³); M4 will add
-/// the R⁴-specific projections (`Schlegel`, `Stereographic`, `Hyperslice`).
+/// Future variants under consideration: `Orthographic { drop_axis }`
+/// (used for "drop one axis" views like a Flatland-style 2D
+/// projection of R³ content), and the R⁴-specific `Schlegel`,
+/// `Stereographic`, and `Hyperslice` projections.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Projection<const N: usize> {
-    /// Pass through: take the first 3 components, zero-pad if `N < 3`, truncate if `N > 3`.
-    /// For `N == 3` this is bitwise identity. This is the M1 default and the only variant
-    /// the M1 line-rasterizer ship actually exercises.
+    /// Pass through: take the first 3 components, zero-pad if `N <
+    /// 3`, truncate if `N > 3`. For `N == 3` this is bitwise identity.
+    /// Default variant; the only one the current line-rasterizer
+    /// pipeline actually exercises.
     #[default]
     Identity,
 }
@@ -142,9 +147,9 @@ mod tests {
         assert_eq!(p, projected);
     }
 
-    /// `tessellate_segment(p0, p1, 1, out)` appends exactly `[p0, p1]` and nothing else. The
-    /// "one subdivision" case is the M1 default for flat spaces where no interior sampling is
-    /// needed.
+    /// `tessellate_segment(p0, p1, 1, out)` appends exactly
+    /// `[p0, p1]` and nothing else. The "one subdivision" case is the
+    /// default for flat spaces where no interior sampling is needed.
     #[test]
     fn r3_tessellate_one_sample_appends_endpoints() {
         let p0 = Vec3::new(0.0, 0.0, 0.0);

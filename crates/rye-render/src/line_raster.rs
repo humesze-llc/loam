@@ -1,32 +1,37 @@
-//! Line rasterizer pipeline: M1 first ship of the rasterization tier.
+//! Line rasterizer pipeline. Antialiased line-list rendering composed
+//! on top of an existing color attachment ("HUD overlay" semantics).
+//! Lines are quad-expanded in the vertex shader to give them pixel
+//! width and antialiased edges; the fragment shader smoothsteps
+//! coverage from line center to expanded edge.
 //!
-//! Renders an antialiased line list on top of the raymarched scene, depth-test disabled
-//! ("HUD overlay" semantics). Lines are quad-expanded in the vertex shader to give them
-//! pixel-width and antialiased edges; the fragment shader smoothsteps coverage from line
-//! center to expanded edge.
-//!
-//! Lives next to [`crate::raymarch`] modules and is constructed standalone, the same way the
-//! existing `Hyperslice4DNode` is. Future milestones (M2-M4) will share a render graph with
-//! depth-tested compositing; v1 keeps it simple and overlay-only.
+//! Lives next to [`crate::raymarch`] modules and is constructed
+//! standalone, the same way the existing `Hyperslice4DNode` is.
 //!
 //! ## Pipeline shape
 //!
-//! - **Vertex buffer**: 4 sprite-corner indices (`0u32`, `1`, `2`, `3`). Static, shared across
-//!   all segments.
-//! - **Index buffer**: `[0u32, 1, 2, 2, 1, 3]`. Static, two triangles per quad.
-//! - **Instance buffer**: per-segment `LineInstance` data (start_pos, end_pos, start_color,
-//!   end_color, width). Re-uploaded when the line mesh changes.
-//! - **Uniform buffer**: `LineRasterUniforms` (view-projection matrix + viewport size).
-//!   Re-uploaded per frame.
+//! - **Vertex buffer**: 4 sprite-corner indices (`0u32`, `1`, `2`,
+//!   `3`). Static, shared across all segments.
+//! - **Index buffer**: `[0u32, 1, 2, 2, 1, 3]`. Static, two triangles
+//!   per quad.
+//! - **Instance buffer**: per-segment `LineInstance` data (start_pos,
+//!   end_pos, start_color, end_color, width). Re-uploaded when the
+//!   line mesh changes via [`LineRasterNode::upload`].
+//! - **Uniform buffer**: `LineRasterUniforms` (view-projection matrix
+//!   + viewport size). Re-uploaded per frame via the camera method.
 //!
-//! ## v1 (M1) limitations
+//! ## Current limitations
 //!
-//! - No depth read or write. The overlay always draws on top of the existing scene; useful for
-//!   debug/visualization, not for honest 3D occlusion. Depth-tested composite + raymarcher
-//!   `FragDepth` emit land in a follow-up commit on this same M1 branch (per
-//!   `docs/devlog/RASTERIZATION_TIER.md`'s M1 scope).
-//! - R³ only. R⁴ projection + Polytope4 wireframes land in M2.
-//! - No Schlegel / stereographic / hyperslice projections. M4.
+//! - No depth read or write. The overlay always draws on top of the
+//!   existing scene; useful for debug / visualization, not for honest
+//!   3D occlusion. Depth-tested compositing is additive: add a depth
+//!   attachment to the render pass and have the raymarcher emit
+//!   `FragDepth`.
+//! - R³ only at v1. R⁴ projection + topology-derived polytope
+//!   wireframes are additive impls on `RasterizableSpace<4>` and
+//!   `Visualizable<4>`.
+//! - [`Projection<N>::Identity`] only; Orthographic / Perspective /
+//!   Schlegel / Stereographic / Hyperslice variants are open
+//!   extensions.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2};
@@ -47,11 +52,11 @@ use wgpu::{
 use crate::device::RenderDevice;
 
 /// WGSL source for the line rasterizer pipeline. Embedded as `&'static str` so the build is
-/// self-contained (no asset loading at startup). Naga-validated as part of the unit tests below.
+/// self-contained (no asset loading at startup). Naga-validated as part of the unit tests.
 const LINE_RASTER_WGSL: &str = include_str!("line_raster.wgsl");
 
 /// Camera uniform shared with the rasterizer's vertex shader. Matches the WGSL `CameraUniform`
-/// struct exactly: 64 bytes for the matrix, 8 bytes for viewport, 8 bytes pad to 16-byte boundary.
+/// struct exactly: 64 bytes for the matrix, 8 bytes for viewport, 8 bytes pad to 16-byte align.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct LineRasterUniforms {
@@ -104,7 +109,7 @@ pub struct LineRasterNode {
     /// Static corner-index buffer (always `[0u32, 1, 2, 3]`). Per-vertex input to the shader's
     /// `corner` location.
     corner_buf: Buffer,
-    /// Static index buffer (`[0u32, 1, 2, 2, 1, 3]` — two triangles per quad).
+    /// Static index buffer (`[0u32, 1, 2, 2, 1, 3]`, two triangles per quad).
     index_buf: Buffer,
     /// Per-instance buffer (one [`LineInstance`] per segment). Grows on demand; re-uploaded via
     /// [`Self::upload`].

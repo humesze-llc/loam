@@ -55,8 +55,8 @@ fn vs_main(
 
     var out: VsOut;
     // Re-multiply by w so the hardware perspective divide recovers our NDC values exactly.
-    // Depth (base_ndc.z) propagates from the projected endpoint, so depth-tested compositing
-    // (when M1 enables it) sees the correct line depth at every fragment.
+    // Depth (base_ndc.z) propagates from the projected endpoint so depth-tested compositing
+    // (when the render pass attaches a depth buffer) sees correct line depth per fragment.
     out.clip = vec4<f32>(
         (base_ndc.xy + off_ndc) * base_w,
         base_ndc.z * base_w,
