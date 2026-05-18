@@ -18,9 +18,16 @@
 //!   [`Shape::Sphere`], which carries a `center` field so SDF scenes can place spheres without a
 //!   transform combinator. Physics ignores that field (it always uses the body's position), the
 //!   physics sphere constructors set `center = Vec3::ZERO`.
-//! - **No behavior.** This crate only defines the data. Rendering emission lives in `rye-scene`;
-//!   collision support lives in `rye-physics`. That keeps the dependency graph a tree (both
-//!   consumers depend on `rye-shape`, `rye-shape` depends on nothing application-level).
+//! - **No behavior, but interfaces are OK.** This crate defines the [`Shape`] data and the
+//!   [`Visualizable`] trait *interface*, but no impls. Trait definitions count as data-shape
+//!   interfaces, not behavior; they add zero dependencies on application-level code. Impls live
+//!   in the role crates ([`rye-scene`] for [`Primitive`] (SDF) and [`Visualizable`] on
+//!   [`Shape`]; [`rye-physics`] for [`Collider`] and [`Visualizable`] on `Polytope4`). The dep
+//!   graph stays a tree.
+
+pub mod visualizable;
+
+pub use visualizable::{LineMesh, NotVisualizable, PointMesh, TriangleMesh, Visualizable};
 
 use glam::{Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
