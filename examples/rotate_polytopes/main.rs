@@ -123,6 +123,64 @@ impl Demo {
             ctx.rd.sample_count(),
         );
 
+        // M1 first-ship: line rasterizer overlay. The pipeline is built once at startup; the
+        // wireframe mesh is uploaded once below and stays in the instance buffer. Per-frame
+        // cost is just the camera-uniform upload + the draw call (a few hundred μs at most).
+        let mut line_raster = rye_render::LineRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            ctx.rd.sample_count(),
+        );
+
+        // Build a unit-cube wireframe as the M1 visible artifact. Centered at the origin,
+        // ±1.0 on each axis, 12 edges, white at 2px. Larger than the polytope bodies (which
+        // are at body_position()) so it surrounds the scene as a debug bounding cage.
+        let cube_extent = 4.0_f32;
+        let cube_corners = [
+            [-cube_extent, -cube_extent, -cube_extent],
+            [cube_extent, -cube_extent, -cube_extent],
+            [-cube_extent, cube_extent, -cube_extent],
+            [cube_extent, cube_extent, -cube_extent],
+            [-cube_extent, -cube_extent, cube_extent],
+            [cube_extent, -cube_extent, cube_extent],
+            [-cube_extent, cube_extent, cube_extent],
+            [cube_extent, cube_extent, cube_extent],
+        ];
+        // 12 cube edges, indexed by corner pairs.
+        let cube_edges: [(usize, usize); 12] = [
+            (0, 1),
+            (1, 3),
+            (3, 2),
+            (2, 0), // back face
+            (4, 5),
+            (5, 7),
+            (7, 6),
+            (6, 4), // front face
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7), // connectors
+        ];
+        let cube_color = [0.9_f32, 0.9, 0.9, 1.0];
+        let mesh: rye_shape::LineMesh<3> = rye_shape::LineMesh {
+            segments: cube_edges
+                .iter()
+                .map(|&(a, b)| (cube_corners[a], cube_corners[b]))
+                .collect(),
+            colors: cube_edges
+                .iter()
+                .map(|_| (cube_color, cube_color))
+                .collect(),
+            widths: cube_edges.iter().map(|_| 2.0_f32).collect(),
+        };
+        line_raster.upload::<EuclideanR3, 3>(
+            &ctx.rd.device,
+            &ctx.rd.queue,
+            &mesh,
+            &rye_math::Projection::Identity,
+            1, // flat space; samples_per_segment = 1 means no interior subdivision
+        );
+
         let n = row.len();
         let bodies: Vec<BodyUniform> = row
             .iter()
@@ -158,6 +216,7 @@ impl Demo {
             camera,
             orbit,
             node,
+            line_raster,
             row,
             w_slice: initial_w,
             slider_up_held: false,
@@ -560,7 +619,21 @@ impl Demo {
                 u.viewport_origin = [viewport.x as f32, viewport.y as f32];
             }
             self.node.flush_uniforms(&rd.queue);
-            self.node.execute_in_viewport(rd, view, viewport)
+            self.node.execute_in_viewport(rd, view, viewport)?;
+
+            // M1 first-ship line-raster overlay. Builds a view-projection matrix matching
+            // the raymarcher's camera (60° FOV, right-handed), uploads it to the line
+            // pipeline's uniform buffer, then runs the line pass against the same color
+            // attachment (LoadOp::Load preserves the raymarched scene underneath).
+            let view_dir = self.camera.view();
+            let aspect = cfg.width as f32 / cfg.height as f32;
+            let view_mat = glam::Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
+            let proj_mat = glam::Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
+            let view_proj = proj_mat * view_mat;
+            let vp_size = glam::Vec2::new(cfg.width as f32, cfg.height as f32);
+            self.line_raster.set_camera(&rd.queue, view_proj, vp_size);
+            self.line_raster.execute(rd, view)?;
+            Ok(())
         }
     }
 

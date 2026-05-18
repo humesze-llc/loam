@@ -40,7 +40,7 @@ use crate::EuclideanR3;
 /// `Vec3::ZERO` and emits a debug-time warning rather than panicking. New variants are added
 /// per-milestone:
 ///
-/// - M1: [`Identity`](Self::Identity). R^N → R³ via "use the first 3 components, zero-pad if
+/// - M1: [`Identity`](Self::Identity). R^N to R³ via "use the first 3 components, zero-pad if
 ///   N < 3." Only sensible for `N == 3` at M1; R² + R⁴ extensions land with their respective
 ///   impl milestones.
 ///

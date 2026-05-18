@@ -211,6 +211,11 @@ pub(crate) struct Demo {
     pub(crate) camera: Camera<EuclideanR3>,
     pub(crate) orbit: OrbitController<EuclideanR3>,
     pub(crate) node: Hyperslice4DNode,
+    /// M1 first-ship: an antialiased wireframe overlay rendered on top of the raymarched
+    /// scene. v1 draws a fixed-size unit cube at the origin to validate the line-raster
+    /// pipeline end-to-end; later milestones (M2+) replace this with the active polytope's
+    /// `Visualizable<4>` output projected to R³.
+    pub(crate) line_raster: rye_render::LineRasterNode,
     /// Polytope row built at startup from `--shapes` CLI args (or `DEFAULT_ROW`); drives
     /// both the body uniforms and per-body label lookups in the overlay.
     pub(crate) row: Vec<ShapeEntry>,

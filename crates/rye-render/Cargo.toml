@@ -20,6 +20,7 @@ glam.workspace = true
 bytemuck.workspace = true
 rye-math    = { path = "../rye-math" }
 rye-physics = { path = "../rye-physics" }
+rye-shape   = { path = "../rye-shape" }
 
 [dev-dependencies]
 naga.workspace = true
