@@ -1,37 +1,31 @@
-//! Line rasterizer pipeline. Antialiased line-list rendering composed
-//! on top of an existing color attachment ("HUD overlay" semantics).
-//! Lines are quad-expanded in the vertex shader to give them pixel
-//! width and antialiased edges; the fragment shader smoothsteps
-//! coverage from line center to expanded edge.
+//! Line rasterizer pipeline. Antialiased line-list rendering composed on top of an existing
+//! color attachment ("HUD overlay" semantics). Lines are quad-expanded in the vertex shader to
+//! give them pixel width and antialiased edges; the fragment shader smoothsteps coverage from
+//! line center to expanded edge.
 //!
-//! Lives next to [`crate::raymarch`] modules and is constructed
-//! standalone, the same way the existing `Hyperslice4DNode` is.
+//! Lives next to [`crate::raymarch`] modules and is constructed standalone, the same way the
+//! existing `Hyperslice4DNode` is.
 //!
 //! ## Pipeline shape
 //!
-//! - **Vertex buffer**: 4 sprite-corner indices (`0u32`, `1`, `2`,
-//!   `3`). Static, shared across all segments.
-//! - **Index buffer**: `[0u32, 1, 2, 2, 1, 3]`. Static, two triangles
-//!   per quad.
-//! - **Instance buffer**: per-segment `LineInstance` data (start_pos,
-//!   end_pos, start_color, end_color, width). Re-uploaded when the
-//!   line mesh changes via [`LineRasterNode::upload`].
-//! - **Uniform buffer**: `LineRasterUniforms` (view-projection matrix
-//!   + viewport size). Re-uploaded per frame via the camera method.
+//! - **Vertex buffer**: 4 sprite-corner indices (`0u32`, `1`, `2`, `3`). Static, shared across
+//!   all segments.
+//! - **Index buffer**: `[0u32, 1, 2, 2, 1, 3]`. Static, two triangles per quad.
+//! - **Instance buffer**: per-segment `LineInstance` data (start_pos, end_pos, start_color,
+//!   end_color, width). Re-uploaded when the line mesh changes via the upload method.
+//! - **Uniform buffer**: `LineRasterUniforms` (view-projection matrix + viewport size).
+//!   Re-uploaded per frame via the camera method.
 //!
 //! ## Current limitations
 //!
-//! - No depth read or write. The overlay always draws on top of the
-//!   existing scene; useful for debug / visualization, not for honest
-//!   3D occlusion. Depth-tested compositing is additive: add a depth
-//!   attachment to the render pass and have the raymarcher emit
+//! - No depth read or write. The overlay always draws on top of the existing scene; useful
+//!   for debug / visualization, not for honest 3D occlusion. Depth-tested compositing is
+//!   additive: add a depth attachment to the render pass and have the raymarcher emit
 //!   `FragDepth`.
-//! - R³ only at v1. R⁴ projection + topology-derived polytope
-//!   wireframes are additive impls on `RasterizableSpace<4>` and
-//!   `Visualizable<4>`.
-//! - [`Projection<N>::Identity`] only; Orthographic / Perspective /
-//!   Schlegel / Stereographic / Hyperslice variants are open
-//!   extensions.
+//! - R³ only at v1. R⁴ projection + topology-derived polytope wireframes are additive impls
+//!   on `RasterizableSpace<4>` and `Visualizable<4>`.
+//! - [`Projection<N>::Identity`] only; Orthographic / Perspective / Schlegel / Stereographic /
+//!   Hyperslice variants are open extensions.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2};

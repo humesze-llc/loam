@@ -20,42 +20,36 @@
 //!
 //! ## Current scope
 //!
-//! Ships `RasterizableSpace<3> for EuclideanR3`. Other dimensions
-//! (`EuclideanR2`, `EuclideanR4`) and curved spaces (`HyperbolicH3`,
-//! `SphericalS3`, `BlendedSpace`) are additive extensions: add an
-//! `impl RasterizableSpace<N> for ...` block, no rasterizer-pipeline
-//! changes required. The [`Projection<N>`] enum starts with
-//! [`Projection::Identity`] only; more variants land alongside their
-//! consuming impls.
+//! Ships `RasterizableSpace<3> for EuclideanR3`. Other dimensions (`EuclideanR2`,
+//! `EuclideanR4`) and curved spaces (`HyperbolicH3`, `SphericalS3`, `BlendedSpace`) are
+//! additive extensions: add an `impl RasterizableSpace<N> for ...` block, no
+//! rasterizer-pipeline changes required. The [`Projection<N>`] enum starts with
+//! [`Projection::Identity`] only; more variants land alongside their consuming impls.
 
 use glam::Vec3;
 
 use crate::space::Space;
 use crate::EuclideanR3;
 
-/// Projection from R^N to R³ for rasterizer screen-space transform.
+/// Projection from R^N to R³ for the rasterizer's screen-space transform.
 ///
-/// All variants are dimension-generic in the type system, but each
-/// variant only makes sense for specific `N`. Impls are expected to
-/// return `Vec3::ZERO` rather than panic when they receive a variant
-/// they don't support; new variants are added alongside their first
-/// consuming impl rather than speculatively.
+/// All variants are dimension-generic in the type system, but each variant only makes sense for
+/// specific `N`. Impls are expected to return `Vec3::ZERO` rather than panic when they receive
+/// a variant they don't support; new variants are added alongside their first consuming impl
+/// rather than speculatively.
 ///
-/// - [`Identity`](Self::Identity): "use the first 3 components, zero-
-///   pad if `N < 3`." Only sensible for `N == 3` today; R² and R⁴
-///   extensions land with their respective `RasterizableSpace<N>`
-///   impls.
+/// - [`Identity`](Self::Identity): "use the first 3 components, zero-pad if `N < 3`." Only
+///   sensible for `N == 3` today; R² and R⁴ extensions land with their respective
+///   `RasterizableSpace<N>` impls.
 ///
-/// Future variants under consideration: `Orthographic { drop_axis }`
-/// (used for "drop one axis" views like a Flatland-style 2D
-/// projection of R³ content), and the R⁴-specific `Schlegel`,
+/// Future variants under consideration: `Orthographic { drop_axis }` (used for "drop one axis"
+/// views like a Flatland-style 2D projection of R³ content), and the R⁴-specific `Schlegel`,
 /// `Stereographic`, and `Hyperslice` projections.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Projection<const N: usize> {
-    /// Pass through: take the first 3 components, zero-pad if `N <
-    /// 3`, truncate if `N > 3`. For `N == 3` this is bitwise identity.
-    /// Default variant; the only one the current line-rasterizer
-    /// pipeline actually exercises.
+    /// Pass through: take the first 3 components, zero-pad if `N < 3`, truncate if `N > 3`.
+    /// For `N == 3` this is bitwise identity. Default variant; the only one the current
+    /// line-rasterizer pipeline actually exercises.
     #[default]
     Identity,
 }
