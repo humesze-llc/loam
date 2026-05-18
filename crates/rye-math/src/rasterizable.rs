@@ -1,22 +1,22 @@
 //! [`RasterizableSpace<N>`] trait + [`Projection<N>`] enum + flat-Euclidean impls.
 //!
-//! Pairs with the [`Visualizable<N>`](../../rye_shape/trait.Visualizable.html) trait in
-//! `rye-shape`. `Visualizable` answers "what mesh data does this shape produce in R^N?";
-//! `RasterizableSpace` answers "given that mesh data in space `S`, how do we get screen-ready
-//! R³ vertices?". The rasterizer pipeline in `rye-render` composes them.
+//! Pairs with the `Visualizable<N>` trait in `rye-shape`. `Visualizable` answers "what mesh
+//! data does this shape produce in R^N?"; `RasterizableSpace` answers "given that mesh data in
+//! space `S`, how do we get screen-ready R³ vertices?". The rasterizer pipeline in `rye-render`
+//! composes them.
 //!
 //! ## Unified for flat and curved spaces
 //!
 //! Existing [`Space`] impls in this crate use `glam::Vec3` / `Vec4` as their `Point` type, not
 //! `[f32; N]`. So [`RasterizableSpace<N>`] is generic over [`Space`] rather than the array
-//! type, and uses [`Self::point_to_array`] / [`Self::array_to_point`] to bridge between the
-//! Space's native `Point` (math-friendly) and `[f32; N]` (storage-friendly for mesh upload).
+//! type, and uses [`RasterizableSpace::point_to_array`] / [`RasterizableSpace::array_to_point`]
+//! to bridge between the Space's native `Point` (math-friendly) and `[f32; N]`
+//! (storage-friendly for mesh upload).
 //!
-//! The flat / curved distinction lives entirely in
-//! [`tessellate_segment`](RasterizableSpace::tessellate_segment): flat spaces use lerp; future
-//! curved spaces use `Space::exp` along the geodesic from `p0` to `p1`. The rasterizer pipeline
-//! is identical for both, so geodesic-space wireframes drop in as additional impls without
-//! changing call sites.
+//! The flat / curved distinction lives entirely in [`RasterizableSpace::tessellate_segment`]:
+//! flat spaces use lerp; future curved spaces use `Space::exp` along the geodesic from `p0`
+//! to `p1`. The rasterizer pipeline is identical for both, so geodesic-space wireframes drop
+//! in as additional impls without changing call sites.
 //!
 //! ## Current scope
 //!
@@ -57,10 +57,9 @@ pub enum Projection<const N: usize> {
 /// A flat or curved space that can drive the rasterizer pipeline: provides projection from its
 /// native point representation to R³, plus segment tessellation.
 ///
-/// `N` is the const-generic ambient dimension matching the
-/// [`Visualizable<N>`](../../rye_shape/trait.Visualizable.html) mesh data. Implementations
-/// bridge between the Space's native `Point` type (typically `glam::Vec3` or `Vec4`) and
-/// `[f32; N]` (mesh storage).
+/// `N` is the const-generic ambient dimension matching the `Visualizable<N>` mesh data in
+/// `rye-shape`. Implementations bridge between the Space's native `Point` type (typically
+/// `glam::Vec3` or `Vec4`) and `[f32; N]` (mesh storage).
 pub trait RasterizableSpace<const N: usize>: Space {
     /// Convert a space-native point to the mesh storage representation `[f32; N]`.
     fn point_to_array(p: Self::Point) -> [f32; N];

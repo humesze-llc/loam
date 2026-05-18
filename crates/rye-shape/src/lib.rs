@@ -1,10 +1,10 @@
 //! `rye-shape`: the canonical geometric-primitive data model.
 //!
-//! Before this crate existed, [`rye_scene::PrimitiveKind`](../rye_scene/index.html) (for
-//! rendering) and [`rye_physics::Collider`](../rye_physics/index.html) (for collision)
-//! each defined their own parallel enum of shape types. Adding a new shape, say a horosphere
-//! for H³, meant touching both, keeping their variant lists in sync by hand, and inventing new
-//! conversion glue. This crate is the single source of truth they both now alias to.
+//! Before this crate existed, `rye_scene::PrimitiveKind` (for rendering) and
+//! `rye_physics::Collider` (for collision) each defined their own parallel enum of shape
+//! types. Adding a new shape, say a horosphere for H³, meant touching both, keeping their
+//! variant lists in sync by hand, and inventing new conversion glue. This crate is the single
+//! source of truth they both now alias to.
 //!
 //! ## Design
 //!
@@ -20,9 +20,9 @@
 //!   physics sphere constructors set `center = Vec3::ZERO`.
 //! - **No behavior, but interfaces are OK.** This crate defines the [`Shape`] data and the
 //!   [`Visualizable`] trait *interface*, but no impls. Trait definitions count as data-shape
-//!   interfaces, not behavior; they add zero dependencies on application-level code. Impls live
-//!   in the role crates ([`rye-scene`] for [`Primitive`] (SDF) and [`Visualizable`] on
-//!   [`Shape`]; [`rye-physics`] for [`Collider`] and [`Visualizable`] on `Polytope4`). The dep
+//!   interfaces, not behavior; they add zero dependencies on application-level code. Impls
+//!   live in the role crates (`rye-scene` for `Primitive` (SDF) and [`Visualizable`] on
+//!   [`Shape`]; `rye-physics` for `Collider` and [`Visualizable`] on `Polytope4`). The dep
 //!   graph stays a tree.
 
 pub mod visualizable;

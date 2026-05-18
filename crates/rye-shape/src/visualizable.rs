@@ -1,10 +1,9 @@
 //! [`Visualizable`] trait + mesh data types for the rasterization tier.
 //!
-//! Symmetric to the [`Primitive`](../../rye_scene/index.html) (SDF role) and
-//! [`Collider`](../../rye_physics/index.html) (physics role) traits in their respective
-//! consumer crates: this trait carries the rasterization role. Implementations live downstream
-//! (`rye-scene` impls it for [`crate::Shape`] variants; `rye-physics` impls it for
-//! [`rye_physics::polytope::Polytope4`]).
+//! Symmetric to the `Primitive` (SDF role) trait in `rye-scene` and the `Collider` (physics
+//! role) trait in `rye-physics`: this trait carries the rasterization role. Implementations
+//! live downstream (`rye-scene` impls it for [`crate::Shape`] variants; `rye-physics` impls it
+//! for `Polytope4`).
 //!
 //! ## Why this trait + the mesh types live in `rye-shape`
 //!
@@ -45,13 +44,13 @@ use serde::{Deserialize, Serialize};
 /// [`Option`]. Callers that want diagnostics get a concrete variant they can pattern-match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotVisualizable {
-    /// Shape extends to infinity in some direction (e.g., [`Shape::HalfSpace`], an infinite
-    /// plane). No bounded mesh representation exists; the editor / debug renderer may still
-    /// draw a "ghost" via a different mechanism (clipped at the view frustum, say).
+    /// Shape extends to infinity in some direction (e.g., [`crate::Shape::HalfSpace`], an
+    /// infinite plane). No bounded mesh representation exists; the editor / debug renderer
+    /// may still draw a "ghost" via a different mechanism (clipped at the view frustum, say).
     Unbounded,
 
     /// Shape's natural dimension doesn't match the requested `N`. For example, asking for
-    /// `Visualizable<3>` output on a [`Shape::HyperSphere4D`] (which is intrinsically 4D)
+    /// `Visualizable<3>` output on a [`crate::Shape::HyperSphere4D`] (intrinsically 4D)
     /// returns this variant. The caller should either pick a different `N` or project first.
     WrongDimension,
 
