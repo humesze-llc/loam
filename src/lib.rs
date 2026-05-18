@@ -12,7 +12,7 @@
 //! - [`time`] (fixed-timestep accumulator)
 //!
 //! The remaining crates (`rye-app`, `rye-camera`, `rye-input`,
-//! `rye-physics`, `rye-player`, `rye-sdf`, `rye-shape`, `rye-text`)
+//! `rye-physics`, `rye-player`, `rye-scene`, `rye-shape`, `rye-text`)
 //! are deliberately not re-exported here. They form the
 //! application/runtime layer and are best depended on directly so
 //! consumers see them in their own `Cargo.toml` rather than nested

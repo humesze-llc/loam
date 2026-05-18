@@ -1,6 +1,6 @@
 //! `rye-shape`: the canonical geometric-primitive data model.
 //!
-//! Before this crate existed, [`rye_sdf::PrimitiveKind`](../rye_sdf/index.html) (for
+//! Before this crate existed, [`rye_scene::PrimitiveKind`](../rye_scene/index.html) (for
 //! rendering) and [`rye_physics::Collider`](../rye_physics/index.html) (for collision)
 //! each defined their own parallel enum of shape types. Adding a new shape, say a horosphere
 //! for H³, meant touching both, keeping their variant lists in sync by hand, and inventing new
@@ -18,7 +18,7 @@
 //!   [`Shape::Sphere`], which carries a `center` field so SDF scenes can place spheres without a
 //!   transform combinator. Physics ignores that field (it always uses the body's position), the
 //!   physics sphere constructors set `center = Vec3::ZERO`.
-//! - **No behavior.** This crate only defines the data. Rendering emission lives in `rye-sdf`;
+//! - **No behavior.** This crate only defines the data. Rendering emission lives in `rye-scene`;
 //!   collision support lives in `rye-physics`. That keeps the dependency graph a tree (both
 //!   consumers depend on `rye-shape`, `rye-shape` depends on nothing application-level).
 
@@ -58,7 +58,7 @@ pub enum Shape {
     ConvexPolytope3D { vertices: Vec<Vec3> },
 
     /// Convex 4D polytope. Physics 4D narrowphase uses 4D GJK+EPA; SDF emission via
-    /// `rye_sdf::Primitive4` (max-of-half-spaces).
+    /// `rye_scene::Primitive4` (max-of-half-spaces).
     ConvexPolytope4D { vertices: Vec<Vec4> },
 
     /// 4D ball with a local centre and radius, the 4D analogue of [`Shape::Sphere`]. SDF:

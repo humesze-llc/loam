@@ -7,7 +7,7 @@
 //! diverge), and converging in S³.
 //!
 //! Note: `HalfSpace` SDF emission gates on `WgslSpace::is_chart_flat`
-//! (rye-sdf T1-1). E³ corridor walls render honestly via chart-coord
+//! (rye-scene T1-1). E³ corridor walls render honestly via chart-coord
 //! `dot(p, n) - d`; H³ / S³ corridor walls sentinel until closed-form
 //! geodesic-plane SDFs land. The pillars (`rye_distance` spheres)
 //! tell the curvature story in every Space.

@@ -23,4 +23,4 @@ rye-physics = { path = "../rye-physics" }
 
 [dev-dependencies]
 naga.workspace = true
-rye-sdf = { path = "../rye-sdf" }
+rye-scene = { path = "../rye-scene" }

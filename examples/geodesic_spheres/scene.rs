@@ -1,12 +1,12 @@
 //! Geodesic-spheres demo scene. Self-contained; depends only on the
-//! typed [`rye_sdf::Scene`] / [`rye_sdf::SceneNode`] layer and emits
+//! typed [`rye_scene::Scene`] / [`rye_scene::SceneNode`] layer and emits
 //! WGSL against `EuclideanR3`.
 
 use std::f32::consts::PI;
 
 use glam::Vec3;
 use rye_math::EuclideanR3;
-use rye_sdf::{Scene, SceneNode};
+use rye_scene::{Scene, SceneNode};
 
 /// Geodesic-spheres demo scene parameters.
 ///

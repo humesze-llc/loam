@@ -1,7 +1,7 @@
 //! [`Hyperslice4DNode`], render node for 4D scenes via hyperslicing.
 //!
-//! Designed to pair with `rye_sdf::Scene4` but takes a pre-compiled [`wgpu::ShaderModule`]
-//! rather than depending on `rye-sdf` directly (matches the existing
+//! Designed to pair with `rye_scene::Scene4` but takes a pre-compiled [`wgpu::ShaderModule`]
+//! rather than depending on `rye-scene` directly (matches the existing
 //! [`crate::raymarch::RayMarchNode`] / [`crate::raymarch::GeodesicRayMarchNode`] pattern;
 //! keeps `rye-render`'s deps minimal).
 //!
@@ -758,7 +758,7 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
 "#;
 
 /// Render node that ray-marches the 3D cross-section of a 4D scene at `u.w_slice`. Pairs with
-/// `rye_sdf::Scene4`.
+/// `rye_scene::Scene4`.
 pub struct Hyperslice4DNode {
     pipeline: RenderPipeline,
     uniforms: Hyperslice4DUniforms,
@@ -1165,7 +1165,7 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
     #[test]
     fn kernel_validates_with_real_scene_union() {
         use glam::Vec4;
-        use rye_sdf::{Scene4, SceneNode4};
+        use rye_scene::{Scene4, SceneNode4};
 
         let scene = Scene4::new(
             SceneNode4::hypersphere(Vec4::new(-0.6, 0.7, -1.5, 0.0), 0.7)

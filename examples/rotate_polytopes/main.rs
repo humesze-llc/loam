@@ -65,7 +65,7 @@ use rye_render::{
     },
     Viewport,
 };
-use rye_sdf::{Scene4, SceneNode4};
+use rye_scene::{Scene4, SceneNode4};
 use winit::window::WindowAttributes;
 
 mod active;
