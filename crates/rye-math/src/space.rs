@@ -157,8 +157,8 @@ pub trait WgslSpace: Space {
     /// diverge visibly.
     ///
     /// Defaults to `false` so a new Space implementor must explicitly opt in to chart-coord SDF
-    /// fast paths. Consumers of this flag (e.g. `rye_scene::Primitive::HalfSpace::to_wgsl`) emit
-    /// the chart-coord formula when `true`, sentinel otherwise.
+    /// fast paths. Consumers of this flag (e.g. `rye_scene::Primitive::HalfSpace`'s emission)
+    /// emit the chart-coord formula when `true`, sentinel otherwise.
     fn is_chart_flat(&self) -> bool {
         false
     }
