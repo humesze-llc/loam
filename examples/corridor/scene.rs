@@ -1,10 +1,10 @@
 //! Corridor demo scene. Self-contained; depends only on the typed
-//! [`rye_sdf::Scene`] / [`rye_sdf::SceneNode`] layer and emits WGSL
+//! [`rye_scene::Scene`] / [`rye_scene::SceneNode`] layer and emits WGSL
 //! against `EuclideanR3`.
 
 use glam::Vec3;
 use rye_math::EuclideanR3;
-use rye_sdf::{Scene, SceneNode};
+use rye_scene::{Scene, SceneNode};
 
 /// A rectangular corridor oriented along the Z axis, lined with rows
 /// of geodesic spheres for depth cues.

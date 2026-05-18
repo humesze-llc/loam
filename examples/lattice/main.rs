@@ -52,7 +52,7 @@ fn shader_path() -> PathBuf {
 fn assemble(prelude: &str, scene: &str, user: &str) -> String {
     format!(
         "// ---- rye-math Space prelude ----\n{prelude}\n\
-         // ---- rye-sdf scene module ----\n{scene}\n\
+         // ---- rye-scene scene module ----\n{scene}\n\
          // ---- rye geodesic march kernel ----\n{GEODESIC_MARCH_KERNEL}\n\
          // ---- user shading ----\n{user}"
     )

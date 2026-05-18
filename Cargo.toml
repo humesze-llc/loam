@@ -2,7 +2,7 @@
 members = [
   "crates/rye-math",
   "crates/rye-shape",
-  "crates/rye-sdf",
+  "crates/rye-scene",
   "crates/rye-time",
   "crates/rye-shader",
   "crates/rye-render",
@@ -50,7 +50,8 @@ description = "Rye: a Rust game engine with non-Euclidean geometry as a primitiv
 
 [dependencies]
 rye-math      = { path = "crates/rye-math" }
-rye-sdf       = { path = "crates/rye-sdf" }
+rye-scene     = { path = "crates/rye-scene" }
+rye-shape     = { path = "crates/rye-shape" }
 rye-time      = { path = "crates/rye-time" }
 rye-shader    = { path = "crates/rye-shader" }
 rye-render    = { path = "crates/rye-render" }

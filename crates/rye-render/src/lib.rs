@@ -15,7 +15,9 @@
 pub mod device;
 pub mod graph;
 pub mod lattice;
+pub mod line_raster;
 pub mod raymarch;
 
 pub use lattice::Viewport;
+pub use line_raster::{LineRasterNode, LineRasterUniforms};
 pub use raymarch::{GeodesicRayMarchNode, RayMarchNode, RayMarchUniforms};

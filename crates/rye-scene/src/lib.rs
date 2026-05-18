@@ -1,4 +1,4 @@
-//! `rye-sdf`: signed-distance field primitives and scene builders for Rye.
+//! `rye-scene`: signed-distance field primitives and scene builders for Rye.
 //!
 //! [`Primitive`] is the typed abstraction for geometric objects. Every primitive emits a WGSL
 //! function `fn {name}(p: vec3<f32>) -> f32` that uses only `rye_*` Space-prelude functions,

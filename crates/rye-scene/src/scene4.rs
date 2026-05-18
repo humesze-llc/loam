@@ -18,7 +18,7 @@
 //!
 //! ```rust
 //! use glam::Vec4;
-//! use rye_sdf::scene4::{Scene4, SceneNode4};
+//! use rye_scene::scene4::{Scene4, SceneNode4};
 //!
 //! let scene = Scene4::new(
 //!     SceneNode4::hypersphere(Vec4::ZERO, 0.5)
@@ -120,7 +120,7 @@ impl Scene4 {
         let (d_root, _k_root) = emit_node_4d(&self.root, &mut counter, &mut helpers, &mut body);
         let kind_consts = SCENE_KIND_CONSTANTS;
         format!(
-            "// ---- rye-sdf scene4 (native 4D) ----\n\
+            "// ---- rye-scene scene4 (native 4D) ----\n\
              {kind_consts}\
              {helpers}\
              fn rye_scene_sdf_4d(p: vec4<f32>) -> f32 {{\n\
@@ -151,7 +151,7 @@ impl Scene4 {
         // naming the parameter `p3` keeps the helper-emit convention (which calls `sdfN_pK(p)`)
         // intact while sidestepping the collision.
         format!(
-            "// ---- rye-sdf scene4 (hyperslice at w = {w_slice_expr}) ----\n\
+            "// ---- rye-scene scene4 (hyperslice at w = {w_slice_expr}) ----\n\
              {kind_consts}\
              struct RyeSceneHit {{ dist: f32, kind: u32 }}\n\
              {helpers}\

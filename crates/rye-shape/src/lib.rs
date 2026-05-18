@@ -1,10 +1,10 @@
 //! `rye-shape`: the canonical geometric-primitive data model.
 //!
-//! Before this crate existed, [`rye_sdf::PrimitiveKind`](../rye_sdf/index.html) (for
-//! rendering) and [`rye_physics::Collider`](../rye_physics/index.html) (for collision)
-//! each defined their own parallel enum of shape types. Adding a new shape, say a horosphere
-//! for H³, meant touching both, keeping their variant lists in sync by hand, and inventing new
-//! conversion glue. This crate is the single source of truth they both now alias to.
+//! Before this crate existed, `rye_scene::PrimitiveKind` (for rendering) and
+//! `rye_physics::Collider` (for collision) each defined their own parallel enum of shape
+//! types. Adding a new shape, say a horosphere for H³, meant touching both, keeping their
+//! variant lists in sync by hand, and inventing new conversion glue. This crate is the single
+//! source of truth they both now alias to.
 //!
 //! ## Design
 //!
@@ -18,9 +18,16 @@
 //!   [`Shape::Sphere`], which carries a `center` field so SDF scenes can place spheres without a
 //!   transform combinator. Physics ignores that field (it always uses the body's position), the
 //!   physics sphere constructors set `center = Vec3::ZERO`.
-//! - **No behavior.** This crate only defines the data. Rendering emission lives in `rye-sdf`;
-//!   collision support lives in `rye-physics`. That keeps the dependency graph a tree (both
-//!   consumers depend on `rye-shape`, `rye-shape` depends on nothing application-level).
+//! - **No behavior, but interfaces are OK.** This crate defines the [`Shape`] data and the
+//!   [`Visualizable`] trait *interface*, but no impls. Trait definitions count as data-shape
+//!   interfaces, not behavior; they add zero dependencies on application-level code. Impls
+//!   live in the role crates (`rye-scene` for `Primitive` (SDF) and [`Visualizable`] on
+//!   [`Shape`]; `rye-physics` for `Collider` and [`Visualizable`] on `Polytope4`). The dep
+//!   graph stays a tree.
+
+pub mod visualizable;
+
+pub use visualizable::{LineMesh, NotVisualizable, PointMesh, TriangleMesh, Visualizable};
 
 use glam::{Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
@@ -58,7 +65,7 @@ pub enum Shape {
     ConvexPolytope3D { vertices: Vec<Vec3> },
 
     /// Convex 4D polytope. Physics 4D narrowphase uses 4D GJK+EPA; SDF emission via
-    /// `rye_sdf::Primitive4` (max-of-half-spaces).
+    /// `rye_scene::Primitive4` (max-of-half-spaces).
     ConvexPolytope4D { vertices: Vec<Vec4> },
 
     /// 4D ball with a local centre and radius, the 4D analogue of [`Shape::Sphere`]. SDF:

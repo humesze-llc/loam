@@ -245,7 +245,7 @@ pub(crate) fn assemble_source_with_scene(
         out.push('\n');
     }
     if let Some(scene_wgsl) = scene_wgsl {
-        out.push_str("// ---- rye-sdf scene module ----\n");
+        out.push_str("// ---- rye-scene scene module ----\n");
         out.push_str(scene_wgsl);
         if !scene_wgsl.ends_with('\n') {
             out.push('\n');
