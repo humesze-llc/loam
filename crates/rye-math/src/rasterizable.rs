@@ -1,9 +1,9 @@
 //! [`RasterizableSpace<N>`] trait + [`Projection<N>`] enum + flat-Euclidean impls.
 //!
 //! Pairs with the `Visualizable<N>` trait in `rye-shape`. `Visualizable` answers "what mesh
-//! data does this shape produce in R^N?"; `RasterizableSpace` answers "given that mesh data in
-//! space `S`, how do we get screen-ready R³ vertices?". The rasterizer pipeline in `rye-render`
-//! composes them.
+//! data does this shape produce in R^N?"; `RasterizableSpace` answers "given that mesh data
+//! in space `S`, how do we get screen-ready R³ vertices?". The rasterizer pipeline in
+//! `rye-render` composes them.
 //!
 //! ## Unified for flat and curved spaces
 //!
@@ -46,7 +46,8 @@ use crate::{EuclideanR3, EuclideanR4};
 ///   3-flat slices. For `N == 3` this can drop one axis to produce a 2D-looking projection
 ///   (used later for Flatland-style reveals).
 ///
-/// Future variants under consideration: R⁴-specific `Schlegel`, `Stereographic`, `Hyperslice`.
+/// Future variants under consideration: R⁴-specific `Schlegel`, `Stereographic`,
+/// `Hyperslice`, and 4D `Perspective`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Projection<const N: usize> {
     /// Pass through: take the first 3 components, zero-pad if `N < 3`, truncate if `N > 3`.

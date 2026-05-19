@@ -23,10 +23,15 @@
 //! - `samples N`: set per-segment tessellation density. `1` is the default and is correct for
 //!   flat-Euclidean impls; higher values exercise the writer-pattern path that curved-space
 //!   impls will use.
-//! - `polytope <name|off>`: show an R⁴ polytope wireframe alongside the R³ scene. `<name>` is
-//!   one of `5cell`, `tesseract`, `16cell`, `24cell`, `120cell`, `600cell` (hyphenated aliases
-//!   accepted). The wireframe is projected to R³ via `Orthographic { drop_axis: 3 }` (drop-w)
-//!   and scaled 2.5x so it's visible alongside the unit cube.
+//! - `polytope <name|off>`: show an R⁴ polytope wireframe alongside the R³ scene. `<name>`
+//!   is one of `5cell`, `tesseract`, `16cell`, `24cell`, `120cell`, `600cell` (hyphenated
+//!   aliases accepted). The wireframe is projected to R³ via `Orthographic { drop_axis: 3 }`
+//!   and scaled 2.5x so it's visible alongside the unit cube. An animated 4D rotation (xw +
+//!   yz planes) is applied before projection so axis-aligned polytopes like the tesseract
+//!   don't collapse onto a degenerate R³ silhouette.
+//! - `tests <on|off>`: bulk-toggle all R³ raster-test categories (axes / cube / widths /
+//!   gradient / tilted) in one go. Useful for clearing the R³ scene when you only want to
+//!   look at an R⁴ polytope.
 //! - `reset`: restore all toggles to default and samples = 1 and polytope off.
 
 use std::borrow::Cow;
@@ -38,13 +43,36 @@ use rye_egui::{Console, ConsoleWriter};
 use rye_math::{EuclideanR3, EuclideanR4, Projection};
 use rye_physics::polytope::Polytope4;
 use rye_render::{device::RenderDevice, LineRasterNode};
-use rye_shape::{LineMesh, Visualizable};
+use rye_shape::LineMesh;
 use winit::window::WindowAttributes;
 
 /// R⁴ scale factor for the polytope wireframe. Polytope vertices live on the unit
 /// 3-sphere; scaling up to 2.5 makes the wireframe comfortably visible alongside the R³
 /// test scene without overflowing the cube's ±1.5 extent.
 const POLYTOPE_SCALE: f32 = 2.5;
+
+/// Angular speeds (rad/s) of the animated 4D rotation applied to polytope vertices before
+/// drop-w projection. Two independent simple rotations: `XW_RATE` rotates in the xw plane
+/// (separates the tesseract's inner / outer cubes when projected); `YZ_RATE` rotates inside
+/// the projected R³ for visual depth. Non-commensurate rates so the orbit doesn't repeat.
+const XW_RATE: f32 = 0.40;
+const YZ_RATE: f32 = 0.30;
+
+/// Apply an animated 4D rotation to a single point. Rotates in the xw plane by `t * XW_RATE`
+/// and in the yz plane by `t * YZ_RATE`. Used to make w-axis-aligned polytopes (the
+/// tesseract is the worst offender) render as visibly 4D under `Orthographic { drop_axis: 3 }`
+/// rather than collapsing onto a degenerate R³ silhouette.
+fn rotate_4d(p: [f32; 4], t: f32) -> [f32; 4] {
+    let (sxw, cxw) = (t * XW_RATE).sin_cos();
+    let (syz, cyz) = (t * YZ_RATE).sin_cos();
+    let [x, y, z, w] = p;
+    [
+        x * cxw - w * sxw,
+        y * cyz - z * syz,
+        y * syz + z * cyz,
+        x * sxw + w * cxw,
+    ]
+}
 
 /// Test-scene toggles. Each maps to a category in [`build_mesh`].
 #[derive(Clone, Copy, Debug)]
@@ -189,8 +217,13 @@ struct Demo {
     /// Tessellation samples-per-segment. 1 for flat space (no interior subdivision); higher
     /// values exercise the writer-pattern path that geodesic-space impls will use later.
     samples: usize,
+    /// Wall-clock time threaded in from [`FrameCtx::time`] each frame. Drives the animated
+    /// 4D rotation in [`rotate_4d`]; only read when `polytope.is_some()`.
+    time: f32,
     /// Set by console toggle / `samples` commands to re-upload meshes on the next frame.
     /// Persists across frames so multiple console mutations within one frame coalesce.
+    /// When `polytope.is_some()` the per-frame animation flips this every frame so the
+    /// rotated mesh re-uploads continuously.
     dirty: bool,
 }
 
@@ -221,6 +254,7 @@ impl Demo {
             toggles: Toggles::default(),
             polytope: None,
             samples: 1,
+            time: 0.0,
             dirty: true,
         };
         demo.reupload(ctx.rd);
@@ -239,13 +273,19 @@ impl Demo {
             self.samples,
         );
 
-        // R⁴ polytope wireframe (if enabled). The scale-up bakes into the mesh before
-        // upload so we don't have to thread a model matrix through the rasterizer; the
-        // wireframe ends up at ~2.5 unit world-space radius.
+        // R⁴ polytope wireframe (if enabled). Vertices are first rotated in R⁴ (so
+        // axis-aligned polytopes don't collapse under drop-w; see [`rotate_4d`]) and then
+        // scaled up so the wireframe ends up at ~2.5 unit world-space radius. Baking both
+        // into the mesh keeps the rasterizer's instance data simple: no per-frame model
+        // matrix threaded through the pipeline.
         if let Some(p) = self.polytope {
-            let mut mesh = <Polytope4 as Visualizable<4>>::to_lines(&p)
-                .expect("polytopes always produce line meshes");
+            // Position-derived per-vertex color: dense wireframes like the 600-cell read as
+            // a coherent color field rather than a uniform tangle. See
+            // [`Polytope4::lines_colored_by_position`].
+            let mut mesh = p.lines_colored_by_position();
             for (a, b) in mesh.segments.iter_mut() {
+                *a = rotate_4d(*a, self.time);
+                *b = rotate_4d(*b, self.time);
                 for k in 0..4 {
                     a[k] *= POLYTOPE_SCALE;
                     b[k] *= POLYTOPE_SCALE;
@@ -284,6 +324,12 @@ impl Demo {
         if !ctx.ui_has_focus {
             self.orbit
                 .advance(ctx.input, &mut self.camera, &EuclideanR3, 0.0);
+        }
+        self.time = ctx.time;
+        // Animated 4D rotation: re-upload the polytope mesh every frame while it's
+        // visible. ~32-720 edges per polytope so the per-frame upload is cheap.
+        if self.polytope.is_some() {
+            self.dirty = true;
         }
         if self.dirty {
             self.reupload(ctx.rd);
@@ -354,36 +400,82 @@ struct RasterTestApp {
     demo: Demo,
     console: Console<Demo>,
     last_egui_keyboard: bool,
+    /// Capture parameters panel (output dir, format, fps, scale, start/stop). Toggled via the
+    /// `capture panel` console command or the F11 default bind. The framework runner reads the
+    /// post-UI swapchain after every frame, so png / gif / apng / frame-sequence output works
+    /// without any per-app render code.
+    capture_panel: rye_app::capture::CapturePanel,
 }
 
 impl RasterTestApp {
     fn build_console() -> Console<Demo> {
         let mut c = Console::<Demo>::new();
-        c.register(rye_egui::cmd(
-            "axes",
-            "toggle world-axes (on|off)",
-            toggle_cmd("axes", |t| &mut t.axes),
-        ));
-        c.register(rye_egui::cmd(
-            "cube",
-            "toggle unit-cube wireframe (on|off)",
-            toggle_cmd("cube", |t| &mut t.cube),
-        ));
-        c.register(rye_egui::cmd(
-            "widths",
-            "toggle width-sweep lines (on|off)",
-            toggle_cmd("widths", |t| &mut t.widths),
-        ));
-        c.register(rye_egui::cmd(
-            "gradient",
-            "toggle gradient line (on|off)",
-            toggle_cmd("gradient", |t| &mut t.gradient),
-        ));
-        c.register(rye_egui::cmd(
-            "tilted",
-            "toggle tilted-line fan (on|off)",
-            toggle_cmd("tilted", |t| &mut t.tilted),
-        ));
+        c.register(
+            rye_egui::cmd(
+                "axes",
+                "toggle world-axes (on|off)",
+                toggle_cmd("axes", |t| &mut t.axes),
+            )
+            .with_args(&[&["on", "off"]]),
+        );
+        c.register(
+            rye_egui::cmd(
+                "cube",
+                "toggle unit-cube wireframe (on|off)",
+                toggle_cmd("cube", |t| &mut t.cube),
+            )
+            .with_args(&[&["on", "off"]]),
+        );
+        c.register(
+            rye_egui::cmd(
+                "widths",
+                "toggle width-sweep lines (on|off)",
+                toggle_cmd("widths", |t| &mut t.widths),
+            )
+            .with_args(&[&["on", "off"]]),
+        );
+        c.register(
+            rye_egui::cmd(
+                "gradient",
+                "toggle gradient line (on|off)",
+                toggle_cmd("gradient", |t| &mut t.gradient),
+            )
+            .with_args(&[&["on", "off"]]),
+        );
+        c.register(
+            rye_egui::cmd(
+                "tilted",
+                "toggle tilted-line fan (on|off)",
+                toggle_cmd("tilted", |t| &mut t.tilted),
+            )
+            .with_args(&[&["on", "off"]]),
+        );
+        c.register(
+            rye_egui::cmd(
+                "tests",
+                "toggle all R³ raster-test categories at once (on|off)",
+                |args, demo: &mut Demo, _out: &mut ConsoleWriter| {
+                    let arg = args
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("usage: tests <on|off>"))?;
+                    let v = match arg.to_ascii_lowercase().as_str() {
+                        "on" | "true" | "1" => true,
+                        "off" | "false" | "0" => false,
+                        other => {
+                            return Err(anyhow::anyhow!("unknown arg `{other}` (try on|off)"))
+                        }
+                    };
+                    demo.toggles.axes = v;
+                    demo.toggles.cube = v;
+                    demo.toggles.widths = v;
+                    demo.toggles.gradient = v;
+                    demo.toggles.tilted = v;
+                    demo.dirty = true;
+                    Ok(())
+                },
+            )
+            .with_args(&[&["on", "off"]]),
+        );
         c.register(rye_egui::cmd(
             "samples",
             "set tessellation samples-per-segment (default 1)",
@@ -400,32 +492,37 @@ impl RasterTestApp {
                 Ok(())
             },
         ));
-        c.register(rye_egui::cmd(
-            "polytope",
-            "set R⁴ polytope wireframe overlay (5cell|tesseract|16cell|24cell|120cell|600cell|off)",
-            |args, demo: &mut Demo, _out: &mut ConsoleWriter| {
-                let name = args
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("usage: polytope <name|off>"))?;
-                demo.polytope = match name.to_ascii_lowercase().as_str() {
-                    "off" | "none" => None,
-                    "5cell" | "5-cell" | "pentatope" => Some(Polytope4::Pentatope),
-                    "8cell" | "8-cell" | "tesseract" => Some(Polytope4::Tesseract),
-                    "16cell" | "16-cell" => Some(Polytope4::Cell16),
-                    "24cell" | "24-cell" => Some(Polytope4::Cell24),
-                    "120cell" | "120-cell" => Some(Polytope4::Cell120),
-                    "600cell" | "600-cell" => Some(Polytope4::Cell600),
-                    other => {
-                        return Err(anyhow::anyhow!(
-                            "unknown polytope `{other}` (try 5cell, tesseract, 16cell, 24cell, \
-                             120cell, 600cell, or off)"
-                        ))
-                    }
-                };
-                demo.dirty = true;
-                Ok(())
-            },
-        ));
+        c.register(
+            rye_egui::cmd(
+                "polytope",
+                "set R⁴ polytope wireframe overlay (5cell|tesseract|16cell|24cell|120cell|600cell|off)",
+                |args, demo: &mut Demo, _out: &mut ConsoleWriter| {
+                    let name = args
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("usage: polytope <name|off>"))?;
+                    demo.polytope = match name.to_ascii_lowercase().as_str() {
+                        "off" | "none" => None,
+                        "5cell" | "5-cell" | "pentatope" => Some(Polytope4::Pentatope),
+                        "8cell" | "8-cell" | "tesseract" => Some(Polytope4::Tesseract),
+                        "16cell" | "16-cell" => Some(Polytope4::Cell16),
+                        "24cell" | "24-cell" => Some(Polytope4::Cell24),
+                        "120cell" | "120-cell" => Some(Polytope4::Cell120),
+                        "600cell" | "600-cell" => Some(Polytope4::Cell600),
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "unknown polytope `{other}` (try 5cell, tesseract, 16cell, 24cell, \
+                                 120cell, 600cell, or off)"
+                            ))
+                        }
+                    };
+                    demo.dirty = true;
+                    Ok(())
+                },
+            )
+            .with_args(&[&[
+                "5cell", "tesseract", "16cell", "24cell", "120cell", "600cell", "off",
+            ]]),
+        );
         c.register(rye_egui::cmd(
             "reset",
             "restore all toggles to default (everything on, samples = 1, no polytope)",
@@ -437,6 +534,12 @@ impl RasterTestApp {
                 Ok(())
             },
         ));
+
+        // Framework-provided capture: `capture png [pre|post|both] [dir]`,
+        // `capture frames|gif|apng [pre|post|both] [dir]`, `capture stop`, `capture panel`.
+        // Bound to F12 (one-shot png), F9 (toggle gif sequence), F11 (panel).
+        rye_app::capture::register_commands(&mut c);
+        rye_app::capture::bind_default_hotkeys(&mut c);
 
         // Standard framework log mirror so tracing events show up in the console scrollback.
         rye_app::log::register_command(&mut c);
@@ -475,6 +578,7 @@ impl App for RasterTestApp {
             demo,
             console,
             last_egui_keyboard: false,
+            capture_panel: rye_app::capture::CapturePanel::new(),
         })
     }
 
@@ -550,6 +654,7 @@ impl App for RasterTestApp {
                 ui.label("press ` to open console");
                 ui.label("orbit: drag, zoom: scroll, exit: Esc");
             });
+        self.capture_panel.show(ctx);
         rye_app::log::pump_into(&mut self.console);
         self.console.ui(ctx, &mut self.demo);
         self.last_egui_keyboard = ctx.wants_keyboard_input();

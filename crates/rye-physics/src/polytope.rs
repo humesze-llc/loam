@@ -219,6 +219,41 @@ impl Polytope4 {
         }
         mesh
     }
+
+    /// Color each edge by its endpoints' 4D positions, producing a per-vertex color field
+    /// that flows continuously across the edge graph. Adjacent edges share their shared-vertex
+    /// color, so the polytope's symmetry shows up as smooth color gradients rather than
+    /// discrete per-edge swatches: useful for dense wireframes like the 600-cell where uniform
+    /// white flattens visually into a tangle.
+    ///
+    /// Mapping (vertex normalized to unit length first):
+    /// - `(x + 1) / 2` to R, `(y + 1) / 2` to G, `(z + 1) / 2` to B, biased into `[0.25, 1.0]`
+    ///   so every edge stays visible (no fully-black vertices).
+    /// - `w` modulates brightness multiplicatively in `[0.7, 1.0]` so the hidden dimension is
+    ///   visible as a soft +w / -w cue without losing contrast.
+    ///
+    /// Deterministic: same polytope always produces the same coloring, no RNG.
+    pub fn lines_colored_by_position(self) -> rye_shape::LineMesh<4> {
+        let topo = self.topology();
+        let mut mesh = rye_shape::LineMesh::<4>::default();
+        mesh.segments.reserve(topo.edges.len());
+        mesh.colors.reserve(topo.edges.len());
+        mesh.widths.reserve(topo.edges.len());
+        let vertex_color = |v: Vec4| -> [f32; 4] {
+            let n = v.try_normalize().unwrap_or(Vec4::ZERO);
+            let bias = |c: f32| 0.25 + 0.75 * (0.5 + 0.5 * c);
+            let w_mod = 0.7 + 0.3 * (0.5 + 0.5 * n.w);
+            [bias(n.x) * w_mod, bias(n.y) * w_mod, bias(n.z) * w_mod, 1.0]
+        };
+        for &[i, j] in topo.edges {
+            let va = topo.vertices[i as usize];
+            let vb = topo.vertices[j as usize];
+            mesh.segments.push((va.to_array(), vb.to_array()));
+            mesh.colors.push((vertex_color(va), vertex_color(vb)));
+            mesh.widths.push(DEFAULT_LINE_WIDTH);
+        }
+        mesh
+    }
 }
 
 // ---------------------------------------------------------------------------
