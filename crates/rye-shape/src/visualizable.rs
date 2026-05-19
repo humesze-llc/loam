@@ -19,9 +19,9 @@
 //!
 //! ## Const-generic dim
 //!
-//! `N` is the ambient dimension: 2 for R², 3 for R³, 4 for R⁴, etc. Const-generic so dimension
-//! mismatches are compile-time errors and vertex storage is stack-friendly (`[f32; N]`, not
-//! `Vec<f32>`). The viral type parameter is contained by:
+//! `N` is the ambient dimension: 2 for R², 3 for R³, 4 for R⁴, etc. Const-generic so
+//! dimension mismatches are compile-time errors and vertex storage is stack-friendly
+//! (`[f32; N]`, not `Vec<f32>`). The viral type parameter is contained by:
 //!
 //! - Scene-level wrappers in `rye-scene` use an enum (`SceneNode::Lines3 | Lines4 | ...`) so
 //!   downstream code only sees `RasterMesh` (enum), not generic types.

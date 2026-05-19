@@ -73,7 +73,9 @@ mod slider_edit;
 mod world;
 
 pub use bivector_matrix::{bivector_matrix, cell_text as bivector_matrix_cell_text};
-pub use console::{cmd, Command, Console, ConsoleWriter, HistoryLine, LineKind};
+pub use console::{
+    cmd, subcommands, Command, Console, ConsoleWriter, HistoryLine, LineKind, SubcommandSet,
+};
 pub use integration::UiIntegration;
 pub use linear_indicator::LinearIndicator;
 pub use overlay::BottomOverlay;

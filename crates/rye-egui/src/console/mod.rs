@@ -150,14 +150,36 @@ pub trait Command<Ctx>: 'static {
     /// One-line description shown by `help`.
     fn help(&self) -> &str;
 
-    /// Tab-completion choices for the `arg_index`-th positional argument. Default is
-    /// empty (no completion / free-form arg like a path or number). Override via
-    /// [`FnCommand::with_args`] when an arg is a fixed enum like `pre|post|both`,
-    /// or include a `key=` entry to declare a key-value arg whose values are
-    /// supplied separately by [`Command::arg_value_choices`].
+    /// Tab-completion choices for the `arg_index`-th positional argument, without
+    /// awareness of values typed in prior slots. Default is empty (no completion /
+    /// free-form arg like a path or number). Override via [`FnCommand::with_args`]
+    /// when an arg is a fixed enum like `pre|post|both`, or include a `key=` entry
+    /// to declare a key-value arg whose values are supplied separately by
+    /// [`Command::arg_value_choices`].
+    ///
+    /// Most commands should override this. Subcommand-style commands whose value
+    /// slot depends on what subcommand was picked should override
+    /// [`Command::arg_choices_ctx`] instead (this method's default returns `&[]`,
+    /// and `arg_choices_ctx`'s default delegates back here).
     fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
         let _ = arg_index;
         &[]
+    }
+
+    /// Context-aware variant of [`Command::arg_choices`]. Receives the arg tokens
+    /// parsed BEFORE the current completion position (`prior.len() == arg_index`),
+    /// so completion can branch on prior choices.
+    ///
+    /// Default delegates to [`Command::arg_choices`], so commands that don't need
+    /// context don't have to override this. Subcommand dispatch (e.g.
+    /// [`SubcommandSet`]) overrides this to gate the value-slot choices on the
+    /// selected subcommand.
+    ///
+    /// The explicit `'a` lifetime ties the returned slice to `&self`; the nested
+    /// `&[&str]` in `prior` would otherwise confuse lifetime elision.
+    fn arg_choices_ctx<'a>(&'a self, arg_index: usize, prior: &[&str]) -> &'a [&'static str] {
+        let _ = prior;
+        self.arg_choices(arg_index)
     }
 
     /// Enumerable values for a `key=value` arg at `arg_index` whose key is `key`
@@ -167,6 +189,20 @@ pub trait Command<Ctx>: 'static {
     fn arg_value_choices(&self, arg_index: usize, key: &str) -> &[&'static str] {
         let _ = (arg_index, key);
         &[]
+    }
+
+    /// Context-aware variant of [`Command::arg_value_choices`]. Receives the arg
+    /// tokens parsed BEFORE the current completion position; subcommand-dispatching
+    /// commands route kv-value lookups to the active subcommand's value table
+    /// using this. Default delegates to [`Command::arg_value_choices`].
+    fn arg_value_choices_ctx<'a>(
+        &'a self,
+        arg_index: usize,
+        key: &str,
+        prior: &[&str],
+    ) -> &'a [&'static str] {
+        let _ = prior;
+        self.arg_value_choices(arg_index, key)
     }
 
     /// Run the command. `args` are whitespace-split tokens after the command name.
@@ -271,6 +307,333 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Subcommand dispatch
+// ---------------------------------------------------------------------------
+
+/// Static on/off completion list used by every `Toggle` subcommand. Lives here so the
+/// `arg_choices_ctx` impl can hand back a `&'static [&'static str]` without owning a
+/// per-instance Vec.
+const ON_OFF_CHOICES: &[&str] = &["off", "on"];
+
+/// Boxed handler for an on/off toggle subcommand. Receives the user's context and the
+/// parsed bool; returns a `Result` so handlers can fail with usage / validation errors.
+type ToggleHandler<Ctx> = Box<dyn FnMut(&mut Ctx, bool) -> anyhow::Result<()>>;
+
+/// Boxed handler for a fixed-choice subcommand. Receives the user's context and the
+/// raw value string (one of the declared choices in normal use; the handler still has
+/// to handle case-insensitivity / aliases if those are wanted).
+type ChoiceHandler<Ctx> = Box<dyn FnMut(&mut Ctx, &str) -> anyhow::Result<()>>;
+
+/// Boxed handler for a custom-grammar subcommand. Receives the user's context, the
+/// raw args slice AFTER the subcommand name (positional + key-value tokens, framework
+/// does not parse them), and the writer. Used for subcommands whose grammar doesn't
+/// fit the simpler `.toggle` / `.choice` shapes (e.g. `capture gif post fps=30
+/// scale=720 palette=global`).
+type CustomHandler<Ctx> =
+    Box<dyn FnMut(&mut Ctx, &[&str], &mut ConsoleWriter) -> anyhow::Result<()>>;
+
+/// One entry in a [`SubcommandSet`]. The dispatch kind decides how the framework
+/// parses the value slot and what's offered for tab completion.
+enum SubcommandKind<Ctx> {
+    /// On/off subcommand. The framework parses `args[1]` as `on|off` and passes the
+    /// resulting bool to `handler`. Completion at the value slot is the static
+    /// `["off", "on"]` list.
+    Toggle { handler: ToggleHandler<Ctx> },
+    /// Fixed-choice subcommand. The framework completes the value slot from `choices`;
+    /// the handler receives the raw value string and decides what to do.
+    Choice {
+        choices: Vec<&'static str>,
+        handler: ChoiceHandler<Ctx>,
+    },
+    /// Custom-grammar subcommand. Per-slot positional choices drive tab completion
+    /// (slot 0 is the first arg AFTER the subcommand name); per-key value enumerables
+    /// drive two-step kv completion. The framework dispatches by subcommand name and
+    /// then hands the raw args + writer to the handler; arg parsing is the
+    /// handler's responsibility.
+    Custom {
+        arg_choices: Vec<Vec<&'static str>>,
+        value_choices: HashMap<&'static str, Vec<&'static str>>,
+        handler: CustomHandler<Ctx>,
+    },
+}
+
+struct SubcommandEntry<Ctx> {
+    help: &'static str,
+    kind: SubcommandKind<Ctx>,
+}
+
+/// A command that dispatches to one of several named subcommands based on the first
+/// positional arg. Provides typed dispatch (no `match arg.to_lowercase()` boilerplate
+/// per command) and context-aware tab completion (the value-slot list narrows to the
+/// chosen subcommand's allowed values).
+///
+/// Build with [`subcommands`] and chain [`SubcommandSet::toggle`] /
+/// [`SubcommandSet::choice`] to register subcommands. Register the whole set as a
+/// single command via `console.register(set)`.
+///
+/// ```ignore
+/// let tests = subcommands::<MyCtx>("tests", "select what renders")
+///     .toggle("axes", "toggle world-axes", |ctx, on| {
+///         ctx.show_axes = on;
+///         Ok(())
+///     })
+///     .choice(
+///         "polytope",
+///         "set R⁴ polytope overlay",
+///         &["5cell", "tesseract", "16cell", "off"],
+///         |ctx, name| { ctx.polytope = parse_polytope(name)?; Ok(()) },
+///     );
+/// console.register(tests);
+/// ```
+pub struct SubcommandSet<Ctx> {
+    name: &'static str,
+    help: &'static str,
+    /// Insertion-ordered subcommands. BTreeMap so iteration is deterministic and Tab
+    /// cycling order is alphabetical, matching the rest of the console.
+    subs: BTreeMap<&'static str, SubcommandEntry<Ctx>>,
+    /// Cached sorted slice of subcommand names. Populated lazily on first
+    /// [`Command::arg_choices`] / [`Command::arg_choices_ctx`] call so [`Self::toggle`]
+    /// and [`Self::choice`] can stay infallible chainable builders.
+    name_cache: std::cell::OnceCell<Vec<&'static str>>,
+}
+
+impl<Ctx: 'static> SubcommandSet<Ctx> {
+    /// Register an on/off subcommand. The framework parses the value slot as
+    /// `on | off | true | false | 1 | 0`; the handler receives the parsed bool.
+    pub fn toggle<F>(mut self, name: &'static str, help: &'static str, handler: F) -> Self
+    where
+        F: FnMut(&mut Ctx, bool) -> anyhow::Result<()> + 'static,
+    {
+        self.subs.insert(
+            name,
+            SubcommandEntry {
+                help,
+                kind: SubcommandKind::Toggle {
+                    handler: Box::new(handler),
+                },
+            },
+        );
+        self
+    }
+
+    /// Register a fixed-choice subcommand. The framework completes the value slot from
+    /// `choices`; the handler receives the raw value string (which is one of `choices`
+    /// only after Tab-completion or exact match, since the framework does not validate
+    /// the value against `choices` before dispatch).
+    pub fn choice<F>(
+        mut self,
+        name: &'static str,
+        help: &'static str,
+        choices: &[&'static str],
+        handler: F,
+    ) -> Self
+    where
+        F: FnMut(&mut Ctx, &str) -> anyhow::Result<()> + 'static,
+    {
+        self.subs.insert(
+            name,
+            SubcommandEntry {
+                help,
+                kind: SubcommandKind::Choice {
+                    choices: choices.to_vec(),
+                    handler: Box::new(handler),
+                },
+            },
+        );
+        self
+    }
+
+    /// Register a custom-grammar subcommand. Use when `.toggle` / `.choice` are too
+    /// rigid: subcommands with multiple positional args, key-value pairs, or both.
+    ///
+    /// - `arg_choices[i]` lists tab-completion choices for the i-th positional arg
+    ///   AFTER the subcommand name. Include `key=` entries for kv-pair prefixes.
+    /// - `value_choices[k]` lists enumerable values for the `key=value` arg whose
+    ///   bare key is `k` (the framework looks this up when the user types `k=` and
+    ///   hits Tab).
+    /// - `handler` receives the raw args after the subcommand name plus the writer;
+    ///   it owns the parsing of positionals and kv tokens.
+    ///
+    /// ```ignore
+    /// subcommands::<Ctx>("capture", "...")
+    ///     .custom(
+    ///         "gif",
+    ///         "gif sequence (with fps/scale/palette knobs)",
+    ///         &[
+    ///             &["pre", "post", "both"],
+    ///             &["fps=", "palette=", "scale="],
+    ///             &["fps=", "palette=", "scale="],
+    ///         ],
+    ///         &[("palette", &["local", "global"])],
+    ///         |ctx, args, out| { /* parse and act */ Ok(()) },
+    ///     )
+    /// ```
+    pub fn custom<F>(
+        mut self,
+        name: &'static str,
+        help: &'static str,
+        arg_choices: &[&[&'static str]],
+        value_choices: &[(&'static str, &[&'static str])],
+        handler: F,
+    ) -> Self
+    where
+        F: FnMut(&mut Ctx, &[&str], &mut ConsoleWriter) -> anyhow::Result<()> + 'static,
+    {
+        let mut vc = HashMap::new();
+        for (k, vs) in value_choices {
+            vc.insert(*k, vs.to_vec());
+        }
+        self.subs.insert(
+            name,
+            SubcommandEntry {
+                help,
+                kind: SubcommandKind::Custom {
+                    arg_choices: arg_choices.iter().map(|slot| slot.to_vec()).collect(),
+                    value_choices: vc,
+                    handler: Box::new(handler),
+                },
+            },
+        );
+        self
+    }
+
+    fn cached_names(&self) -> &[&'static str] {
+        self.name_cache
+            .get_or_init(|| self.subs.keys().copied().collect())
+    }
+}
+
+/// Build a [`SubcommandSet`] for a multi-subcommand console command. See the
+/// [`SubcommandSet`] docs for the full builder pattern.
+pub fn subcommands<Ctx: 'static>(name: &'static str, help: &'static str) -> SubcommandSet<Ctx> {
+    SubcommandSet {
+        name,
+        help,
+        subs: BTreeMap::new(),
+        name_cache: std::cell::OnceCell::new(),
+    }
+}
+
+impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn help(&self) -> &str {
+        self.help
+    }
+
+    fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
+        if arg_index == 0 {
+            self.cached_names()
+        } else {
+            &[]
+        }
+    }
+
+    fn arg_choices_ctx<'a>(&'a self, arg_index: usize, prior: &[&str]) -> &'a [&'static str] {
+        if arg_index == 0 {
+            return self.cached_names();
+        }
+        let Some(&sub_name) = prior.first() else {
+            return &[];
+        };
+        let Some(entry) = self.subs.get(sub_name) else {
+            return &[];
+        };
+        // Within-subcommand slot index: arg_index 1 is the first arg AFTER the
+        // subcommand name, which is slot 0 of the subcommand's own grammar.
+        let sub_slot = arg_index - 1;
+        match &entry.kind {
+            SubcommandKind::Toggle { .. } => {
+                if sub_slot == 0 {
+                    ON_OFF_CHOICES
+                } else {
+                    &[]
+                }
+            }
+            SubcommandKind::Choice { choices, .. } => {
+                if sub_slot == 0 {
+                    choices.as_slice()
+                } else {
+                    &[]
+                }
+            }
+            SubcommandKind::Custom { arg_choices, .. } => arg_choices
+                .get(sub_slot)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+        }
+    }
+
+    fn arg_value_choices_ctx<'a>(
+        &'a self,
+        _arg_index: usize,
+        key: &str,
+        prior: &[&str],
+    ) -> &'a [&'static str] {
+        let Some(&sub_name) = prior.first() else {
+            return &[];
+        };
+        let Some(entry) = self.subs.get(sub_name) else {
+            return &[];
+        };
+        match &entry.kind {
+            SubcommandKind::Custom { value_choices, .. } => {
+                value_choices.get(key).map(|v| v.as_slice()).unwrap_or(&[])
+            }
+            _ => &[],
+        }
+    }
+
+    fn run(&mut self, args: &[&str], ctx: &mut Ctx, out: &mut ConsoleWriter) -> anyhow::Result<()> {
+        let Some((sub_name, rest)) = args.split_first() else {
+            // Usage block lists subcommands with their one-line help so `tests` with no
+            // args is self-documenting instead of dumping a bare grammar.
+            let mut msg = format!("usage: {} <subcommand> <value>; subcommands:", self.name);
+            for (name, entry) in &self.subs {
+                msg.push_str(&format!("\n  {name:12} {}", entry.help));
+            }
+            return Err(anyhow::anyhow!(msg));
+        };
+        let Some(entry) = self.subs.get_mut(*sub_name) else {
+            let names: Vec<&str> = self.subs.keys().copied().collect();
+            return Err(anyhow::anyhow!(
+                "unknown subcommand `{sub_name}` for `{}` (try {})",
+                self.name,
+                names.join(", ")
+            ));
+        };
+        match &mut entry.kind {
+            SubcommandKind::Toggle { handler } => {
+                let value = rest
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("usage: {} {sub_name} <on|off>", self.name))?;
+                let v = match value.to_ascii_lowercase().as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "unknown value `{other}` for `{} {sub_name}` (try on|off)",
+                            self.name
+                        ))
+                    }
+                };
+                let _ = out;
+                handler(ctx, v)
+            }
+            SubcommandKind::Choice { handler, .. } => {
+                let value = rest
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("usage: {} {sub_name} <value>", self.name))?;
+                let _ = out;
+                handler(ctx, value)
+            }
+            SubcommandKind::Custom { handler, .. } => handler(ctx, rest, out),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Console
 // ---------------------------------------------------------------------------
 
@@ -341,10 +704,14 @@ struct TabState {
 enum CompletionContext {
     /// Completing the command name (no whitespace yet, or whitespace-leading input).
     Command { prefix: String },
-    /// Completing positional argument `arg_index` of `cmd_name`.
+    /// Completing positional argument `arg_index` of `cmd_name`. `prior` carries the
+    /// fully-typed arg tokens BEFORE the cursor (`prior.len() == arg_index`); commands
+    /// that branch their value-slot completion on prior choices (subcommand dispatch)
+    /// read it via [`Command::arg_choices_ctx`].
     Arg {
         cmd_name: String,
         arg_index: usize,
+        prior: Vec<String>,
         prefix: String,
     },
 }
@@ -643,22 +1010,20 @@ impl<Ctx: 'static> Console<Ctx> {
 
     fn all_command_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.commands.keys().cloned().collect();
-        names.push("help".into());
-        names.push("clear".into());
-        names.push("detach".into());
-        names.push("dock".into());
+        names.extend(Builtin::ALL.iter().map(|b| b.name().to_string()));
         names.sort();
         names
     }
 
     /// Inspect [`Console::input`] to decide what the user is currently completing: the
     /// command name, or the n-th positional argument of a known command. Returns `None`
-    /// for empty input.
+    /// for empty input. Uses the quote-aware [`tokenize`] so `tests "5 cell" o<Tab>`
+    /// completes on arg 1 with prefix `o`, not on a garbage `cell"` token.
     fn completion_context(&self) -> Option<CompletionContext> {
         if self.input.is_empty() {
             return None;
         }
-        let parsed: Vec<&str> = self.input.split_whitespace().collect();
+        let parsed = tokenize(&self.input);
         if parsed.is_empty() {
             return None;
         }
@@ -667,27 +1032,28 @@ impl<Ctx: 'static> Console<Ctx> {
         // No whitespace yet: still typing the command name.
         if parsed.len() == 1 && !trailing_ws {
             return Some(CompletionContext::Command {
-                prefix: parsed[0].to_string(),
+                prefix: parsed.into_iter().next().unwrap(),
             });
         }
 
         // After whitespace: we're on an argument. `arg_index` is 0-based positional.
         // The `else` arm is reached only when `parsed.len() >= 2` (the `len() == 1 &&
-        // !trailing_ws` case returned above), so `parsed.last()` is always `Some`;
-        // `unwrap_or_default` returns the empty-string fallback only in the impossible
-        // path, keeping library code free of `unwrap()`.
-        let cmd_name = parsed[0].to_string();
-        let (arg_index, prefix) = if trailing_ws {
-            (parsed.len() - 1, String::new())
+        // !trailing_ws` case returned above), so the partial-token pop is safe. `prior`
+        // captures the fully-typed arg tokens before the cursor so subcommand-dispatching
+        // commands can gate their value-slot completion on what came earlier.
+        let mut parts = parsed;
+        let cmd_name = parts.remove(0);
+        let (arg_index, prefix, prior) = if trailing_ws {
+            let idx = parts.len();
+            (idx, String::new(), parts)
         } else {
-            (
-                parsed.len() - 2,
-                parsed.last().copied().unwrap_or_default().to_string(),
-            )
+            let partial = parts.pop().unwrap_or_default();
+            (parts.len(), partial, parts)
         };
         Some(CompletionContext::Arg {
             cmd_name,
             arg_index,
+            prior,
             prefix,
         })
     }
@@ -702,21 +1068,24 @@ impl<Ctx: 'static> Console<Ctx> {
             CompletionContext::Arg {
                 cmd_name,
                 arg_index,
+                prior,
                 prefix,
             } => {
                 let Some(cmd) = self.commands.get(cmd_name) else {
                     return Vec::new();
                 };
+                let prior_refs: Vec<&str> = prior.iter().map(String::as_str).collect();
 
                 // Mid-`key=` value completion: if the partial token already
                 // contains an `=`, we're past the key and completing its value.
                 // Look up the enumerable values declared via `with_value_choices`
+                // (or the context-aware variant for subcommand-dispatching commands)
                 // and return them prefixed with `key=`.
                 if let Some(eq) = prefix.find('=') {
                     let key = &prefix[..eq];
                     let value_prefix = &prefix[eq + 1..];
                     let mut matches: Vec<String> = cmd
-                        .arg_value_choices(*arg_index, key)
+                        .arg_value_choices_ctx(*arg_index, key, &prior_refs)
                         .iter()
                         .filter(|v| v.starts_with(value_prefix))
                         .map(|v| format!("{key}={v}"))
@@ -747,8 +1116,10 @@ impl<Ctx: 'static> Console<Ctx> {
                 // Sort matches alphabetically so command authors can declare choices
                 // in any order (workflow, frequency, narrative) without affecting Tab
                 // cycling order. Matches the command-name path, which is also sorted.
+                // Uses the context-aware variant so subcommand-dispatching commands
+                // can gate value-slot choices on the prior subcommand pick.
                 let mut matches: Vec<String> = cmd
-                    .arg_choices(*arg_index)
+                    .arg_choices_ctx(*arg_index, &prior_refs)
                     .iter()
                     .filter(|choice| choice.starts_with(prefix.as_str()))
                     .filter(|choice| {
@@ -813,23 +1184,11 @@ impl<Ctx: 'static> Console<Ctx> {
             return;
         };
 
-        // Built-ins first.
-        if name == "help" {
-            self.builtin_help(args.first().map(String::as_str));
-            return;
-        }
-        if name == "clear" {
-            self.history.clear();
-            return;
-        }
-        if name == "detach" {
-            self.detached = true;
-            self.push_history(HistoryLine::system("console detached"));
-            return;
-        }
-        if name == "dock" {
-            self.detached = false;
-            self.push_history(HistoryLine::system("console docked"));
+        // Built-ins first. Framework-owned, dispatched off the `Builtin` enum so the
+        // name + help info isn't duplicated across `execute`, `builtin_help`, and
+        // `all_command_names` (single source of truth for the four primitives).
+        if let Some(builtin) = Builtin::from_name(&name) {
+            self.run_builtin(builtin, args.first().map(String::as_str));
             return;
         }
 
@@ -854,33 +1213,34 @@ impl<Ctx: 'static> Console<Ctx> {
         }
     }
 
+    /// Dispatch one of the framework built-ins. `target` is the optional first-arg
+    /// token (only used by `help` to look up a specific command).
+    fn run_builtin(&mut self, builtin: Builtin, target: Option<&str>) {
+        match builtin {
+            Builtin::Help => self.builtin_help(target),
+            Builtin::Clear => self.history.clear(),
+            Builtin::Detach => {
+                self.detached = true;
+                self.push_history(HistoryLine::system("console detached"));
+            }
+            Builtin::Dock => {
+                self.detached = false;
+                self.push_history(HistoryLine::system("console docked"));
+            }
+        }
+    }
+
     fn builtin_help(&mut self, target: Option<&str>) {
         match target {
-            Some("help") => {
-                self.push_history(HistoryLine::output(
-                    "help: list commands, or 'help <name>' for one",
-                ));
-            }
-            Some("clear") => {
-                self.push_history(HistoryLine::output("clear: clear the scrollback buffer"));
-            }
-            Some("detach") => {
-                self.push_history(HistoryLine::output(
-                    "detach: render console as a draggable window",
-                ));
-            }
-            Some("dock") => {
-                self.push_history(HistoryLine::output(
-                    "dock: render console as a half-screen drop-down (default)",
-                ));
-            }
-            Some(name) => match self.commands.get(name) {
-                Some(c) => {
-                    let line = format!("{}: {}", c.name(), c.help());
-                    self.push_history(HistoryLine::output(line));
+            Some(name) => {
+                if let Some(b) = Builtin::from_name(name) {
+                    self.push_history(HistoryLine::output(format!("{}: {}", b.name(), b.help())));
+                } else if let Some(c) = self.commands.get(name) {
+                    self.push_history(HistoryLine::output(format!("{}: {}", c.name(), c.help())));
+                } else {
+                    self.push_history(HistoryLine::error(format!("no command '{name}'")));
                 }
-                None => self.push_history(HistoryLine::error(format!("no command '{name}'"))),
-            },
+            }
             None => {
                 self.push_history(HistoryLine::output("commands:"));
                 let mut entries: Vec<(String, String)> = self
@@ -888,15 +1248,72 @@ impl<Ctx: 'static> Console<Ctx> {
                     .values()
                     .map(|c| (c.name().to_string(), c.help().to_string()))
                     .collect();
-                entries.push(("help".into(), "list commands or describe one".into()));
-                entries.push(("clear".into(), "clear the scrollback buffer".into()));
-                entries.push(("detach".into(), "render as a draggable window".into()));
-                entries.push(("dock".into(), "render as a half-screen drop-down".into()));
+                for b in Builtin::ALL {
+                    entries.push((b.name().to_string(), b.help().to_string()));
+                }
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 for (name, help) in entries {
                     self.push_history(HistoryLine::output(format!("  {name:16} {help}")));
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in commands
+// ---------------------------------------------------------------------------
+
+/// Framework-owned commands that mutate [`Console`] internal state directly: history,
+/// detached flag, etc. They can't go through [`Command<Ctx>`] cleanly because that
+/// trait only sees `&mut Ctx` (the user's context), not `&mut Console<Ctx>`. Storing
+/// their name + help in one enum centralizes what was previously duplicated across
+/// [`Console::execute`], [`Console::builtin_help`], and [`Console::all_command_names`].
+///
+/// User crates cannot add new built-ins; framework primitives only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Builtin {
+    Help,
+    Clear,
+    Detach,
+    Dock,
+}
+
+impl Builtin {
+    /// Iteration order is alphabetical, matching the rest of the console's sort
+    /// conventions (Tab cycling, help listing). Keep this slice sorted by `name()`.
+    const ALL: &'static [Builtin] = &[
+        Builtin::Clear,
+        Builtin::Detach,
+        Builtin::Dock,
+        Builtin::Help,
+    ];
+
+    fn from_name(name: &str) -> Option<Builtin> {
+        match name {
+            "help" => Some(Builtin::Help),
+            "clear" => Some(Builtin::Clear),
+            "detach" => Some(Builtin::Detach),
+            "dock" => Some(Builtin::Dock),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Builtin::Help => "help",
+            Builtin::Clear => "clear",
+            Builtin::Detach => "detach",
+            Builtin::Dock => "dock",
+        }
+    }
+
+    fn help(self) -> &'static str {
+        match self {
+            Builtin::Help => "list commands or describe one",
+            Builtin::Clear => "clear the scrollback buffer",
+            Builtin::Detach => "render as a draggable window",
+            Builtin::Dock => "render as a half-screen drop-down (default)",
         }
     }
 }
@@ -921,14 +1338,78 @@ fn key_text(key: egui::Key) -> Option<&'static str> {
     }
 }
 
-/// Whitespace-split parser. Returns `(command_name, args)` or `None` for an
-/// empty/whitespace-only line. No quoting in v0; commands that need spaces in args
-/// should split on something else or wait for the quoted-arg upgrade.
+/// Quote-aware tokenizer. Returns `(command_name, args)` or `None` for an
+/// empty/whitespace-only line. Tokens are whitespace-separated; double-quoted
+/// (`"..."`) and single-quoted (`'...'`) strings preserve internal whitespace.
+/// Inside double quotes, `\"` and `\\` are escapes; inside single quotes, the
+/// content is literal (no escapes, matching shell convention).
+///
+/// Unterminated quotes are tolerated for interactive ergonomics: trailing content
+/// after an opening quote with no matching close becomes one token through end of
+/// line. This lets mid-typing tab completion work without erroring on the partial
+/// quote state.
 fn parse_line(line: &str) -> Option<(String, Vec<String>)> {
-    let mut parts = line.split_whitespace();
-    let name = parts.next()?.to_string();
-    let args = parts.map(String::from).collect();
-    Some((name, args))
+    let mut tokens = tokenize(line);
+    if tokens.is_empty() {
+        return None;
+    }
+    let name = tokens.remove(0);
+    Some((name, tokens))
+}
+
+/// Quote-aware token splitter. See [`parse_line`] for the grammar.
+fn tokenize(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_token = true;
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next == '"' {
+                        break;
+                    }
+                    if next == '\\' {
+                        if let Some(&escaped) = chars.peek() {
+                            if matches!(escaped, '"' | '\\') {
+                                cur.push(escaped);
+                                chars.next();
+                                continue;
+                            }
+                        }
+                    }
+                    cur.push(next);
+                }
+            }
+            '\'' => {
+                in_token = true;
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next == '\'' {
+                        break;
+                    }
+                    cur.push(next);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_token {
+                    out.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            c => {
+                in_token = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_token {
+        out.push(cur);
+    }
+    out
 }
 
 /// Splice `choice` into `input` at the position the user is completing, preserving
@@ -939,19 +1420,15 @@ fn apply_completion(input: &str, ctx: &CompletionContext, choice: &str) -> Strin
     match ctx {
         CompletionContext::Command { .. } => choice.to_string(),
         CompletionContext::Arg { .. } => {
-            let parsed: Vec<&str> = input.split_whitespace().collect();
-            let trailing_ws = input.ends_with(char::is_whitespace);
-            let kept = if trailing_ws {
-                &parsed[..]
-            } else {
-                &parsed[..parsed.len() - 1]
-            };
-            let mut result = kept.join(" ");
-            if !result.is_empty() {
-                result.push(' ');
+            // Preserve the input string verbatim up to the start of the partial token
+            // under the cursor, then append the completion choice. Verbatim
+            // preservation is important for quoted args -- a re-tokenize-and-rejoin
+            // would mangle `tests "5 cell"` into `tests 5 cell` on the rejoin step.
+            if input.ends_with(char::is_whitespace) {
+                return format!("{input}{choice}");
             }
-            result.push_str(choice);
-            result
+            let prefix_end = input.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+            format!("{}{choice}", &input[..prefix_end])
         }
     }
 }
@@ -1380,5 +1857,369 @@ mod tests {
         let last = c.history.back().unwrap();
         assert_eq!(last.kind, LineKind::Error);
         assert!(last.text.contains("nope"));
+    }
+
+    // ----------------- SubcommandSet -----------------
+
+    /// Holds a single `Ctx: u32` slot plus a `last_choice` string so tests can verify
+    /// which branch ran.
+    type SubCtx = (u32, String);
+
+    fn sample_subset() -> SubcommandSet<SubCtx> {
+        subcommands::<SubCtx>("tests", "umbrella")
+            .toggle("axes", "toggle axes", |c, v| {
+                c.0 = if v { 1 } else { 0 };
+                c.1 = format!("axes={v}");
+                Ok(())
+            })
+            .toggle("cube", "toggle cube", |c, v| {
+                c.0 = if v { 2 } else { 0 };
+                c.1 = format!("cube={v}");
+                Ok(())
+            })
+            .choice(
+                "polytope",
+                "set polytope",
+                &["5cell", "tesseract", "off"],
+                |c, name| {
+                    c.1 = format!("polytope={name}");
+                    Ok(())
+                },
+            )
+    }
+
+    #[test]
+    fn subcommand_dispatch_runs_correct_handler() {
+        let mut con = Console::<SubCtx>::new();
+        con.register(sample_subset());
+        let mut ctx: SubCtx = (0, String::new());
+
+        con.execute("tests axes on", &mut ctx);
+        assert_eq!(ctx, (1, "axes=true".into()));
+
+        con.execute("tests cube off", &mut ctx);
+        assert_eq!(ctx, (0, "cube=false".into()));
+
+        con.execute("tests polytope tesseract", &mut ctx);
+        assert_eq!(ctx.1, "polytope=tesseract");
+    }
+
+    #[test]
+    fn subcommand_toggle_accepts_aliases() {
+        let mut con = Console::<SubCtx>::new();
+        con.register(sample_subset());
+        let mut ctx: SubCtx = (0, String::new());
+        for alias in &["on", "true", "1"] {
+            con.execute(&format!("tests axes {alias}"), &mut ctx);
+            assert_eq!(ctx.1, "axes=true", "alias `{alias}`");
+        }
+        for alias in &["off", "false", "0"] {
+            con.execute(&format!("tests axes {alias}"), &mut ctx);
+            assert_eq!(ctx.1, "axes=false", "alias `{alias}`");
+        }
+    }
+
+    #[test]
+    fn subcommand_unknown_subcommand_errors() {
+        let mut con = Console::<SubCtx>::new();
+        con.register(sample_subset());
+        let mut ctx: SubCtx = (0, String::new());
+        con.execute("tests xyzzy on", &mut ctx);
+        let last = con.history.back().unwrap();
+        assert_eq!(last.kind, LineKind::Error);
+        assert!(
+            last.text.contains("unknown subcommand"),
+            "got: {}",
+            last.text
+        );
+    }
+
+    #[test]
+    fn subcommand_missing_value_errors() {
+        let mut con = Console::<SubCtx>::new();
+        con.register(sample_subset());
+        let mut ctx: SubCtx = (0, String::new());
+        con.execute("tests axes", &mut ctx);
+        let last = con.history.back().unwrap();
+        assert_eq!(last.kind, LineKind::Error);
+        assert!(last.text.contains("usage"), "got: {}", last.text);
+    }
+
+    /// Tab completion at the value slot narrows to ONLY the chosen subcommand's choices.
+    /// This is the load-bearing context-aware-completion test: previously the second-arg
+    /// completion list would have to be the union (`on, off, 5cell, ...`).
+    #[test]
+    fn subcommand_value_completion_is_context_aware() {
+        let mut con = Console::<SubCtx>::new();
+        con.register(sample_subset());
+
+        // `tests axes ` -> only on/off in the cycle.
+        con.input = "tests axes ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert_eq!(m, vec!["off".to_string(), "on".to_string()]);
+
+        // `tests polytope ` -> only polytope names in the cycle, no on/off.
+        con.input = "tests polytope ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert_eq!(
+            m,
+            vec![
+                "5cell".to_string(),
+                "off".to_string(),
+                "tesseract".to_string()
+            ]
+        );
+        assert!(!m.contains(&"on".into()));
+    }
+
+    /// Tab completion at the subcommand slot lists every registered subcommand,
+    /// sorted alphabetically (matches the rest of the console's completion convention).
+    #[test]
+    fn subcommand_first_slot_completion_lists_subcommands() {
+        let mut con = Console::<SubCtx>::new();
+        con.register(sample_subset());
+        con.input = "tests ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert_eq!(
+            m,
+            vec![
+                "axes".to_string(),
+                "cube".to_string(),
+                "polytope".to_string()
+            ]
+        );
+    }
+
+    // ----------------- SubcommandSet::Custom -----------------
+
+    type CustomCtx = Vec<String>;
+
+    fn custom_subset() -> SubcommandSet<CustomCtx> {
+        subcommands::<CustomCtx>("capture", "umbrella")
+            // No-arg subcommand.
+            .custom("stop", "stop running capture", &[], &[], |c, rest, _out| {
+                c.push(format!("stop;rest={}", rest.join(",")));
+                Ok(())
+            })
+            // Single-slot positional subcommand.
+            .custom(
+                "png",
+                "one-shot png",
+                &[&["pre", "post", "both"]],
+                &[],
+                |c, rest, _out| {
+                    c.push(format!("png;rest={}", rest.join(",")));
+                    Ok(())
+                },
+            )
+            // Multi-slot with kv pairs + enumerable value for one of them.
+            .custom(
+                "gif",
+                "gif sequence",
+                &[
+                    &["pre", "post", "both"],
+                    &["fps=", "palette=", "scale="],
+                    &["fps=", "palette=", "scale="],
+                ],
+                &[("palette", &["local", "global"])],
+                |c, rest, _out| {
+                    c.push(format!("gif;rest={}", rest.join(",")));
+                    Ok(())
+                },
+            )
+    }
+
+    #[test]
+    fn custom_subcommand_dispatch_receives_full_rest() {
+        let mut con = Console::<CustomCtx>::new();
+        con.register(custom_subset());
+        let mut ctx: CustomCtx = Vec::new();
+
+        con.execute("capture png post", &mut ctx);
+        con.execute("capture gif both fps=30 palette=global", &mut ctx);
+        con.execute("capture stop", &mut ctx);
+
+        assert_eq!(
+            ctx,
+            vec![
+                "png;rest=post".to_string(),
+                "gif;rest=both,fps=30,palette=global".to_string(),
+                "stop;rest=".to_string(),
+            ]
+        );
+    }
+
+    /// Multi-slot tab completion: each positional slot AFTER the subcommand name
+    /// returns the slot-specific arg_choices. Slot 0 of `gif` is the stage; slot 1
+    /// is the first kv key.
+    #[test]
+    fn custom_multi_slot_completion_per_slot() {
+        let mut con = Console::<CustomCtx>::new();
+        con.register(custom_subset());
+
+        // `capture gif ` -> slot 0 of `gif`: stages.
+        con.input = "capture gif ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert_eq!(
+            m,
+            vec!["both".to_string(), "post".to_string(), "pre".to_string()]
+        );
+
+        // `capture gif post ` -> slot 1 of `gif`: kv prefixes.
+        con.input = "capture gif post ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert!(m.contains(&"fps=".into()));
+        assert!(m.contains(&"palette=".into()));
+        assert!(m.contains(&"scale=".into()));
+
+        // `capture png ` -> slot 0 of `png`: stages, NOT kv prefixes (those belong
+        // to gif).
+        con.input = "capture png ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert!(m.contains(&"post".into()));
+        assert!(!m.contains(&"fps=".into()), "got: {m:?}");
+
+        // `capture stop ` -> no choices (zero-slot subcommand).
+        con.input = "capture stop ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert!(m.is_empty(), "got: {m:?}");
+    }
+
+    /// Two-step kv-value completion: after the user types `palette=`, ghost/Tab
+    /// should cycle the declared values. This is the context-aware kv path -- the
+    /// same `palette=` prefix in a hypothetical non-gif subcommand wouldn't produce
+    /// these (gif is the only subcommand that declares `palette` value-choices).
+    #[test]
+    fn custom_subcommand_kv_value_completion_is_context_aware() {
+        let mut con = Console::<CustomCtx>::new();
+        con.register(custom_subset());
+
+        con.input = "capture gif post palette=".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert_eq!(
+            m,
+            vec!["palette=global".to_string(), "palette=local".to_string()]
+        );
+    }
+
+    // ----------------- Quoted-string tokenizer -----------------
+
+    #[test]
+    fn tokenize_handles_bare_words() {
+        assert_eq!(tokenize("foo bar baz"), vec!["foo", "bar", "baz"]);
+        assert_eq!(tokenize("   foo    bar  "), vec!["foo", "bar"]);
+        assert_eq!(tokenize(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tokenize_preserves_spaces_in_double_quotes() {
+        assert_eq!(
+            tokenize(r#"foo "bar baz" qux"#),
+            vec!["foo", "bar baz", "qux"]
+        );
+    }
+
+    #[test]
+    fn tokenize_preserves_spaces_in_single_quotes() {
+        assert_eq!(tokenize("foo 'bar baz' qux"), vec!["foo", "bar baz", "qux"]);
+    }
+
+    #[test]
+    fn tokenize_handles_double_quote_escapes() {
+        // `\"` -> literal `"`; `\\` -> literal `\`; other `\x` keeps the backslash.
+        assert_eq!(
+            tokenize(r#"a "he said \"hi\"" b"#),
+            vec!["a", r#"he said "hi""#, "b"]
+        );
+        assert_eq!(tokenize(r#""back\\slash""#), vec![r"back\slash"]);
+    }
+
+    #[test]
+    fn tokenize_single_quotes_are_literal() {
+        // Backslashes inside single quotes are literal (matches shell convention).
+        assert_eq!(tokenize(r"'a \n b'"), vec![r"a \n b"]);
+    }
+
+    #[test]
+    fn tokenize_unterminated_quote_consumes_to_end() {
+        // For interactive ergonomics: don't error on unterminated quotes; treat
+        // trailing content as one token.
+        assert_eq!(
+            tokenize(r#"foo "unterminated"#),
+            vec!["foo", "unterminated"]
+        );
+    }
+
+    #[test]
+    fn parse_line_routes_quoted_args_to_handler() {
+        type Ctx = Vec<String>;
+        let mut con = Console::<Ctx>::new();
+        con.register(cmd("echoargs", "record args", |args, c: &mut Ctx, _out| {
+            for a in args {
+                c.push((*a).to_string());
+            }
+            Ok(())
+        }));
+        let mut ctx: Ctx = Vec::new();
+        con.execute(r#"echoargs "5 cell" off"#, &mut ctx);
+        assert_eq!(ctx, vec!["5 cell".to_string(), "off".to_string()]);
+    }
+
+    // ----------------- Unified built-ins -----------------
+
+    #[test]
+    fn builtin_from_name_round_trips() {
+        for b in Builtin::ALL {
+            assert_eq!(Builtin::from_name(b.name()), Some(*b));
+        }
+        assert_eq!(Builtin::from_name("nope"), None);
+    }
+
+    #[test]
+    fn help_lists_user_commands_and_builtins_sorted() {
+        type Ctx = u32;
+        let mut con = Console::<Ctx>::new();
+        con.register(cmd("zebra", "fast horse", |_, _, _| Ok(())));
+        con.register(cmd("alpha", "first letter", |_, _, _| Ok(())));
+        let mut ctx: Ctx = 0;
+        con.execute("help", &mut ctx);
+        let texts: Vec<&str> = con.history.iter().map(|h| h.text.as_str()).collect();
+        let i_alpha = texts.iter().position(|t| t.contains("alpha")).unwrap();
+        let i_clear = texts.iter().position(|t| t.contains("clear")).unwrap();
+        let i_zebra = texts.iter().position(|t| t.contains("zebra")).unwrap();
+        // Alphabetical: alpha < clear < zebra.
+        assert!(i_alpha < i_clear);
+        assert!(i_clear < i_zebra);
+    }
+
+    #[test]
+    fn clear_builtin_empties_history() {
+        type Ctx = u32;
+        let mut con = Console::<Ctx>::new();
+        let mut ctx: Ctx = 0;
+        con.push_history(HistoryLine::output("first"));
+        con.push_history(HistoryLine::output("second"));
+        con.execute("clear", &mut ctx);
+        assert!(con.history.is_empty());
+    }
+
+    #[test]
+    fn detach_dock_builtins_flip_flag() {
+        type Ctx = u32;
+        let mut con = Console::<Ctx>::new();
+        let mut ctx: Ctx = 0;
+        assert!(!con.detached);
+        con.execute("detach", &mut ctx);
+        assert!(con.detached);
+        con.execute("dock", &mut ctx);
+        assert!(!con.detached);
     }
 }
