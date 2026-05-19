@@ -96,7 +96,7 @@ use wgpu::{
     TextureAspect, TextureFormat,
 };
 
-use rye_egui::{cmd, Console, ConsoleWriter};
+use rye_egui::Console;
 
 /// Where in the frame pipeline the capture is taken from.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1450,39 +1450,18 @@ fn write_png_bytes(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<
 /// aspect preserved); GIF-only. Args are key-value, not in arg_choices, so tab
 /// completion doesn't surface them (free-form values aren't enumerable).
 pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
-    console.register(
-        cmd("capture", capture_help(), |args, _ctx: &mut Ctx, out| {
-            run_capture(args, out)
-        })
-        // Positional arg-choice grammar drives tab-completion + ghost preview.
-        // All kv keys appear at the arg level (`fps=`, `palette=`, `scale=`); the
-        // *values* for `palette=` are declared separately via
-        // `with_value_choices` so the console can do two-step completion: first
-        // Tab lands on `palette=`, then ghost/Tab cycles `global`/`local`.
-        // `fps=` and `scale=` have no value choices (free-form numeric input)
-        // so completion stops at the bare key.
-        .with_args(&[
-            &["png", "frames", "gif", "apng", "toggle", "stop", "panel"],
-            &["both", "fps=", "palette=", "post", "pre", "scale="],
-            &["fps=", "palette=", "scale="],
-            &["fps=", "palette=", "scale="],
-        ])
-        .with_value_choices("palette", &["local", "global"]),
-    );
-}
+    // Each subcommand is its own typed registration. Per-subcommand `arg_choices`
+    // drive context-aware tab completion (the `gif` palette/fps/scale prefixes only
+    // surface after the user types `capture gif `), and `palette=` is the only kv
+    // key with enumerable values. The framework handles dispatch + subcommand-name
+    // completion; the handlers only own arg parsing + enqueue logic.
+    let stage_choices: &[&'static str] = &["pre", "post", "both"];
+    let png_kv: &[&'static str] = &["fps=", "scale="];
+    let gif_kv: &[&'static str] = &["fps=", "palette=", "scale="];
+    let palette_values: &[&'static str] = &["local", "global"];
 
-fn capture_help() -> &'static str {
-    "capture <png|frames|gif|apng|toggle|stop|panel> [pre|post|both] [dir] [fps=N] \
-     [scale=W] [palette=local|global]"
-}
-
-fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
-    let Some((sub, rest)) = args.split_first() else {
-        out.error(format!("usage: {}", capture_help()));
-        return Ok(());
-    };
-    match *sub {
-        "png" => {
+    let cap = rye_egui::subcommands::<Ctx>("capture", capture_help())
+        .custom("png", "one-shot PNG capture", &[stage_choices], &[], |_, rest, out| {
             let p = parse_capture_args(rest);
             enqueue(CaptureRequest::OneShot {
                 stage: p.stage,
@@ -1490,115 +1469,144 @@ fn run_capture(args: &[&str], out: &mut ConsoleWriter) -> Result<()> {
                 name: None,
             });
             out.line(format!("queued one-shot ({:?})", p.stage));
-        }
-        "frames" => {
-            let p = parse_capture_args(rest);
-            enqueue(CaptureRequest::StartSequence {
-                format: CaptureFormat::Png,
-                stage: p.stage,
-                dir: p.dir,
-                name: None,
-                fps: p.fps,
-                scale: None,
-                palette: PaletteMode::default(),
-            });
-            out.line(format!("started PNG sequence ({:?})", p.stage));
-        }
-        "gif" => {
-            let p = parse_capture_args(rest);
-            // Always surface the GIF quality caveat. Raymarched continuous-tone
-            // content fights the 256-color palette and produces visible flicker.
-            out.error(
-                "GIF: per-frame NeuQuant flickers on raymarched content. Prefer \
-                 `capture apng` for shareable clips, or `capture frames` + ffmpeg \
-                 palettegen for high-quality post-processed GIFs.",
-            );
-            tracing::warn!(
-                "capture: GIF quality is limited for raymarched content (per-frame \
-                 palette regeneration causes flicker); prefer apng or PNG sequence"
-            );
-            // `palette=global` is the more experimental path (warmup buffer, shared
-            // NeuQuant, training-data bias if anything is visible during warmup).
-            // Stack a second warning so the extra caveats are surfaced.
-            if p.palette == PaletteMode::Global {
+            Ok(())
+        })
+        .custom(
+            "frames",
+            "PNG frame sequence (per-frame .png files)",
+            &[stage_choices, png_kv, png_kv],
+            &[],
+            |_, rest, out| {
+                let p = parse_capture_args(rest);
+                enqueue(CaptureRequest::StartSequence {
+                    format: CaptureFormat::Png,
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                    fps: p.fps,
+                    scale: None,
+                    palette: PaletteMode::default(),
+                });
+                out.line(format!("started PNG sequence ({:?})", p.stage));
+                Ok(())
+            },
+        )
+        .custom(
+            "gif",
+            "GIF sequence (limited quality on raymarched content)",
+            &[stage_choices, gif_kv, gif_kv, gif_kv],
+            &[("palette", palette_values)],
+            |_, rest, out| {
+                let p = parse_capture_args(rest);
+                // Surface the GIF quality caveat. Raymarched continuous-tone content
+                // fights the 256-color palette and produces visible flicker.
                 out.error(
-                    "GIF palette=global: palette is trained from the first ~1s of \
-                     captures; anything on screen during that window (the console, \
-                     transient overlays) biases the palette toward those colors and \
-                     the rest of the recording looks desaturated. Capture pre-egui \
-                     (`capture gif pre palette=global`) to avoid.",
+                    "GIF: per-frame NeuQuant flickers on raymarched content. Prefer \
+                     `capture apng` for shareable clips, or `capture frames` + ffmpeg \
+                     palettegen for high-quality post-processed GIFs.",
                 );
                 tracing::warn!(
-                    "capture: GIF palette=global trains on the warmup buffer; ensure \
-                     no transient UI is visible during the first ~1s of capture"
+                    "capture: GIF quality is limited for raymarched content (per-frame \
+                     palette regeneration causes flicker); prefer apng or PNG sequence"
                 );
-            }
-            enqueue(CaptureRequest::StartSequence {
-                format: CaptureFormat::Gif,
-                stage: p.stage,
-                dir: p.dir,
-                name: None,
-                fps: p.fps,
-                scale: p.scale,
-                palette: p.palette,
-            });
-            out.line(format!(
-                "started GIF stream ({:?}, fps={}, scale={}, palette={:?})",
-                p.stage,
-                p.fps.map_or("default".into(), |f| f.to_string()),
-                p.scale.map_or("native".into(), |s| s.to_string()),
-                p.palette,
-            ));
-        }
-        "apng" => {
-            let p = parse_capture_args(rest);
-            enqueue(CaptureRequest::StartSequence {
-                format: CaptureFormat::Apng,
-                stage: p.stage,
-                dir: p.dir,
-                name: None,
-                fps: p.fps,
-                scale: p.scale,
-                palette: PaletteMode::default(),
-            });
-            out.line(format!(
-                "started APNG stream ({:?}, fps={}, scale={})",
-                p.stage,
-                p.fps.map_or("default".into(), |f| f.to_string()),
-                p.scale.map_or("native".into(), |s| s.to_string()),
-            ));
-        }
-        "stop" => {
+                if p.palette == PaletteMode::Global {
+                    out.error(
+                        "GIF palette=global: palette is trained from the first ~1s of \
+                         captures; anything on screen during that window (the console, \
+                         transient overlays) biases the palette toward those colors and \
+                         the rest of the recording looks desaturated. Capture pre-egui \
+                         (`capture gif pre palette=global`) to avoid.",
+                    );
+                    tracing::warn!(
+                        "capture: GIF palette=global trains on the warmup buffer; ensure \
+                         no transient UI is visible during the first ~1s of capture"
+                    );
+                }
+                enqueue(CaptureRequest::StartSequence {
+                    format: CaptureFormat::Gif,
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                    fps: p.fps,
+                    scale: p.scale,
+                    palette: p.palette,
+                });
+                out.line(format!(
+                    "started GIF stream ({:?}, fps={}, scale={}, palette={:?})",
+                    p.stage,
+                    p.fps.map_or("default".into(), |f| f.to_string()),
+                    p.scale.map_or("native".into(), |s| s.to_string()),
+                    p.palette,
+                ));
+                Ok(())
+            },
+        )
+        .custom(
+            "apng",
+            "APNG sequence (true-color, larger than GIF)",
+            &[stage_choices, png_kv, png_kv],
+            &[],
+            |_, rest, out| {
+                let p = parse_capture_args(rest);
+                enqueue(CaptureRequest::StartSequence {
+                    format: CaptureFormat::Apng,
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                    fps: p.fps,
+                    scale: p.scale,
+                    palette: PaletteMode::default(),
+                });
+                out.line(format!(
+                    "started APNG stream ({:?}, fps={}, scale={})",
+                    p.stage,
+                    p.fps.map_or("default".into(), |f| f.to_string()),
+                    p.scale.map_or("native".into(), |s| s.to_string()),
+                ));
+                Ok(())
+            },
+        )
+        .custom(
+            "toggle",
+            "start/stop a sequence in one command (format + args)",
+            &[&["png", "frames", "gif", "apng"], stage_choices, gif_kv, gif_kv],
+            &[("palette", palette_values)],
+            |_, rest, out| {
+                let (format, after_format) = parse_format(rest);
+                let p = parse_capture_args(after_format);
+                enqueue(CaptureRequest::Toggle {
+                    format,
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                    fps: p.fps,
+                    scale: p.scale,
+                    palette: p.palette,
+                });
+                out.line(format!("toggle queued ({format:?}, {:?})", p.stage));
+                Ok(())
+            },
+        )
+        .custom("stop", "stop the active sequence", &[], &[], |_, _rest, out| {
             enqueue(CaptureRequest::Stop);
             out.line("stop queued");
-        }
-        "panel" => {
+            Ok(())
+        })
+        .custom("panel", "toggle the capture parameters panel", &[], &[], |_, _rest, out| {
             let now_open = toggle_panel_global();
             out.line(if now_open {
                 "panel opened"
             } else {
                 "panel closed"
             });
-        }
-        "toggle" => {
-            let (format, after_format) = parse_format(rest);
-            let p = parse_capture_args(after_format);
-            enqueue(CaptureRequest::Toggle {
-                format,
-                stage: p.stage,
-                dir: p.dir,
-                name: None,
-                fps: p.fps,
-                scale: p.scale,
-                palette: p.palette,
-            });
-            out.line(format!("toggle queued ({format:?}, {:?})", p.stage));
-        }
-        other => {
-            out.error(format!("unknown sub-command `{other}`. {}", capture_help()));
-        }
-    }
-    Ok(())
+            Ok(())
+        });
+    console.register(cap);
+}
+
+fn capture_help() -> &'static str {
+    "capture <png|frames|gif|apng|toggle|stop|panel> [pre|post|both] [dir] [fps=N] \
+     [scale=W] [palette=local|global]"
 }
 
 struct ParsedCaptureArgs {

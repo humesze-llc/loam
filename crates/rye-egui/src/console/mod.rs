@@ -191,6 +191,20 @@ pub trait Command<Ctx>: 'static {
         &[]
     }
 
+    /// Context-aware variant of [`Command::arg_value_choices`]. Receives the arg
+    /// tokens parsed BEFORE the current completion position; subcommand-dispatching
+    /// commands route kv-value lookups to the active subcommand's value table
+    /// using this. Default delegates to [`Command::arg_value_choices`].
+    fn arg_value_choices_ctx<'a>(
+        &'a self,
+        arg_index: usize,
+        key: &str,
+        prior: &[&str],
+    ) -> &'a [&'static str] {
+        let _ = prior;
+        self.arg_value_choices(arg_index, key)
+    }
+
     /// Run the command. `args` are whitespace-split tokens after the command name.
     /// Output goes to `out`; recoverable issues get `out.error(..)`; unrecoverable
     /// ones return `Err`.
@@ -310,6 +324,14 @@ type ToggleHandler<Ctx> = Box<dyn FnMut(&mut Ctx, bool) -> anyhow::Result<()>>;
 /// to handle case-insensitivity / aliases if those are wanted).
 type ChoiceHandler<Ctx> = Box<dyn FnMut(&mut Ctx, &str) -> anyhow::Result<()>>;
 
+/// Boxed handler for a custom-grammar subcommand. Receives the user's context, the
+/// raw args slice AFTER the subcommand name (positional + key-value tokens, framework
+/// does not parse them), and the writer. Used for subcommands whose grammar doesn't
+/// fit the simpler `.toggle` / `.choice` shapes (e.g. `capture gif post fps=30
+/// scale=720 palette=global`).
+type CustomHandler<Ctx> =
+    Box<dyn FnMut(&mut Ctx, &[&str], &mut ConsoleWriter) -> anyhow::Result<()>>;
+
 /// One entry in a [`SubcommandSet`]. The dispatch kind decides how the framework
 /// parses the value slot and what's offered for tab completion.
 enum SubcommandKind<Ctx> {
@@ -322,6 +344,16 @@ enum SubcommandKind<Ctx> {
     Choice {
         choices: Vec<&'static str>,
         handler: ChoiceHandler<Ctx>,
+    },
+    /// Custom-grammar subcommand. Per-slot positional choices drive tab completion
+    /// (slot 0 is the first arg AFTER the subcommand name); per-key value enumerables
+    /// drive two-step kv completion. The framework dispatches by subcommand name and
+    /// then hands the raw args + writer to the handler; arg parsing is the
+    /// handler's responsibility.
+    Custom {
+        arg_choices: Vec<Vec<&'static str>>,
+        value_choices: HashMap<&'static str, Vec<&'static str>>,
+        handler: CustomHandler<Ctx>,
     },
 }
 
@@ -411,6 +443,60 @@ impl<Ctx: 'static> SubcommandSet<Ctx> {
         self
     }
 
+    /// Register a custom-grammar subcommand. Use when `.toggle` / `.choice` are too
+    /// rigid: subcommands with multiple positional args, key-value pairs, or both.
+    ///
+    /// - `arg_choices[i]` lists tab-completion choices for the i-th positional arg
+    ///   AFTER the subcommand name. Include `key=` entries for kv-pair prefixes.
+    /// - `value_choices[k]` lists enumerable values for the `key=value` arg whose
+    ///   bare key is `k` (the framework looks this up when the user types `k=` and
+    ///   hits Tab).
+    /// - `handler` receives the raw args after the subcommand name plus the writer;
+    ///   it owns the parsing of positionals and kv tokens.
+    ///
+    /// ```ignore
+    /// subcommands::<Ctx>("capture", "...")
+    ///     .custom(
+    ///         "gif",
+    ///         "gif sequence (with fps/scale/palette knobs)",
+    ///         &[
+    ///             &["pre", "post", "both"],
+    ///             &["fps=", "palette=", "scale="],
+    ///             &["fps=", "palette=", "scale="],
+    ///         ],
+    ///         &[("palette", &["local", "global"])],
+    ///         |ctx, args, out| { /* parse and act */ Ok(()) },
+    ///     )
+    /// ```
+    pub fn custom<F>(
+        mut self,
+        name: &'static str,
+        help: &'static str,
+        arg_choices: &[&[&'static str]],
+        value_choices: &[(&'static str, &[&'static str])],
+        handler: F,
+    ) -> Self
+    where
+        F: FnMut(&mut Ctx, &[&str], &mut ConsoleWriter) -> anyhow::Result<()> + 'static,
+    {
+        let mut vc = HashMap::new();
+        for (k, vs) in value_choices {
+            vc.insert(*k, vs.to_vec());
+        }
+        self.subs.insert(
+            name,
+            SubcommandEntry {
+                help,
+                kind: SubcommandKind::Custom {
+                    arg_choices: arg_choices.iter().map(|slot| slot.to_vec()).collect(),
+                    value_choices: vc,
+                    handler: Box::new(handler),
+                },
+            },
+        );
+        self
+    }
+
     fn cached_names(&self) -> &[&'static str] {
         self.name_cache
             .get_or_init(|| self.subs.keys().copied().collect())
@@ -451,12 +537,43 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
         if arg_index == 0 {
             return self.cached_names();
         }
-        if arg_index != 1 {
+        let Some(&sub_name) = prior.first() else {
             return &[];
+        };
+        let Some(entry) = self.subs.get(sub_name) else {
+            return &[];
+        };
+        // Within-subcommand slot index: arg_index 1 is the first arg AFTER the
+        // subcommand name, which is slot 0 of the subcommand's own grammar.
+        let sub_slot = arg_index - 1;
+        match &entry.kind {
+            SubcommandKind::Toggle { .. } => {
+                if sub_slot == 0 {
+                    ON_OFF_CHOICES
+                } else {
+                    &[]
+                }
+            }
+            SubcommandKind::Choice { choices, .. } => {
+                if sub_slot == 0 {
+                    choices.as_slice()
+                } else {
+                    &[]
+                }
+            }
+            SubcommandKind::Custom { arg_choices, .. } => arg_choices
+                .get(sub_slot)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
         }
-        // `&sub_name` pattern peels one reference off the `&&str` returned by
-        // `prior.first()`, leaving `sub_name: &str` whose lifetime is tied to `prior`
-        // (which is fine: we only use it to look up in `subs` and don't return it).
+    }
+
+    fn arg_value_choices_ctx<'a>(
+        &'a self,
+        _arg_index: usize,
+        key: &str,
+        prior: &[&str],
+    ) -> &'a [&'static str] {
         let Some(&sub_name) = prior.first() else {
             return &[];
         };
@@ -464,8 +581,11 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
             return &[];
         };
         match &entry.kind {
-            SubcommandKind::Toggle { .. } => ON_OFF_CHOICES,
-            SubcommandKind::Choice { choices, .. } => choices.as_slice(),
+            SubcommandKind::Custom { value_choices, .. } => value_choices
+                .get(key)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            _ => &[],
         }
     }
 
@@ -487,7 +607,6 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
                 names.join(", ")
             ));
         };
-        let _ = out;
         match &mut entry.kind {
             SubcommandKind::Toggle { handler } => {
                 let value = rest.first().ok_or_else(|| {
@@ -503,14 +622,17 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
                         ))
                     }
                 };
+                let _ = out;
                 handler(ctx, v)
             }
             SubcommandKind::Choice { handler, .. } => {
                 let value = rest.first().ok_or_else(|| {
                     anyhow::anyhow!("usage: {} {sub_name} <value>", self.name)
                 })?;
+                let _ = out;
                 handler(ctx, value)
             }
+            SubcommandKind::Custom { handler, .. } => handler(ctx, rest, out),
         }
     }
 }
@@ -971,12 +1093,13 @@ impl<Ctx: 'static> Console<Ctx> {
                 // Mid-`key=` value completion: if the partial token already
                 // contains an `=`, we're past the key and completing its value.
                 // Look up the enumerable values declared via `with_value_choices`
+                // (or the context-aware variant for subcommand-dispatching commands)
                 // and return them prefixed with `key=`.
                 if let Some(eq) = prefix.find('=') {
                     let key = &prefix[..eq];
                     let value_prefix = &prefix[eq + 1..];
                     let mut matches: Vec<String> = cmd
-                        .arg_value_choices(*arg_index, key)
+                        .arg_value_choices_ctx(*arg_index, key, &prior_refs)
                         .iter()
                         .filter(|v| v.starts_with(value_prefix))
                         .map(|v| format!("{key}={v}"))
@@ -1767,6 +1890,123 @@ mod tests {
         assert_eq!(
             m,
             vec!["axes".to_string(), "cube".to_string(), "polytope".to_string()]
+        );
+    }
+
+    // ----------------- SubcommandSet::Custom -----------------
+
+    type CustomCtx = Vec<String>;
+
+    fn custom_subset() -> SubcommandSet<CustomCtx> {
+        subcommands::<CustomCtx>("capture", "umbrella")
+            // No-arg subcommand.
+            .custom("stop", "stop running capture", &[], &[], |c, rest, _out| {
+                c.push(format!("stop;rest={}", rest.join(",")));
+                Ok(())
+            })
+            // Single-slot positional subcommand.
+            .custom(
+                "png",
+                "one-shot png",
+                &[&["pre", "post", "both"]],
+                &[],
+                |c, rest, _out| {
+                    c.push(format!("png;rest={}", rest.join(",")));
+                    Ok(())
+                },
+            )
+            // Multi-slot with kv pairs + enumerable value for one of them.
+            .custom(
+                "gif",
+                "gif sequence",
+                &[
+                    &["pre", "post", "both"],
+                    &["fps=", "palette=", "scale="],
+                    &["fps=", "palette=", "scale="],
+                ],
+                &[("palette", &["local", "global"])],
+                |c, rest, _out| {
+                    c.push(format!("gif;rest={}", rest.join(",")));
+                    Ok(())
+                },
+            )
+    }
+
+    #[test]
+    fn custom_subcommand_dispatch_receives_full_rest() {
+        let mut con = Console::<CustomCtx>::new();
+        con.register(custom_subset());
+        let mut ctx: CustomCtx = Vec::new();
+
+        con.execute("capture png post", &mut ctx);
+        con.execute("capture gif both fps=30 palette=global", &mut ctx);
+        con.execute("capture stop", &mut ctx);
+
+        assert_eq!(
+            ctx,
+            vec![
+                "png;rest=post".to_string(),
+                "gif;rest=both,fps=30,palette=global".to_string(),
+                "stop;rest=".to_string(),
+            ]
+        );
+    }
+
+    /// Multi-slot tab completion: each positional slot AFTER the subcommand name
+    /// returns the slot-specific arg_choices. Slot 0 of `gif` is the stage; slot 1
+    /// is the first kv key.
+    #[test]
+    fn custom_multi_slot_completion_per_slot() {
+        let mut con = Console::<CustomCtx>::new();
+        con.register(custom_subset());
+
+        // `capture gif ` -> slot 0 of `gif`: stages.
+        con.input = "capture gif ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert_eq!(
+            m,
+            vec!["both".to_string(), "post".to_string(), "pre".to_string()]
+        );
+
+        // `capture gif post ` -> slot 1 of `gif`: kv prefixes.
+        con.input = "capture gif post ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert!(m.contains(&"fps=".into()));
+        assert!(m.contains(&"palette=".into()));
+        assert!(m.contains(&"scale=".into()));
+
+        // `capture png ` -> slot 0 of `png`: stages, NOT kv prefixes (those belong
+        // to gif).
+        con.input = "capture png ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert!(m.contains(&"post".into()));
+        assert!(!m.contains(&"fps=".into()), "got: {m:?}");
+
+        // `capture stop ` -> no choices (zero-slot subcommand).
+        con.input = "capture stop ".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert!(m.is_empty(), "got: {m:?}");
+    }
+
+    /// Two-step kv-value completion: after the user types `palette=`, ghost/Tab
+    /// should cycle the declared values. This is the context-aware kv path -- the
+    /// same `palette=` prefix in a hypothetical non-gif subcommand wouldn't produce
+    /// these (gif is the only subcommand that declares `palette` value-choices).
+    #[test]
+    fn custom_subcommand_kv_value_completion_is_context_aware() {
+        let mut con = Console::<CustomCtx>::new();
+        con.register(custom_subset());
+
+        con.input = "capture gif post palette=".into();
+        let ctx = con.completion_context().unwrap();
+        let m = con.completion_matches(&ctx);
+        assert_eq!(
+            m,
+            vec!["palette=global".to_string(), "palette=local".to_string()]
         );
     }
 }
