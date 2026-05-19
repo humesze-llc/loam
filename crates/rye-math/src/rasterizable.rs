@@ -61,9 +61,7 @@ pub enum Projection<const N: usize> {
     /// with `drop_axis: 1` it produces `(x, z, 0)`, a 2D-looking projection in the XZ plane.
     ///
     /// Out-of-range `drop_axis` (>= `N`) returns `Vec3::ZERO`.
-    Orthographic {
-        drop_axis: usize,
-    },
+    Orthographic { drop_axis: usize },
 }
 
 /// A flat or curved space that can drive the rasterizer pipeline: provides projection from its

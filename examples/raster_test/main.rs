@@ -15,23 +15,17 @@
 //!
 //! ## Console commands
 //!
-//! - `axes on|off`: toggle the world-space colored axes.
-//! - `cube on|off`: toggle the unit cube wireframe.
-//! - `widths on|off`: toggle the four horizontal width-sweep lines.
-//! - `gradient on|off`: toggle the rainbow gradient line.
-//! - `tilted on|off`: toggle the fan of tilted lines.
+//! - `tests <target> <value>`: select what renders. `<target>` is one of:
+//!   - `all`, `axes`, `cube`, `widths`, `gradient`, `tilted`: toggle that R³ category;
+//!     `<value>` is `on` or `off`. Use `tests all off` to clear the R³ scene when you only
+//!     want to see the R⁴ polytope.
+//!   - `polytope`: set the R⁴ polytope overlay. `<value>` is one of `5cell`, `tesseract`,
+//!     `16cell`, `24cell`, `120cell`, `600cell` (hyphenated aliases accepted) or `off`. The
+//!     wireframe projects to R³ via `Orthographic { drop_axis: 3 }`, scaled 2.5x, with an
+//!     animated xw + yz rotation so axis-aligned polytopes don't collapse on projection.
 //! - `samples N`: set per-segment tessellation density. `1` is the default and is correct for
 //!   flat-Euclidean impls; higher values exercise the writer-pattern path that curved-space
 //!   impls will use.
-//! - `polytope <name|off>`: show an R⁴ polytope wireframe alongside the R³ scene. `<name>`
-//!   is one of `5cell`, `tesseract`, `16cell`, `24cell`, `120cell`, `600cell` (hyphenated
-//!   aliases accepted). The wireframe is projected to R³ via `Orthographic { drop_axis: 3 }`
-//!   and scaled 2.5x so it's visible alongside the unit cube. An animated 4D rotation (xw +
-//!   yz planes) is applied before projection so axis-aligned polytopes like the tesseract
-//!   don't collapse onto a degenerate R³ silhouette.
-//! - `tests <on|off>`: bulk-toggle all R³ raster-test categories (axes / cube / widths /
-//!   gradient / tilted) in one go. Useful for clearing the R³ scene when you only want to
-//!   look at an R⁴ polytope.
 //! - `reset`: restore all toggles to default and samples = 1 and polytope off.
 
 use std::borrow::Cow;
@@ -349,8 +343,10 @@ impl Demo {
         let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
         let view_proj = proj_mat * view_mat;
         let vp_size = Vec2::new(cfg.width as f32, cfg.height as f32);
-        self.line_raster_r3.set_camera(&rd.queue, view_proj, vp_size);
-        self.line_raster_r4.set_camera(&rd.queue, view_proj, vp_size);
+        self.line_raster_r3
+            .set_camera(&rd.queue, view_proj, vp_size);
+        self.line_raster_r4
+            .set_camera(&rd.queue, view_proj, vp_size);
 
         // Clear the framebuffer to a dark slate so the lines are visible. The rasterizer's
         // pass uses LoadOp::Load, so we need a prior pass to clear; do it inline here via a
@@ -410,71 +406,71 @@ struct RasterTestApp {
 impl RasterTestApp {
     fn build_console() -> Console<Demo> {
         let mut c = Console::<Demo>::new();
+        // `tests` umbrella: typed subcommands instead of one ad-hoc string-dispatch body.
+        // The framework parses on/off for toggle subs, completes polytope names at the value
+        // slot only when the user has typed `tests polytope ` (context-aware completion).
         c.register(
-            rye_egui::cmd(
-                "axes",
-                "toggle world-axes (on|off)",
-                toggle_cmd("axes", |t| &mut t.axes),
-            )
-            .with_args(&[&["on", "off"]]),
-        );
-        c.register(
-            rye_egui::cmd(
-                "cube",
-                "toggle unit-cube wireframe (on|off)",
-                toggle_cmd("cube", |t| &mut t.cube),
-            )
-            .with_args(&[&["on", "off"]]),
-        );
-        c.register(
-            rye_egui::cmd(
-                "widths",
-                "toggle width-sweep lines (on|off)",
-                toggle_cmd("widths", |t| &mut t.widths),
-            )
-            .with_args(&[&["on", "off"]]),
-        );
-        c.register(
-            rye_egui::cmd(
-                "gradient",
-                "toggle gradient line (on|off)",
-                toggle_cmd("gradient", |t| &mut t.gradient),
-            )
-            .with_args(&[&["on", "off"]]),
-        );
-        c.register(
-            rye_egui::cmd(
-                "tilted",
-                "toggle tilted-line fan (on|off)",
-                toggle_cmd("tilted", |t| &mut t.tilted),
-            )
-            .with_args(&[&["on", "off"]]),
-        );
-        c.register(
-            rye_egui::cmd(
-                "tests",
-                "toggle all R³ raster-test categories at once (on|off)",
-                |args, demo: &mut Demo, _out: &mut ConsoleWriter| {
-                    let arg = args
-                        .first()
-                        .ok_or_else(|| anyhow::anyhow!("usage: tests <on|off>"))?;
-                    let v = match arg.to_ascii_lowercase().as_str() {
-                        "on" | "true" | "1" => true,
-                        "off" | "false" | "0" => false,
-                        other => {
-                            return Err(anyhow::anyhow!("unknown arg `{other}` (try on|off)"))
-                        }
-                    };
-                    demo.toggles.axes = v;
-                    demo.toggles.cube = v;
-                    demo.toggles.widths = v;
-                    demo.toggles.gradient = v;
-                    demo.toggles.tilted = v;
-                    demo.dirty = true;
+            rye_egui::subcommands::<Demo>("tests", "toggle what renders in raster_test")
+                .toggle("all", "toggle every R³ raster-test category at once", |d, v| {
+                    d.toggles.axes = v;
+                    d.toggles.cube = v;
+                    d.toggles.widths = v;
+                    d.toggles.gradient = v;
+                    d.toggles.tilted = v;
+                    d.dirty = true;
                     Ok(())
-                },
-            )
-            .with_args(&[&["on", "off"]]),
+                })
+                .toggle("axes", "toggle world-axes (R/G/B basis vectors)", |d, v| {
+                    d.toggles.axes = v;
+                    d.dirty = true;
+                    Ok(())
+                })
+                .toggle("cube", "toggle unit-cube wireframe", |d, v| {
+                    d.toggles.cube = v;
+                    d.dirty = true;
+                    Ok(())
+                })
+                .toggle("widths", "toggle width-sweep horizontal lines", |d, v| {
+                    d.toggles.widths = v;
+                    d.dirty = true;
+                    Ok(())
+                })
+                .toggle("gradient", "toggle red-to-blue gradient line", |d, v| {
+                    d.toggles.gradient = v;
+                    d.dirty = true;
+                    Ok(())
+                })
+                .toggle("tilted", "toggle tilted-line fan", |d, v| {
+                    d.toggles.tilted = v;
+                    d.dirty = true;
+                    Ok(())
+                })
+                .choice(
+                    "polytope",
+                    "set R⁴ polytope overlay (or `off` to clear it)",
+                    &[
+                        "off", "5cell", "tesseract", "16cell", "24cell", "120cell", "600cell",
+                    ],
+                    |d, name| {
+                        d.polytope = match name.to_ascii_lowercase().as_str() {
+                            "off" | "none" => None,
+                            "5cell" | "5-cell" | "pentatope" => Some(Polytope4::Pentatope),
+                            "8cell" | "8-cell" | "tesseract" => Some(Polytope4::Tesseract),
+                            "16cell" | "16-cell" => Some(Polytope4::Cell16),
+                            "24cell" | "24-cell" => Some(Polytope4::Cell24),
+                            "120cell" | "120-cell" => Some(Polytope4::Cell120),
+                            "600cell" | "600-cell" => Some(Polytope4::Cell600),
+                            other => {
+                                return Err(anyhow::anyhow!(
+                                    "unknown polytope `{other}` (try 5cell, tesseract, \
+                                     16cell, 24cell, 120cell, 600cell, or off)"
+                                ))
+                            }
+                        };
+                        d.dirty = true;
+                        Ok(())
+                    },
+                ),
         );
         c.register(rye_egui::cmd(
             "samples",
@@ -492,37 +488,6 @@ impl RasterTestApp {
                 Ok(())
             },
         ));
-        c.register(
-            rye_egui::cmd(
-                "polytope",
-                "set R⁴ polytope wireframe overlay (5cell|tesseract|16cell|24cell|120cell|600cell|off)",
-                |args, demo: &mut Demo, _out: &mut ConsoleWriter| {
-                    let name = args
-                        .first()
-                        .ok_or_else(|| anyhow::anyhow!("usage: polytope <name|off>"))?;
-                    demo.polytope = match name.to_ascii_lowercase().as_str() {
-                        "off" | "none" => None,
-                        "5cell" | "5-cell" | "pentatope" => Some(Polytope4::Pentatope),
-                        "8cell" | "8-cell" | "tesseract" => Some(Polytope4::Tesseract),
-                        "16cell" | "16-cell" => Some(Polytope4::Cell16),
-                        "24cell" | "24-cell" => Some(Polytope4::Cell24),
-                        "120cell" | "120-cell" => Some(Polytope4::Cell120),
-                        "600cell" | "600-cell" => Some(Polytope4::Cell600),
-                        other => {
-                            return Err(anyhow::anyhow!(
-                                "unknown polytope `{other}` (try 5cell, tesseract, 16cell, 24cell, \
-                                 120cell, 600cell, or off)"
-                            ))
-                        }
-                    };
-                    demo.dirty = true;
-                    Ok(())
-                },
-            )
-            .with_args(&[&[
-                "5cell", "tesseract", "16cell", "24cell", "120cell", "600cell", "off",
-            ]]),
-        );
         c.register(rye_egui::cmd(
             "reset",
             "restore all toggles to default (everything on, samples = 1, no polytope)",
@@ -544,27 +509,6 @@ impl RasterTestApp {
         // Standard framework log mirror so tracing events show up in the console scrollback.
         rye_app::log::register_command(&mut c);
         c
-    }
-}
-
-/// Helper: build a console command that flips a boolean inside [`Toggles`].
-fn toggle_cmd<F>(
-    name: &'static str,
-    field: F,
-) -> impl FnMut(&[&str], &mut Demo, &mut ConsoleWriter) -> Result<()> + 'static
-where
-    F: Fn(&mut Toggles) -> &mut bool + 'static,
-{
-    move |args, demo: &mut Demo, _out: &mut ConsoleWriter| {
-        let new = match args.first().copied() {
-            Some("on") => true,
-            Some("off") => false,
-            Some(_) => return Err(anyhow::anyhow!("usage: {name} on|off")),
-            None => !*field(&mut demo.toggles), // toggle if no arg
-        };
-        *field(&mut demo.toggles) = new;
-        demo.dirty = true;
-        Ok(())
     }
 }
 
