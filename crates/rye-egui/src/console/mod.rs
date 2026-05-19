@@ -1014,22 +1014,20 @@ impl<Ctx: 'static> Console<Ctx> {
 
     fn all_command_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.commands.keys().cloned().collect();
-        names.push("help".into());
-        names.push("clear".into());
-        names.push("detach".into());
-        names.push("dock".into());
+        names.extend(Builtin::ALL.iter().map(|b| b.name().to_string()));
         names.sort();
         names
     }
 
     /// Inspect [`Console::input`] to decide what the user is currently completing: the
     /// command name, or the n-th positional argument of a known command. Returns `None`
-    /// for empty input.
+    /// for empty input. Uses the quote-aware [`tokenize`] so `tests "5 cell" o<Tab>`
+    /// completes on arg 1 with prefix `o`, not on a garbage `cell"` token.
     fn completion_context(&self) -> Option<CompletionContext> {
         if self.input.is_empty() {
             return None;
         }
-        let parsed: Vec<&str> = self.input.split_whitespace().collect();
+        let parsed = tokenize(&self.input);
         if parsed.is_empty() {
             return None;
         }
@@ -1038,31 +1036,23 @@ impl<Ctx: 'static> Console<Ctx> {
         // No whitespace yet: still typing the command name.
         if parsed.len() == 1 && !trailing_ws {
             return Some(CompletionContext::Command {
-                prefix: parsed[0].to_string(),
+                prefix: parsed.into_iter().next().unwrap(),
             });
         }
 
         // After whitespace: we're on an argument. `arg_index` is 0-based positional.
         // The `else` arm is reached only when `parsed.len() >= 2` (the `len() == 1 &&
-        // !trailing_ws` case returned above), so `parsed.last()` is always `Some`;
-        // `unwrap_or_default` returns the empty-string fallback only in the impossible
-        // path, keeping library code free of `unwrap()`. `prior` captures the fully-
-        // typed arg tokens before the cursor so subcommand-dispatching commands can
-        // gate their value-slot completion on what came earlier.
-        let cmd_name = parsed[0].to_string();
+        // !trailing_ws` case returned above), so the partial-token pop is safe. `prior`
+        // captures the fully-typed arg tokens before the cursor so subcommand-dispatching
+        // commands can gate their value-slot completion on what came earlier.
+        let mut parts = parsed;
+        let cmd_name = parts.remove(0);
         let (arg_index, prefix, prior) = if trailing_ws {
-            let prior: Vec<String> = parsed[1..].iter().map(|s| (*s).to_string()).collect();
-            (parsed.len() - 1, String::new(), prior)
+            let idx = parts.len();
+            (idx, String::new(), parts)
         } else {
-            let prior: Vec<String> = parsed[1..parsed.len() - 1]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
-            (
-                parsed.len() - 2,
-                parsed.last().copied().unwrap_or_default().to_string(),
-                prior,
-            )
+            let partial = parts.pop().unwrap_or_default();
+            (parts.len(), partial, parts)
         };
         Some(CompletionContext::Arg {
             cmd_name,
@@ -1198,23 +1188,11 @@ impl<Ctx: 'static> Console<Ctx> {
             return;
         };
 
-        // Built-ins first.
-        if name == "help" {
-            self.builtin_help(args.first().map(String::as_str));
-            return;
-        }
-        if name == "clear" {
-            self.history.clear();
-            return;
-        }
-        if name == "detach" {
-            self.detached = true;
-            self.push_history(HistoryLine::system("console detached"));
-            return;
-        }
-        if name == "dock" {
-            self.detached = false;
-            self.push_history(HistoryLine::system("console docked"));
+        // Built-ins first. Framework-owned, dispatched off the `Builtin` enum so the
+        // name + help info isn't duplicated across `execute`, `builtin_help`, and
+        // `all_command_names` (single source of truth for the four primitives).
+        if let Some(builtin) = Builtin::from_name(&name) {
+            self.run_builtin(builtin, args.first().map(String::as_str));
             return;
         }
 
@@ -1239,33 +1217,34 @@ impl<Ctx: 'static> Console<Ctx> {
         }
     }
 
+    /// Dispatch one of the framework built-ins. `target` is the optional first-arg
+    /// token (only used by `help` to look up a specific command).
+    fn run_builtin(&mut self, builtin: Builtin, target: Option<&str>) {
+        match builtin {
+            Builtin::Help => self.builtin_help(target),
+            Builtin::Clear => self.history.clear(),
+            Builtin::Detach => {
+                self.detached = true;
+                self.push_history(HistoryLine::system("console detached"));
+            }
+            Builtin::Dock => {
+                self.detached = false;
+                self.push_history(HistoryLine::system("console docked"));
+            }
+        }
+    }
+
     fn builtin_help(&mut self, target: Option<&str>) {
         match target {
-            Some("help") => {
-                self.push_history(HistoryLine::output(
-                    "help: list commands, or 'help <name>' for one",
-                ));
-            }
-            Some("clear") => {
-                self.push_history(HistoryLine::output("clear: clear the scrollback buffer"));
-            }
-            Some("detach") => {
-                self.push_history(HistoryLine::output(
-                    "detach: render console as a draggable window",
-                ));
-            }
-            Some("dock") => {
-                self.push_history(HistoryLine::output(
-                    "dock: render console as a half-screen drop-down (default)",
-                ));
-            }
-            Some(name) => match self.commands.get(name) {
-                Some(c) => {
-                    let line = format!("{}: {}", c.name(), c.help());
-                    self.push_history(HistoryLine::output(line));
+            Some(name) => {
+                if let Some(b) = Builtin::from_name(name) {
+                    self.push_history(HistoryLine::output(format!("{}: {}", b.name(), b.help())));
+                } else if let Some(c) = self.commands.get(name) {
+                    self.push_history(HistoryLine::output(format!("{}: {}", c.name(), c.help())));
+                } else {
+                    self.push_history(HistoryLine::error(format!("no command '{name}'")));
                 }
-                None => self.push_history(HistoryLine::error(format!("no command '{name}'"))),
-            },
+            }
             None => {
                 self.push_history(HistoryLine::output("commands:"));
                 let mut entries: Vec<(String, String)> = self
@@ -1273,15 +1252,72 @@ impl<Ctx: 'static> Console<Ctx> {
                     .values()
                     .map(|c| (c.name().to_string(), c.help().to_string()))
                     .collect();
-                entries.push(("help".into(), "list commands or describe one".into()));
-                entries.push(("clear".into(), "clear the scrollback buffer".into()));
-                entries.push(("detach".into(), "render as a draggable window".into()));
-                entries.push(("dock".into(), "render as a half-screen drop-down".into()));
+                for b in Builtin::ALL {
+                    entries.push((b.name().to_string(), b.help().to_string()));
+                }
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 for (name, help) in entries {
                     self.push_history(HistoryLine::output(format!("  {name:16} {help}")));
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in commands
+// ---------------------------------------------------------------------------
+
+/// Framework-owned commands that mutate [`Console`] internal state directly: history,
+/// detached flag, etc. They can't go through [`Command<Ctx>`] cleanly because that
+/// trait only sees `&mut Ctx` (the user's context), not `&mut Console<Ctx>`. Storing
+/// their name + help in one enum centralizes what was previously duplicated across
+/// [`Console::execute`], [`Console::builtin_help`], and [`Console::all_command_names`].
+///
+/// User crates cannot add new built-ins; framework primitives only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Builtin {
+    Help,
+    Clear,
+    Detach,
+    Dock,
+}
+
+impl Builtin {
+    /// Iteration order is alphabetical, matching the rest of the console's sort
+    /// conventions (Tab cycling, help listing). Keep this slice sorted by `name()`.
+    const ALL: &'static [Builtin] = &[
+        Builtin::Clear,
+        Builtin::Detach,
+        Builtin::Dock,
+        Builtin::Help,
+    ];
+
+    fn from_name(name: &str) -> Option<Builtin> {
+        match name {
+            "help" => Some(Builtin::Help),
+            "clear" => Some(Builtin::Clear),
+            "detach" => Some(Builtin::Detach),
+            "dock" => Some(Builtin::Dock),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Builtin::Help => "help",
+            Builtin::Clear => "clear",
+            Builtin::Detach => "detach",
+            Builtin::Dock => "dock",
+        }
+    }
+
+    fn help(self) -> &'static str {
+        match self {
+            Builtin::Help => "list commands or describe one",
+            Builtin::Clear => "clear the scrollback buffer",
+            Builtin::Detach => "render as a draggable window",
+            Builtin::Dock => "render as a half-screen drop-down (default)",
         }
     }
 }
@@ -1306,14 +1342,78 @@ fn key_text(key: egui::Key) -> Option<&'static str> {
     }
 }
 
-/// Whitespace-split parser. Returns `(command_name, args)` or `None` for an
-/// empty/whitespace-only line. No quoting in v0; commands that need spaces in args
-/// should split on something else or wait for the quoted-arg upgrade.
+/// Quote-aware tokenizer. Returns `(command_name, args)` or `None` for an
+/// empty/whitespace-only line. Tokens are whitespace-separated; double-quoted
+/// (`"..."`) and single-quoted (`'...'`) strings preserve internal whitespace.
+/// Inside double quotes, `\"` and `\\` are escapes; inside single quotes, the
+/// content is literal (no escapes, matching shell convention).
+///
+/// Unterminated quotes are tolerated for interactive ergonomics: trailing content
+/// after an opening quote with no matching close becomes one token through end of
+/// line. This lets mid-typing tab completion work without erroring on the partial
+/// quote state.
 fn parse_line(line: &str) -> Option<(String, Vec<String>)> {
-    let mut parts = line.split_whitespace();
-    let name = parts.next()?.to_string();
-    let args = parts.map(String::from).collect();
-    Some((name, args))
+    let mut tokens = tokenize(line);
+    if tokens.is_empty() {
+        return None;
+    }
+    let name = tokens.remove(0);
+    Some((name, tokens))
+}
+
+/// Quote-aware token splitter. See [`parse_line`] for the grammar.
+fn tokenize(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                in_token = true;
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next == '"' {
+                        break;
+                    }
+                    if next == '\\' {
+                        if let Some(&escaped) = chars.peek() {
+                            if matches!(escaped, '"' | '\\') {
+                                cur.push(escaped);
+                                chars.next();
+                                continue;
+                            }
+                        }
+                    }
+                    cur.push(next);
+                }
+            }
+            '\'' => {
+                in_token = true;
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next == '\'' {
+                        break;
+                    }
+                    cur.push(next);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_token {
+                    out.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            c => {
+                in_token = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_token {
+        out.push(cur);
+    }
+    out
 }
 
 /// Splice `choice` into `input` at the position the user is completing, preserving
@@ -1324,19 +1424,15 @@ fn apply_completion(input: &str, ctx: &CompletionContext, choice: &str) -> Strin
     match ctx {
         CompletionContext::Command { .. } => choice.to_string(),
         CompletionContext::Arg { .. } => {
-            let parsed: Vec<&str> = input.split_whitespace().collect();
-            let trailing_ws = input.ends_with(char::is_whitespace);
-            let kept = if trailing_ws {
-                &parsed[..]
-            } else {
-                &parsed[..parsed.len() - 1]
-            };
-            let mut result = kept.join(" ");
-            if !result.is_empty() {
-                result.push(' ');
+            // Preserve the input string verbatim up to the start of the partial token
+            // under the cursor, then append the completion choice. Verbatim
+            // preservation is important for quoted args -- a re-tokenize-and-rejoin
+            // would mangle `tests "5 cell"` into `tests 5 cell` on the rejoin step.
+            if input.ends_with(char::is_whitespace) {
+                return format!("{input}{choice}");
             }
-            result.push_str(choice);
-            result
+            let prefix_end = input.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+            format!("{}{choice}", &input[..prefix_end])
         }
     }
 }
@@ -2008,5 +2104,112 @@ mod tests {
             m,
             vec!["palette=global".to_string(), "palette=local".to_string()]
         );
+    }
+
+    // ----------------- Quoted-string tokenizer -----------------
+
+    #[test]
+    fn tokenize_handles_bare_words() {
+        assert_eq!(tokenize("foo bar baz"), vec!["foo", "bar", "baz"]);
+        assert_eq!(tokenize("   foo    bar  "), vec!["foo", "bar"]);
+        assert_eq!(tokenize(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tokenize_preserves_spaces_in_double_quotes() {
+        assert_eq!(tokenize(r#"foo "bar baz" qux"#), vec!["foo", "bar baz", "qux"]);
+    }
+
+    #[test]
+    fn tokenize_preserves_spaces_in_single_quotes() {
+        assert_eq!(tokenize("foo 'bar baz' qux"), vec!["foo", "bar baz", "qux"]);
+    }
+
+    #[test]
+    fn tokenize_handles_double_quote_escapes() {
+        // `\"` -> literal `"`; `\\` -> literal `\`; other `\x` keeps the backslash.
+        assert_eq!(
+            tokenize(r#"a "he said \"hi\"" b"#),
+            vec!["a", r#"he said "hi""#, "b"]
+        );
+        assert_eq!(tokenize(r#""back\\slash""#), vec![r"back\slash"]);
+    }
+
+    #[test]
+    fn tokenize_single_quotes_are_literal() {
+        // Backslashes inside single quotes are literal (matches shell convention).
+        assert_eq!(tokenize(r"'a \n b'"), vec![r"a \n b"]);
+    }
+
+    #[test]
+    fn tokenize_unterminated_quote_consumes_to_end() {
+        // For interactive ergonomics: don't error on unterminated quotes; treat
+        // trailing content as one token.
+        assert_eq!(tokenize(r#"foo "unterminated"#), vec!["foo", "unterminated"]);
+    }
+
+    #[test]
+    fn parse_line_routes_quoted_args_to_handler() {
+        type Ctx = Vec<String>;
+        let mut con = Console::<Ctx>::new();
+        con.register(cmd("echoargs", "record args", |args, c: &mut Ctx, _out| {
+            for a in args {
+                c.push((*a).to_string());
+            }
+            Ok(())
+        }));
+        let mut ctx: Ctx = Vec::new();
+        con.execute(r#"echoargs "5 cell" off"#, &mut ctx);
+        assert_eq!(ctx, vec!["5 cell".to_string(), "off".to_string()]);
+    }
+
+    // ----------------- Unified built-ins -----------------
+
+    #[test]
+    fn builtin_from_name_round_trips() {
+        for b in Builtin::ALL {
+            assert_eq!(Builtin::from_name(b.name()), Some(*b));
+        }
+        assert_eq!(Builtin::from_name("nope"), None);
+    }
+
+    #[test]
+    fn help_lists_user_commands_and_builtins_sorted() {
+        type Ctx = u32;
+        let mut con = Console::<Ctx>::new();
+        con.register(cmd("zebra", "fast horse", |_, _, _| Ok(())));
+        con.register(cmd("alpha", "first letter", |_, _, _| Ok(())));
+        let mut ctx: Ctx = 0;
+        con.execute("help", &mut ctx);
+        let texts: Vec<&str> = con.history.iter().map(|h| h.text.as_str()).collect();
+        let i_alpha = texts.iter().position(|t| t.contains("alpha")).unwrap();
+        let i_clear = texts.iter().position(|t| t.contains("clear")).unwrap();
+        let i_zebra = texts.iter().position(|t| t.contains("zebra")).unwrap();
+        // Alphabetical: alpha < clear < zebra.
+        assert!(i_alpha < i_clear);
+        assert!(i_clear < i_zebra);
+    }
+
+    #[test]
+    fn clear_builtin_empties_history() {
+        type Ctx = u32;
+        let mut con = Console::<Ctx>::new();
+        let mut ctx: Ctx = 0;
+        con.push_history(HistoryLine::output("first"));
+        con.push_history(HistoryLine::output("second"));
+        con.execute("clear", &mut ctx);
+        assert!(con.history.is_empty());
+    }
+
+    #[test]
+    fn detach_dock_builtins_flip_flag() {
+        type Ctx = u32;
+        let mut con = Console::<Ctx>::new();
+        let mut ctx: Ctx = 0;
+        assert!(!con.detached);
+        con.execute("detach", &mut ctx);
+        assert!(con.detached);
+        con.execute("dock", &mut ctx);
+        assert!(!con.detached);
     }
 }
