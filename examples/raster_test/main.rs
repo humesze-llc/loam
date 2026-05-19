@@ -411,15 +411,19 @@ impl RasterTestApp {
         // slot only when the user has typed `tests polytope ` (context-aware completion).
         c.register(
             rye_egui::subcommands::<Demo>("tests", "toggle what renders in raster_test")
-                .toggle("all", "toggle every R³ raster-test category at once", |d, v| {
-                    d.toggles.axes = v;
-                    d.toggles.cube = v;
-                    d.toggles.widths = v;
-                    d.toggles.gradient = v;
-                    d.toggles.tilted = v;
-                    d.dirty = true;
-                    Ok(())
-                })
+                .toggle(
+                    "all",
+                    "toggle every R³ raster-test category at once",
+                    |d, v| {
+                        d.toggles.axes = v;
+                        d.toggles.cube = v;
+                        d.toggles.widths = v;
+                        d.toggles.gradient = v;
+                        d.toggles.tilted = v;
+                        d.dirty = true;
+                        Ok(())
+                    },
+                )
                 .toggle("axes", "toggle world-axes (R/G/B basis vectors)", |d, v| {
                     d.toggles.axes = v;
                     d.dirty = true;
@@ -449,7 +453,13 @@ impl RasterTestApp {
                     "polytope",
                     "set R⁴ polytope overlay (or `off` to clear it)",
                     &[
-                        "off", "5cell", "tesseract", "16cell", "24cell", "120cell", "600cell",
+                        "off",
+                        "5cell",
+                        "tesseract",
+                        "16cell",
+                        "24cell",
+                        "120cell",
+                        "600cell",
                     ],
                     |d, name| {
                         d.polytope = match name.to_ascii_lowercase().as_str() {

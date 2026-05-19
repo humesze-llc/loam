@@ -505,10 +505,7 @@ impl<Ctx: 'static> SubcommandSet<Ctx> {
 
 /// Build a [`SubcommandSet`] for a multi-subcommand console command. See the
 /// [`SubcommandSet`] docs for the full builder pattern.
-pub fn subcommands<Ctx: 'static>(
-    name: &'static str,
-    help: &'static str,
-) -> SubcommandSet<Ctx> {
+pub fn subcommands<Ctx: 'static>(name: &'static str, help: &'static str) -> SubcommandSet<Ctx> {
     SubcommandSet {
         name,
         help,
@@ -581,10 +578,9 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
             return &[];
         };
         match &entry.kind {
-            SubcommandKind::Custom { value_choices, .. } => value_choices
-                .get(key)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]),
+            SubcommandKind::Custom { value_choices, .. } => {
+                value_choices.get(key).map(|v| v.as_slice()).unwrap_or(&[])
+            }
             _ => &[],
         }
     }
@@ -609,9 +605,9 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
         };
         match &mut entry.kind {
             SubcommandKind::Toggle { handler } => {
-                let value = rest.first().ok_or_else(|| {
-                    anyhow::anyhow!("usage: {} {sub_name} <on|off>", self.name)
-                })?;
+                let value = rest
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("usage: {} {sub_name} <on|off>", self.name))?;
                 let v = match value.to_ascii_lowercase().as_str() {
                     "on" | "true" | "1" => true,
                     "off" | "false" | "0" => false,
@@ -626,9 +622,9 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
                 handler(ctx, v)
             }
             SubcommandKind::Choice { handler, .. } => {
-                let value = rest.first().ok_or_else(|| {
-                    anyhow::anyhow!("usage: {} {sub_name} <value>", self.name)
-                })?;
+                let value = rest
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("usage: {} {sub_name} <value>", self.name))?;
                 let _ = out;
                 handler(ctx, value)
             }
@@ -1969,7 +1965,11 @@ mod tests {
         let m = con.completion_matches(&ctx);
         assert_eq!(
             m,
-            vec!["5cell".to_string(), "off".to_string(), "tesseract".to_string()]
+            vec![
+                "5cell".to_string(),
+                "off".to_string(),
+                "tesseract".to_string()
+            ]
         );
         assert!(!m.contains(&"on".into()));
     }
@@ -1985,7 +1985,11 @@ mod tests {
         let m = con.completion_matches(&ctx);
         assert_eq!(
             m,
-            vec!["axes".to_string(), "cube".to_string(), "polytope".to_string()]
+            vec![
+                "axes".to_string(),
+                "cube".to_string(),
+                "polytope".to_string()
+            ]
         );
     }
 
@@ -2117,7 +2121,10 @@ mod tests {
 
     #[test]
     fn tokenize_preserves_spaces_in_double_quotes() {
-        assert_eq!(tokenize(r#"foo "bar baz" qux"#), vec!["foo", "bar baz", "qux"]);
+        assert_eq!(
+            tokenize(r#"foo "bar baz" qux"#),
+            vec!["foo", "bar baz", "qux"]
+        );
     }
 
     #[test]
@@ -2145,7 +2152,10 @@ mod tests {
     fn tokenize_unterminated_quote_consumes_to_end() {
         // For interactive ergonomics: don't error on unterminated quotes; treat
         // trailing content as one token.
-        assert_eq!(tokenize(r#"foo "unterminated"#), vec!["foo", "unterminated"]);
+        assert_eq!(
+            tokenize(r#"foo "unterminated"#),
+            vec!["foo", "unterminated"]
+        );
     }
 
     #[test]

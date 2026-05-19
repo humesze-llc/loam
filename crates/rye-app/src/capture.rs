@@ -1461,16 +1461,22 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
     let palette_values: &[&'static str] = &["local", "global"];
 
     let cap = rye_egui::subcommands::<Ctx>("capture", capture_help())
-        .custom("png", "one-shot PNG capture", &[stage_choices], &[], |_, rest, out| {
-            let p = parse_capture_args(rest);
-            enqueue(CaptureRequest::OneShot {
-                stage: p.stage,
-                dir: p.dir,
-                name: None,
-            });
-            out.line(format!("queued one-shot ({:?})", p.stage));
-            Ok(())
-        })
+        .custom(
+            "png",
+            "one-shot PNG capture",
+            &[stage_choices],
+            &[],
+            |_, rest, out| {
+                let p = parse_capture_args(rest);
+                enqueue(CaptureRequest::OneShot {
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                });
+                out.line(format!("queued one-shot ({:?})", p.stage));
+                Ok(())
+            },
+        )
         .custom(
             "frames",
             "PNG frame sequence (per-frame .png files)",
@@ -1569,7 +1575,12 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
         .custom(
             "toggle",
             "start/stop a sequence in one command (format + args)",
-            &[&["png", "frames", "gif", "apng"], stage_choices, gif_kv, gif_kv],
+            &[
+                &["png", "frames", "gif", "apng"],
+                stage_choices,
+                gif_kv,
+                gif_kv,
+            ],
             &[("palette", palette_values)],
             |_, rest, out| {
                 let (format, after_format) = parse_format(rest);
@@ -1587,20 +1598,32 @@ pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
                 Ok(())
             },
         )
-        .custom("stop", "stop the active sequence", &[], &[], |_, _rest, out| {
-            enqueue(CaptureRequest::Stop);
-            out.line("stop queued");
-            Ok(())
-        })
-        .custom("panel", "toggle the capture parameters panel", &[], &[], |_, _rest, out| {
-            let now_open = toggle_panel_global();
-            out.line(if now_open {
-                "panel opened"
-            } else {
-                "panel closed"
-            });
-            Ok(())
-        });
+        .custom(
+            "stop",
+            "stop the active sequence",
+            &[],
+            &[],
+            |_, _rest, out| {
+                enqueue(CaptureRequest::Stop);
+                out.line("stop queued");
+                Ok(())
+            },
+        )
+        .custom(
+            "panel",
+            "toggle the capture parameters panel",
+            &[],
+            &[],
+            |_, _rest, out| {
+                let now_open = toggle_panel_global();
+                out.line(if now_open {
+                    "panel opened"
+                } else {
+                    "panel closed"
+                });
+                Ok(())
+            },
+        );
     console.register(cap);
 }
 
