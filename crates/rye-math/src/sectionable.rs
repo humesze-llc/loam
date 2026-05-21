@@ -116,8 +116,12 @@ impl SectionableSpace<4> for EuclideanR4 {
             return None;
         }
         let t = (slice.w_slice - p0.w) / dw;
-        // Strictly inside the edge. `<` rather than `<=` at the boundaries prevents
-        // double-counting at shared cell vertices when the slice grazes a vertex's w.
+        // Closed `[0, 1]` interval: an endpoint exactly on the slice (t = 0 or t = 1)
+        // counts as an intersection at that endpoint's R³ coordinates. The cell-
+        // assembly caller's `SLICE_PERTURBATION_EPSILON` shift moves the slice off
+        // any polytope vertex before this method is called, so the endpoint case is
+        // primarily reached by callers who skip perturbation; it is exercised by
+        // [`r4_edge_section_endpoint_on_slice_returns_t_zero`].
         if !(0.0..=1.0).contains(&t) {
             return None;
         }

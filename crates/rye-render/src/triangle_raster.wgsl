@@ -47,10 +47,10 @@ fn vs_main(
     return out;
 }
 
-// `fs_flat` retains the name `fs_main` for source-compat with any external WGSL
-// inspection; the lambert entry point is the new addition.
+// Flat pass-through. The vertex shader's interpolated per-vertex color reaches the
+// framebuffer unmodified.
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_flat(in: VsOut) -> @location(0) vec4<f32> {
     return in.color;
 }
 

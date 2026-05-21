@@ -39,7 +39,7 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
 use rye_egui::{Console, ConsoleWriter};
 use rye_math::{EuclideanR3, EuclideanR4, Projection, WPlane};
-use rye_physics::polytope::{polytope_section_with_vertices, Polytope4};
+use rye_physics::polytope::{polytope_section_overlay_with_vertices, Polytope4};
 use rye_render::{
     device::RenderDevice, DepthBuffer, DepthMode, LineRasterNode, TriangleRasterNode,
 };
@@ -269,7 +269,7 @@ struct Demo {
     triangle_raster: TriangleRasterNode,
     /// Triangle rasterizer for the active polytope's cross-section caps (filled). Translucent
     /// white per-cell triangulation produced by
-    /// [`rye_physics::polytope::polytope_section_with_vertices`].
+    /// [`rye_physics::polytope::polytope_section_overlay_with_vertices`].
     section_triangles: TriangleRasterNode,
     /// Line rasterizer for the active polytope's cross-section perimeter (bright cyan edges
     /// around each cap polygon). Same pipeline shape as `line_raster_r3`.
@@ -435,7 +435,7 @@ impl Demo {
                         )
                     })
                     .collect();
-                polytope_section_with_vertices(
+                polytope_section_overlay_with_vertices(
                     topo.edges,
                     topo.cells,
                     &world_vertices,
@@ -672,6 +672,22 @@ impl RasterTestApp {
                         "600cell",
                     ],
                     |d, name| {
+                        // Bare invocation cycles through the polytope list in declared order
+                        // (off, 5cell, tesseract, 16cell, 24cell, 120cell, 600cell), wrapping.
+                        let Some(name) = name else {
+                            let next = match d.polytope {
+                                None => Some(Polytope4::Pentatope),
+                                Some(Polytope4::Pentatope) => Some(Polytope4::Tesseract),
+                                Some(Polytope4::Tesseract) => Some(Polytope4::Cell16),
+                                Some(Polytope4::Cell16) => Some(Polytope4::Cell24),
+                                Some(Polytope4::Cell24) => Some(Polytope4::Cell120),
+                                Some(Polytope4::Cell120) => Some(Polytope4::Cell600),
+                                Some(Polytope4::Cell600) => None,
+                            };
+                            d.polytope = next;
+                            d.dirty = true;
+                            return Ok(());
+                        };
                         d.polytope = match name.to_ascii_lowercase().as_str() {
                             "off" | "none" => None,
                             "5cell" | "5-cell" | "pentatope" => Some(Polytope4::Pentatope),

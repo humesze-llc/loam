@@ -26,16 +26,21 @@ impl Demo {
     /// Apply/Clear in `Composer`).
     pub(crate) fn render_shapes_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        let has_heavy = self.row.iter().any(|e| {
-            matches!(
-                e.shape,
-                RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
-            )
-        });
-        if has_heavy {
+        // Only the SDF raymarch path is heavy on the 120/600-cell (~24 KB of const face-
+        // normal data + per-pixel Wolfe-greedy projection); the rasterized section-faces
+        // path keeps both polychora at vsync regardless of how many are in the row, so
+        // the warning is irrelevant when `surface_raster_enabled`.
+        let has_heavy_sdf = !self.surface_raster_enabled
+            && self.row.iter().any(|e| {
+                matches!(
+                    e.shape,
+                    RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
+                )
+            });
+        if has_heavy_sdf {
             ui.colored_label(
                 egui::Color32::from_rgb(242, 130, 70),
-                "120/600-cell SDFs are heavy; expect <60 fps.",
+                "120/600-cell SDFs are heavy; expect <60 fps. Try `surface raster`.",
             );
         }
         let mut row_changed = false;

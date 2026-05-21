@@ -107,7 +107,7 @@ impl FragmentShading {
     /// shaders embedded in `triangle_raster.wgsl`.
     fn entry_point(self) -> &'static str {
         match self {
-            Self::Flat => "fs_main",
+            Self::Flat => "fs_flat",
             Self::FaceNormalLambert => "fs_lambert",
         }
     }

@@ -60,7 +60,7 @@ use rye_egui::Console;
 use rye_math::WPlane;
 use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
 use rye_physics::polytope::{
-    polytope_section_faces_with_vertices, polytope_section_with_vertices, vertex_color_by_position,
+    polytope_section_faces_append, polytope_section_overlay_with_vertices, vertex_color_by_position,
 };
 use rye_render::{
     device::RenderDevice,
@@ -228,6 +228,8 @@ impl Demo {
             wireframe_color_mode: WireframeColorMode::default(),
             section_faces,
             section_faces_depth: None,
+            section_world_vertices_scratch: Vec::new(),
+            section_faces_mesh_scratch: rye_shape::TriangleMesh::<3>::default(),
             surface_raster_enabled: true,
             row,
             w_slice: initial_w,
@@ -705,53 +707,57 @@ impl Demo {
     /// algorithm then runs on these world vertices against the demo's `w_slice`,
     /// producing R³ geometry that composes with the camera the SDF raymarcher uses.
     ///
-    /// Depth: each polychoral cap polygon is fan-triangulated, with sub-triangles
-    /// sharing a centroid. They don't self-occlude (all on the same slice hyperplane)
-    /// but caps from *different* polychoral bodies in the row can occlude each other,
-    /// so the depth attachment is sized + cleared once here.
+    /// Depth: within a single cap, the fan triangles are coplanar (the cap is a 2D
+    /// polygon in R³) and don't occlude one another. Different caps within one
+    /// polytope, and caps across different polychoral bodies, all project to
+    /// different camera depths after the view-projection step, so they DO require a
+    /// depth attachment to resolve front-to-back occlusion correctly. The shared
+    /// depth buffer is ensured + cleared at the top of the Shapes-view render path
+    /// (see `Demo::ensure_and_clear_shared_depth`); this pass writes into it.
     fn render_section_faces(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
         let cfg = &rd.surface_bundle.config;
         let n = self.row.len();
 
-        let mut combined = rye_shape::TriangleMesh::<3>::default();
+        // Reuse the per-Demo scratch mesh; capacity grows once to fit the largest
+        // polychoron and stays there. Each frame's `clear()` keeps the underlying
+        // allocations.
+        let combined = &mut self.section_faces_mesh_scratch;
+        combined.vertices.clear();
+        combined.colors.clear();
+        combined.indices.clear();
+
         for (slot, entry) in self.row.iter().enumerate() {
             let Some(polytope) = entry.shape.polytope4() else {
                 continue;
             };
             let topo = polytope.topology();
             let bp = Vec4::from_array(body_position(slot, n));
-            let world_vertices: Vec<Vec4> = topo
-                .vertices
-                .iter()
-                .map(|v| bp + BODY_SIZE * self.rot_state.apply(*v))
-                .collect();
+
+            // Reusable scratch for per-body world-space vertices. Same growth pattern
+            // as `combined` above.
+            self.section_world_vertices_scratch.clear();
+            self.section_world_vertices_scratch.extend(
+                topo.vertices
+                    .iter()
+                    .map(|v| bp + BODY_SIZE * self.rot_state.apply(*v)),
+            );
 
             // Match the SDF's per-body solid coloring: every cap of this polychoron
             // uses the body's identity color from the catalog. Per-face Lambert in the
             // fragment shader adds the geometric depth; the underlying color is flat.
             let [r, g, b] = entry.body_color;
-            let body_mesh = polytope_section_faces_with_vertices(
+            polytope_section_faces_append(
                 topo.edges,
                 topo.cells,
-                &world_vertices,
+                &self.section_world_vertices_scratch,
                 WPlane::new(self.w_slice),
                 [r, g, b, 1.0],
+                combined,
             );
-
-            // Concatenate: append vertices + colors verbatim, indices are offset by
-            // the pre-append vertex count. This keeps the combined mesh a single
-            // upload regardless of how many polychoral bodies are in the row.
-            let base = combined.vertices.len() as u32;
-            combined.vertices.extend_from_slice(&body_mesh.vertices);
-            combined.colors.extend_from_slice(&body_mesh.colors);
-            for [a, b, c] in &body_mesh.indices {
-                combined.indices.push([base + a, base + b, base + c]);
-            }
         }
 
-        if combined.vertices.is_empty() {
-            return Ok(());
-        }
+        // Empty mesh handling lives in `TriangleRasterNode::execute` (it short-circuits
+        // when `index_count == 0`); no need for a redundant early-return here.
 
         // Camera matches the SDF raymarcher's effective view-projection (same as the
         // wireframe overlay uses), so pixel-aligned composition over the SDF pass.
@@ -773,7 +779,7 @@ impl Demo {
         self.section_faces.upload::<EuclideanR3, 3>(
             &rd.device,
             &rd.queue,
-            &combined,
+            combined,
             &rye_math::Projection::Identity,
         );
         self.section_faces.execute(rd, view, Some(&depth.view))?;
@@ -838,10 +844,10 @@ impl Demo {
             // Cross-section perimeter edges only. The SDF raymarcher renders the section
             // as a solid volume; we just need to outline the boundaries between adjacent
             // cell caps (each cap contributes one face of the 3D section polytope).
-            // `polytope_section_with_vertices` returns `(triangles, perimeter)`; we
+            // `polytope_section_overlay_with_vertices` returns `(triangles, perimeter)`; we
             // discard the filled triangles since they would obscure the SDF without
             // adding information.
-            let (_tri, mut perim) = polytope_section_with_vertices(
+            let (_tri, mut perim) = polytope_section_overlay_with_vertices(
                 topo.edges,
                 topo.cells,
                 &world_vertices,
@@ -1088,13 +1094,18 @@ impl RotatePolytopesApp {
                 )
                 .choice(
                     "color",
-                    "base RGB for parent edges: unique (default) or active",
+                    "base RGB for parent edges (bare cycles): unique (default) or active",
                     &["unique", "active"],
                     |d, name| {
-                        d.wireframe_color_mode =
-                            WireframeColorMode::from_token(name).ok_or_else(|| {
-                                anyhow!("unknown color mode `{name}` (try unique|active)")
-                            })?;
+                        d.wireframe_color_mode = match name {
+                            Some(n) => WireframeColorMode::from_token(n).ok_or_else(|| {
+                                anyhow!("unknown color mode `{n}` (try unique|active)")
+                            })?,
+                            None => match d.wireframe_color_mode {
+                                WireframeColorMode::Unique => WireframeColorMode::Active,
+                                WireframeColorMode::Active => WireframeColorMode::Unique,
+                            },
+                        };
                         Ok(())
                     },
                 ),

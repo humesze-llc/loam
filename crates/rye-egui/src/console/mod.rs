@@ -355,11 +355,11 @@ where
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
 
-// Tab-completion for toggle subcommands intentionally returns an empty list at the
-// value slot. The primary UX for a toggle is *bare* invocation (e.g. `wireframe
-// nearest-active` flips), and surfacing `on|off` in completion implied that one of
-// them was required when it isn't. The parser still accepts `on|off|true|false|1|0`
-// for callers that want explicit set; it's just no longer promoted in the cycle.
+// Tab-completion for toggle subcommands intentionally returns an empty list at the value
+// slot. The primary UX for a toggle is *bare* invocation (e.g. `wireframe nearest-active`
+// flips), and surfacing `on|off` in completion implied that one of them was required when it
+// isn't. The parser still accepts `on|off|true|false|1|0` for callers that want explicit
+// set; it's just no longer promoted in the cycle.
 
 /// Boxed handler for an on/off toggle subcommand. The framework passes `Some(bool)`
 /// when the user supplied `on|off|true|false|1|0` and `None` when the user invoked the
@@ -376,10 +376,24 @@ where
 /// ```
 type ToggleHandler<Ctx> = Box<dyn FnMut(&mut Ctx, Option<bool>) -> anyhow::Result<()>>;
 
-/// Boxed handler for a fixed-choice subcommand. Receives the user's context and the
-/// raw value string (one of the declared choices in normal use; the handler still has
-/// to handle case-insensitivity / aliases if those are wanted).
-type ChoiceHandler<Ctx> = Box<dyn FnMut(&mut Ctx, &str) -> anyhow::Result<()>>;
+/// Boxed handler for a fixed-choice subcommand. The framework passes `Some(value)` when the
+/// user supplied a value and `None` when the subcommand was invoked bare (no value),
+/// mirroring [`ToggleHandler`]'s shape. On `None`, the handler is expected to cycle to the
+/// next choice (or whatever's contextually meaningful); the framework can't help because it
+/// doesn't know the current state.
+///
+/// Idiomatic handler for a `Mode` enum field with a `cycle` method:
+///
+/// ```ignore
+/// .choice("color", "...", &["unique", "active"], |ctx, name| {
+///     ctx.color_mode = match name {
+///         Some(n) => parse_mode(n)?,
+///         None => ctx.color_mode.cycle(),
+///     };
+///     Ok(())
+/// })
+/// ```
+type ChoiceHandler<Ctx> = Box<dyn FnMut(&mut Ctx, Option<&str>) -> anyhow::Result<()>>;
 
 /// Boxed handler for a `SubcommandSet`'s bare invocation (no subcommand supplied).
 /// When set via [`SubcommandSet::on_bare`], replaces the default usage-block error
@@ -398,14 +412,14 @@ type CustomHandler<Ctx> =
 /// One entry in a [`SubcommandSet`]. The dispatch kind decides how the framework
 /// parses the value slot and what's offered for tab completion.
 enum SubcommandKind<Ctx> {
-    /// On/off subcommand. The framework parses `args[1]` as
-    /// `on|off|true|false|1|0` and passes `Some(bool)`; bare invocation (no value)
-    /// passes `None` and the handler is expected to flip its field. No value-slot
-    /// tab completion is offered (bare-flip is the canonical UX; explicit set is
-    /// supported but not promoted).
+    /// On/off subcommand. The framework parses `args[1]` as `on|off|true|false|1|0` and
+    /// passes `Some(bool)`; bare invocation (no value) passes `None` and the handler is
+    /// expected to flip its field. No value-slot tab completion is offered (bare-flip is the
+    /// canonical UX; explicit set is supported but not promoted).
     Toggle { handler: ToggleHandler<Ctx> },
-    /// Fixed-choice subcommand. The framework completes the value slot from `choices`;
-    /// the handler receives the raw value string and decides what to do.
+    /// Fixed-choice subcommand. The framework completes the value slot from `choices`
+    /// and passes `Some(value)` when present, `None` on bare invocation (handler is
+    /// expected to cycle).
     Choice {
         choices: Vec<&'static str>,
         handler: ChoiceHandler<Ctx>,
@@ -509,7 +523,7 @@ impl<Ctx: 'static> SubcommandSet<Ctx> {
         handler: F,
     ) -> Self
     where
-        F: FnMut(&mut Ctx, &str) -> anyhow::Result<()> + 'static,
+        F: FnMut(&mut Ctx, Option<&str>) -> anyhow::Result<()> + 'static,
     {
         self.subs.insert(
             name,
@@ -752,9 +766,10 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
                 handler(ctx, v)
             }
             SubcommandKind::Choice { handler, .. } => {
-                let value = rest
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("usage: {} {sub_name} <value>", self.name))?;
+                // `Some(value)` with an explicit arg, `None` on bare invocation. The
+                // handler decides what to do on `None` (cycle to next choice is the
+                // canonical pattern; alternatives include "error" or "no-op").
+                let value: Option<&str> = rest.first().copied();
                 let _ = out;
                 handler(ctx, value)
             }
@@ -2036,7 +2051,7 @@ mod tests {
                 "set polytope",
                 &["5cell", "tesseract", "off"],
                 |c, name| {
-                    c.1 = format!("polytope={name}");
+                    c.1 = format!("polytope={}", name.unwrap_or("<bare>"));
                     Ok(())
                 },
             )
@@ -2105,17 +2120,16 @@ mod tests {
         assert_eq!(ctx, (0, "axes=false".into()));
     }
 
-    /// Choice subcommand still requires a value (no cycle-on-bare equivalent yet).
-    /// Pins the contract so a future cycle-on-bare extension updates this test.
+    /// Bare choice invocation passes `None` to the handler; the handler decides what
+    /// "no value" means (cycle, no-op, error). Pins the framework-level contract that
+    /// the handler is invoked at all.
     #[test]
-    fn subcommand_choice_missing_value_errors() {
+    fn subcommand_choice_bare_invocation_passes_none() {
         let mut con = Console::<SubCtx>::new();
         con.register(sample_subset());
         let mut ctx: SubCtx = (0, String::new());
         con.execute("tests polytope", &mut ctx);
-        let last = con.history.back().unwrap();
-        assert_eq!(last.kind, LineKind::Error);
-        assert!(last.text.contains("usage"), "got: {}", last.text);
+        assert_eq!(ctx.1, "polytope=<bare>");
     }
 
     /// Bare `SubcommandSet` invocation (no subcommand) calls the registered

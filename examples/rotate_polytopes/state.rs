@@ -285,6 +285,12 @@ pub(crate) struct Demo {
     ///   correctly occluded. In SDF mode the cleared depth makes every wireframe
     ///   fragment pass the test trivially, preserving the historical visual.
     pub(crate) section_faces_depth: Option<rye_render::DepthBuffer>,
+    /// Scratch buffers reused across frames + bodies inside `render_section_faces` to
+    /// avoid per-body heap allocations on the 240 fps hot path. Both are cleared at
+    /// the start of each invocation; capacity grows monotonically with the largest
+    /// polychoron's vertex / triangle count seen so far.
+    pub(crate) section_world_vertices_scratch: Vec<glam::Vec4>,
+    pub(crate) section_faces_mesh_scratch: rye_shape::TriangleMesh<3>,
     /// Selects how the six regular convex 4-polytopes are rendered:
     /// - `true` (default): rasterized filled cross-section cell caps via
     ///   [`Self::section_faces`]. Much faster for the 120-cell + 600-cell, exact (no
