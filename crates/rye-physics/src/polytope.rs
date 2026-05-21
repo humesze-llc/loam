@@ -257,6 +257,241 @@ impl Polytope4 {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-section algorithm
+// ---------------------------------------------------------------------------
+
+/// Default cross-section fill color: translucent white. Picks up tinting from the SDF or
+/// parent wireframe behind it; alpha 0.55 keeps both visible.
+const SECTION_FILL_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.55];
+/// Default cross-section perimeter color: bright cyan, opaque. Reads as the "boundary of
+/// what you're currently looking at" against both the dim parent wireframe and SDF.
+const SECTION_EDGE_COLOR: [f32; 4] = [0.30, 0.85, 0.95, 1.0];
+const SECTION_EDGE_WIDTH: f32 = 2.0;
+
+/// Per-cell cross-section assembly. Intersects the 4-polytope's cells with the w-slice
+/// hyperplane, producing the section as a pair (filled triangles, perimeter edges) ready to
+/// hand to `rye-render`'s `TriangleRasterNode` + `LineRasterNode`.
+///
+/// Algorithm:
+///
+/// 1. Perturb the slice if any vertex's w sits within `SLICE_PERTURBATION_EPSILON`. The
+///    single perturbation kills three degeneracies at once (vertex on slice, edge in slice
+///    plane, slice grazes a face).
+/// 2. For each cell, compute its w-range and skip if entirely above or below the slice.
+/// 3. For each parent edge restricted to that cell (both endpoints in the cell's vertex
+///    list), intersect the edge with the slice via
+///    [`rye_math::SectionableSpace::edge_section`]. Collect the resulting R³ points as the
+///    cap polygon.
+/// 4. If the cap has fewer than 3 points the cell barely grazes the slice; skip.
+/// 5. Otherwise, fit the cap's plane via the first non-collinear basis, order the cap
+///    points by angle around their centroid, fan-triangulate from the centroid, and emit
+///    the perimeter as a sequence of line segments.
+///
+/// The same algorithm produces classical cross-section polytopes from `Polytope4` topology
+/// alone: 5-cell midpoint slice -> regular tetrahedron, tesseract midpoint slice -> cube,
+/// 16-cell -> octahedron, etc. No per-polytope special-casing.
+///
+/// Returns `(triangles, perimeter)`. Either may be empty if the slice doesn't cross the
+/// polytope at all.
+pub fn polytope4_section(
+    polytope: Polytope4,
+    slice: rye_math::WPlane,
+) -> (rye_shape::TriangleMesh<3>, rye_shape::LineMesh<3>) {
+    let topo = polytope.topology();
+    polytope_section_with_vertices(topo.edges, topo.cells, topo.vertices, slice)
+}
+
+/// Lower-level cross-section assembly that takes vertices, edges, and cells directly. Use
+/// this when the polytope's vertices have been transformed (rigid-body rotation, world-space
+/// placement, animated 4D rotation) before sectioning -- the canonical [`polytope4_section`]
+/// reads vertices from [`Polytope4::topology`] and isn't aware of any transform applied
+/// after.
+///
+/// The vertex set must remain index-compatible with `edges` and `cells`: each `edges[i]`
+/// pair indexes into `vertices`, and each `cells[i]` is a vertex-index list. Topology shape
+/// (edges, cells) is unchanged by rigid transforms, so callers reuse the parent polytope's
+/// topology arrays and substitute only the vertex set.
+pub fn polytope_section_with_vertices(
+    edges: &[[u32; 2]],
+    cells: &[&[u32]],
+    vertices: &[Vec4],
+    slice: rye_math::WPlane,
+) -> (rye_shape::TriangleMesh<3>, rye_shape::LineMesh<3>) {
+    let slice = perturb_slice_if_needed(slice, vertices);
+
+    let mut tri_mesh = rye_shape::TriangleMesh::<3>::default();
+    let mut edge_mesh = rye_shape::LineMesh::<3>::default();
+
+    for cell in cells {
+        // Per-cell w-range pruning: cells entirely above or below the slice can't
+        // contribute, and skipping them early is the load-bearing optimization for the
+        // 600-cell (600 cells x 720 edges naive = ~430K ops; with pruning, typical case
+        // is ~100 active cells x 30 edges-per-cell = ~3K ops).
+        let (w_min, w_max) = cell_w_range(cell, vertices);
+        if w_max < slice.w_slice - rye_math::SLICE_PERTURBATION_EPSILON
+            || w_min > slice.w_slice + rye_math::SLICE_PERTURBATION_EPSILON
+        {
+            continue;
+        }
+
+        // Cell-edges = parent-edges restricted to the cell's vertex set. Avoids needing
+        // per-cell 2-face incidence data; works because the standard polychora's edge
+        // sets are exactly their cells' edge sets (cells are convex 3-polytopes whose
+        // 1-skeleton is a subgraph of the parent).
+        let mut cap: Vec<Vec3> = Vec::with_capacity(8);
+        for &[i, j] in edges {
+            if !cell.contains(&i) || !cell.contains(&j) {
+                continue;
+            }
+            if let Some((_, p3)) =
+                <rye_math::EuclideanR4 as rye_math::SectionableSpace<4>>::edge_section(
+                    &slice,
+                    vertices[i as usize],
+                    vertices[j as usize],
+                )
+            {
+                cap.push(p3);
+            }
+        }
+        if cap.len() < 3 {
+            continue;
+        }
+
+        // Centroid + plane basis. The cap is a convex 2-polygon in R³ (intersection of a
+        // convex 3-cell with a hyperplane). `fit_plane_basis` finds two orthonormal basis
+        // vectors in the cap's plane via the first non-collinear pair of cap offsets.
+        let centroid: Vec3 = cap.iter().copied().sum::<Vec3>() / cap.len() as f32;
+        let Some((basis_u, basis_v)) = fit_plane_basis(centroid, &cap) else {
+            continue;
+        };
+
+        // Order cap points by angle around the centroid in the (u, v) plane. Convex
+        // polygons sort cleanly under atan2 ordering since the centroid is interior.
+        let ordered = order_around_centroid(&cap, centroid, basis_u, basis_v);
+
+        // Emit a triangle fan from the centroid. Adds the centroid as an interior vertex
+        // (invisible inside the convex cap) plus each cap vertex; triangles are
+        // (centroid, ordered[k], ordered[k+1]).
+        let cv_base = tri_mesh.vertices.len() as u32;
+        tri_mesh.vertices.push(centroid.to_array());
+        tri_mesh.colors.push(SECTION_FILL_COLOR);
+        for p in &ordered {
+            tri_mesh.vertices.push(p.to_array());
+            tri_mesh.colors.push(SECTION_FILL_COLOR);
+        }
+        let n = ordered.len() as u32;
+        for k in 0..n {
+            let k_next = (k + 1) % n;
+            tri_mesh
+                .indices
+                .push([cv_base, cv_base + 1 + k, cv_base + 1 + k_next]);
+        }
+
+        // Emit the perimeter as cap-vertex-pair line segments. Shared edges between
+        // adjacent cell caps are drawn twice (cells share their face-on-slice edges); the
+        // duplication is visually invisible and avoids a global edge-dedup pass.
+        for k in 0..ordered.len() {
+            let a = ordered[k];
+            let b = ordered[(k + 1) % ordered.len()];
+            edge_mesh.segments.push((a.to_array(), b.to_array()));
+            edge_mesh
+                .colors
+                .push((SECTION_EDGE_COLOR, SECTION_EDGE_COLOR));
+            edge_mesh.widths.push(SECTION_EDGE_WIDTH);
+        }
+    }
+
+    (tri_mesh, edge_mesh)
+}
+
+/// Shift the slice by [`rye_math::SLICE_PERTURBATION_EPSILON`] when any polytope vertex's w
+/// sits within that epsilon. Kills vertex-on-slice / edge-in-plane / face-graze
+/// degeneracies in one step so the cell-assembly loop can ignore them.
+fn perturb_slice_if_needed(slice: rye_math::WPlane, vertices: &[Vec4]) -> rye_math::WPlane {
+    let eps = rye_math::SLICE_PERTURBATION_EPSILON;
+    let near = vertices
+        .iter()
+        .any(|v| (v.w - slice.w_slice).abs() < eps);
+    if near {
+        rye_math::WPlane::new(slice.w_slice + eps)
+    } else {
+        slice
+    }
+}
+
+/// Min and max w-coordinate of a cell's vertex set. O(n) per cell; used by the per-cell
+/// pruning step in [`polytope4_section`].
+fn cell_w_range(cell: &[u32], vertices: &[Vec4]) -> (f32, f32) {
+    let mut w_min = f32::INFINITY;
+    let mut w_max = f32::NEG_INFINITY;
+    for &i in cell {
+        let w = vertices[i as usize].w;
+        if w < w_min {
+            w_min = w;
+        }
+        if w > w_max {
+            w_max = w;
+        }
+    }
+    (w_min, w_max)
+}
+
+/// Find two orthonormal basis vectors `(basis_u, basis_v)` spanning the plane of the
+/// cap polygon. Picks the first non-trivial offset from the centroid as `basis_u`, then
+/// looks for a second offset whose cross with `basis_u` is non-degenerate (gives the
+/// plane normal); `basis_v` is recovered as `normal x basis_u`.
+///
+/// Returns `None` when all cap points are collinear or coincide with the centroid -- a
+/// degenerate cap that the caller should skip. The slice-perturbation step in
+/// [`polytope4_section`] keeps this from firing under non-pathological inputs.
+fn fit_plane_basis(centroid: Vec3, points: &[Vec3]) -> Option<(Vec3, Vec3)> {
+    let eps = rye_math::EDGE_PARALLEL_EPSILON;
+    let mut basis_u = Vec3::ZERO;
+    for p in points {
+        let off = *p - centroid;
+        if off.length_squared() > eps * eps {
+            basis_u = off.normalize();
+            break;
+        }
+    }
+    if basis_u == Vec3::ZERO {
+        return None;
+    }
+    for p in points {
+        let off = *p - centroid;
+        let cross = basis_u.cross(off);
+        if cross.length_squared() > eps * eps {
+            let normal = cross.normalize();
+            let basis_v = normal.cross(basis_u);
+            return Some((basis_u, basis_v));
+        }
+    }
+    None
+}
+
+/// Sort cap points by angle around the centroid in the cap's `(basis_u, basis_v)` plane.
+/// Convex polygons sort cleanly under this ordering since the centroid is interior; the
+/// resulting sequence walks the perimeter once.
+fn order_around_centroid(
+    points: &[Vec3],
+    centroid: Vec3,
+    basis_u: Vec3,
+    basis_v: Vec3,
+) -> Vec<Vec3> {
+    let mut indexed: Vec<(usize, f32)> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let off = *p - centroid;
+            let angle = off.dot(basis_v).atan2(off.dot(basis_u));
+            (i, angle)
+        })
+        .collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.into_iter().map(|(i, _)| points[i]).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Per-polytope vertex caches
 // ---------------------------------------------------------------------------
 //
@@ -997,6 +1232,93 @@ mod tests {
         for (start_color, end_color) in &mesh.colors {
             assert!(palette.contains(start_color));
             assert!(palette.contains(end_color));
+        }
+    }
+
+    // ----------------- Cross-section algorithm -----------------
+
+    /// 5-cell at the midpoint slice: exactly 4 of the 5 cells cross w=0 (the cell missing
+    /// the apex sits entirely at w=-0.25 and is skipped by per-cell pruning). Each crossing
+    /// cell contributes a triangle cap (3 cap vertices), fan-triangulated as 3 sub-triangles
+    /// from the centroid. Total: 4 caps * 3 sub-triangles = 12 triangles; perimeter has
+    /// 4 caps * 3 edges = 12 edges (with duplication where caps share boundary edges).
+    /// Matches Coxeter's classical result: pentatope midpoint section is a regular tetrahedron.
+    #[test]
+    fn pentatope_section_at_midpoint() {
+        let (tri, edges) =
+            polytope4_section(Polytope4::Pentatope, rye_math::WPlane::new(0.0));
+        assert_eq!(tri.indices.len(), 12, "expected 12 fan triangles");
+        assert_eq!(edges.segments.len(), 12, "expected 12 perimeter segments");
+        // Each cap has 4 mesh-vertices (centroid + 3 cap points). 4 caps total.
+        assert_eq!(tri.vertices.len(), 16);
+    }
+
+    /// Tesseract at the midpoint slice: 6 of the 8 cubical cells cross w=0 (the 2 cells with
+    /// `w = +/- 0.5` fixed don't). Each crossing cell contributes a square cap (4 cap
+    /// vertices), fan-triangulated as 4 sub-triangles. Total: 6 caps * 4 sub-triangles = 24
+    /// triangles; perimeter has 6 caps * 4 edges = 24 segments.
+    #[test]
+    fn tesseract_section_at_midpoint_has_six_square_caps() {
+        let (tri, edges) =
+            polytope4_section(Polytope4::Tesseract, rye_math::WPlane::new(0.0));
+        assert_eq!(tri.indices.len(), 24, "6 cubical cells * 4 fan-triangles");
+        assert_eq!(edges.segments.len(), 24, "6 caps * 4 perimeter edges");
+        // Each cap has 5 mesh-vertices (centroid + 4 cap points). 6 caps total.
+        assert_eq!(tri.vertices.len(), 30);
+    }
+
+    /// Slice well outside the polytope (`w = 2` is beyond every vertex's w in any of the
+    /// six polychora) returns an empty section. Per-cell pruning catches this in O(cells).
+    #[test]
+    fn section_outside_polytope_is_empty() {
+        for polytope in Polytope4::ALL {
+            let (tri, edges) = polytope4_section(polytope, rye_math::WPlane::new(2.0));
+            assert!(
+                tri.indices.is_empty(),
+                "{polytope:?} above-vertex slice should yield no triangles"
+            );
+            assert!(
+                edges.segments.is_empty(),
+                "{polytope:?} above-vertex slice should yield no perimeter edges"
+            );
+        }
+    }
+
+    /// Slice placed exactly on a polytope's vertex w-coordinate triggers the perturbation
+    /// path. The result should be valid (no NaN, no infinite triangles), even if the
+    /// perturbed slice produces a slightly different cap than the unperturbed analytical
+    /// case would. Test with the 5-cell base-vertex w = -0.25.
+    #[test]
+    fn vertex_on_slice_is_perturbed_not_nan() {
+        let (tri, edges) =
+            polytope4_section(Polytope4::Pentatope, rye_math::WPlane::new(-0.25));
+        for v in &tri.vertices {
+            for component in v {
+                assert!(component.is_finite(), "triangle vertex must be finite");
+            }
+        }
+        for (a, b) in &edges.segments {
+            for component in a.iter().chain(b.iter()) {
+                assert!(component.is_finite(), "edge vertex must be finite");
+            }
+        }
+    }
+
+    /// Slice value inside the polytope's w-range produces non-empty section for every one
+    /// of the six polychora. Catches accidental "always-empty" failures from per-cell
+    /// pruning misjudging the slice value.
+    #[test]
+    fn midpoint_slice_is_non_empty_for_every_polytope() {
+        for polytope in Polytope4::ALL {
+            let (tri, edges) = polytope4_section(polytope, rye_math::WPlane::new(0.0));
+            assert!(
+                !tri.indices.is_empty(),
+                "{polytope:?} midpoint slice should yield triangles"
+            );
+            assert!(
+                !edges.segments.is_empty(),
+                "{polytope:?} midpoint slice should yield perimeter edges"
+            );
         }
     }
 }

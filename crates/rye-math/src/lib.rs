@@ -30,6 +30,7 @@ pub mod euclidean_r2;
 pub mod euclidean_r4;
 pub mod hyperbolic;
 pub mod rasterizable;
+pub mod sectionable;
 pub mod space;
 pub mod spherical;
 pub mod tangent;
@@ -43,6 +44,9 @@ pub use euclidean_r2::{EuclideanR2, Iso2};
 pub use euclidean_r4::{EuclideanR4, Iso4Flat};
 pub use hyperbolic::{HyperbolicH3, Iso3H};
 pub use rasterizable::{Projection, RasterizableSpace};
+pub use sectionable::{
+    SectionableSpace, WPlane, EDGE_PARALLEL_EPSILON, SLICE_PERTURBATION_EPSILON,
+};
 pub use space::{Space, WgslSpace};
 pub use spherical::{Iso4, SphericalS3};
 pub use tangent::Tangent;
