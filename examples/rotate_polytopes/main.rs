@@ -57,8 +57,8 @@ use anyhow::{anyhow, Result};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
 use rye_egui::Console;
-use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
 use rye_math::WPlane;
+use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
 use rye_physics::polytope::{polytope_section_with_vertices, vertex_color_by_position};
 use rye_render::{
     device::RenderDevice,
@@ -67,8 +67,8 @@ use rye_render::{
     },
     DepthMode, LineRasterNode, Viewport,
 };
-use rye_shape::LineMesh;
 use rye_scene::{Scene4, SceneNode4};
+use rye_shape::LineMesh;
 use winit::window::WindowAttributes;
 
 mod active;
@@ -181,7 +181,8 @@ impl Demo {
             node,
             section_edges,
             parent_wireframe,
-            overlay_enabled: false,
+            wireframe_enabled: false,
+            wireframe_nearest_active: true,
             row,
             w_slice: initial_w,
             slider_up_held: false,
@@ -588,8 +589,8 @@ impl Demo {
             // Cross-section + parent-wireframe overlay (when toggled). Only in Shapes
             // view since Filmstrip's per-cell viewport composition would require
             // per-cell depth-clear + per-cell uploads that aren't worth the v1 plumbing.
-            if self.overlay_enabled {
-                self.render_section_overlay(rd, view)?;
+            if self.wireframe_enabled {
+                self.render_wireframe_overlay(rd, view)?;
             }
             Ok(())
         }
@@ -607,7 +608,7 @@ impl Demo {
     /// Non-polychoral shapes (Clifford torus, duocylinder, etc.) in the row are skipped:
     /// they have no [`rye_physics::polytope::Polytope4`] mapping and the cross-section
     /// algorithm doesn't apply to smooth surfaces.
-    fn render_section_overlay(
+    fn render_wireframe_overlay(
         &mut self,
         rd: &RenderDevice,
         view: &wgpu::TextureView,
@@ -618,10 +619,14 @@ impl Demo {
         // Build combined meshes across the entire row.
         let mut section_edges = LineMesh::<3>::default();
         let mut parent_lines = LineMesh::<3>::default();
-        // Dim alpha so the wireframe reads as a "structure-context" overlay rather than
-        // competing with the bright section perimeter edges.
-        const PARENT_ALPHA: f32 = 0.55;
+        // Uniform-alpha endpoints when `nearest-active` is off; the active-mode mapping
+        // interpolates between DIM (cells the slice misses entirely) and BRIGHT (cells
+        // the slice is at the midpoint of).
+        const PARENT_ALPHA_UNIFORM: f32 = 0.55;
+        const PARENT_ALPHA_DIM: f32 = 0.10;
+        const PARENT_ALPHA_BRIGHT: f32 = 0.85;
         const PARENT_WIDTH: f32 = 1.2;
+        let nearest_active = self.wireframe_nearest_active;
 
         for (slot, entry) in self.row.iter().enumerate() {
             let Some(polytope) = entry.shape.polytope4() else {
@@ -656,12 +661,52 @@ impl Demo {
             section_edges.colors.append(&mut perim.colors);
             section_edges.widths.append(&mut perim.widths);
 
+            // Per-cell "crossing strength" in [0, 1]: 1 when `w_slice` is at the cell's
+            // w-midpoint (cap face is widest), 0 when the slice is at the cell's w-boundary
+            // or outside it entirely. A linear w-midpoint proxy avoids computing actual
+            // cap areas while giving the same visual gradient: cells the slice is *deep
+            // in* peak in brightness, cells the slice barely touches taper to dim.
+            let cell_strengths: Vec<f32> = topo
+                .cells
+                .iter()
+                .map(|cell| {
+                    let (w_min, w_max) = cell
+                        .iter()
+                        .map(|&i| world_vertices[i as usize].w)
+                        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), w| {
+                            (lo.min(w), hi.max(w))
+                        });
+                    let half_extent = (w_max - w_min) * 0.5;
+                    if half_extent <= 0.0 {
+                        return 0.0;
+                    }
+                    let mid = (w_min + w_max) * 0.5;
+                    let dist = (self.w_slice - mid).abs();
+                    (1.0 - dist / half_extent).clamp(0.0, 1.0)
+                })
+                .collect();
+
+            // Per-edge brightness: max strength across cells the edge belongs to. An edge
+            // belongs to a cell when both endpoints sit in that cell's vertex list. This
+            // lets a single edge "light up" as soon as ANY containing cell is being
+            // crossed deep; doesn't require the slice to specifically hit the cell whose
+            // boundary the edge sits on.
+            let edge_strength = |i: u32, j: u32| -> f32 {
+                let mut best = 0.0_f32;
+                for (cell, strength) in topo.cells.iter().zip(cell_strengths.iter()) {
+                    if cell.contains(&i) && cell.contains(&j) && *strength > best {
+                        best = *strength;
+                    }
+                }
+                best
+            };
+
             // Parent wireframe: every polytope edge as a world-R³ line, colored by
             // position-derived RGB from the canonical (unit-circumradius) vertex set so
             // adjacent edges share their endpoint colors and the polytope's symmetry
             // shows as smooth color gradients across the wireframe (same scheme as
-            // [`Polytope4::lines_colored_by_position`]). Alpha is dimmed uniformly so
-            // the wireframe sits visually behind the bright section perimeter.
+            // [`Polytope4::lines_colored_by_position`]). Alpha modulated per-edge by the
+            // `nearest-active` strength when that toggle is on; uniform otherwise.
             for &[i, j] in topo.edges {
                 let ia = i as usize;
                 let ja = j as usize;
@@ -669,8 +714,14 @@ impl Demo {
                 let b = world_vertices[ja];
                 let mut color_a = vertex_color_by_position(topo.vertices[ia]);
                 let mut color_b = vertex_color_by_position(topo.vertices[ja]);
-                color_a[3] = PARENT_ALPHA;
-                color_b[3] = PARENT_ALPHA;
+                let alpha = if nearest_active {
+                    let s = edge_strength(i, j);
+                    PARENT_ALPHA_DIM + (PARENT_ALPHA_BRIGHT - PARENT_ALPHA_DIM) * s
+                } else {
+                    PARENT_ALPHA_UNIFORM
+                };
+                color_a[3] = alpha;
+                color_b[3] = alpha;
                 parent_lines
                     .segments
                     .push(([a.x, a.y, a.z], [b.x, b.y, b.z]));
@@ -704,8 +755,7 @@ impl Demo {
         let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
         let view_proj = proj_mat * view_mat;
         let vp_size = Vec2::new(cfg.width as f32, cfg.height as f32);
-        self.section_edges
-            .set_camera(&rd.queue, view_proj, vp_size);
+        self.section_edges.set_camera(&rd.queue, view_proj, vp_size);
         self.parent_wireframe
             .set_camera(&rd.queue, view_proj, vp_size);
 
@@ -790,25 +840,65 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
-        // Cross-section + parent-wireframe overlay. Off by default; toggle with
-        // `overlay on` / `overlay off` / bare `overlay` to flip.
+        // Cross-section + parent-wireframe overlay. Tab-complete cycles through:
+        //   wireframe on               -- enable the overlay
+        //   wireframe off              -- disable
+        //   wireframe nearest-active on|off -- toggle the per-cell alpha gradient that
+        //                                     highlights cells the slice is currently
+        //                                     deep into
+        // Bare `wireframe` (no args) flips the main on/off.
         c.register(
             rye_egui::cmd(
-                "overlay",
-                "toggle cross-section + parent-wireframe overlay (on|off; no arg = toggle)",
-                |args, demo: &mut Demo, _out| {
-                    demo.overlay_enabled = match args.first().copied() {
-                        Some("on") => true,
-                        Some("off") => false,
-                        Some(other) => {
-                            return Err(anyhow!("unknown arg `{other}` (try on|off)"))
+                "wireframe",
+                "wireframe + cross-section overlay (see `help wireframe`)",
+                |args, demo: &mut Demo, _out| match args.first().copied() {
+                    Some("on") => {
+                        demo.wireframe_enabled = true;
+                        Ok(())
+                    }
+                    Some("off") => {
+                        demo.wireframe_enabled = false;
+                        Ok(())
+                    }
+                    Some("nearest-active") => match args.get(1).copied() {
+                        Some("on") => {
+                            demo.wireframe_nearest_active = true;
+                            Ok(())
                         }
-                        None => !demo.overlay_enabled,
-                    };
-                    Ok(())
+                        Some("off") => {
+                            demo.wireframe_nearest_active = false;
+                            Ok(())
+                        }
+                        Some(other) => Err(anyhow!(
+                            "unknown arg `{other}` for `wireframe nearest-active` (try on|off)"
+                        )),
+                        None => Err(anyhow!("usage: wireframe nearest-active <on|off>")),
+                    },
+                    Some(other) => Err(anyhow!(
+                        "unknown arg `{other}` (try on|off|nearest-active)"
+                    )),
+                    None => {
+                        demo.wireframe_enabled = !demo.wireframe_enabled;
+                        Ok(())
+                    }
                 },
             )
-            .with_args(&[&["on", "off"]]),
+            .with_args(&[&["on", "off", "nearest-active"], &["on", "off"]])
+            .with_long_help(
+                "Cross-section + parent-wireframe overlay on top of the SDF raymarch.\n\
+                 \n\
+                 The SDF already fills the active 3D cross-section (the polyhedron an\n\
+                 inhabitant at w = w_slice would see). The wireframe overlay adds:\n\
+                 - cyan perimeter edges tracing the boundaries between adjacent cell caps\n\
+                 - the parent polytope's full edge graph drop-w projected to R³\n\
+                 \n\
+                 subcommands:\n  \
+                 on              enable the overlay\n  \
+                 off             disable\n  \
+                 nearest-active  <on|off>  toggle the per-edge alpha gradient that\n                                  highlights cells whose midpoint w is near the\n                                  current slice. ON by default. When ON, edges of\n                                  cells the slice is deep in glow at high alpha;\n                                  edges of unaffected cells fade to ~0.10 alpha,\n                                  visualizing the slice's path through the polytope.\n\
+                 \n\
+                 With no args, `wireframe` flips the main on/off.",
+            ),
         );
 
         // Framework-provided capture: `capture png [pre|post|both] [dir]`,

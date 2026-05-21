@@ -20,10 +20,10 @@
 //! // clear pass then raster passes against `depth.view`
 //! ```
 //!
-//! The framework doesn't surface a resize hook on `App`, so [`DepthBuffer::ensure`] checks size +
-//! sample count each frame and recreates the texture only when they change. Holds the
-//! [`wgpu::TextureView`] only; the underlying texture stays alive via wgpu's internal Arc
-//! reference held by the view.
+//! The framework doesn't surface a resize hook on `App`, so [`DepthBuffer::ensure`] checks
+//! size + sample count each frame and recreates the texture only when they change. Holds
+//! the [`wgpu::TextureView`] only; the underlying texture stays alive via wgpu's internal
+//! Arc reference held by the view.
 
 use wgpu::{
     Device, Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
@@ -32,7 +32,7 @@ use wgpu::{
 
 /// Owns a depth texture view sized to the swapchain, recreated on resize.
 pub struct DepthBuffer {
-    /// Texture view bound to the depth attachment in [`wgpu::RenderPassDepthStencilAttachment`].
+    /// Texture view bound to the `wgpu::RenderPassDepthStencilAttachment`.
     pub view: TextureView,
     /// Format the texture was created with. Stored so [`Self::ensure`] can recreate when
     /// the caller changes its mind (rare in practice).

@@ -139,8 +139,7 @@ mod tests {
         let slice = WPlane::new(0.0);
         let p0 = Vec4::new(1.0, 2.0, 3.0, -1.0);
         let p1 = Vec4::new(5.0, 6.0, 7.0, 1.0);
-        let (t, p3) =
-            <EuclideanR4 as SectionableSpace<4>>::edge_section(&slice, p0, p1).unwrap();
+        let (t, p3) = <EuclideanR4 as SectionableSpace<4>>::edge_section(&slice, p0, p1).unwrap();
         assert!((t - 0.5).abs() < 1e-6);
         assert_eq!(p3, Vec3::new(3.0, 4.0, 5.0));
     }
@@ -173,8 +172,7 @@ mod tests {
         let slice = WPlane::new(0.0);
         let p0 = Vec4::new(2.0, 2.0, 2.0, 0.0);
         let p1 = Vec4::new(5.0, 5.0, 5.0, 1.0);
-        let (t, p3) =
-            <EuclideanR4 as SectionableSpace<4>>::edge_section(&slice, p0, p1).unwrap();
+        let (t, p3) = <EuclideanR4 as SectionableSpace<4>>::edge_section(&slice, p0, p1).unwrap();
         assert!(t.abs() < 1e-6);
         assert_eq!(p3, Vec3::new(2.0, 2.0, 2.0));
     }

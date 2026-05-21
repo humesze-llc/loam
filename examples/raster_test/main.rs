@@ -40,7 +40,9 @@ use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, Run
 use rye_egui::{Console, ConsoleWriter};
 use rye_math::{EuclideanR3, EuclideanR4, Projection, WPlane};
 use rye_physics::polytope::{polytope_section_with_vertices, Polytope4};
-use rye_render::{device::RenderDevice, DepthBuffer, DepthMode, LineRasterNode, TriangleRasterNode};
+use rye_render::{
+    device::RenderDevice, DepthBuffer, DepthMode, LineRasterNode, TriangleRasterNode,
+};
 use rye_shape::{LineMesh, TriangleMesh};
 use winit::window::WindowAttributes;
 
@@ -499,8 +501,7 @@ impl Demo {
             .set_camera(&rd.queue, view_proj, vp_size);
         self.triangle_raster.set_camera(&rd.queue, view_proj);
         self.section_triangles.set_camera(&rd.queue, view_proj);
-        self.section_edges
-            .set_camera(&rd.queue, view_proj, vp_size);
+        self.section_edges.set_camera(&rd.queue, view_proj, vp_size);
 
         // Lazy / resize-aware depth buffer. The framework doesn't surface a resize hook to
         // App; comparing dimensions each frame is cheap and avoids the extra trait method.

@@ -147,8 +147,22 @@ pub trait Command<Ctx>: 'static {
     /// (`capture.start`).
     fn name(&self) -> &str;
 
-    /// One-line description shown by `help`.
+    /// One-line description shown by `help` (no argument) when listing every command.
+    /// Conventionally <= ~60 chars so the listing fits in a single console row.
     fn help(&self) -> &str;
+
+    /// Multi-line help shown by `help <name>` for a specific command. Default returns
+    /// just the one-line [`Self::help`] string -- override when the command's surface
+    /// is richer than fits one line (multiple subcommands, multi-step usage examples,
+    /// arg-by-arg explanations).
+    ///
+    /// `\n` line breaks are honored; the panel paints each line into the scrollback as
+    /// its own entry so word-wrap and scroll behavior stay consistent with the rest of
+    /// the console. Returns owned `String` so subcommand-dispatching commands can build
+    /// the listing dynamically from their registered children without storing a static.
+    fn long_help(&self) -> String {
+        self.help().to_string()
+    }
 
     /// Tab-completion choices for the `arg_index`-th positional argument, without
     /// awareness of values typed in prior slots. Default is empty (no completion /
@@ -215,6 +229,9 @@ pub trait Command<Ctx>: 'static {
 pub struct FnCommand<F> {
     name: &'static str,
     help: &'static str,
+    /// Optional multi-line text returned by [`Command::long_help`] when set. When `None`,
+    /// `long_help` falls back to repeating `help`. Set via [`FnCommand::with_long_help`].
+    long_help: Option<&'static str>,
     arg_choices: Vec<Vec<&'static str>>,
     /// Per-key value choices for `key=value` args, applied across every arg
     /// position the key appears at. Keyed by the bare key name (no `=`).
@@ -253,6 +270,28 @@ impl<F> FnCommand<F> {
         self.value_choices.insert(key, values.to_vec());
         self
     }
+
+    /// Attach a multi-line help block returned by [`Command::long_help`]. Newlines are
+    /// honored; the console paints each line as its own scrollback entry so wrapping +
+    /// scroll behavior stay consistent. Use for commands whose surface (multiple
+    /// subcommand-style args, usage examples) doesn't fit one line.
+    ///
+    /// ```ignore
+    /// cmd("wireframe", "wireframe overlay (see help)", handler)
+    ///     .with_args(&[&["on", "off", "nearest-active"], &["on", "off"]])
+    ///     .with_long_help(
+    ///         "Cross-section + parent-wireframe overlay.\n\
+    ///          \n\
+    ///          subcommands:\n  \
+    ///          on              enable the overlay\n  \
+    ///          off             disable\n  \
+    ///          nearest-active  toggle the per-cell brightness gradient",
+    ///     )
+    /// ```
+    pub fn with_long_help(mut self, long: &'static str) -> Self {
+        self.long_help = Some(long);
+        self
+    }
 }
 
 /// Build a [`Command`] from a closure. The closure mutates a `Ctx` and writes lines
@@ -273,6 +312,7 @@ where
     FnCommand {
         name,
         help,
+        long_help: None,
         arg_choices: Vec::new(),
         value_choices: HashMap::new(),
         f,
@@ -288,6 +328,11 @@ where
     }
     fn help(&self) -> &str {
         self.help
+    }
+    fn long_help(&self) -> String {
+        self.long_help
+            .map(str::to_string)
+            .unwrap_or_else(|| self.help.to_string())
     }
     fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
         self.arg_choices
@@ -520,6 +565,26 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
     }
     fn help(&self) -> &str {
         self.help
+    }
+
+    fn long_help(&self) -> String {
+        // First line is the umbrella's one-liner; subsequent lines list every
+        // registered subcommand with its description. `help <set-name>` then reads as a
+        // mini-manual page for the whole subcommand family.
+        let mut out = String::with_capacity(128 + self.subs.len() * 64);
+        out.push_str(self.help);
+        if !self.subs.is_empty() {
+            out.push_str("\nsubcommands:");
+            for (name, entry) in &self.subs {
+                let kind = match entry.kind {
+                    SubcommandKind::Toggle { .. } => "<on|off>",
+                    SubcommandKind::Choice { .. } => "<choice>",
+                    SubcommandKind::Custom { .. } => "<args...>",
+                };
+                out.push_str(&format!("\n  {name:14} {kind:9}  {}", entry.help));
+            }
+        }
+        out
     }
 
     fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
@@ -1234,11 +1299,32 @@ impl<Ctx: 'static> Console<Ctx> {
         match target {
             Some(name) => {
                 if let Some(b) = Builtin::from_name(name) {
+                    // Built-ins only have one-line descriptions; no multi-line variant.
                     self.push_history(HistoryLine::output(format!("{}: {}", b.name(), b.help())));
-                } else if let Some(c) = self.commands.get(name) {
-                    self.push_history(HistoryLine::output(format!("{}: {}", c.name(), c.help())));
                 } else {
-                    self.push_history(HistoryLine::error(format!("no command '{name}'")));
+                    // Materialize the help lines BEFORE pushing to history: `c` borrows
+                    // `self.commands` immutably and `push_history` borrows `self` mutably,
+                    // so the two can't coexist.
+                    let prepared: Option<(String, Vec<String>)> =
+                        self.commands.get(name).map(|c| {
+                            let header_prefix = format!("{}: ", c.name());
+                            let body = c.long_help();
+                            let indent = " ".repeat(c.name().len() + 2);
+                            let mut lines = body.lines();
+                            let first = lines.next().unwrap_or("");
+                            let mut rendered = vec![format!("{header_prefix}{first}")];
+                            for line in lines {
+                                rendered.push(format!("{indent}{line}"));
+                            }
+                            (c.name().to_string(), rendered)
+                        });
+                    if let Some((_name, lines)) = prepared {
+                        for line in lines {
+                            self.push_history(HistoryLine::output(line));
+                        }
+                    } else {
+                        self.push_history(HistoryLine::error(format!("no command '{name}'")));
+                    }
                 }
             }
             None => {

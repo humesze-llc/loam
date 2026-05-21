@@ -221,9 +221,17 @@ pub(crate) struct Demo {
     /// which slice is currently shown.
     pub(crate) parent_wireframe: rye_render::LineRasterNode,
     /// Whether the cross-section + parent-wireframe overlay renders. Off by default so
-    /// the existing SDF-only demo is unchanged; toggle via the `overlay on|off` console
+    /// the existing SDF-only demo is unchanged; toggle via the `wireframe on|off` console
     /// subcommand.
-    pub(crate) overlay_enabled: bool,
+    pub(crate) wireframe_enabled: bool,
+    /// When `true`, parent-wireframe edges are alpha-graded by how close the current
+    /// `w_slice` is to the midpoint of each cell they belong to: edges of cells the slice
+    /// is *deep in* glow at full alpha, edges of cells the slice doesn't touch fade to the
+    /// dim "context" alpha. As the slice scrubs, brightness propagates through the
+    /// wireframe as a wave, visually identifying which cells are contributing caps at
+    /// each moment. When `false`, every edge uses the same uniform dim alpha (the
+    /// previous behavior).
+    pub(crate) wireframe_nearest_active: bool,
     /// Polytope row built at startup from `--shapes` CLI args (or `DEFAULT_ROW`); drives
     /// both the body uniforms and per-body label lookups in the overlay.
     pub(crate) row: Vec<ShapeEntry>,
@@ -446,4 +454,3 @@ impl Demo {
         self.write_all(Rotor4::IDENTITY);
     }
 }
-

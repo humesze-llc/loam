@@ -267,12 +267,7 @@ pub fn vertex_color_by_position(v: Vec4) -> [f32; 4] {
     let n = v.try_normalize().unwrap_or(Vec4::ZERO);
     let bias = |c: f32| 0.25 + 0.75 * (0.5 + 0.5 * c);
     let w_mod = 0.7 + 0.3 * (0.5 + 0.5 * n.w);
-    [
-        bias(n.x) * w_mod,
-        bias(n.y) * w_mod,
-        bias(n.z) * w_mod,
-        1.0,
-    ]
+    [bias(n.x) * w_mod, bias(n.y) * w_mod, bias(n.z) * w_mod, 1.0]
 }
 
 // ---------------------------------------------------------------------------
@@ -428,9 +423,7 @@ pub fn polytope_section_with_vertices(
 /// degeneracies in one step so the cell-assembly loop can ignore them.
 fn perturb_slice_if_needed(slice: rye_math::WPlane, vertices: &[Vec4]) -> rye_math::WPlane {
     let eps = rye_math::SLICE_PERTURBATION_EPSILON;
-    let near = vertices
-        .iter()
-        .any(|v| (v.w - slice.w_slice).abs() < eps);
+    let near = vertices.iter().any(|v| (v.w - slice.w_slice).abs() < eps);
     if near {
         rye_math::WPlane::new(slice.w_slice + eps)
     } else {
@@ -1264,8 +1257,7 @@ mod tests {
     /// Matches Coxeter's classical result: pentatope midpoint section is a regular tetrahedron.
     #[test]
     fn pentatope_section_at_midpoint() {
-        let (tri, edges) =
-            polytope4_section(Polytope4::Pentatope, rye_math::WPlane::new(0.0));
+        let (tri, edges) = polytope4_section(Polytope4::Pentatope, rye_math::WPlane::new(0.0));
         assert_eq!(tri.indices.len(), 12, "expected 12 fan triangles");
         assert_eq!(edges.segments.len(), 12, "expected 12 perimeter segments");
         // Each cap has 4 mesh-vertices (centroid + 3 cap points). 4 caps total.
@@ -1278,8 +1270,7 @@ mod tests {
     /// triangles; perimeter has 6 caps * 4 edges = 24 segments.
     #[test]
     fn tesseract_section_at_midpoint_has_six_square_caps() {
-        let (tri, edges) =
-            polytope4_section(Polytope4::Tesseract, rye_math::WPlane::new(0.0));
+        let (tri, edges) = polytope4_section(Polytope4::Tesseract, rye_math::WPlane::new(0.0));
         assert_eq!(tri.indices.len(), 24, "6 cubical cells * 4 fan-triangles");
         assert_eq!(edges.segments.len(), 24, "6 caps * 4 perimeter edges");
         // Each cap has 5 mesh-vertices (centroid + 4 cap points). 6 caps total.
@@ -1309,8 +1300,7 @@ mod tests {
     /// case would. Test with the 5-cell base-vertex w = -0.25.
     #[test]
     fn vertex_on_slice_is_perturbed_not_nan() {
-        let (tri, edges) =
-            polytope4_section(Polytope4::Pentatope, rye_math::WPlane::new(-0.25));
+        let (tri, edges) = polytope4_section(Polytope4::Pentatope, rye_math::WPlane::new(-0.25));
         for v in &tri.vertices {
             for component in v {
                 assert!(component.is_finite(), "triangle vertex must be finite");
