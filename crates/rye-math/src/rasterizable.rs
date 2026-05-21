@@ -45,9 +45,13 @@ use crate::{EuclideanR3, EuclideanR4};
 ///   view is `Orthographic { drop_axis: 3 }` (drop `w`); other axis choices show alternative
 ///   3-flat slices. For `N == 3` this can drop one axis to produce a 2D-looking projection
 ///   (used later for Flatland-style reveals).
+/// - [`Perspective4D`](Self::Perspective4D): R⁴ pinhole projection from a viewer at
+///   `w = focal_distance` looking in -w. Produces the canonical "cube within a cube"
+///   tesseract view; drop-w renders axis-aligned polytopes as degenerate flat shapes because
+///   every pair of w-opposite vertices collapses to the same R³ point, and Perspective4D
+///   separates them.
 ///
-/// Future variants under consideration: R⁴-specific `Schlegel`, `Stereographic`,
-/// `Hyperslice`, and 4D `Perspective`.
+/// Future variants under consideration: R⁴-specific `Schlegel`, `Stereographic`, `Hyperslice`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Projection<const N: usize> {
     /// Pass through: take the first 3 components, zero-pad if `N < 3`, truncate if `N > 3`.
@@ -62,6 +66,26 @@ pub enum Projection<const N: usize> {
     ///
     /// Out-of-range `drop_axis` (>= `N`) returns `Vec3::ZERO`.
     Orthographic { drop_axis: usize },
+
+    /// 4D pinhole projection from a viewer at `(0, 0, 0, focal_distance)` looking in the -w
+    /// direction. A point `(x, y, z, w)` maps to `(x, y, z) * scale` where
+    /// `scale = focal_distance / (focal_distance - w)`. Points at `w = 0` are unchanged;
+    /// positive-w points (closer to the viewer in 4D) scale up; negative-w points scale down.
+    /// For a unit-circumradius polytope (vertices in `[-1, 1]^4`) this produces the classical
+    /// "cube within a cube" tesseract view: the +w face renders as the outer cube, the -w
+    /// face as the inner cube, connecting edges as the frustum.
+    ///
+    /// **Precondition: `focal_distance > max(w)` across every input vertex.** Otherwise the
+    /// denominator goes through zero (singularity at the viewer's eye) or negative (the
+    /// projection flips inside-out). The impl clamps the denominator to a small positive
+    /// epsilon rather than panicking, so a bad parameter degrades gracefully instead of NaN-
+    /// ing the upload, but the resulting picture is meaningless.
+    ///
+    /// Only meaningful for `N == 4`; impls for other `N` return `Vec3::ZERO`.
+    Perspective4D {
+        /// Viewer position along the w-axis. Typical value for unit polytopes: `2.0`.
+        focal_distance: f32,
+    },
 }
 
 /// A flat or curved space that can drive the rasterizer pipeline: provides projection from its
@@ -121,6 +145,9 @@ impl RasterizableSpace<3> for EuclideanR3 {
                 2 => Vec3::new(point.x, point.y, 0.0),
                 _ => Vec3::ZERO,
             },
+            // Perspective4D is meaningful only for `N == 4`; on R³ there's no w axis to
+            // project from. Per the enum contract, return zero rather than panic.
+            Projection::Perspective4D { .. } => Vec3::ZERO,
         }
     }
 
@@ -154,6 +181,17 @@ impl RasterizableSpace<4> for EuclideanR4 {
                 3 => Vec3::new(point.x, point.y, point.z),
                 _ => Vec3::ZERO,
             },
+            Projection::Perspective4D { focal_distance } => {
+                // Pinhole from viewer at `(0, 0, 0, focal_distance)` looking in -w. The
+                // denominator clamp guards against zero / negative values: callers should
+                // pick `focal_distance > max(w)` so the clamp never engages on legitimate
+                // input, but clamping lets a misconfigured projection degrade visibly
+                // rather than emit NaN through the rest of the upload path. The `1e-4`
+                // floor matches `EDGE_PARALLEL_EPSILON`'s order of magnitude.
+                let denom = (focal_distance - point.w).max(1e-4);
+                let scale = focal_distance / denom;
+                Vec3::new(point.x, point.y, point.z) * scale
+            }
         }
     }
 
@@ -298,6 +336,75 @@ mod tests {
         assert_eq!(pj(3), Vec3::new(1.0, 2.0, 3.0));
         // Out-of-range falls back to zero per the doc contract.
         assert_eq!(pj(4), Vec3::ZERO);
+    }
+
+    /// `Projection::Perspective4D` projects a `w = 0` point unchanged: the viewer sits at
+    /// `(0, 0, 0, focal_distance)` and a point on the `w = 0` 3-flat is at perpendicular
+    /// distance `focal_distance` from the eye, giving `scale = focal_distance / focal_distance
+    /// = 1`. Pins the boundary case where Perspective4D collapses to Identity.
+    #[test]
+    fn r4_perspective4d_w_zero_is_unchanged() {
+        let p = Vec4::new(1.0, 2.0, 3.0, 0.0);
+        let proj = Projection::Perspective4D {
+            focal_distance: 2.0,
+        };
+        let got = <EuclideanR4 as RasterizableSpace<4>>::project_point(p, &proj);
+        assert_eq!(got, Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    /// `Projection::Perspective4D` on the tesseract's w-extreme vertices produces the
+    /// canonical "cube within a cube" scale relationship: the +w face renders as the outer
+    /// (larger) cube and the -w face as the inner (smaller) cube. Pins the qualitative
+    /// behavior the demo depends on by checking the two end scales and their ratio.
+    #[test]
+    fn r4_perspective4d_cube_within_cube_scaling() {
+        let focal = 2.0;
+        let proj = Projection::Perspective4D {
+            focal_distance: focal,
+        };
+        let near = Vec4::new(0.5, 0.5, 0.5, 0.5);
+        let far = Vec4::new(0.5, 0.5, 0.5, -0.5);
+        let pn = <EuclideanR4 as RasterizableSpace<4>>::project_point(near, &proj);
+        let pf = <EuclideanR4 as RasterizableSpace<4>>::project_point(far, &proj);
+        // Scale at w=+0.5 is `2 / (2 - 0.5) = 4/3`; at w=-0.5 is `2 / 2.5 = 4/5`. Each R³
+        // component scales by the same factor, so the ratio of magnitudes is `(4/3)/(4/5) = 5/3`.
+        let r_near = (pn.length() / 0.5_f32.mul_add(3.0_f32.sqrt(), 0.0)).abs(); // |near|/|input|
+        let r_far = (pf.length() / 0.5_f32.mul_add(3.0_f32.sqrt(), 0.0)).abs();
+        assert!((r_near - 4.0 / 3.0).abs() < 1e-5, "near scale {r_near}");
+        assert!((r_far - 4.0 / 5.0).abs() < 1e-5, "far scale {r_far}");
+        // Outer cube (|+w face|) > inner cube (|-w face|).
+        assert!(pn.length() > pf.length(), "near={pn:?} far={pf:?}");
+    }
+
+    /// `Projection::Perspective4D` clamps the denominator rather than dividing by zero or
+    /// going negative. A point at the viewer's eye (`w == focal_distance`) would naively
+    /// produce infinite scale; the impl returns a finite (large) result instead so a single
+    /// misconfigured vertex doesn't NaN the entire upload buffer.
+    #[test]
+    fn r4_perspective4d_at_viewer_clamps_finite() {
+        let p = Vec4::new(0.1, 0.2, 0.3, 2.0);
+        let proj = Projection::Perspective4D {
+            focal_distance: 2.0,
+        };
+        let got = <EuclideanR4 as RasterizableSpace<4>>::project_point(p, &proj);
+        for c in [got.x, got.y, got.z] {
+            assert!(
+                c.is_finite(),
+                "expected finite output at viewer, got {got:?}"
+            );
+        }
+    }
+
+    /// `Projection::Perspective4D` on R³ falls back to `Vec3::ZERO` per the enum's
+    /// "unsupported variant returns zero" contract (R³ has no w axis to project from).
+    #[test]
+    fn r3_perspective4d_returns_zero() {
+        let p = Vec3::new(1.0, 2.0, 3.0);
+        let proj = Projection::Perspective4D {
+            focal_distance: 2.0,
+        };
+        let got = <EuclideanR3 as RasterizableSpace<3>>::project_point(p, &proj);
+        assert_eq!(got, Vec3::ZERO);
     }
 
     /// `tessellate_segment` on R⁴ is plain lerp (since `EuclideanR4` is flat). Each sample

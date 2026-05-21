@@ -27,10 +27,10 @@ impl Demo {
     pub(crate) fn render_shapes_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         // Only the SDF raymarch path is heavy on the 120/600-cell (~24 KB of const face-
-        // normal data + per-pixel Wolfe-greedy projection); the rasterized section-faces
-        // path keeps both polychora at vsync regardless of how many are in the row, so
-        // the warning is irrelevant when `surface_raster_enabled`.
-        let has_heavy_sdf = !self.surface_raster_enabled
+        // normal data + per-pixel Wolfe-greedy projection); the rasterized path keeps both
+        // polychora at vsync regardless of how many are in the row, and Off doesn't render
+        // their surface at all, so the warning only fires when `surface sdf` is active.
+        let has_heavy_sdf = self.surface_mode.uses_sdf_for_polychora()
             && self.row.iter().any(|e| {
                 matches!(
                     e.shape,

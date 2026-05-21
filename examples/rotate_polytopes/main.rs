@@ -74,6 +74,30 @@ use rye_render::{
 /// enough precision to depth-sort cell caps from the 600-cell (which can have ~24
 /// active caps within tenths of a unit of camera-z) without artifacting.
 const SECTION_FACES_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Uniform R³ scale factor that `projection` applies to a 4D point with `w = w_slice`.
+/// For `Projection::Identity` (drop-w) the result is `1.0`; for `Projection::Perspective4D`
+/// it's `focal_distance / (focal_distance - w_slice)`, clamped against the same epsilon
+/// the impl uses internally. Used by the wireframe overlay to translate section caps (whose
+/// vertices all share `w = w_slice`) into the perspective-scaled R³ frame without re-running
+/// the cap algorithm in 4D.
+fn perspective_scale_at_w(w_slice: f32, projection: &rye_math::Projection<4>) -> f32 {
+    match *projection {
+        rye_math::Projection::Identity | rye_math::Projection::Orthographic { .. } => 1.0,
+        rye_math::Projection::Perspective4D { focal_distance } => {
+            focal_distance / (focal_distance - w_slice).max(1e-4)
+        }
+    }
+}
+
+/// Map a body-local R³ point to world R³: scale by `section_scale` (the perspective scale at
+/// the cap's w-coordinate) then translate by the body's R³ position. Cap rendering uses this
+/// because the cross-section algorithm internally drops w and emits body-local R³; the world
+/// transform happens here.
+fn local_r3_to_world(p: [f32; 3], section_scale: f32, body_pos_r3: Vec3) -> [f32; 3] {
+    let scaled = Vec3::from_array(p) * section_scale;
+    (scaled + body_pos_r3).to_array()
+}
 use rye_scene::{Scene4, SceneNode4};
 use rye_shape::LineMesh;
 use winit::window::WindowAttributes;
@@ -90,7 +114,10 @@ mod ui;
 use active::combo_name;
 use catalog::{parse_row_from_args, SHAPE_CATALOG};
 use consts::{BODY_SIZE, BODY_Y, T_SCRUB_RATE, T_SLIDER_INITIAL, W_RANGE, W_SCRUB_RATE};
-use state::{body_position, Demo, RotationMode, ViewMode, WireframeColorMode};
+use state::{
+    body_position, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode,
+    WireframeProjection,
+};
 
 #[cfg(test)]
 use catalog::{parse_shape_name, ShapeEntry, DEFAULT_ROW};
@@ -191,7 +218,7 @@ impl Demo {
         // shading. Uses a depth attachment so caps from different cells of the same
         // polychoron occlude each other correctly when projected to camera space. The
         // depth buffer is sized + cleared per-frame inside the render path (only when
-        // `surface_raster_enabled`); see `Demo::render_section_faces` in this file.
+        // surface mode is `Raster`); see `Demo::render_section_faces` in this file.
         let section_faces = TriangleRasterNode::new(
             &ctx.rd.device,
             ctx.rd.surface_bundle.config.format,
@@ -225,12 +252,14 @@ impl Demo {
             parent_wireframe,
             wireframe_enabled: false,
             wireframe_nearest_active: true,
+            wireframe_perimeter: true,
             wireframe_color_mode: WireframeColorMode::default(),
+            wireframe_projection: WireframeProjection::default(),
             section_faces,
             section_faces_depth: None,
             section_world_vertices_scratch: Vec::new(),
             section_faces_mesh_scratch: rye_shape::TriangleMesh::<3>::default(),
-            surface_raster_enabled: true,
+            surface_mode: SurfaceMode::default(),
             row,
             w_slice: initial_w,
             slider_up_held: false,
@@ -641,7 +670,7 @@ impl Demo {
             // mode no pass writes depth, so the cleared `1.0` buffer makes every
             // wireframe fragment pass the depth-test trivially -- visual unchanged.
             self.ensure_and_clear_shared_depth(rd)?;
-            if self.surface_raster_enabled {
+            if matches!(self.surface_mode, SurfaceMode::Raster) {
                 self.render_section_faces(rd, view)?;
             }
             // Cross-section + parent-wireframe overlay (when toggled). Only in Shapes
@@ -726,26 +755,37 @@ impl Demo {
         combined.colors.clear();
         combined.indices.clear();
 
+        // Same perspective scaling logic the wireframe path uses (see render_wireframe_overlay):
+        // section the body in body-local 4D, then translate the produced R³ caps by the body's
+        // R³ position with the active perspective scale at the slice's w. With drop-w this
+        // collapses to identity scaling; with Perspective4D the cap scales by
+        // `focal / (focal - w_slice)`.
+        let wireframe_projection = self.wireframe_projection.to_projection();
+        let section_scale = perspective_scale_at_w(self.w_slice, &wireframe_projection);
+
         for (slot, entry) in self.row.iter().enumerate() {
             let Some(polytope) = entry.shape.polytope4() else {
                 continue;
             };
             let topo = polytope.topology();
-            let bp = Vec4::from_array(body_position(slot, n));
+            let body_pos = body_position(slot, n);
+            let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
 
-            // Reusable scratch for per-body world-space vertices. Same growth pattern
-            // as `combined` above.
+            // Body-local 4D scratch (rotor-rotated, scaled, NO world translate). Same
+            // rationale as the wireframe path: keep the body's R³ position out of the 4D
+            // perspective math so it doesn't get scaled by `focal / (focal - w)`.
             self.section_world_vertices_scratch.clear();
             self.section_world_vertices_scratch.extend(
                 topo.vertices
                     .iter()
-                    .map(|v| bp + BODY_SIZE * self.rot_state.apply(*v)),
+                    .map(|v| BODY_SIZE * self.rot_state.apply(*v)),
             );
 
-            // Match the SDF's per-body solid coloring: every cap of this polychoron
-            // uses the body's identity color from the catalog. Per-face Lambert in the
-            // fragment shader adds the geometric depth; the underlying color is flat.
+            // Match the SDF's per-body solid coloring: every cap of this polychoron uses
+            // the body's identity color from the catalog. Per-face Lambert in the fragment
+            // shader adds the geometric depth; the underlying color is flat.
             let [r, g, b] = entry.body_color;
+            let start = combined.vertices.len();
             polytope_section_faces_append(
                 topo.edges,
                 topo.cells,
@@ -754,6 +794,12 @@ impl Demo {
                 [r, g, b, 1.0],
                 combined,
             );
+            // Translate this body's body-local cap vertices into world R³. Indices were
+            // emitted with the correct vertex offset already (the `_append` API handles
+            // that internally); only the vertex positions need rebasing.
+            for v in &mut combined.vertices[start..] {
+                *v = local_r3_to_world(*v, section_scale, body_pos_r3);
+            }
         }
 
         // Empty mesh handling lives in `TriangleRasterNode::execute` (it short-circuits
@@ -823,6 +869,9 @@ impl Demo {
         const INACTIVE_GRAY: [f32; 4] = [0.55, 0.55, 0.58, 1.0];
         let nearest_active = self.wireframe_nearest_active;
         let color_mode = self.wireframe_color_mode;
+        // Resolve once per frame; same projection applied to every body's wireframe so all
+        // bodies share a consistent R³ embedding.
+        let wireframe_projection = self.wireframe_projection.to_projection();
 
         for (slot, entry) in self.row.iter().enumerate() {
             let Some(polytope) = entry.shape.polytope4() else {
@@ -830,32 +879,43 @@ impl Demo {
             };
             let topo = polytope.topology();
             let body_pos = body_position(slot, n);
-            let bp = Vec4::from_array(body_pos);
-            // Transform canonical vertices into world Vec4 coords. Same shape transform
-            // the SDF kernel applies (`body_position + body_size * rotor.apply(v)`), so
-            // the rasterized geometry sits at the same world-space position as the
-            // raymarched SDF.
-            let world_vertices: Vec<Vec4> = topo
+            // Body's R³ position. The body sits at body_pos.w = 0 in 4D, so the perspective
+            // projection at this body's location collapses to a pure R³ translation; doing
+            // the projection in body-local 4D and translating in R³ AFTER is the only way
+            // to keep the body's apparent x-position stable when Perspective4D scales the
+            // (x, y, z) channel by `focal / (focal - w)`.
+            let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+            // Body-local 4D vertices: rotor-rotated, scaled, NO world translate yet. The
+            // translate happens after the chosen `wireframe_projection` maps each vertex
+            // from R⁴ to R³.
+            let local_vertices: Vec<Vec4> = topo
                 .vertices
                 .iter()
-                .map(|v| bp + BODY_SIZE * self.rot_state.apply(*v))
+                .map(|v| BODY_SIZE * self.rot_state.apply(*v))
                 .collect();
 
-            // Cross-section perimeter edges only. The SDF raymarcher renders the section
-            // as a solid volume; we just need to outline the boundaries between adjacent
-            // cell caps (each cap contributes one face of the 3D section polytope).
-            // `polytope_section_overlay_with_vertices` returns `(triangles, perimeter)`; we
-            // discard the filled triangles since they would obscure the SDF without
-            // adding information.
-            let (_tri, mut perim) = polytope_section_overlay_with_vertices(
-                topo.edges,
-                topo.cells,
-                &world_vertices,
-                WPlane::new(self.w_slice),
-            );
-            section_edges.segments.append(&mut perim.segments);
-            section_edges.colors.append(&mut perim.colors);
-            section_edges.widths.append(&mut perim.widths);
+            // Cross-section perimeter edges. The cyan outlines bound each cell cap on the
+            // slice; gated by `wireframe_perimeter` so users can show the parent edge graph
+            // on its own. `polytope_section_overlay_with_vertices` uses drop-w internally,
+            // so its R³ output is in body-local frame; we apply the perspective scale at
+            // w_slice (uniform across the cap because every cap point shares the slice's w)
+            // and translate to world R³.
+            if self.wireframe_perimeter {
+                let section_scale = perspective_scale_at_w(self.w_slice, &wireframe_projection);
+                let (_tri, mut perim) = polytope_section_overlay_with_vertices(
+                    topo.edges,
+                    topo.cells,
+                    &local_vertices,
+                    WPlane::new(self.w_slice),
+                );
+                for (a, b) in &mut perim.segments {
+                    *a = local_r3_to_world(*a, section_scale, body_pos_r3);
+                    *b = local_r3_to_world(*b, section_scale, body_pos_r3);
+                }
+                section_edges.segments.append(&mut perim.segments);
+                section_edges.colors.append(&mut perim.colors);
+                section_edges.widths.append(&mut perim.widths);
+            }
 
             // Per-cell "crossing strength" in [0, 1]: 1 when `w_slice` is at the cell's
             // w-midpoint (cap face is widest), 0 when the slice is at the cell's w-boundary
@@ -868,7 +928,7 @@ impl Demo {
                 .map(|cell| {
                     let (w_min, w_max) = cell
                         .iter()
-                        .map(|&i| world_vertices[i as usize].w)
+                        .map(|&i| local_vertices[i as usize].w)
                         .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), w| {
                             (lo.min(w), hi.max(w))
                         });
@@ -922,8 +982,8 @@ impl Demo {
             for &[i, j] in topo.edges {
                 let ia = i as usize;
                 let ja = j as usize;
-                let a = world_vertices[ia];
-                let b = world_vertices[ja];
+                let a = local_vertices[ia];
+                let b = local_vertices[ja];
                 let (mut color_a, mut color_b) = match color_mode {
                     WireframeColorMode::Unique => (
                         vertex_color_by_position(topo.vertices[ia]),
@@ -946,9 +1006,23 @@ impl Demo {
                 };
                 color_a[3] = alpha;
                 color_b[3] = alpha;
-                parent_lines
-                    .segments
-                    .push(([a.x, a.y, a.z], [b.x, b.y, b.z]));
+                // Project 4D endpoints to R³ through the active wireframe projection (in
+                // body-local frame), then translate by `body_pos_r3` to land in world R³.
+                // For DropW the projection is identity-on-(x, y, z); for Perspective4D each
+                // component scales by `focal / (focal - w)`.
+                let a3_local =
+                    <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                        a,
+                        &wireframe_projection,
+                    );
+                let b3_local =
+                    <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                        b,
+                        &wireframe_projection,
+                    );
+                let a3 = a3_local + body_pos_r3;
+                let b3 = b3_local + body_pos_r3;
+                parent_lines.segments.push((a3.to_array(), b3.to_array()));
                 parent_lines.colors.push((color_a, color_b));
                 parent_lines.widths.push(PARENT_WIDTH);
             }
@@ -1092,6 +1166,14 @@ impl RotatePolytopesApp {
                         Ok(())
                     },
                 )
+                .toggle(
+                    "perimeter",
+                    "cyan cross-section perimeter outlines (bare flips)",
+                    |d, v| {
+                        d.wireframe_perimeter = v.unwrap_or(!d.wireframe_perimeter);
+                        Ok(())
+                    },
+                )
                 .choice(
                     "color",
                     "base RGB for parent edges (bare cycles): unique (default) or active",
@@ -1108,45 +1190,64 @@ impl RotatePolytopesApp {
                         };
                         Ok(())
                     },
+                )
+                .choice(
+                    "perspective",
+                    "wireframe 4D->R³ projection (bare cycles): drop-w (default) or w-depth",
+                    &["drop-w", "w-depth"],
+                    |d, name| {
+                        d.wireframe_projection = match name {
+                            Some(n) => WireframeProjection::from_token(n).ok_or_else(|| {
+                                anyhow!("unknown projection `{n}` (try drop-w|w-depth)")
+                            })?,
+                            None => match d.wireframe_projection {
+                                WireframeProjection::DropW => WireframeProjection::WDepth,
+                                WireframeProjection::WDepth => WireframeProjection::DropW,
+                            },
+                        };
+                        Ok(())
+                    },
                 ),
         );
 
-        // Polychoral surface renderer: SDF raymarch vs rasterized section faces.
+        // Polychoral surface renderer: raster (default) / SDF / off. Bare `surface` is
+        // shorthand for "off" so the user can hide cap fills quickly when inspecting the
+        // wireframe and cross-section perimeter on their own. Explicit `surface raster`
+        // and `surface sdf` set those modes; `surface off` is the same as bare.
         c.register(
             rye_egui::cmd(
                 "surface",
-                "polychoral surface: SDF raymarch or rasterized section faces",
+                "polychoral surface mode: raster | sdf | off (bare = off)",
                 |args, demo: &mut Demo, _out| {
                     let next = match args.first().copied() {
-                        Some("sdf") => false,
-                        Some("raster") => true,
-                        Some(other) => {
-                            return Err(anyhow!("unknown arg `{other}` (try sdf|raster)"));
-                        }
-                        None => !demo.surface_raster_enabled,
+                        Some(token) => SurfaceMode::from_token(token).ok_or_else(|| {
+                            anyhow!("unknown arg `{token}` (try raster|sdf|off)")
+                        })?,
+                        None => SurfaceMode::Off,
                     };
-                    if next != demo.surface_raster_enabled {
-                        demo.surface_raster_enabled = next;
-                        // Flip redirects polychoral bodies between SDF and the raster
-                        // pipeline. `rebuild_bodies` re-emits the SDF body list,
-                        // marking the polychora inert in raster mode (or live again
-                        // in SDF mode).
+                    if next != demo.surface_mode {
+                        demo.surface_mode = next;
+                        // Re-emit the SDF body list: switching INTO Sdf mode makes the
+                        // polychora live in the kernel, switching OUT marks them inert.
                         demo.rebuild_bodies();
                     }
                     Ok(())
                 },
             )
-            .with_args(&[&["sdf", "raster"]])
+            .with_args(&[&["raster", "sdf", "off"]])
             .with_long_help(
-                "Selects how the six regular convex 4-polytopes (5-cell, tesseract,\n\
-                 16-cell, 24-cell, 120-cell, 600-cell) are rendered.\n\
+                "Selects how the six regular convex 4-polytopes (5-cell, tesseract, 16-cell,\n\
+                 24-cell, 120-cell, 600-cell) are rendered.\n\
                  \n\
                  subcommands:\n  \
-                 raster  Rasterized cross-section cell-caps (the default). Face-normal\n                         Lambert lit, per-body solid color. Much faster for the\n                         120-cell + 600-cell and exact (no SDF approximation).\n  \
-                 sdf     SDF raymarch. The historical pre-rasterizer path; smoother\n                         shading but the 120-cell and 600-cell carry a face-plane\n                         approximation BUG. Kept for visual comparison.\n\
+                 raster  Rasterized cross-section cell-caps (the default). Face-normal Lambert\n                         lit, per-body solid color. Much faster for the 120-cell + 600-cell\n                         and exact (no SDF approximation).\n  \
+                 sdf     SDF raymarch. The historical pre-rasterizer path; smoother shading\n                         but the 120-cell and 600-cell carry a face-plane approximation BUG.\n                         Kept for visual comparison.\n  \
+                 off     No surface rendered. Wireframe overlay + cross-section perimeter\n                         stay visible if enabled; the cap interiors are blank. Useful for\n                         inspecting the wireframe on its own.\n\
+                 \n\
+                 Bare `surface` (no argument) is shorthand for `surface off`.\n\
                  \n\
                  Smooth-surface shapes (Clifford torus, duocylinder, spherinder, 3-sphere)\n\
-                 ignore this toggle and always render via the SDF.",
+                 ignore this and always render via the SDF; they have no rasterizer path.",
             ),
         );
 
