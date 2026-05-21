@@ -12,7 +12,8 @@ use rye_egui::{
     },
     media::add_button,
 };
-use rye_render::raymarch::{SHAPE_120CELL, SHAPE_600CELL};
+use rye_physics::polytope::Polytope4;
+use rye_render::raymarch::RaymarchShape;
 
 use crate::catalog::{render_shape_catalog_menu, ShapeEntry};
 use crate::consts::{CARD_ITEM_SPACING_X, CONTROL_H, CONTROL_W, MAX_ROW_LEN, SHAPE_CARD_WIDTH};
@@ -25,10 +26,12 @@ impl Demo {
     /// Apply/Clear in `Composer`).
     pub(crate) fn render_shapes_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        let has_heavy = self
-            .row
-            .iter()
-            .any(|e| e.shape == SHAPE_120CELL || e.shape == SHAPE_600CELL);
+        let has_heavy = self.row.iter().any(|e| {
+            matches!(
+                e.shape,
+                RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
+            )
+        });
         if has_heavy {
             ui.colored_label(
                 egui::Color32::from_rgb(242, 130, 70),

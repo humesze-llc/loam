@@ -54,17 +54,20 @@
 //!   `octahedron`, `cuboctahedron`, `dodecahedron`, `icosahedron`).
 
 use anyhow::{anyhow, Result};
-use glam::{Vec3, Vec4};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
 use rye_egui::Console;
 use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
+use rye_math::WPlane;
+use rye_physics::polytope::{polytope_section_with_vertices, vertex_color_by_position};
 use rye_render::{
     device::RenderDevice,
     raymarch::{
         polytope_extended_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL,
     },
-    Viewport,
+    DepthMode, LineRasterNode, Viewport,
 };
+use rye_shape::LineMesh;
 use rye_scene::{Scene4, SceneNode4};
 use winit::window::WindowAttributes;
 
@@ -130,7 +133,7 @@ impl Demo {
             .map(|(slot, entry)| {
                 BodyUniform::polytope_with_rotor(
                     body_position(slot, n),
-                    entry.shape,
+                    entry.shape.shape_id(),
                     BODY_SIZE,
                     Rotor4::IDENTITY,
                     entry.body_color,
@@ -138,6 +141,24 @@ impl Demo {
             })
             .collect();
         node.set_bodies(&bodies);
+
+        // Overlay raster pipelines. No depth attachment: the SDF raymarcher renders the
+        // active section as a solid volume on its own, and the rasterizer's job here is
+        // to outline boundaries between cell caps + show the full polytope wireframe on
+        // top, not to compose another opaque layer. With everything in DepthMode::Off
+        // the passes draw in submission order over the SDF.
+        let section_edges = LineRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            DepthMode::Off,
+            ctx.rd.sample_count(),
+        );
+        let parent_wireframe = LineRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            DepthMode::Off,
+            ctx.rd.sample_count(),
+        );
 
         let mut camera = Camera::<EuclideanR3>::at_origin();
         camera.position = Vec3::new(0.0, 3.0, 9.0);
@@ -158,6 +179,9 @@ impl Demo {
             camera,
             orbit,
             node,
+            section_edges,
+            parent_wireframe,
+            overlay_enabled: false,
             row,
             w_slice: initial_w,
             slider_up_held: false,
@@ -540,7 +564,7 @@ impl Demo {
                     };
                     let body = BodyUniform::polytope_with_rotor(
                         [0.0, BODY_Y, 0.0, 0.0],
-                        entry.shape,
+                        entry.shape.shape_id(),
                         BODY_SIZE,
                         cell_rotor,
                         entry.body_color,
@@ -560,8 +584,137 @@ impl Demo {
                 u.viewport_origin = [viewport.x as f32, viewport.y as f32];
             }
             self.node.flush_uniforms(&rd.queue);
-            self.node.execute_in_viewport(rd, view, viewport)
+            self.node.execute_in_viewport(rd, view, viewport)?;
+            // Cross-section + parent-wireframe overlay (when toggled). Only in Shapes
+            // view since Filmstrip's per-cell viewport composition would require
+            // per-cell depth-clear + per-cell uploads that aren't worth the v1 plumbing.
+            if self.overlay_enabled {
+                self.render_section_overlay(rd, view)?;
+            }
+            Ok(())
         }
+    }
+
+    /// Build the three overlay meshes (section triangles, section perimeter edges, parent
+    /// wireframe) from the current row + rotor + w_slice, upload them, clear the overlay
+    /// depth buffer, and execute the three raster passes on top of the existing SDF render.
+    ///
+    /// Per-body transform: each canonical Polytope4 vertex `v` becomes the world Vec4
+    /// `body.position + BODY_SIZE * rot_state.apply(v)`. The section algorithm then runs
+    /// on these world vertices against the demo's `w_slice`, producing geometry in world
+    /// R³ that composes cleanly with the SDF camera frame.
+    ///
+    /// Non-polychoral shapes (Clifford torus, duocylinder, etc.) in the row are skipped:
+    /// they have no [`rye_physics::polytope::Polytope4`] mapping and the cross-section
+    /// algorithm doesn't apply to smooth surfaces.
+    fn render_section_overlay(
+        &mut self,
+        rd: &RenderDevice,
+        view: &wgpu::TextureView,
+    ) -> Result<()> {
+        let cfg = &rd.surface_bundle.config;
+        let n = self.row.len();
+
+        // Build combined meshes across the entire row.
+        let mut section_edges = LineMesh::<3>::default();
+        let mut parent_lines = LineMesh::<3>::default();
+        // Dim alpha so the wireframe reads as a "structure-context" overlay rather than
+        // competing with the bright section perimeter edges.
+        const PARENT_ALPHA: f32 = 0.55;
+        const PARENT_WIDTH: f32 = 1.2;
+
+        for (slot, entry) in self.row.iter().enumerate() {
+            let Some(polytope) = entry.shape.polytope4() else {
+                continue;
+            };
+            let topo = polytope.topology();
+            let body_pos = body_position(slot, n);
+            let bp = Vec4::from_array(body_pos);
+            // Transform canonical vertices into world Vec4 coords. Same shape transform
+            // the SDF kernel applies (`body_position + body_size * rotor.apply(v)`), so
+            // the rasterized geometry sits at the same world-space position as the
+            // raymarched SDF.
+            let world_vertices: Vec<Vec4> = topo
+                .vertices
+                .iter()
+                .map(|v| bp + BODY_SIZE * self.rot_state.apply(*v))
+                .collect();
+
+            // Cross-section perimeter edges only. The SDF raymarcher renders the section
+            // as a solid volume; we just need to outline the boundaries between adjacent
+            // cell caps (each cap contributes one face of the 3D section polytope).
+            // `polytope_section_with_vertices` returns `(triangles, perimeter)`; we
+            // discard the filled triangles since they would obscure the SDF without
+            // adding information.
+            let (_tri, mut perim) = polytope_section_with_vertices(
+                topo.edges,
+                topo.cells,
+                &world_vertices,
+                WPlane::new(self.w_slice),
+            );
+            section_edges.segments.append(&mut perim.segments);
+            section_edges.colors.append(&mut perim.colors);
+            section_edges.widths.append(&mut perim.widths);
+
+            // Parent wireframe: every polytope edge as a world-R³ line, colored by
+            // position-derived RGB from the canonical (unit-circumradius) vertex set so
+            // adjacent edges share their endpoint colors and the polytope's symmetry
+            // shows as smooth color gradients across the wireframe (same scheme as
+            // [`Polytope4::lines_colored_by_position`]). Alpha is dimmed uniformly so
+            // the wireframe sits visually behind the bright section perimeter.
+            for &[i, j] in topo.edges {
+                let ia = i as usize;
+                let ja = j as usize;
+                let a = world_vertices[ia];
+                let b = world_vertices[ja];
+                let mut color_a = vertex_color_by_position(topo.vertices[ia]);
+                let mut color_b = vertex_color_by_position(topo.vertices[ja]);
+                color_a[3] = PARENT_ALPHA;
+                color_b[3] = PARENT_ALPHA;
+                parent_lines
+                    .segments
+                    .push(([a.x, a.y, a.z], [b.x, b.y, b.z]));
+                parent_lines.colors.push((color_a, color_b));
+                parent_lines.widths.push(PARENT_WIDTH);
+            }
+        }
+
+        // Upload (each call is a no-op when its mesh is empty).
+        self.section_edges.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &section_edges,
+            &rye_math::Projection::Identity,
+            1,
+        );
+        self.parent_wireframe.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &parent_lines,
+            &rye_math::Projection::Identity,
+            1,
+        );
+
+        // Camera. Build the same view+projection matrix the SDF raymarcher uses
+        // implicitly via its ray basis, so the rasterized overlay aligns pixel-for-pixel
+        // with the raymarched scene.
+        let view_dir = self.camera.view();
+        let aspect = cfg.width as f32 / cfg.height as f32;
+        let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
+        let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
+        let view_proj = proj_mat * view_mat;
+        let vp_size = Vec2::new(cfg.width as f32, cfg.height as f32);
+        self.section_edges
+            .set_camera(&rd.queue, view_proj, vp_size);
+        self.parent_wireframe
+            .set_camera(&rd.queue, view_proj, vp_size);
+
+        // Section perimeter edges then dim parent wireframe, both depth-off. The SDF
+        // pass renders solid bodies underneath; the overlay just adds line context on
+        // top in submission order.
+        self.section_edges.execute(rd, view, None)?;
+        self.parent_wireframe.execute(rd, view, None)?;
+        Ok(())
     }
 
     pub(crate) fn title(&self, _fps: f32) -> std::borrow::Cow<'static, str> {
@@ -637,6 +790,26 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
+        // Cross-section + parent-wireframe overlay. Off by default; toggle with
+        // `overlay on` / `overlay off` / bare `overlay` to flip.
+        c.register(
+            rye_egui::cmd(
+                "overlay",
+                "toggle cross-section + parent-wireframe overlay (on|off; no arg = toggle)",
+                |args, demo: &mut Demo, _out| {
+                    demo.overlay_enabled = match args.first().copied() {
+                        Some("on") => true,
+                        Some("off") => false,
+                        Some(other) => {
+                            return Err(anyhow!("unknown arg `{other}` (try on|off)"))
+                        }
+                        None => !demo.overlay_enabled,
+                    };
+                    Ok(())
+                },
+            )
+            .with_args(&[&["on", "off"]]),
+        );
 
         // Framework-provided capture: `capture png [pre|post|both] [dir]`,
         // `capture frames [pre|post|both] [dir]`, `capture stop`. Bound to F12 (one-shot)

@@ -23,6 +23,99 @@ pub use hyperslice4d::{
 };
 pub use polytope_data::{polytope_extended_sdfs_wgsl, polytope_stub_sdfs_wgsl};
 
+/// Bridge a raymarch shape ID (one of the `SHAPE_*` u32 constants re-exported above) to
+/// the corresponding [`rye_physics::polytope::Polytope4`] variant for the six convex
+/// regular polychora. Returns `None` for the smooth-surface SDFs (`SHAPE_3SPHERE`,
+/// `SHAPE_DUOCYLINDER`, `SHAPE_CLIFFORD_TORUS`, `SHAPE_SPHERINDER`) which have no polytope
+/// topology -- the cross-section algorithm and per-vertex coloring don't apply to them.
+///
+/// Low-level bridge for callers that already have a raw `u32`. Higher-level call sites
+/// (catalogs, panel state) should prefer [`RaymarchShape`], which unifies the GPU shape
+/// ID and the polytope topology on one type.
+pub fn polytope4_from_shape_id(shape: u32) -> Option<rye_physics::polytope::Polytope4> {
+    use rye_physics::polytope::Polytope4;
+    Some(match shape {
+        s if s == SHAPE_PENTATOPE => Polytope4::Pentatope,
+        s if s == SHAPE_TESSERACT => Polytope4::Tesseract,
+        s if s == SHAPE_16CELL => Polytope4::Cell16,
+        s if s == SHAPE_24CELL => Polytope4::Cell24,
+        s if s == SHAPE_120CELL => Polytope4::Cell120,
+        s if s == SHAPE_600CELL => Polytope4::Cell600,
+        _ => return None,
+    })
+}
+
+/// All shapes the hyperslice raymarch kernel can render, unified across the polychoral
+/// and smooth-surface families.
+///
+/// - The six convex regular polychora wrap a [`rye_physics::polytope::Polytope4`] so callers
+///   can pull topology + vertex generators alongside the GPU shape ID via
+///   [`RaymarchShape::polytope4`] / [`rye_physics::polytope::Polytope4::topology`].
+/// - The four smooth-surface SDFs (3-sphere, duocylinder, Clifford torus, spherinder) are
+///   their own variants. They have no polytope topology, so [`RaymarchShape::polytope4`]
+///   returns `None` for them.
+///
+/// Use this in app catalogs instead of raw `u32` shape IDs so adding a new shape is
+/// type-checked end-to-end. The raw `u32` for the GPU side comes from
+/// [`RaymarchShape::shape_id`]; if needed, [`From<RaymarchShape> for u32`] supplies the
+/// same conversion via `.into()`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RaymarchShape {
+    /// One of the six convex regular 4-polytopes.
+    Polytope(rye_physics::polytope::Polytope4),
+    /// 4-ball boundary (a 3-sphere SDF; smooth, no topology).
+    ThreeSphere,
+    /// Cartesian product of two disks; smooth.
+    Duocylinder,
+    /// Flat 2-torus embedded in S³; smooth.
+    CliffordTorus,
+    /// Cylinder x line, extended to 4D; smooth.
+    Spherinder,
+}
+
+impl RaymarchShape {
+    /// GPU-side shape index (matches a `SHAPE_*` u32 constant). The hyperslice kernel
+    /// branches on this when computing the SDF for a body.
+    pub fn shape_id(&self) -> u32 {
+        use rye_physics::polytope::Polytope4;
+        match self {
+            RaymarchShape::Polytope(p) => match p {
+                Polytope4::Pentatope => SHAPE_PENTATOPE,
+                Polytope4::Tesseract => SHAPE_TESSERACT,
+                Polytope4::Cell16 => SHAPE_16CELL,
+                Polytope4::Cell24 => SHAPE_24CELL,
+                Polytope4::Cell120 => SHAPE_120CELL,
+                Polytope4::Cell600 => SHAPE_600CELL,
+            },
+            RaymarchShape::ThreeSphere => SHAPE_3SPHERE,
+            RaymarchShape::Duocylinder => SHAPE_DUOCYLINDER,
+            RaymarchShape::CliffordTorus => SHAPE_CLIFFORD_TORUS,
+            RaymarchShape::Spherinder => SHAPE_SPHERINDER,
+        }
+    }
+
+    /// The polytope variant for polychoral shapes, or `None` for smooth-surface shapes
+    /// that don't have a polytope topology.
+    pub fn polytope4(&self) -> Option<rye_physics::polytope::Polytope4> {
+        match self {
+            RaymarchShape::Polytope(p) => Some(*p),
+            _ => None,
+        }
+    }
+}
+
+impl From<rye_physics::polytope::Polytope4> for RaymarchShape {
+    fn from(p: rye_physics::polytope::Polytope4) -> Self {
+        RaymarchShape::Polytope(p)
+    }
+}
+
+impl From<RaymarchShape> for u32 {
+    fn from(s: RaymarchShape) -> u32 {
+        s.shape_id()
+    }
+}
+
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use wgpu::*;

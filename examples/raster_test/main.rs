@@ -40,7 +40,7 @@ use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, Run
 use rye_egui::{Console, ConsoleWriter};
 use rye_math::{EuclideanR3, EuclideanR4, Projection, WPlane};
 use rye_physics::polytope::{polytope_section_with_vertices, Polytope4};
-use rye_render::{device::RenderDevice, DepthMode, LineRasterNode, TriangleRasterNode};
+use rye_render::{device::RenderDevice, DepthBuffer, DepthMode, LineRasterNode, TriangleRasterNode};
 use rye_shape::{LineMesh, TriangleMesh};
 use winit::window::WindowAttributes;
 
@@ -53,61 +53,6 @@ const POLYTOPE_SCALE: f32 = 2.5;
 /// choice: 32-bit float depth, no stencil. Universally supported, plenty of precision for
 /// the demo's near=0.1 / far=100 frustum.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-
-/// Swapchain-sized depth attachment shared by the R³ and R⁴ line raster passes. Recreated
-/// on resize via [`DepthBuffer::ensure`]. Owned by the example (not the render node) so
-/// future multi-pass compositions (filled triangles, point markers) can share or separate
-/// depth without reaching into the rasterizer node's internals.
-///
-/// Holds the [`wgpu::TextureView`] only; the underlying texture stays alive via wgpu's
-/// internal Arc reference held by the view.
-struct DepthBuffer {
-    view: wgpu::TextureView,
-    size: (u32, u32),
-    sample_count: u32,
-}
-
-impl DepthBuffer {
-    fn create(device: &wgpu::Device, size: (u32, u32), sample_count: u32) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("raster_test depth"),
-            size: wgpu::Extent3d {
-                width: size.0,
-                height: size.1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self {
-            view,
-            size,
-            sample_count,
-        }
-    }
-
-    /// Recreate if the swapchain has resized or the sample count has changed. No-op when
-    /// dimensions match. Called once per frame at the top of `render`.
-    fn ensure(
-        slot: &mut Option<DepthBuffer>,
-        device: &wgpu::Device,
-        size: (u32, u32),
-        sample_count: u32,
-    ) {
-        let needs_recreate = match slot {
-            Some(b) => b.size != size || b.sample_count != sample_count,
-            None => true,
-        };
-        if needs_recreate {
-            *slot = Some(DepthBuffer::create(device, size, sample_count));
-        }
-    }
-}
 
 /// Angular speeds (rad/s) of the animated 4D rotation applied to polytope vertices before
 /// drop-w projection. Two independent simple rotations: `XW_RATE` rotates in the xw plane
@@ -562,6 +507,7 @@ impl Demo {
         DepthBuffer::ensure(
             &mut self.depth,
             &rd.device,
+            DEPTH_FORMAT,
             (cfg.width, cfg.height),
             rd.sample_count(),
         );

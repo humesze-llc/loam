@@ -239,21 +239,40 @@ impl Polytope4 {
         mesh.segments.reserve(topo.edges.len());
         mesh.colors.reserve(topo.edges.len());
         mesh.widths.reserve(topo.edges.len());
-        let vertex_color = |v: Vec4| -> [f32; 4] {
-            let n = v.try_normalize().unwrap_or(Vec4::ZERO);
-            let bias = |c: f32| 0.25 + 0.75 * (0.5 + 0.5 * c);
-            let w_mod = 0.7 + 0.3 * (0.5 + 0.5 * n.w);
-            [bias(n.x) * w_mod, bias(n.y) * w_mod, bias(n.z) * w_mod, 1.0]
-        };
         for &[i, j] in topo.edges {
             let va = topo.vertices[i as usize];
             let vb = topo.vertices[j as usize];
             mesh.segments.push((va.to_array(), vb.to_array()));
-            mesh.colors.push((vertex_color(va), vertex_color(vb)));
+            mesh.colors
+                .push((vertex_color_by_position(va), vertex_color_by_position(vb)));
             mesh.widths.push(DEFAULT_LINE_WIDTH);
         }
         mesh
     }
+}
+
+/// Map a unit-circumradius 4D vertex to an RGBA color via position-based encoding.
+///
+/// - Normalize the vertex to unit length first (skipped if it's the zero vector).
+/// - `(x + 1) / 2` to R, `(y + 1) / 2` to G, `(z + 1) / 2` to B, biased into `[0.25, 1.0]`
+///   so every vertex stays visible (no fully-black bias).
+/// - `w` modulates brightness multiplicatively in `[0.7, 1.0]` so the hidden dimension is
+///   visible as a soft +w / -w cue without losing contrast.
+///
+/// Deterministic + continuous: adjacent edges sharing a vertex pick up the same vertex
+/// color at that endpoint, so the polytope's symmetry shows as smooth color gradients
+/// across the edge graph. Used by [`Polytope4::lines_colored_by_position`] and by
+/// example-side overlays that build their own meshes from per-body transformed vertices.
+pub fn vertex_color_by_position(v: Vec4) -> [f32; 4] {
+    let n = v.try_normalize().unwrap_or(Vec4::ZERO);
+    let bias = |c: f32| 0.25 + 0.75 * (0.5 + 0.5 * c);
+    let w_mod = 0.7 + 0.3 * (0.5 + 0.5 * n.w);
+    [
+        bias(n.x) * w_mod,
+        bias(n.y) * w_mod,
+        bias(n.z) * w_mod,
+        1.0,
+    ]
 }
 
 // ---------------------------------------------------------------------------

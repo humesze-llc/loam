@@ -211,6 +211,19 @@ pub(crate) struct Demo {
     pub(crate) camera: Camera<EuclideanR3>,
     pub(crate) orbit: OrbitController<EuclideanR3>,
     pub(crate) node: Hyperslice4DNode,
+    /// Rasterizer node for the cross-section perimeter (bright cyan edges around each
+    /// cap polygon). Filled caps are NOT drawn -- the SDF raymarcher already renders the
+    /// section polytope as a solid volume, so the rasterizer's job is to outline the
+    /// boundaries between adjacent cell contributions, not to fill them.
+    pub(crate) section_edges: rye_render::LineRasterNode,
+    /// Rasterizer node for the dim "parent wireframe" overlay: the full polytope's edge
+    /// graph (per body) projected via drop-w. Conveys polytope structure independent of
+    /// which slice is currently shown.
+    pub(crate) parent_wireframe: rye_render::LineRasterNode,
+    /// Whether the cross-section + parent-wireframe overlay renders. Off by default so
+    /// the existing SDF-only demo is unchanged; toggle via the `overlay on|off` console
+    /// subcommand.
+    pub(crate) overlay_enabled: bool,
     /// Polytope row built at startup from `--shapes` CLI args (or `DEFAULT_ROW`); drives
     /// both the body uniforms and per-body label lookups in the overlay.
     pub(crate) row: Vec<ShapeEntry>,
@@ -360,7 +373,7 @@ impl Demo {
         for (slot, entry) in self.row.iter().enumerate() {
             let body = BodyUniform::polytope_with_rotor(
                 body_position(slot, n),
-                entry.shape,
+                entry.shape.shape_id(),
                 BODY_SIZE,
                 rotor,
                 entry.body_color,
@@ -381,7 +394,7 @@ impl Demo {
             .map(|(slot, entry)| {
                 BodyUniform::polytope_with_rotor(
                     body_position(slot, n),
-                    entry.shape,
+                    entry.shape.shape_id(),
                     BODY_SIZE,
                     rotor,
                     entry.body_color,
@@ -433,3 +446,4 @@ impl Demo {
         self.write_all(Rotor4::IDENTITY);
     }
 }
+
