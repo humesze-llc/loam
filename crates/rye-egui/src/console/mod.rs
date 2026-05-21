@@ -355,10 +355,11 @@ where
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
 
-/// Static on/off completion list used by every `Toggle` subcommand. Lives here so the
-/// `arg_choices_ctx` impl can hand back a `&'static [&'static str]` without owning a
-/// per-instance Vec.
-const ON_OFF_CHOICES: &[&str] = &["off", "on"];
+// Tab-completion for toggle subcommands intentionally returns an empty list at the
+// value slot. The primary UX for a toggle is *bare* invocation (e.g. `wireframe
+// nearest-active` flips), and surfacing `on|off` in completion implied that one of
+// them was required when it isn't. The parser still accepts `on|off|true|false|1|0`
+// for callers that want explicit set; it's just no longer promoted in the cycle.
 
 /// Boxed handler for an on/off toggle subcommand. The framework passes `Some(bool)`
 /// when the user supplied `on|off|true|false|1|0` and `None` when the user invoked the
@@ -397,9 +398,11 @@ type CustomHandler<Ctx> =
 /// One entry in a [`SubcommandSet`]. The dispatch kind decides how the framework
 /// parses the value slot and what's offered for tab completion.
 enum SubcommandKind<Ctx> {
-    /// On/off subcommand. The framework parses `args[1]` as `on|off` and passes the
-    /// resulting bool to `handler`. Completion at the value slot is the static
-    /// `["off", "on"]` list.
+    /// On/off subcommand. The framework parses `args[1]` as
+    /// `on|off|true|false|1|0` and passes `Some(bool)`; bare invocation (no value)
+    /// passes `None` and the handler is expected to flip its field. No value-slot
+    /// tab completion is offered (bare-flip is the canonical UX; explicit set is
+    /// supported but not promoted).
     Toggle { handler: ToggleHandler<Ctx> },
     /// Fixed-choice subcommand. The framework completes the value slot from `choices`;
     /// the handler receives the raw value string and decides what to do.
@@ -667,11 +670,10 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
         let sub_slot = arg_index - 1;
         match &entry.kind {
             SubcommandKind::Toggle { .. } => {
-                if sub_slot == 0 {
-                    ON_OFF_CHOICES
-                } else {
-                    &[]
-                }
+                // Empty by design — see the comment on `ON_OFF_CHOICES`'s old slot
+                // above. Bare invocation is the canonical UX; `on|off` is still
+                // accepted as input but not surfaced as a suggestion.
+                &[]
             }
             SubcommandKind::Choice { choices, .. } => {
                 if sub_slot == 0 {
@@ -2145,18 +2147,28 @@ mod tests {
     }
 
     /// Tab completion at the value slot narrows to ONLY the chosen subcommand's choices.
-    /// This is the load-bearing context-aware-completion test: previously the second-arg
-    /// completion list would have to be the union (`on, off, 5cell, ...`).
+    /// This is the load-bearing context-aware-completion test: the value slot
+    /// completion is narrow to the chosen subcommand's allowed values, not the
+    /// union over all subcommands.
+    ///
+    /// Toggle subcommands deliberately surface NO value-slot suggestions: bare
+    /// invocation flips, so `on|off` is supported as input but not promoted in
+    /// the cycle (avoids implying that one of them is required when it isn't).
+    /// Choice subcommands surface their declared choice list.
     #[test]
     fn subcommand_value_completion_is_context_aware() {
         let mut con = Console::<SubCtx>::new();
         con.register(sample_subset());
 
-        // `tests axes ` -> only on/off in the cycle.
+        // `tests axes ` -> toggle, no suggestions (bare invocation is the UX;
+        // typing `on|off` still works but isn't promoted).
         con.input = "tests axes ".into();
         let ctx = con.completion_context().unwrap();
         let m = con.completion_matches(&ctx);
-        assert_eq!(m, vec!["off".to_string(), "on".to_string()]);
+        assert!(
+            m.is_empty(),
+            "toggle value slot should suggest nothing, got {m:?}"
+        );
 
         // `tests polytope ` -> only polytope names in the cycle, no on/off.
         con.input = "tests polytope ".into();
