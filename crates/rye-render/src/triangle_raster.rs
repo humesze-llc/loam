@@ -21,8 +21,12 @@
 //!
 //! `TriangleMesh<N>`'s docs spell this out: lighting in R⁴ has no standard convention, so
 //! normals are deliberately omitted at v1. Per-vertex color covers the cross-section /
-//! face-fill / debug-fill use cases the rasterizer was built for. Add normals when a real
-//! consumer (lit shading in a specific Space) demands them.
+//! face-fill / debug-fill use cases the rasterizer was built for. When a caller wants lit
+//! shading (e.g., polychoral cross-section cell caps), [`FragmentShading::FaceNormalLambert`]
+//! computes the face normal in the fragment shader from screen-space derivatives of
+//! world-space position; no normal vertex attribute required. This stays honest to the
+//! "no convention for normals in R^N" invariant: derivatives are local to the projected
+//! R³ surface, computed downstream of [`RasterizableSpace::project_point`].
 
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
@@ -75,6 +79,40 @@ pub struct TriangleVertex {
     pub color: [f32; 4],
 }
 
+/// Fragment-shader selector for [`TriangleRasterNode`]. Picked at construction time so
+/// the pipeline state matches the chosen entry point; switching modes after construction
+/// would require a new pipeline (cheap but the caller usually knows up front which path
+/// it wants).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum FragmentShading {
+    /// Pass per-vertex color through unmodified. Use for overlays, debug fills, and any
+    /// mesh whose shading is already baked into vertex colors. This is the v1 behavior
+    /// and the default.
+    #[default]
+    Flat,
+    /// Face-normal Lambert. Computes the face normal from screen-space derivatives of
+    /// world-space position in the fragment shader, multiplies the vertex color by
+    /// Lambert intensity + ambient floor. Suitable for faceted surfaces (e.g.,
+    /// polychoral cross-section cell caps) where each triangle is geometrically flat,
+    /// since derivative-based normals are exact for that case.
+    ///
+    /// No normal vertex attribute is required; the [`TriangleMesh`] format does not
+    /// change between modes.
+    FaceNormalLambert,
+}
+
+impl FragmentShading {
+    /// WGSL entry-point name to bind into the fragment stage. Stable across versions;
+    /// callers don't see this string but it's how the pipeline picks between the two
+    /// shaders embedded in `triangle_raster.wgsl`.
+    fn entry_point(self) -> &'static str {
+        match self {
+            Self::Flat => "fs_main",
+            Self::FaceNormalLambert => "fs_lambert",
+        }
+    }
+}
+
 /// Triangle rasterizer node. Parallel to [`crate::line_raster::LineRasterNode`]; both
 /// own their pipeline + buffers and are constructed standalone.
 pub struct TriangleRasterNode {
@@ -103,11 +141,13 @@ impl TriangleRasterNode {
     /// - `surface_format` must match the color attachment at draw time.
     /// - `depth`: see [`crate::DepthMode`]. Determines whether the pipeline reads depth,
     ///   reads + writes depth, or skips it.
+    /// - `shading`: which fragment shader the pipeline binds; see [`FragmentShading`].
     /// - `sample_count` must match the attachment's MSAA sample count.
     pub fn new(
         device: &Device,
         surface_format: TextureFormat,
         depth: crate::DepthMode,
+        shading: FragmentShading,
         sample_count: u32,
     ) -> Self {
         let module = device.create_shader_module(ShaderModuleDescriptor {
@@ -182,7 +222,7 @@ impl TriangleRasterNode {
             },
             fragment: Some(FragmentState {
                 module: &module,
-                entry_point: Some("fs_main"),
+                entry_point: Some(shading.entry_point()),
                 targets: &[Some(ColorTargetState {
                     format: surface_format,
                     blend: Some(BlendState {

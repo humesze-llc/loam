@@ -331,10 +331,152 @@ pub fn polytope_section_with_vertices(
     vertices: &[Vec4],
     slice: rye_math::WPlane,
 ) -> (rye_shape::TriangleMesh<3>, rye_shape::LineMesh<3>) {
-    let slice = perturb_slice_if_needed(slice, vertices);
-
     let mut tri_mesh = rye_shape::TriangleMesh::<3>::default();
     let mut edge_mesh = rye_shape::LineMesh::<3>::default();
+
+    for_each_section_cap(edges, cells, vertices, slice, |ordered, centroid| {
+        // Emit a triangle fan from the centroid. The centroid is invisible inside the
+        // convex cap; cap vertices form the visible perimeter.
+        let cv_base = tri_mesh.vertices.len() as u32;
+        tri_mesh.vertices.push(centroid.point3.to_array());
+        tri_mesh.colors.push(SECTION_FILL_COLOR);
+        for cap_v in ordered {
+            tri_mesh.vertices.push(cap_v.point3.to_array());
+            tri_mesh.colors.push(SECTION_FILL_COLOR);
+        }
+        let n = ordered.len() as u32;
+        for k in 0..n {
+            let k_next = (k + 1) % n;
+            tri_mesh
+                .indices
+                .push([cv_base, cv_base + 1 + k, cv_base + 1 + k_next]);
+        }
+
+        // Emit the perimeter as cap-vertex-pair line segments. Shared edges between
+        // adjacent cell caps are drawn twice (cells share their face-on-slice edges); the
+        // duplication is visually invisible and avoids a global edge-dedup pass.
+        for k in 0..ordered.len() {
+            let a = ordered[k].point3;
+            let b = ordered[(k + 1) % ordered.len()].point3;
+            edge_mesh.segments.push((a.to_array(), b.to_array()));
+            edge_mesh
+                .colors
+                .push((SECTION_EDGE_COLOR, SECTION_EDGE_COLOR));
+            edge_mesh.widths.push(SECTION_EDGE_WIDTH);
+        }
+    });
+
+    (tri_mesh, edge_mesh)
+}
+
+/// Cross-section faces only, opaque + per-vertex position-colored, fan-triangulated.
+/// Intended as the *primary* surface representation for a polychoral body at a w-slice,
+/// replacing the SDF raymarch for the six regular convex 4-polytopes.
+///
+/// Differs from [`polytope_section_with_vertices`] in two ways:
+///
+/// - Returns only the [`rye_shape::TriangleMesh<3>`]; the caller composes perimeter
+///   edges separately (typically via the wireframe overlay).
+/// - Per-vertex color comes from [`vertex_color_by_position`] applied to the *4D* parent
+///   point at each edge intersection. Adjacent cells share their cap-vertex 4D positions
+///   (the same edge intersects the same point in both cells), so the gradient is
+///   continuous across cell boundaries (same property the parent wireframe has).
+///   Alpha = 1.0; pairs with `FragmentShading::FaceNormalLambert` in `rye-render` for
+///   faceted shaded surfaces (the rasterizer derives face normals from screen-space
+///   derivatives of position, so no normal attribute is required here).
+///
+/// The centroid (fan apex) is colored by `vertex_color_by_position` of its 4D centroid
+/// (mean of cap 4D points), not by averaging colors. Keeps the coloring law consistent
+/// across all vertices.
+///
+/// Performance: 600-cell midpoint slice produces ~24-60 active cells × tetrahedral cap
+/// (3-point) × 3 fan-triangles ≈ 200-500 triangles per body per frame. The cost is
+/// dominated by the per-edge intersection sweep (`edges.len() × cells.len()` worst case,
+/// pruned per-cell), not the fan-triangulation step.
+pub fn polytope_section_faces_with_vertices(
+    edges: &[[u32; 2]],
+    cells: &[&[u32]],
+    vertices: &[Vec4],
+    slice: rye_math::WPlane,
+) -> rye_shape::TriangleMesh<3> {
+    let mut tri_mesh = rye_shape::TriangleMesh::<3>::default();
+
+    for_each_section_cap(edges, cells, vertices, slice, |ordered, centroid| {
+        let cv_base = tri_mesh.vertices.len() as u32;
+        tri_mesh.vertices.push(centroid.point3.to_array());
+        tri_mesh
+            .colors
+            .push(opaque(vertex_color_by_position(centroid.point4)));
+        for cap_v in ordered {
+            tri_mesh.vertices.push(cap_v.point3.to_array());
+            tri_mesh
+                .colors
+                .push(opaque(vertex_color_by_position(cap_v.point4)));
+        }
+        let n = ordered.len() as u32;
+        for k in 0..n {
+            let k_next = (k + 1) % n;
+            tri_mesh
+                .indices
+                .push([cv_base, cv_base + 1 + k, cv_base + 1 + k_next]);
+        }
+    });
+
+    tri_mesh
+}
+
+/// Canonical-vertex convenience: section faces using the polytope's own topology
+/// vertices (unrotated, unit circumradius). Mirrors [`polytope4_section`] but returns
+/// just the position-colored opaque triangle mesh suitable for replacing the SDF
+/// surface.
+pub fn polytope4_section_faces(
+    polytope: Polytope4,
+    slice: rye_math::WPlane,
+) -> rye_shape::TriangleMesh<3> {
+    let topo = polytope.topology();
+    polytope_section_faces_with_vertices(topo.edges, topo.cells, topo.vertices, slice)
+}
+
+/// One cap vertex paired with its 4D origin. The R³ point is what the rasterizer
+/// consumes; the R⁴ point is what [`vertex_color_by_position`] needs to keep coloring
+/// continuous across cells (the same 4D edge intersection has the same color in every
+/// cell that contains the edge).
+#[derive(Copy, Clone, Debug)]
+struct CapVertex {
+    point3: Vec3,
+    point4: Vec4,
+}
+
+/// Promote a [`vertex_color_by_position`] RGBA (alpha = 1.0 by construction) to an
+/// opaque RGBA. Defined for clarity at call sites that emit opaque section faces;
+/// the upstream function already sets alpha = 1.0, so this is currently the identity.
+/// Explicit in case the upstream alpha encoding changes.
+fn opaque(rgba: [f32; 4]) -> [f32; 4] {
+    [rgba[0], rgba[1], rgba[2], 1.0]
+}
+
+/// Shared core of the section algorithm: iterate over every cell whose w-range crosses
+/// the slice, intersect the cell's edges with the slice, fit + order the resulting cap
+/// polygon, and invoke `emit` once per cell with the ordered cap vertices (each carrying
+/// both R³ and R⁴ coordinates) and the centroid. Cells that miss the slice or whose cap
+/// degenerates (< 3 vertices, collinear cap) are skipped silently.
+///
+/// `emit` is called *in cell order*, which is the topology cell order (deterministic
+/// across runs). Mesh-builders can rely on it for stable triangle ordering between
+/// frames.
+///
+/// Algorithm details captured here in one place so the two public consumers
+/// ([`polytope_section_with_vertices`] for overlays, [`polytope_section_faces_with_vertices`]
+/// for surface replacement) share the geometric logic. Either consumer can change its
+/// output shape (color, width, mesh format) without touching the cross-section math.
+fn for_each_section_cap(
+    edges: &[[u32; 2]],
+    cells: &[&[u32]],
+    vertices: &[Vec4],
+    slice: rye_math::WPlane,
+    mut emit: impl FnMut(&[CapVertex], CapVertex),
+) {
+    let slice = perturb_slice_if_needed(slice, vertices);
 
     for cell in cells {
         // Per-cell w-range pruning: cells entirely above or below the slice can't
@@ -352,19 +494,26 @@ pub fn polytope_section_with_vertices(
         // per-cell 2-face incidence data; works because the standard polychora's edge
         // sets are exactly their cells' edge sets (cells are convex 3-polytopes whose
         // 1-skeleton is a subgraph of the parent).
-        let mut cap: Vec<Vec3> = Vec::with_capacity(8);
+        let mut cap: Vec<CapVertex> = Vec::with_capacity(8);
         for &[i, j] in edges {
             if !cell.contains(&i) || !cell.contains(&j) {
                 continue;
             }
-            if let Some((_, p3)) =
+            let p0 = vertices[i as usize];
+            let p1 = vertices[j as usize];
+            if let Some((t, p3)) =
                 <rye_math::EuclideanR4 as rye_math::SectionableSpace<4>>::edge_section(
-                    &slice,
-                    vertices[i as usize],
-                    vertices[j as usize],
+                    &slice, p0, p1,
                 )
             {
-                cap.push(p3);
+                // Reconstruct the 4D intersection point from the lerp parameter `t`.
+                // Same `t` produces the same `p4` for both cells sharing this edge, so
+                // position-coloring stays seamless across cap boundaries.
+                let p4 = p0 + (p1 - p0) * t;
+                cap.push(CapVertex {
+                    point3: p3,
+                    point4: p4,
+                });
             }
         }
         if cap.len() < 3 {
@@ -374,48 +523,27 @@ pub fn polytope_section_with_vertices(
         // Centroid + plane basis. The cap is a convex 2-polygon in R³ (intersection of a
         // convex 3-cell with a hyperplane). `fit_plane_basis` finds two orthonormal basis
         // vectors in the cap's plane via the first non-collinear pair of cap offsets.
-        let centroid: Vec3 = cap.iter().copied().sum::<Vec3>() / cap.len() as f32;
-        let Some((basis_u, basis_v)) = fit_plane_basis(centroid, &cap) else {
+        let centroid_p3: Vec3 = cap.iter().map(|cv| cv.point3).sum::<Vec3>() / cap.len() as f32;
+        let centroid_p4: Vec4 = cap.iter().map(|cv| cv.point4).sum::<Vec4>() / cap.len() as f32;
+        let cap_p3: Vec<Vec3> = cap.iter().map(|cv| cv.point3).collect();
+        let Some((basis_u, basis_v)) = fit_plane_basis(centroid_p3, &cap_p3) else {
             continue;
         };
 
         // Order cap points by angle around the centroid in the (u, v) plane. Convex
-        // polygons sort cleanly under atan2 ordering since the centroid is interior.
-        let ordered = order_around_centroid(&cap, centroid, basis_u, basis_v);
+        // polygons sort cleanly under atan2 ordering since the centroid is interior. We
+        // sort the (p3, p4) pairs together so the 4D color stays attached to its 3D
+        // partner across the reorder.
+        let ordered = order_cap_around_centroid(&cap, centroid_p3, basis_u, basis_v);
 
-        // Emit a triangle fan from the centroid. Adds the centroid as an interior vertex
-        // (invisible inside the convex cap) plus each cap vertex; triangles are
-        // (centroid, ordered[k], ordered[k+1]).
-        let cv_base = tri_mesh.vertices.len() as u32;
-        tri_mesh.vertices.push(centroid.to_array());
-        tri_mesh.colors.push(SECTION_FILL_COLOR);
-        for p in &ordered {
-            tri_mesh.vertices.push(p.to_array());
-            tri_mesh.colors.push(SECTION_FILL_COLOR);
-        }
-        let n = ordered.len() as u32;
-        for k in 0..n {
-            let k_next = (k + 1) % n;
-            tri_mesh
-                .indices
-                .push([cv_base, cv_base + 1 + k, cv_base + 1 + k_next]);
-        }
-
-        // Emit the perimeter as cap-vertex-pair line segments. Shared edges between
-        // adjacent cell caps are drawn twice (cells share their face-on-slice edges); the
-        // duplication is visually invisible and avoids a global edge-dedup pass.
-        for k in 0..ordered.len() {
-            let a = ordered[k];
-            let b = ordered[(k + 1) % ordered.len()];
-            edge_mesh.segments.push((a.to_array(), b.to_array()));
-            edge_mesh
-                .colors
-                .push((SECTION_EDGE_COLOR, SECTION_EDGE_COLOR));
-            edge_mesh.widths.push(SECTION_EDGE_WIDTH);
-        }
+        emit(
+            &ordered,
+            CapVertex {
+                point3: centroid_p3,
+                point4: centroid_p4,
+            },
+        );
     }
-
-    (tri_mesh, edge_mesh)
 }
 
 /// Shift the slice by [`rye_math::SLICE_PERTURBATION_EPSILON`] when any polytope vertex's w
@@ -481,26 +609,28 @@ fn fit_plane_basis(centroid: Vec3, points: &[Vec3]) -> Option<(Vec3, Vec3)> {
     None
 }
 
-/// Sort cap points by angle around the centroid in the cap's `(basis_u, basis_v)` plane.
+/// Sort cap vertices by angle around the centroid in the cap's `(basis_u, basis_v)` plane.
 /// Convex polygons sort cleanly under this ordering since the centroid is interior; the
-/// resulting sequence walks the perimeter once.
-fn order_around_centroid(
-    points: &[Vec3],
+/// resulting sequence walks the perimeter once. The 4D companion coordinate
+/// (`CapVertex::point4`) rides along with each R³ point so position-coloring stays
+/// attached to the right cap vertex through the reorder.
+fn order_cap_around_centroid(
+    cap: &[CapVertex],
     centroid: Vec3,
     basis_u: Vec3,
     basis_v: Vec3,
-) -> Vec<Vec3> {
-    let mut indexed: Vec<(usize, f32)> = points
+) -> Vec<CapVertex> {
+    let mut indexed: Vec<(usize, f32)> = cap
         .iter()
         .enumerate()
-        .map(|(i, p)| {
-            let off = *p - centroid;
+        .map(|(i, cv)| {
+            let off = cv.point3 - centroid;
             let angle = off.dot(basis_v).atan2(off.dot(basis_u));
             (i, angle)
         })
         .collect();
     indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    indexed.into_iter().map(|(i, _)| points[i]).collect()
+    indexed.into_iter().map(|(i, _)| cap[i]).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,6 +1458,110 @@ mod tests {
                 !edges.segments.is_empty(),
                 "{polytope:?} midpoint slice should yield perimeter edges"
             );
+        }
+    }
+
+    // ----------------- Section faces (filled, position-colored) -----------------
+    //
+    // The face variant ([`polytope4_section_faces`]) shares its geometric core with
+    // [`polytope4_section`] via [`for_each_section_cap`]. The tests below pin the
+    // additional invariants specific to the face variant: triangle count agreement
+    // with the overlay variant, opaque + non-uniform per-vertex coloring, and color
+    // continuity across cell boundaries.
+
+    /// Face triangulation produces the same triangle count as the overlay's triangle
+    /// output, since both go through the same cap-iteration core. Agreement here is
+    /// the cheapest assertion that the refactor didn't drop or duplicate triangles in
+    /// one variant relative to the other.
+    #[test]
+    fn section_faces_triangle_count_matches_section_triangles() {
+        for polytope in Polytope4::ALL {
+            let slice = rye_math::WPlane::new(0.1);
+            let (overlay_tri, _) = polytope4_section(polytope, slice);
+            let faces_tri = polytope4_section_faces(polytope, slice);
+            assert_eq!(
+                faces_tri.indices.len(),
+                overlay_tri.indices.len(),
+                "{polytope:?}: section_faces triangle count must match polytope4_section"
+            );
+            assert_eq!(
+                faces_tri.vertices.len(),
+                overlay_tri.vertices.len(),
+                "{polytope:?}: section_faces vertex count must match polytope4_section"
+            );
+        }
+    }
+
+    /// All face vertices have alpha = 1.0 and at least one non-grey color appears.
+    /// Pins that the position-coloring scheme is actually being applied (a regression
+    /// to a fixed white fill would still produce alpha = 1.0 but only one unique color
+    /// across all vertices).
+    #[test]
+    fn section_faces_are_opaque_and_position_colored() {
+        // 5-cell midpoint slice produces 4 tetrahedral caps with cap vertices on the
+        // edges of the parent (the 4D edge midpoints), which span enough of the unit
+        // 3-sphere to produce visibly different colors per vertex.
+        let mesh = polytope4_section_faces(Polytope4::Pentatope, rye_math::WPlane::new(0.0));
+        assert!(!mesh.colors.is_empty(), "section faces must produce colors");
+        for c in &mesh.colors {
+            assert!(
+                (c[3] - 1.0).abs() < 1e-6,
+                "section face vertex must be opaque (alpha = 1.0), got {c:?}"
+            );
+        }
+        // At least two distinct colors across the cap vertex set. Catches a
+        // regression where all vertices land on the same color (e.g. a future
+        // refactor accidentally passing the centroid 4D point to every cap vertex).
+        let distinct: std::collections::HashSet<[u32; 3]> = mesh
+            .colors
+            .iter()
+            .map(|c| [c[0].to_bits(), c[1].to_bits(), c[2].to_bits()])
+            .collect();
+        assert!(
+            distinct.len() >= 2,
+            "section face coloring is degenerate: only {} unique color(s)",
+            distinct.len()
+        );
+    }
+
+    /// Cap vertices shared between adjacent cells (i.e., a parent-edge's intersection
+    /// with the slice, which belongs to every cell containing that edge) receive the
+    /// SAME color in every cap. Catches a regression where the cap-vertex color
+    /// depends on cell context rather than the 4D intersection point.
+    #[test]
+    fn section_faces_color_is_continuous_across_cells() {
+        // Tesseract midpoint slice has 6 square caps; each cap-edge of one cap is
+        // shared with exactly one adjacent cap. So cap-vertex coordinates appear in
+        // pairs: two cells, same R³ position, must have the same color.
+        let mesh = polytope4_section_faces(Polytope4::Tesseract, rye_math::WPlane::new(0.0));
+
+        // Bucket cap vertices by R³ position (with quantization to absorb f32 jitter).
+        // For each position, all bucketed colors must agree.
+        use std::collections::HashMap;
+        let mut by_pos: HashMap<[i32; 3], Vec<[f32; 4]>> = HashMap::new();
+        for (v, c) in mesh.vertices.iter().zip(mesh.colors.iter()) {
+            let key = [
+                (v[0] * 1e4).round() as i32,
+                (v[1] * 1e4).round() as i32,
+                (v[2] * 1e4).round() as i32,
+            ];
+            by_pos.entry(key).or_default().push(*c);
+        }
+        for (pos, colors) in &by_pos {
+            // Centroids are unique per cell; only inspect positions that appear in
+            // multiple caps (= cap-perimeter vertices shared between adjacent cells).
+            if colors.len() < 2 {
+                continue;
+            }
+            let first = colors[0];
+            for c in &colors[1..] {
+                for k in 0..4 {
+                    assert!(
+                        (c[k] - first[k]).abs() < 1e-5,
+                        "color discontinuity at shared cap vertex {pos:?}: {first:?} vs {c:?}"
+                    );
+                }
+            }
         }
     }
 }

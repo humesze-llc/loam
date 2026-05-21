@@ -316,12 +316,14 @@ impl Demo {
             &ctx.rd.device,
             ctx.rd.surface_bundle.config.format,
             depth_mode,
+            rye_render::FragmentShading::Flat,
             ctx.rd.sample_count(),
         );
         let section_triangles = TriangleRasterNode::new(
             &ctx.rd.device,
             ctx.rd.surface_bundle.config.format,
             depth_mode,
+            rye_render::FragmentShading::Flat,
             ctx.rd.sample_count(),
         );
         let section_edges = LineRasterNode::new(

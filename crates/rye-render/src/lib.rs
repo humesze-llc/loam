@@ -24,7 +24,9 @@ pub use depth::DepthBuffer;
 pub use lattice::Viewport;
 pub use line_raster::{LineRasterNode, LineRasterUniforms};
 pub use raymarch::{GeodesicRayMarchNode, RayMarchNode, RayMarchUniforms};
-pub use triangle_raster::{TriangleRasterNode, TriangleRasterUniforms, TriangleVertex};
+pub use triangle_raster::{
+    FragmentShading, TriangleRasterNode, TriangleRasterUniforms, TriangleVertex,
+};
 
 /// How a rasterizer pipeline interacts with depth. Three states only -- avoids the
 /// invalid-combination problem an `Option<TextureFormat> + bool depth_write` API would
