@@ -50,6 +50,38 @@ pub(crate) enum ViewMode {
     Filmstrip,
 }
 
+/// How the parent-wireframe edges are colored. Orthogonal to the alpha-modulation
+/// toggle [`Demo::wireframe_nearest_active`]: the color mode picks the hue, the
+/// nearest-active toggle then modulates alpha on top.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum WireframeColorMode {
+    /// Per-vertex RGB from [`rye_physics::polytope::vertex_color_by_position`]: a
+    /// continuous color field over the polytope's vertex set that flows smoothly
+    /// across the edge graph and reveals symmetry as color gradients. Every vertex
+    /// picks up a distinct hue from its 4D coordinates, so the polytope reads as a
+    /// stylized colorful identity rather than a uniform mass of edges.
+    #[default]
+    Unique,
+    /// Binary green/gray by cell activity: edges that belong to at least one cell
+    /// the slice is *currently* intersecting are bright green; all other edges are
+    /// dim neutral gray. Reads as "which cells of the polytope am I looking at right
+    /// now" at a glance, complementing the gradient `nearest-active` mode (which is
+    /// continuous and shows *how strongly* each cell is being crossed).
+    Active,
+}
+
+impl WireframeColorMode {
+    /// Parse a console-arg spelling (`unique` or `active`). Returns `None` for any
+    /// other input; the caller surfaces a usage error.
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "unique" => Some(WireframeColorMode::Unique),
+            "active" => Some(WireframeColorMode::Active),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RotorTerm + display helpers
 // ---------------------------------------------------------------------------
@@ -232,15 +264,26 @@ pub(crate) struct Demo {
     /// each moment. When `false`, every edge uses the same uniform dim alpha (the
     /// previous behavior).
     pub(crate) wireframe_nearest_active: bool,
+    /// Base RGB for wireframe edges. Orthogonal to [`Self::wireframe_nearest_active`]:
+    /// the color mode picks the hue, the nearest-active toggle then modulates alpha on
+    /// top.
+    pub(crate) wireframe_color_mode: WireframeColorMode,
     /// Filled-faces rasterizer for the cross-section of every polychoral body. When
     /// [`Self::surface_raster_enabled`] is `true`, this replaces the SDF raymarch for the
     /// six regular convex 4-polytopes: the SDF gets `BodyUniform::default()` for those
     /// slots (which the kernel skips) and the section's filled cell-caps come through
-    /// here instead. Per-vertex position-colored, face-normal Lambert lit, opaque.
+    /// here instead. Per-body solid color + face-normal Lambert in the fragment shader.
     pub(crate) section_faces: rye_render::TriangleRasterNode,
-    /// Depth attachment for [`Self::section_faces`]. Sized to the swapchain on first frame
-    /// and recreated on resize via [`rye_render::DepthBuffer::ensure`]. None until the
-    /// first frame in raster mode; ignored entirely in SDF mode.
+    /// Shared depth attachment for the rasterizer chain in Shapes view. Sized to the
+    /// swapchain and recreated on resize via [`rye_render::DepthBuffer::ensure`].
+    ///
+    /// Cleared once per frame at the top of the Shapes-view render path
+    /// ([`crate::Demo::ensure_and_clear_shared_depth`]). Two passes consume it:
+    /// - `section_faces` writes depth + color when raster mode is on (no-op in SDF
+    ///   mode, so the buffer stays at the cleared `1.0` value).
+    /// - `parent_wireframe` reads depth (no write) so lines behind a section cap are
+    ///   correctly occluded. In SDF mode the cleared depth makes every wireframe
+    ///   fragment pass the test trivially, preserving the historical visual.
     pub(crate) section_faces_depth: Option<rye_render::DepthBuffer>,
     /// Selects how the six regular convex 4-polytopes are rendered:
     /// - `true` (default): rasterized filled cross-section cell caps via

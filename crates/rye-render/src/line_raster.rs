@@ -273,10 +273,14 @@ impl LineRasterNode {
             depth_stencil: depth.format().map(|format| DepthStencilState {
                 format,
                 depth_write_enabled: depth.writes(),
-                // `Less` is the convention: a fragment writes only if it's closer than what's
-                // already there. The clear value at the start of the frame is `1.0` (far plane);
-                // any rendered fragment passes the test until something nearer overwrites it.
-                depth_compare: CompareFunction::Less,
+                // `LessEqual` rather than the usual `Less`: lines are typically drawn on top
+                // of filled triangles as overlays / outlines / wireframes, and the polygon
+                // outline use case puts the line at *exactly* the polygon's depth. Strict
+                // `Less` would discard the line in that case (`line_depth < tri_depth` fails
+                // when they're equal), making outlines invisible wherever they coincide with
+                // their own polygon. `LessEqual` keeps them visible. Lines geometrically
+                // behind a filled surface still fail the test and are correctly occluded.
+                depth_compare: CompareFunction::LessEqual,
                 stencil: StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),

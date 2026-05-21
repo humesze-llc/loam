@@ -594,39 +594,50 @@ impl RasterTestApp {
                     "all",
                     "toggle every R³ raster-test category at once",
                     |d, v| {
-                        d.toggles.axes = v;
-                        d.toggles.cube = v;
-                        d.toggles.widths = v;
-                        d.toggles.gradient = v;
-                        d.toggles.tilted = v;
-                        d.toggles.triangles = v;
-                        d.toggles.section = v;
+                        // Bare `tests all` flips based on whether anything is off;
+                        // explicit on|off sets every category at once.
+                        let on = v.unwrap_or(
+                            !(d.toggles.axes
+                                && d.toggles.cube
+                                && d.toggles.widths
+                                && d.toggles.gradient
+                                && d.toggles.tilted
+                                && d.toggles.triangles
+                                && d.toggles.section),
+                        );
+                        d.toggles.axes = on;
+                        d.toggles.cube = on;
+                        d.toggles.widths = on;
+                        d.toggles.gradient = on;
+                        d.toggles.tilted = on;
+                        d.toggles.triangles = on;
+                        d.toggles.section = on;
                         d.dirty = true;
                         Ok(())
                     },
                 )
                 .toggle("axes", "toggle world-axes (R/G/B basis vectors)", |d, v| {
-                    d.toggles.axes = v;
+                    d.toggles.axes = v.unwrap_or(!d.toggles.axes);
                     d.dirty = true;
                     Ok(())
                 })
                 .toggle("cube", "toggle unit-cube wireframe", |d, v| {
-                    d.toggles.cube = v;
+                    d.toggles.cube = v.unwrap_or(!d.toggles.cube);
                     d.dirty = true;
                     Ok(())
                 })
                 .toggle("widths", "toggle width-sweep horizontal lines", |d, v| {
-                    d.toggles.widths = v;
+                    d.toggles.widths = v.unwrap_or(!d.toggles.widths);
                     d.dirty = true;
                     Ok(())
                 })
                 .toggle("gradient", "toggle red-to-blue gradient line", |d, v| {
-                    d.toggles.gradient = v;
+                    d.toggles.gradient = v.unwrap_or(!d.toggles.gradient);
                     d.dirty = true;
                     Ok(())
                 })
                 .toggle("tilted", "toggle tilted-line fan", |d, v| {
-                    d.toggles.tilted = v;
+                    d.toggles.tilted = v.unwrap_or(!d.toggles.tilted);
                     d.dirty = true;
                     Ok(())
                 })
@@ -634,7 +645,7 @@ impl RasterTestApp {
                     "triangles",
                     "toggle the filled-triangle pair (depth-test smoke test)",
                     |d, v| {
-                        d.toggles.triangles = v;
+                        d.toggles.triangles = v.unwrap_or(!d.toggles.triangles);
                         d.dirty = true;
                         Ok(())
                     },
@@ -643,7 +654,7 @@ impl RasterTestApp {
                     "section",
                     "overlay active polytope's cross-section at world w=0",
                     |d, v| {
-                        d.toggles.section = v;
+                        d.toggles.section = v.unwrap_or(!d.toggles.section);
                         d.dirty = true;
                         Ok(())
                     },
