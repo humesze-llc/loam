@@ -232,6 +232,27 @@ pub(crate) struct Demo {
     /// each moment. When `false`, every edge uses the same uniform dim alpha (the
     /// previous behavior).
     pub(crate) wireframe_nearest_active: bool,
+    /// Filled-faces rasterizer for the cross-section of every polychoral body. When
+    /// [`Self::surface_raster_enabled`] is `true`, this replaces the SDF raymarch for the
+    /// six regular convex 4-polytopes: the SDF gets `BodyUniform::default()` for those
+    /// slots (which the kernel skips) and the section's filled cell-caps come through
+    /// here instead. Per-vertex position-colored, face-normal Lambert lit, opaque.
+    pub(crate) section_faces: rye_render::TriangleRasterNode,
+    /// Depth attachment for [`Self::section_faces`]. Sized to the swapchain on first frame
+    /// and recreated on resize via [`rye_render::DepthBuffer::ensure`]. None until the
+    /// first frame in raster mode; ignored entirely in SDF mode.
+    pub(crate) section_faces_depth: Option<rye_render::DepthBuffer>,
+    /// Selects how the six regular convex 4-polytopes are rendered:
+    /// - `true` (default): rasterized filled cross-section cell caps via
+    ///   [`Self::section_faces`]. Much faster for the 120-cell + 600-cell, exact (no
+    ///   Wolfe-greedy approximation), sidesteps the cell120/600 face-plane BUG in
+    ///   `rye_physics::euclidean_r4`.
+    /// - `false`: SDF raymarch in [`Self::node`]. The historical pre-rasterizer
+    ///   behavior, kept available behind the console toggle for visual comparison.
+    ///
+    /// Smooth-surface shapes (Clifford torus, duocylinder, etc.) ignore this toggle and
+    /// always render via the SDF; they have no polytope topology to section.
+    pub(crate) surface_raster_enabled: bool,
     /// Polytope row built at startup from `--shapes` CLI args (or `DEFAULT_ROW`); drives
     /// both the body uniforms and per-body label lookups in the overlay.
     pub(crate) row: Vec<ShapeEntry>,
@@ -374,40 +395,47 @@ impl Demo {
         }
     }
 
+    /// Build the SDF body uniform for a single row entry, with surface-raster opt-out:
+    /// when raster mode is on AND the entry has polytope topology, the returned uniform
+    /// is `BodyUniform::default()` (kind = Invalid), which the kernel's dispatch chain
+    /// skips. The slot is preserved (so the visual layout doesn't shift); the polychoral
+    /// surface is rendered separately via [`Self::section_faces`] in `main.rs`.
+    ///
+    /// Smooth-surface shapes (Clifford torus, etc.) ignore the raster toggle and always
+    /// produce a live SDF body.
+    fn sdf_body_for_slot(&self, slot: usize, n: usize, rotor: Rotor4) -> BodyUniform {
+        let entry = &self.row[slot];
+        if self.surface_raster_enabled && entry.shape.polytope4().is_some() {
+            return BodyUniform::default();
+        }
+        BodyUniform::polytope_with_rotor(
+            body_position(slot, n),
+            entry.shape.shape_id(),
+            BODY_SIZE,
+            rotor,
+            entry.body_color,
+        )
+    }
+
     /// Drive every body in the row with the same rotor, lets the user directly compare
     /// slice signatures under identical 4D motion.
     pub(crate) fn write_all(&mut self, rotor: Rotor4) {
         let n = self.row.len();
-        for (slot, entry) in self.row.iter().enumerate() {
-            let body = BodyUniform::polytope_with_rotor(
-                body_position(slot, n),
-                entry.shape.shape_id(),
-                BODY_SIZE,
-                rotor,
-                entry.body_color,
-            );
+        for slot in 0..n {
+            let body = self.sdf_body_for_slot(slot, n, rotor);
             self.node.set_body(slot, body);
         }
     }
 
     /// Re-emit every body's uniform from the current row + rotor state. Called after row
-    /// mutations (add/remove/reorder) to resync the GPU side to what the panel shows.
+    /// mutations (add/remove/reorder), rotor changes during spin, and surface-mode
+    /// toggles (since flipping `surface_raster_enabled` redirects polychora between the
+    /// SDF and the raster pipelines).
     pub(crate) fn rebuild_bodies(&mut self) {
         let n = self.row.len();
         let rotor = self.rot_state;
-        let bodies: Vec<BodyUniform> = self
-            .row
-            .iter()
-            .enumerate()
-            .map(|(slot, entry)| {
-                BodyUniform::polytope_with_rotor(
-                    body_position(slot, n),
-                    entry.shape.shape_id(),
-                    BODY_SIZE,
-                    rotor,
-                    entry.body_color,
-                )
-            })
+        let bodies: Vec<BodyUniform> = (0..n)
+            .map(|slot| self.sdf_body_for_slot(slot, n, rotor))
             .collect();
         self.node.set_bodies(&bodies);
     }
