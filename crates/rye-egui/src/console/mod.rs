@@ -670,8 +670,8 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
         let sub_slot = arg_index - 1;
         match &entry.kind {
             SubcommandKind::Toggle { .. } => {
-                // Empty by design — see the comment on `ON_OFF_CHOICES`'s old slot
-                // above. Bare invocation is the canonical UX; `on|off` is still
+                // Empty by design (see the comment on `ON_OFF_CHOICES`'s old slot
+                // above). Bare invocation is the canonical UX; `on|off` is still
                 // accepted as input but not surfaced as a suggestion.
                 &[]
             }
