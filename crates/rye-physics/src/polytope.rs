@@ -1572,4 +1572,96 @@ mod tests {
              a face-normal regression may have widened the error."
         );
     }
+
+    // ----------------- Pruning + recompute invariants -----------------
+
+    /// w-range of a cell, helper for `cell_pruning_matches_full_scan`. Independent
+    /// copy of the algorithm's internal `cell_w_range`; if the two ever drift, this
+    /// test fires and signals a refactor that didn't update both sites.
+    fn test_cell_w_range(cell: &[u32], vertices: &[Vec4]) -> (f32, f32) {
+        cell.iter()
+            .map(|&i| vertices[i as usize].w)
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), w| {
+                (lo.min(w), hi.max(w))
+            })
+    }
+
+    /// The per-cell w-range pruning step inside the section algorithm is the
+    /// load-bearing optimization for the 600-cell (factor 100x speedup at typical
+    /// slices). It MUST be exact: every cell that straddles the slice contributes a
+    /// cap, and no cell contributes that doesn't straddle.
+    ///
+    /// Counts caps in the output via `vertices.len() - indices.len()`: each cap's
+    /// fan-triangulation adds one centroid vertex over and above its N cap-vertices
+    /// and emits N triangles, so subtracting triangle count from vertex count
+    /// recovers the number of caps. Compares against an independent count of
+    /// straddling cells computed from the topology directly.
+    #[test]
+    fn cell_pruning_matches_full_scan() {
+        // Slice values across the [-1, 1] interior of each polytope. Avoid grazing
+        // values (within `SLICE_PERTURBATION_EPSILON` of any vertex's w) so the
+        // perturbation path doesn't shift the slice between our independent count
+        // and the algorithm's count.
+        let slices = [-0.7, -0.3, -0.1, 0.0, 0.1, 0.3, 0.7];
+        let eps = rye_math::SLICE_PERTURBATION_EPSILON;
+
+        for polytope in Polytope4::ALL {
+            let topo = polytope.topology();
+            for &w in &slices {
+                // Reproduce the algorithm's perturbation logic so our independent
+                // straddle count uses the same effective slice value the algorithm
+                // does internally.
+                let effective_w = if topo.vertices.iter().any(|v| (v.w - w).abs() < eps) {
+                    w + eps
+                } else {
+                    w
+                };
+                let expected_caps: usize = topo
+                    .cells
+                    .iter()
+                    .filter(|cell| {
+                        let (lo, hi) = test_cell_w_range(cell, topo.vertices);
+                        // Strict `<` matches the algorithm's effective predicate:
+                        // a cell whose w_max == effective_w + eps would be skipped
+                        // by the algorithm's edge-section step (no crossing edge
+                        // produces a finite intersection point at that boundary).
+                        lo < effective_w && effective_w < hi
+                    })
+                    .count();
+
+                let (tri, _) = polytope4_section(polytope, rye_math::WPlane::new(w));
+                let actual_caps = tri.vertices.len().saturating_sub(tri.indices.len());
+
+                assert_eq!(
+                    actual_caps, expected_caps,
+                    "{polytope:?} at slice w={w}: algorithm produced {actual_caps} caps, \
+                     topology-derived straddle count expected {expected_caps}"
+                );
+            }
+        }
+    }
+
+    /// `polytope4_section` is a pure function of `(polytope, slice)`: re-invoking it
+    /// with a different slice produces a different section mesh. Trivial but pins
+    /// the contract so a future caching optimization that accidentally returns a
+    /// stale mesh across slice changes fires here.
+    ///
+    /// **Polytope choice matters.** The tesseract's cubical cells have w-edges
+    /// going from (x,y,z,-0.5) to (x,y,z,+0.5): same R³ endpoints, only differing
+    /// in w. Slicing at any interior `w` produces the same R³ intersection point
+    /// (x,y,z,w_slice), so the tesseract's R³ section is *literally invariant*
+    /// across its w-range. A non-trivial recompute test needs a polytope whose
+    /// cells aren't axis-aligned in w; the 5-cell qualifies (apex edges run from
+    /// (0,0,0,1) to (t,t,t,-0.25), so the slice intersection moves in R³ as `w`
+    /// changes).
+    #[test]
+    fn section_recomputes_when_w_slice_changes() {
+        let (a, _) = polytope4_section(Polytope4::Pentatope, rye_math::WPlane::new(0.0));
+        let (b, _) = polytope4_section(Polytope4::Pentatope, rye_math::WPlane::new(0.4));
+        assert_ne!(
+            a.vertices, b.vertices,
+            "section at w=0.0 and w=0.4 must differ; result was identical, \
+             suggesting a stale cache or incorrect slice parameter use"
+        );
+    }
 }
