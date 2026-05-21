@@ -54,18 +54,28 @@
 //!   `octahedron`, `cuboctahedron`, `dodecahedron`, `icosahedron`).
 
 use anyhow::{anyhow, Result};
-use glam::{Vec3, Vec4};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
 use rye_egui::Console;
+use rye_math::WPlane;
 use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
+use rye_physics::polytope::{
+    polytope_section_faces_append, polytope_section_overlay_with_vertices, vertex_color_by_position,
+};
 use rye_render::{
     device::RenderDevice,
     raymarch::{
         polytope_extended_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL,
     },
-    Viewport,
+    DepthBuffer, DepthMode, LineRasterNode, TriangleRasterNode, Viewport,
 };
+
+/// Depth-attachment format for the rasterized section-faces pass. 32-bit float gives
+/// enough precision to depth-sort cell caps from the 600-cell (which can have ~24
+/// active caps within tenths of a unit of camera-z) without artifacting.
+const SECTION_FACES_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 use rye_scene::{Scene4, SceneNode4};
+use rye_shape::LineMesh;
 use winit::window::WindowAttributes;
 
 mod active;
@@ -80,7 +90,7 @@ mod ui;
 use active::combo_name;
 use catalog::{parse_row_from_args, SHAPE_CATALOG};
 use consts::{BODY_SIZE, BODY_Y, T_SCRUB_RATE, T_SLIDER_INITIAL, W_RANGE, W_SCRUB_RATE};
-use state::{body_position, Demo, RotationMode, ViewMode};
+use state::{body_position, Demo, RotationMode, ViewMode, WireframeColorMode};
 
 #[cfg(test)]
 use catalog::{parse_shape_name, ShapeEntry, DEFAULT_ROW};
@@ -123,21 +133,74 @@ impl Demo {
             ctx.rd.sample_count(),
         );
 
+        // Initial body uniforms for the SDF kernel. With the surface default flipped to
+        // raster, polychoral entries are emitted as `BodyUniform::default()` (kind =
+        // Invalid) so the kernel skips them; the section-faces rasterizer draws them
+        // instead. Mirrors `Demo::sdf_body_for_slot` for the initial upload; subsequent
+        // re-uploads go through that helper directly.
         let n = row.len();
         let bodies: Vec<BodyUniform> = row
             .iter()
             .enumerate()
             .map(|(slot, entry)| {
-                BodyUniform::polytope_with_rotor(
-                    body_position(slot, n),
-                    entry.shape,
-                    BODY_SIZE,
-                    Rotor4::IDENTITY,
-                    entry.body_color,
-                )
+                if entry.shape.polytope4().is_some() {
+                    BodyUniform::default()
+                } else {
+                    BodyUniform::polytope_with_rotor(
+                        body_position(slot, n),
+                        entry.shape.shape_id(),
+                        BODY_SIZE,
+                        Rotor4::IDENTITY,
+                        entry.body_color,
+                    )
+                }
             })
             .collect();
         node.set_bodies(&bodies);
+
+        // Section perimeter (cyan outlines): depth-test ReadOnly against the shared
+        // section-faces depth attachment. With multiple polychora in a row, polytope A's
+        // perimeter must be occluded by polytope B's filled caps when A sits behind B.
+        // `LineRasterNode` uses `CompareFunction::LessEqual`, so a perimeter line sitting
+        // at exactly its own cap's depth still passes the test and draws on top, keeping
+        // the intended "outline of this cap" visual.
+        let section_edges = LineRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            DepthMode::ReadOnly {
+                format: SECTION_FACES_DEPTH_FORMAT,
+            },
+            ctx.rd.sample_count(),
+        );
+        // Parent wireframe: depth-test ReadOnly against the shared section-faces depth
+        // attachment. Lines whose projected R³ position sits behind a section cap get
+        // occluded by it; lines in front draw over. No depth-write so the wireframe
+        // doesn't muddy the depth buffer for any downstream pass. In SDF mode the
+        // depth buffer is cleared per frame but no pass writes to it, so the test
+        // trivially passes everywhere -- the SDF visual stays unchanged.
+        let parent_wireframe = LineRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            DepthMode::ReadOnly {
+                format: SECTION_FACES_DEPTH_FORMAT,
+            },
+            ctx.rd.sample_count(),
+        );
+
+        // Rasterized cross-section faces: filled cell-caps with face-normal Lambert
+        // shading. Uses a depth attachment so caps from different cells of the same
+        // polychoron occlude each other correctly when projected to camera space. The
+        // depth buffer is sized + cleared per-frame inside the render path (only when
+        // `surface_raster_enabled`); see `Demo::render_section_faces` in this file.
+        let section_faces = TriangleRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            DepthMode::ReadWrite {
+                format: SECTION_FACES_DEPTH_FORMAT,
+            },
+            rye_render::FragmentShading::FaceNormalLambert,
+            ctx.rd.sample_count(),
+        );
 
         let mut camera = Camera::<EuclideanR3>::at_origin();
         camera.position = Vec3::new(0.0, 3.0, 9.0);
@@ -158,6 +221,16 @@ impl Demo {
             camera,
             orbit,
             node,
+            section_edges,
+            parent_wireframe,
+            wireframe_enabled: false,
+            wireframe_nearest_active: true,
+            wireframe_color_mode: WireframeColorMode::default(),
+            section_faces,
+            section_faces_depth: None,
+            section_world_vertices_scratch: Vec::new(),
+            section_faces_mesh_scratch: rye_shape::TriangleMesh::<3>::default(),
+            surface_raster_enabled: true,
             row,
             w_slice: initial_w,
             slider_up_held: false,
@@ -540,7 +613,7 @@ impl Demo {
                     };
                     let body = BodyUniform::polytope_with_rotor(
                         [0.0, BODY_Y, 0.0, 0.0],
-                        entry.shape,
+                        entry.shape.shape_id(),
                         BODY_SIZE,
                         cell_rotor,
                         entry.body_color,
@@ -560,8 +633,370 @@ impl Demo {
                 u.viewport_origin = [viewport.x as f32, viewport.y as f32];
             }
             self.node.flush_uniforms(&rd.queue);
-            self.node.execute_in_viewport(rd, view, viewport)
+            self.node.execute_in_viewport(rd, view, viewport)?;
+            // Shared depth attachment for the rasterized section pass + the parent
+            // wireframe's depth-test. Ensured + cleared once per Shapes-view frame so
+            // the order is: SDF (color only) -> section_faces (writes depth + color
+            // when raster mode is on) -> wireframe (tests depth, no write). In SDF
+            // mode no pass writes depth, so the cleared `1.0` buffer makes every
+            // wireframe fragment pass the depth-test trivially -- visual unchanged.
+            self.ensure_and_clear_shared_depth(rd)?;
+            if self.surface_raster_enabled {
+                self.render_section_faces(rd, view)?;
+            }
+            // Cross-section + parent-wireframe overlay (when toggled). Only in Shapes
+            // view since Filmstrip's per-cell viewport composition would require
+            // per-cell depth-clear + per-cell uploads that aren't worth the v1 plumbing.
+            if self.wireframe_enabled {
+                self.render_wireframe_overlay(rd, view)?;
+            }
+            Ok(())
         }
+    }
+
+    /// Ensure the shared section-faces depth attachment exists at the current
+    /// swapchain size + sample count, then clear it to `1.0`. Called once per
+    /// Shapes-view frame at the top of the rasterizer chain.
+    ///
+    /// The buffer is shared between `section_faces` (which writes depth when raster
+    /// mode is on) and `parent_wireframe` (which depth-tests against it without
+    /// writing). Sharing means we pay one ensure + one clear per frame regardless of
+    /// surface mode.
+    fn ensure_and_clear_shared_depth(&mut self, rd: &RenderDevice) -> Result<()> {
+        let cfg = &rd.surface_bundle.config;
+        DepthBuffer::ensure(
+            &mut self.section_faces_depth,
+            &rd.device,
+            SECTION_FACES_DEPTH_FORMAT,
+            (cfg.width, cfg.height),
+            rd.sample_count(),
+        );
+        let depth = self
+            .section_faces_depth
+            .as_ref()
+            .expect("ensure() guarantees Some");
+        let mut encoder = rd
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("shared depth clear"),
+            });
+        let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shared depth clear pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rd.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    /// Build a combined section-faces mesh across every polychoral body in `self.row`,
+    /// upload it, clear the section-faces depth attachment, and execute the triangle
+    /// raster pass. No-op when no polychoral body is present in the row.
+    ///
+    /// Per-body world transform mirrors `render_wireframe_overlay`: canonical vertices
+    /// `v` become `body_position + BODY_SIZE * rot_state.apply(v)`. The section
+    /// algorithm then runs on these world vertices against the demo's `w_slice`,
+    /// producing R³ geometry that composes with the camera the SDF raymarcher uses.
+    ///
+    /// Depth: within a single cap, the fan triangles are coplanar (the cap is a 2D
+    /// polygon in R³) and don't occlude one another. Different caps within one
+    /// polytope, and caps across different polychoral bodies, all project to
+    /// different camera depths after the view-projection step, so they DO require a
+    /// depth attachment to resolve front-to-back occlusion correctly. The shared
+    /// depth buffer is ensured + cleared at the top of the Shapes-view render path
+    /// (see `Demo::ensure_and_clear_shared_depth`); this pass writes into it.
+    fn render_section_faces(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
+        let cfg = &rd.surface_bundle.config;
+        let n = self.row.len();
+
+        // Reuse the per-Demo scratch mesh; capacity grows once to fit the largest
+        // polychoron and stays there. Each frame's `clear()` keeps the underlying
+        // allocations.
+        let combined = &mut self.section_faces_mesh_scratch;
+        combined.vertices.clear();
+        combined.colors.clear();
+        combined.indices.clear();
+
+        for (slot, entry) in self.row.iter().enumerate() {
+            let Some(polytope) = entry.shape.polytope4() else {
+                continue;
+            };
+            let topo = polytope.topology();
+            let bp = Vec4::from_array(body_position(slot, n));
+
+            // Reusable scratch for per-body world-space vertices. Same growth pattern
+            // as `combined` above.
+            self.section_world_vertices_scratch.clear();
+            self.section_world_vertices_scratch.extend(
+                topo.vertices
+                    .iter()
+                    .map(|v| bp + BODY_SIZE * self.rot_state.apply(*v)),
+            );
+
+            // Match the SDF's per-body solid coloring: every cap of this polychoron
+            // uses the body's identity color from the catalog. Per-face Lambert in the
+            // fragment shader adds the geometric depth; the underlying color is flat.
+            let [r, g, b] = entry.body_color;
+            polytope_section_faces_append(
+                topo.edges,
+                topo.cells,
+                &self.section_world_vertices_scratch,
+                WPlane::new(self.w_slice),
+                [r, g, b, 1.0],
+                combined,
+            );
+        }
+
+        // Empty mesh handling lives in `TriangleRasterNode::execute` (it short-circuits
+        // when `index_count == 0`); no need for a redundant early-return here.
+
+        // Camera matches the SDF raymarcher's effective view-projection (same as the
+        // wireframe overlay uses), so pixel-aligned composition over the SDF pass.
+        let view_dir = self.camera.view();
+        let aspect = cfg.width as f32 / cfg.height as f32;
+        let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
+        let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
+        let view_proj = proj_mat * view_mat;
+
+        // The shared depth attachment is ensured + cleared once per frame by
+        // `ensure_and_clear_shared_depth` at the top of the Shapes-view render path;
+        // here we just consume the view for the triangle pass's depth-write.
+        let depth = self
+            .section_faces_depth
+            .as_ref()
+            .expect("shared depth buffer must be ensured before section_faces");
+
+        self.section_faces.set_camera(&rd.queue, view_proj);
+        self.section_faces.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            combined,
+            &rye_math::Projection::Identity,
+        );
+        self.section_faces.execute(rd, view, Some(&depth.view))?;
+        Ok(())
+    }
+
+    /// Build the three overlay meshes (section triangles, section perimeter edges, parent
+    /// wireframe) from the current row + rotor + w_slice, upload them, clear the overlay
+    /// depth buffer, and execute the three raster passes on top of the existing SDF render.
+    ///
+    /// Per-body transform: each canonical Polytope4 vertex `v` becomes the world Vec4
+    /// `body.position + BODY_SIZE * rot_state.apply(v)`. The section algorithm then runs
+    /// on these world vertices against the demo's `w_slice`, producing geometry in world
+    /// R³ that composes cleanly with the SDF camera frame.
+    ///
+    /// Non-polychoral shapes (Clifford torus, duocylinder, etc.) in the row are skipped:
+    /// they have no [`rye_physics::polytope::Polytope4`] mapping and the cross-section
+    /// algorithm doesn't apply to smooth surfaces.
+    fn render_wireframe_overlay(
+        &mut self,
+        rd: &RenderDevice,
+        view: &wgpu::TextureView,
+    ) -> Result<()> {
+        let cfg = &rd.surface_bundle.config;
+        let n = self.row.len();
+
+        // Build combined meshes across the entire row.
+        let mut section_edges = LineMesh::<3>::default();
+        let mut parent_lines = LineMesh::<3>::default();
+        // Uniform-alpha endpoints when `nearest-active` is off; the active-mode mapping
+        // interpolates between DIM (cells the slice misses entirely) and BRIGHT (cells
+        // the slice is at the midpoint of).
+        const PARENT_ALPHA_UNIFORM: f32 = 0.55;
+        const PARENT_ALPHA_DIM: f32 = 0.10;
+        const PARENT_ALPHA_BRIGHT: f32 = 0.85;
+        const PARENT_WIDTH: f32 = 1.2;
+        // Active-mode palette. Green for edges in any currently-intersected cell;
+        // neutral gray for the rest. Chosen for clear binary contrast against the
+        // grayish-blue scene backdrop and the dim ground checkerboard.
+        const ACTIVE_GREEN: [f32; 4] = [0.40, 1.00, 0.55, 1.0];
+        const INACTIVE_GRAY: [f32; 4] = [0.55, 0.55, 0.58, 1.0];
+        let nearest_active = self.wireframe_nearest_active;
+        let color_mode = self.wireframe_color_mode;
+
+        for (slot, entry) in self.row.iter().enumerate() {
+            let Some(polytope) = entry.shape.polytope4() else {
+                continue;
+            };
+            let topo = polytope.topology();
+            let body_pos = body_position(slot, n);
+            let bp = Vec4::from_array(body_pos);
+            // Transform canonical vertices into world Vec4 coords. Same shape transform
+            // the SDF kernel applies (`body_position + body_size * rotor.apply(v)`), so
+            // the rasterized geometry sits at the same world-space position as the
+            // raymarched SDF.
+            let world_vertices: Vec<Vec4> = topo
+                .vertices
+                .iter()
+                .map(|v| bp + BODY_SIZE * self.rot_state.apply(*v))
+                .collect();
+
+            // Cross-section perimeter edges only. The SDF raymarcher renders the section
+            // as a solid volume; we just need to outline the boundaries between adjacent
+            // cell caps (each cap contributes one face of the 3D section polytope).
+            // `polytope_section_overlay_with_vertices` returns `(triangles, perimeter)`; we
+            // discard the filled triangles since they would obscure the SDF without
+            // adding information.
+            let (_tri, mut perim) = polytope_section_overlay_with_vertices(
+                topo.edges,
+                topo.cells,
+                &world_vertices,
+                WPlane::new(self.w_slice),
+            );
+            section_edges.segments.append(&mut perim.segments);
+            section_edges.colors.append(&mut perim.colors);
+            section_edges.widths.append(&mut perim.widths);
+
+            // Per-cell "crossing strength" in [0, 1]: 1 when `w_slice` is at the cell's
+            // w-midpoint (cap face is widest), 0 when the slice is at the cell's w-boundary
+            // or outside it entirely. A linear w-midpoint proxy avoids computing actual
+            // cap areas while giving the same visual gradient: cells the slice is *deep
+            // in* peak in brightness, cells the slice barely touches taper to dim.
+            let cell_strengths: Vec<f32> = topo
+                .cells
+                .iter()
+                .map(|cell| {
+                    let (w_min, w_max) = cell
+                        .iter()
+                        .map(|&i| world_vertices[i as usize].w)
+                        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), w| {
+                            (lo.min(w), hi.max(w))
+                        });
+                    let half_extent = (w_max - w_min) * 0.5;
+                    if half_extent <= 0.0 {
+                        return 0.0;
+                    }
+                    let mid = (w_min + w_max) * 0.5;
+                    let dist = (self.w_slice - mid).abs();
+                    (1.0 - dist / half_extent).clamp(0.0, 1.0)
+                })
+                .collect();
+
+            // Per-edge brightness: max strength across cells the edge belongs to. An edge
+            // belongs to a cell when both endpoints sit in that cell's vertex list. This
+            // lets a single edge "light up" as soon as ANY containing cell is being
+            // crossed deep; doesn't require the slice to specifically hit the cell whose
+            // boundary the edge sits on.
+            let edge_strength = |i: u32, j: u32| -> f32 {
+                let mut best = 0.0_f32;
+                for (cell, strength) in topo.cells.iter().zip(cell_strengths.iter()) {
+                    if cell.contains(&i) && cell.contains(&j) && *strength > best {
+                        best = *strength;
+                    }
+                }
+                best
+            };
+
+            // Active-mode binary classification: an edge is "active" if at least one of
+            // its containing cells has the slice strictly between its w-range endpoints
+            // (i.e., the slice is currently producing a cap from that cell). Uses the
+            // same `edges-in-cell` membership rule as `edge_strength`; threshold is
+            // `cell_strength > 0.0`, which corresponds exactly to `w_min < w_slice <
+            // w_max` after the `(1 - dist / half_extent)` clamp.
+            let edge_is_active = |i: u32, j: u32| -> bool {
+                topo.cells
+                    .iter()
+                    .zip(cell_strengths.iter())
+                    .any(|(cell, &s)| s > 0.0 && cell.contains(&i) && cell.contains(&j))
+            };
+
+            // Parent wireframe: every polytope edge as a world-R³ line. Base RGB is
+            // picked by `wireframe_color_mode`:
+            // - `Unique`: per-vertex position-derived RGB from the canonical vertex
+            //   set so each vertex gets a distinct hue from its 4D coordinates and
+            //   the polytope's symmetry shows as smooth gradients (same scheme as
+            //   `Polytope4::lines_colored_by_position`).
+            // - `Active`: binary green/gray by cell-activity (see `edge_is_active`).
+            // Alpha is then modulated per-edge by the `nearest-active` strength (when
+            // that toggle is on) or held uniform.
+            for &[i, j] in topo.edges {
+                let ia = i as usize;
+                let ja = j as usize;
+                let a = world_vertices[ia];
+                let b = world_vertices[ja];
+                let (mut color_a, mut color_b) = match color_mode {
+                    WireframeColorMode::Unique => (
+                        vertex_color_by_position(topo.vertices[ia]),
+                        vertex_color_by_position(topo.vertices[ja]),
+                    ),
+                    WireframeColorMode::Active => {
+                        let c = if edge_is_active(i, j) {
+                            ACTIVE_GREEN
+                        } else {
+                            INACTIVE_GRAY
+                        };
+                        (c, c)
+                    }
+                };
+                let alpha = if nearest_active {
+                    let s = edge_strength(i, j);
+                    PARENT_ALPHA_DIM + (PARENT_ALPHA_BRIGHT - PARENT_ALPHA_DIM) * s
+                } else {
+                    PARENT_ALPHA_UNIFORM
+                };
+                color_a[3] = alpha;
+                color_b[3] = alpha;
+                parent_lines
+                    .segments
+                    .push(([a.x, a.y, a.z], [b.x, b.y, b.z]));
+                parent_lines.colors.push((color_a, color_b));
+                parent_lines.widths.push(PARENT_WIDTH);
+            }
+        }
+
+        // Upload (each call is a no-op when its mesh is empty).
+        self.section_edges.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &section_edges,
+            &rye_math::Projection::Identity,
+            1,
+        );
+        self.parent_wireframe.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &parent_lines,
+            &rye_math::Projection::Identity,
+            1,
+        );
+
+        // Camera. Build the same view+projection matrix the SDF raymarcher uses
+        // implicitly via its ray basis, so the rasterized overlay aligns pixel-for-pixel
+        // with the raymarched scene.
+        let view_dir = self.camera.view();
+        let aspect = cfg.width as f32 / cfg.height as f32;
+        let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
+        let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
+        let view_proj = proj_mat * view_mat;
+        let vp_size = Vec2::new(cfg.width as f32, cfg.height as f32);
+        self.section_edges.set_camera(&rd.queue, view_proj, vp_size);
+        self.parent_wireframe
+            .set_camera(&rd.queue, view_proj, vp_size);
+
+        // Section perimeter edges then dim parent wireframe. Both depth-test (no write)
+        // against the shared section-faces depth attachment so lines behind a cap get
+        // correctly occluded across polytopes in a row. The shared buffer is ensured +
+        // cleared earlier in the frame; here we just borrow the view. In SDF mode no
+        // pass writes depth, so the cleared `1.0` buffer makes every fragment pass the
+        // test, preserving the historical visual.
+        let depth_view = self
+            .section_faces_depth
+            .as_ref()
+            .map(|b| &b.view)
+            .expect("shared depth buffer must be ensured before wireframe overlay");
+        self.section_edges.execute(rd, view, Some(depth_view))?;
+        self.parent_wireframe.execute(rd, view, Some(depth_view))?;
+        Ok(())
     }
 
     pub(crate) fn title(&self, _fps: f32) -> std::borrow::Cow<'static, str> {
@@ -637,6 +1072,83 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
+        // Cross-section + parent-wireframe overlay. Tab-completion is context-aware
+        // via [`SubcommandSet`]: each subcommand's value slot lists only that
+        // subcommand's choices. Bare invocations flip:
+        //   `wireframe`                 -> flips main on/off
+        //   `wireframe nearest-active`  -> flips the alpha gradient toggle
+        //   `wireframe color <mode>`    -> sets the color mode
+        c.register(
+            rye_egui::subcommands::<Demo>("wireframe", "wireframe + cross-section overlay")
+                .on_bare(|d| {
+                    d.wireframe_enabled = !d.wireframe_enabled;
+                    Ok(())
+                })
+                .toggle(
+                    "nearest-active",
+                    "per-edge alpha gradient by cell-crossing strength (bare flips)",
+                    |d, v| {
+                        d.wireframe_nearest_active = v.unwrap_or(!d.wireframe_nearest_active);
+                        Ok(())
+                    },
+                )
+                .choice(
+                    "color",
+                    "base RGB for parent edges (bare cycles): unique (default) or active",
+                    &["unique", "active"],
+                    |d, name| {
+                        d.wireframe_color_mode = match name {
+                            Some(n) => WireframeColorMode::from_token(n).ok_or_else(|| {
+                                anyhow!("unknown color mode `{n}` (try unique|active)")
+                            })?,
+                            None => match d.wireframe_color_mode {
+                                WireframeColorMode::Unique => WireframeColorMode::Active,
+                                WireframeColorMode::Active => WireframeColorMode::Unique,
+                            },
+                        };
+                        Ok(())
+                    },
+                ),
+        );
+
+        // Polychoral surface renderer: SDF raymarch vs rasterized section faces.
+        c.register(
+            rye_egui::cmd(
+                "surface",
+                "polychoral surface: SDF raymarch or rasterized section faces",
+                |args, demo: &mut Demo, _out| {
+                    let next = match args.first().copied() {
+                        Some("sdf") => false,
+                        Some("raster") => true,
+                        Some(other) => {
+                            return Err(anyhow!("unknown arg `{other}` (try sdf|raster)"));
+                        }
+                        None => !demo.surface_raster_enabled,
+                    };
+                    if next != demo.surface_raster_enabled {
+                        demo.surface_raster_enabled = next;
+                        // Flip redirects polychoral bodies between SDF and the raster
+                        // pipeline. `rebuild_bodies` re-emits the SDF body list,
+                        // marking the polychora inert in raster mode (or live again
+                        // in SDF mode).
+                        demo.rebuild_bodies();
+                    }
+                    Ok(())
+                },
+            )
+            .with_args(&[&["sdf", "raster"]])
+            .with_long_help(
+                "Selects how the six regular convex 4-polytopes (5-cell, tesseract,\n\
+                 16-cell, 24-cell, 120-cell, 600-cell) are rendered.\n\
+                 \n\
+                 subcommands:\n  \
+                 raster  Rasterized cross-section cell-caps (the default). Face-normal\n                         Lambert lit, per-body solid color. Much faster for the\n                         120-cell + 600-cell and exact (no SDF approximation).\n  \
+                 sdf     SDF raymarch. The historical pre-rasterizer path; smoother\n                         shading but the 120-cell and 600-cell carry a face-plane\n                         approximation BUG. Kept for visual comparison.\n\
+                 \n\
+                 Smooth-surface shapes (Clifford torus, duocylinder, spherinder, 3-sphere)\n\
+                 ignore this toggle and always render via the SDF.",
+            ),
+        );
 
         // Framework-provided capture: `capture png [pre|post|both] [dir]`,
         // `capture frames [pre|post|both] [dir]`, `capture stop`. Bound to F12 (one-shot)

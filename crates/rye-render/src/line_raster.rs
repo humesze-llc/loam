@@ -1,7 +1,7 @@
 //! Line rasterizer pipeline. Antialiased line-list rendering composed on top of an existing
-//! color attachment ("HUD overlay" semantics). Lines are quad-expanded in the vertex shader to
-//! give them pixel width and antialiased edges; the fragment shader smoothsteps coverage from
-//! line center to expanded edge.
+//! color attachment. Lines are quad-expanded in the vertex shader to give them pixel width and
+//! antialiased edges; the fragment shader smoothsteps coverage from line center to expanded
+//! edge.
 //!
 //! Lives next to [`crate::raymarch`] modules and is constructed standalone, the same way the
 //! existing `Hyperslice4DNode` is.
@@ -16,16 +16,31 @@
 //! - **Uniform buffer**: `LineRasterUniforms` (view-projection matrix + viewport size).
 //!   Re-uploaded per frame via the camera method.
 //!
+//! ## Depth
+//!
+//! [`LineRasterNode::new`] takes a [`crate::DepthMode`]:
+//!
+//! - `Off`: no depth attachment, lines draw on top in submission order (HUD-style overlay).
+//! - `ReadWrite { format }`: standard scene-geometry depth, `depth_compare: Less` +
+//!   depth-write enabled. Use for opaque line wireframes that should occlude / be
+//!   occluded by other depth-aware geometry.
+//! - `ReadOnly { format }`: depth-test against the existing buffer but don't write. Use
+//!   for alpha-blended overlays that should be occluded by scene geometry in front of
+//!   them without burying subsequent draws behind them.
+//!
+//! When depth is active (`ReadWrite` or `ReadOnly`), [`LineRasterNode::execute`] requires
+//! the matching depth attachment.
+//!
+//! The caller owns the depth texture lifecycle: examples create a swapchain-sized depth
+//! texture, recreate it on resize, and clear it via a dedicated clear pass before the
+//! rasterizer's draw (which uses `LoadOp::Load` for both color and depth).
+//!
 //! ## Current limitations
 //!
-//! - No depth read or write. The overlay always draws on top of the existing scene; useful
-//!   for debug / visualization, not for honest 3D occlusion. Depth-tested compositing is
-//!   additive: add a depth attachment to the render pass and have the raymarcher emit
-//!   `FragDepth`.
-//! - R³ only at v1. R⁴ projection + topology-derived polytope wireframes are additive impls
-//!   on `RasterizableSpace<4>` and `Visualizable<4>`.
-//! - [`Projection<N>::Identity`] only; Orthographic / Perspective / Schlegel / Stereographic /
-//!   Hyperslice variants are open extensions.
+//! - R³ + R⁴ impls only; other dimensions are additive on `RasterizableSpace<N>` and
+//!   `Visualizable<N>`.
+//! - [`Projection<N>`] variants beyond `Identity` + `Orthographic` (Perspective, Schlegel,
+//!   Stereographic, Hyperslice) are open extensions.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2};
@@ -36,11 +51,12 @@ use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingType, BlendComponent, BlendFactor, BlendOperation, BlendState,
     Buffer, BufferBindingType, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites,
-    CommandEncoderDescriptor, Device, FragmentState, LoadOp, MultisampleState, Operations,
-    PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages, StoreOp, TextureFormat, VertexAttribute, VertexBufferLayout,
-    VertexFormat, VertexState, VertexStepMode,
+    CommandEncoderDescriptor, CompareFunction, DepthStencilState, Device, FragmentState, LoadOp,
+    MultisampleState, Operations, PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology,
+    Queue, RenderPassColorAttachment, RenderPassDepthStencilAttachment, RenderPassDescriptor,
+    RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages,
+    StencilState, StoreOp, TextureFormat, VertexAttribute, VertexBufferLayout, VertexFormat,
+    VertexState, VertexStepMode,
 };
 
 use crate::device::RenderDevice;
@@ -113,12 +129,26 @@ pub struct LineRasterNode {
     /// Allocated capacity of `instance_buf` in instances. The buffer is re-created if a future
     /// upload exceeds this.
     instance_capacity: u32,
+    /// `true` if the pipeline was created with a depth attachment; [`Self::execute`] then
+    /// requires the matching depth view. Tracks the depth-or-not API contract so callers
+    /// don't silently get mismatched render passes.
+    has_depth: bool,
 }
 
 impl LineRasterNode {
-    /// Construct the pipeline. `surface_format` must match the color attachment at draw time;
-    /// `sample_count` must match the attachment's MSAA sample count.
-    pub fn new(device: &Device, surface_format: TextureFormat, sample_count: u32) -> Self {
+    /// Construct the pipeline.
+    ///
+    /// - `surface_format` must match the color attachment at draw time.
+    /// - `depth`: see [`crate::DepthMode`]. Determines whether the pipeline reads depth,
+    ///   reads + writes depth, or skips it entirely.
+    /// - `sample_count` must match the attachment's MSAA sample count (color and depth
+    ///   must share it when depth is enabled).
+    pub fn new(
+        device: &Device,
+        surface_format: TextureFormat,
+        depth: crate::DepthMode,
+        sample_count: u32,
+    ) -> Self {
         let module = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("line_raster shader"),
             source: ShaderSource::Wgsl(LINE_RASTER_WGSL.into()),
@@ -240,7 +270,20 @@ impl LineRasterNode {
                 topology: PrimitiveTopology::TriangleList,
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil: depth.format().map(|format| DepthStencilState {
+                format,
+                depth_write_enabled: depth.writes(),
+                // `LessEqual` rather than the usual `Less`: lines are typically drawn on top
+                // of filled triangles as overlays / outlines / wireframes, and the polygon
+                // outline use case puts the line at *exactly* the polygon's depth. Strict
+                // `Less` would discard the line in that case (`line_depth < tri_depth` fails
+                // when they're equal), making outlines invisible wherever they coincide with
+                // their own polygon. `LessEqual` keeps them visible. Lines geometrically
+                // behind a filled surface still fail the test and are correctly occluded.
+                depth_compare: CompareFunction::LessEqual,
+                stencil: StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: MultisampleState {
                 count: sample_count,
                 ..Default::default()
@@ -281,6 +324,7 @@ impl LineRasterNode {
             instance_buf,
             instance_count: 0,
             instance_capacity,
+            has_depth: depth.is_active(),
         }
     }
 
@@ -374,8 +418,32 @@ impl LineRasterNode {
 
     /// Render the uploaded line mesh onto `view`. `LoadOp::Load` preserves the existing color
     /// attachment contents; the rasterizer composes with whatever ran before it (the
-    /// raymarcher's scene render in `rotate_polytopes`).
-    pub fn execute(&self, rd: &RenderDevice, view: &wgpu::TextureView) -> anyhow::Result<()> {
+    /// raymarcher's scene render in `rotate_polytopes`, or a dedicated clear pass).
+    ///
+    /// `depth_view` is required when the pipeline was created with `Some(depth_format)` and
+    /// must be `None` otherwise. Mismatch panics with a descriptive message rather than
+    /// surfacing a less-readable wgpu validation error.
+    pub fn execute(
+        &self,
+        rd: &RenderDevice,
+        view: &wgpu::TextureView,
+        depth_view: Option<&wgpu::TextureView>,
+    ) -> anyhow::Result<()> {
+        match (self.has_depth, depth_view.is_some()) {
+            (true, false) => {
+                panic!(
+                    "LineRasterNode::execute: pipeline was created with a depth format but \
+                     no depth view was provided"
+                )
+            }
+            (false, true) => {
+                panic!(
+                    "LineRasterNode::execute: pipeline was created without a depth format but \
+                     a depth view was provided"
+                )
+            }
+            _ => {}
+        }
         if self.instance_count == 0 {
             return Ok(());
         }
@@ -383,6 +451,18 @@ impl LineRasterNode {
             label: Some("line_raster encoder"),
         });
         {
+            let depth_attachment = depth_view.map(|dv| RenderPassDepthStencilAttachment {
+                view: dv,
+                // `Load` matches the color attachment: the caller is responsible for clearing
+                // depth (typically in the same clear pass that clears color). This lets
+                // multiple LineRasterNode / TriangleRasterNode draws share one depth buffer
+                // within a frame without each clearing it.
+                depth_ops: Some(Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            });
             let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("line_raster pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
@@ -394,7 +474,7 @@ impl LineRasterNode {
                         store: StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: depth_attachment,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });

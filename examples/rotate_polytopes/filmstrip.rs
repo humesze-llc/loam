@@ -6,7 +6,8 @@
 //! overlay drawn on top of the rendered scene.
 
 use rye_app::egui;
-use rye_render::raymarch::{SHAPE_120CELL, SHAPE_600CELL};
+use rye_physics::polytope::Polytope4;
+use rye_render::raymarch::RaymarchShape;
 
 use crate::catalog::render_shape_catalog_menu;
 use crate::consts::BODY_SIZE;
@@ -138,8 +139,10 @@ impl Demo {
     /// since `render_shapes_section` (where the warning otherwise
     /// lives) is hidden in this view.
     pub(crate) fn render_filmstrip_body(&mut self, ui: &mut egui::Ui) {
-        let heavy =
-            self.strip_subject.shape == SHAPE_120CELL || self.strip_subject.shape == SHAPE_600CELL;
+        let heavy = matches!(
+            self.strip_subject.shape,
+            RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
+        );
         if heavy {
             ui.colored_label(
                 egui::Color32::from_rgb(242, 130, 70),

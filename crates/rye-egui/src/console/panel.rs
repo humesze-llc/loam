@@ -28,7 +28,8 @@
 //! frame), so the user can click outside the window to give keyboard back to the app.
 
 use egui::{
-    Color32, FontId, Frame, Layout, Margin, Order, RichText, ScrollArea, Sense, Stroke, TextEdit,
+    Color32, FontId, Frame, Label, Layout, Margin, Order, RichText, ScrollArea, Sense, Stroke,
+    TextEdit, TextWrapMode,
 };
 
 use super::{Console, HistoryLine, LineKind, PANEL_HEIGHT_FRACTION};
@@ -229,6 +230,28 @@ fn draw_separator(ui: &mut egui::Ui, width: f32) {
 }
 
 fn draw_scrollback<Ctx>(ui: &mut egui::Ui, console: &Console<Ctx>, height: f32, width: f32) {
+    // Word-wrap design notes (engine-wide, not console-internal):
+    //
+    // The previous layout wrapped each `HistoryLine` in `ui.horizontal()`, which sets an
+    // unbounded horizontal area; egui's `Label` wrap heuristic then gives up because
+    // there's no constraint to wrap against. The fix is twofold:
+    //
+    // 1. Drop `ui.horizontal()`. The label goes directly into the (vertical) ScrollArea
+    //    so it inherits the ScrollArea's content width.
+    // 2. Set the label's wrap mode explicitly to [`TextWrapMode::Wrap`]. Default mode
+    //    elides with `...` instead of wrapping; we want hard wrap.
+    //
+    // Side padding (the 8px gutter that used to come from `add_space`) now comes from a
+    // [`Frame::inner_margin`] so the wrap-width calculation correctly accounts for it:
+    // padding inside the constraint, not outside. Each line still renders as one logical
+    // history entry; when text spans multiple visual rows, all wrapped rows belong to the
+    // same scrollback entry so navigation + selection behave correctly.
+    //
+    // Continuation-line hanging indent is intentionally NOT added: with proportional
+    // monospace it's hard to pick a visually distinguishing indent without breaking
+    // copy-paste of code blocks. If the readability becomes a problem in practice the
+    // right fix is CPU-side soft-wrap into `LayoutSection`s, not a hanging-indent
+    // post-process.
     ui.allocate_ui_with_layout(
         egui::vec2(width, height),
         Layout::top_down(egui::Align::Min),
@@ -238,14 +261,21 @@ fn draw_scrollback<Ctx>(ui: &mut egui::Ui, console: &Console<Ctx>, height: f32, 
                 .stick_to_bottom(true)
                 .max_height(height)
                 .show(ui, |ui| {
-                    ui.add_space(4.0);
-                    for line in &console.history {
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            ui.label(line_text(line));
+                    Frame::new()
+                        .inner_margin(Margin {
+                            left: 8,
+                            right: 8,
+                            top: 4,
+                            bottom: 4,
+                        })
+                        .show(ui, |ui| {
+                            // Tight per-line vertical spacing keeps the scrollback
+                            // dense without crowding wrapped continuation rows.
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            for line in &console.history {
+                                ui.add(Label::new(line_text(line)).wrap_mode(TextWrapMode::Wrap));
+                            }
                         });
-                    }
-                    ui.add_space(4.0);
                 });
         },
     );

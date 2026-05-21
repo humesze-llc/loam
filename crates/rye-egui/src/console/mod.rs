@@ -147,8 +147,22 @@ pub trait Command<Ctx>: 'static {
     /// (`capture.start`).
     fn name(&self) -> &str;
 
-    /// One-line description shown by `help`.
+    /// One-line description shown by `help` (no argument) when listing every command.
+    /// Conventionally <= ~60 chars so the listing fits in a single console row.
     fn help(&self) -> &str;
+
+    /// Multi-line help shown by `help <name>` for a specific command. Default returns
+    /// just the one-line [`Self::help`] string -- override when the command's surface
+    /// is richer than fits one line (multiple subcommands, multi-step usage examples,
+    /// arg-by-arg explanations).
+    ///
+    /// `\n` line breaks are honored; the panel paints each line into the scrollback as
+    /// its own entry so word-wrap and scroll behavior stay consistent with the rest of
+    /// the console. Returns owned `String` so subcommand-dispatching commands can build
+    /// the listing dynamically from their registered children without storing a static.
+    fn long_help(&self) -> String {
+        self.help().to_string()
+    }
 
     /// Tab-completion choices for the `arg_index`-th positional argument, without
     /// awareness of values typed in prior slots. Default is empty (no completion /
@@ -215,6 +229,9 @@ pub trait Command<Ctx>: 'static {
 pub struct FnCommand<F> {
     name: &'static str,
     help: &'static str,
+    /// Optional multi-line text returned by [`Command::long_help`] when set. When `None`,
+    /// `long_help` falls back to repeating `help`. Set via [`FnCommand::with_long_help`].
+    long_help: Option<&'static str>,
     arg_choices: Vec<Vec<&'static str>>,
     /// Per-key value choices for `key=value` args, applied across every arg
     /// position the key appears at. Keyed by the bare key name (no `=`).
@@ -253,6 +270,28 @@ impl<F> FnCommand<F> {
         self.value_choices.insert(key, values.to_vec());
         self
     }
+
+    /// Attach a multi-line help block returned by [`Command::long_help`]. Newlines are
+    /// honored; the console paints each line as its own scrollback entry so wrapping +
+    /// scroll behavior stay consistent. Use for commands whose surface (multiple
+    /// subcommand-style args, usage examples) doesn't fit one line.
+    ///
+    /// ```ignore
+    /// cmd("wireframe", "wireframe overlay (see help)", handler)
+    ///     .with_args(&[&["on", "off", "nearest-active"], &["on", "off"]])
+    ///     .with_long_help(
+    ///         "Cross-section + parent-wireframe overlay.\n\
+    ///          \n\
+    ///          subcommands:\n  \
+    ///          on              enable the overlay\n  \
+    ///          off             disable\n  \
+    ///          nearest-active  toggle the per-cell brightness gradient",
+    ///     )
+    /// ```
+    pub fn with_long_help(mut self, long: &'static str) -> Self {
+        self.long_help = Some(long);
+        self
+    }
 }
 
 /// Build a [`Command`] from a closure. The closure mutates a `Ctx` and writes lines
@@ -273,6 +312,7 @@ where
     FnCommand {
         name,
         help,
+        long_help: None,
         arg_choices: Vec::new(),
         value_choices: HashMap::new(),
         f,
@@ -288,6 +328,11 @@ where
     }
     fn help(&self) -> &str {
         self.help
+    }
+    fn long_help(&self) -> String {
+        self.long_help
+            .map(str::to_string)
+            .unwrap_or_else(|| self.help.to_string())
     }
     fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
         self.arg_choices
@@ -310,19 +355,51 @@ where
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
 
-/// Static on/off completion list used by every `Toggle` subcommand. Lives here so the
-/// `arg_choices_ctx` impl can hand back a `&'static [&'static str]` without owning a
-/// per-instance Vec.
-const ON_OFF_CHOICES: &[&str] = &["off", "on"];
+// Tab-completion for toggle subcommands intentionally returns an empty list at the value
+// slot. The primary UX for a toggle is *bare* invocation (e.g. `wireframe nearest-active`
+// flips), and surfacing `on|off` in completion implied that one of them was required when it
+// isn't. The parser still accepts `on|off|true|false|1|0` for callers that want explicit
+// set; it's just no longer promoted in the cycle.
 
-/// Boxed handler for an on/off toggle subcommand. Receives the user's context and the
-/// parsed bool; returns a `Result` so handlers can fail with usage / validation errors.
-type ToggleHandler<Ctx> = Box<dyn FnMut(&mut Ctx, bool) -> anyhow::Result<()>>;
+/// Boxed handler for an on/off toggle subcommand. The framework passes `Some(bool)`
+/// when the user supplied `on|off|true|false|1|0` and `None` when the user invoked the
+/// subcommand bare (no value). The handler is responsible for flipping the field in
+/// the `None` case; the framework can't because it doesn't own the field.
+///
+/// Idiomatic shape for a `bool` field on `Ctx`:
+///
+/// ```ignore
+/// .toggle("axes", "toggle world-axes", |ctx, v| {
+///     ctx.show_axes = v.unwrap_or(!ctx.show_axes);
+///     Ok(())
+/// })
+/// ```
+type ToggleHandler<Ctx> = Box<dyn FnMut(&mut Ctx, Option<bool>) -> anyhow::Result<()>>;
 
-/// Boxed handler for a fixed-choice subcommand. Receives the user's context and the
-/// raw value string (one of the declared choices in normal use; the handler still has
-/// to handle case-insensitivity / aliases if those are wanted).
-type ChoiceHandler<Ctx> = Box<dyn FnMut(&mut Ctx, &str) -> anyhow::Result<()>>;
+/// Boxed handler for a fixed-choice subcommand. The framework passes `Some(value)` when the
+/// user supplied a value and `None` when the subcommand was invoked bare (no value),
+/// mirroring [`ToggleHandler`]'s shape. On `None`, the handler is expected to cycle to the
+/// next choice (or whatever's contextually meaningful); the framework can't help because it
+/// doesn't know the current state.
+///
+/// Idiomatic handler for a `Mode` enum field with a `cycle` method:
+///
+/// ```ignore
+/// .choice("color", "...", &["unique", "active"], |ctx, name| {
+///     ctx.color_mode = match name {
+///         Some(n) => parse_mode(n)?,
+///         None => ctx.color_mode.cycle(),
+///     };
+///     Ok(())
+/// })
+/// ```
+type ChoiceHandler<Ctx> = Box<dyn FnMut(&mut Ctx, Option<&str>) -> anyhow::Result<()>>;
+
+/// Boxed handler for a `SubcommandSet`'s bare invocation (no subcommand supplied).
+/// When set via [`SubcommandSet::on_bare`], replaces the default usage-block error
+/// with a caller-defined action, typically flipping a primary toggle field so
+/// `wireframe` alone reads as "flip the overlay's main on/off."
+type BareHandler<Ctx> = Box<dyn FnMut(&mut Ctx) -> anyhow::Result<()>>;
 
 /// Boxed handler for a custom-grammar subcommand. Receives the user's context, the
 /// raw args slice AFTER the subcommand name (positional + key-value tokens, framework
@@ -335,12 +412,14 @@ type CustomHandler<Ctx> =
 /// One entry in a [`SubcommandSet`]. The dispatch kind decides how the framework
 /// parses the value slot and what's offered for tab completion.
 enum SubcommandKind<Ctx> {
-    /// On/off subcommand. The framework parses `args[1]` as `on|off` and passes the
-    /// resulting bool to `handler`. Completion at the value slot is the static
-    /// `["off", "on"]` list.
+    /// On/off subcommand. The framework parses `args[1]` as `on|off|true|false|1|0` and
+    /// passes `Some(bool)`; bare invocation (no value) passes `None` and the handler is
+    /// expected to flip its field. No value-slot tab completion is offered (bare-flip is the
+    /// canonical UX; explicit set is supported but not promoted).
     Toggle { handler: ToggleHandler<Ctx> },
-    /// Fixed-choice subcommand. The framework completes the value slot from `choices`;
-    /// the handler receives the raw value string and decides what to do.
+    /// Fixed-choice subcommand. The framework completes the value slot from `choices`
+    /// and passes `Some(value)` when present, `None` on bare invocation (handler is
+    /// expected to cycle).
     Choice {
         choices: Vec<&'static str>,
         handler: ChoiceHandler<Ctx>,
@@ -395,14 +474,30 @@ pub struct SubcommandSet<Ctx> {
     /// [`Command::arg_choices`] / [`Command::arg_choices_ctx`] call so [`Self::toggle`]
     /// and [`Self::choice`] can stay infallible chainable builders.
     name_cache: std::cell::OnceCell<Vec<&'static str>>,
+    /// Optional bare-invocation handler. When set via [`Self::on_bare`], the
+    /// command's `run` calls it instead of returning the usage-block error when the
+    /// user types just the command name with no subcommand. Use for "primary toggle"
+    /// commands where bare invocation should flip a main field.
+    bare: Option<BareHandler<Ctx>>,
 }
 
 impl<Ctx: 'static> SubcommandSet<Ctx> {
     /// Register an on/off subcommand. The framework parses the value slot as
-    /// `on | off | true | false | 1 | 0`; the handler receives the parsed bool.
+    /// `on | off | true | false | 1 | 0` when present and passes `Some(bool)`; when
+    /// the user types just the subcommand name with no value, the handler is called
+    /// with `None` so it can flip the field in place.
+    ///
+    /// Idiomatic handler shape for a `bool` field:
+    ///
+    /// ```ignore
+    /// .toggle("axes", "toggle world-axes", |ctx, v| {
+    ///     ctx.show_axes = v.unwrap_or(!ctx.show_axes);
+    ///     Ok(())
+    /// })
+    /// ```
     pub fn toggle<F>(mut self, name: &'static str, help: &'static str, handler: F) -> Self
     where
-        F: FnMut(&mut Ctx, bool) -> anyhow::Result<()> + 'static,
+        F: FnMut(&mut Ctx, Option<bool>) -> anyhow::Result<()> + 'static,
     {
         self.subs.insert(
             name,
@@ -428,7 +523,7 @@ impl<Ctx: 'static> SubcommandSet<Ctx> {
         handler: F,
     ) -> Self
     where
-        F: FnMut(&mut Ctx, &str) -> anyhow::Result<()> + 'static,
+        F: FnMut(&mut Ctx, Option<&str>) -> anyhow::Result<()> + 'static,
     {
         self.subs.insert(
             name,
@@ -497,6 +592,29 @@ impl<Ctx: 'static> SubcommandSet<Ctx> {
         self
     }
 
+    /// Attach a bare-invocation handler. When set, typing just the command name
+    /// (no subcommand, no args) runs `handler` instead of returning a usage error.
+    /// Use for "primary toggle" commands where bare invocation should flip a main
+    /// field (e.g. `wireframe` toggles the overlay's main on/off, then
+    /// `wireframe nearest-active` and `wireframe color` modulate behavior).
+    ///
+    /// ```ignore
+    /// subcommands::<Ctx>("wireframe", "...")
+    ///     .on_bare(|ctx| {
+    ///         ctx.wireframe_enabled = !ctx.wireframe_enabled;
+    ///         Ok(())
+    ///     })
+    ///     .toggle("nearest-active", "...", |ctx, v| { ... })
+    ///     .choice("color", "...", &["position", "active"], |ctx, v| { ... })
+    /// ```
+    pub fn on_bare<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(&mut Ctx) -> anyhow::Result<()> + 'static,
+    {
+        self.bare = Some(Box::new(handler));
+        self
+    }
+
     fn cached_names(&self) -> &[&'static str] {
         self.name_cache
             .get_or_init(|| self.subs.keys().copied().collect())
@@ -511,6 +629,7 @@ pub fn subcommands<Ctx: 'static>(name: &'static str, help: &'static str) -> Subc
         help,
         subs: BTreeMap::new(),
         name_cache: std::cell::OnceCell::new(),
+        bare: None,
     }
 }
 
@@ -520,6 +639,26 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
     }
     fn help(&self) -> &str {
         self.help
+    }
+
+    fn long_help(&self) -> String {
+        // First line is the umbrella's one-liner; subsequent lines list every
+        // registered subcommand with its description. `help <set-name>` then reads as a
+        // mini-manual page for the whole subcommand family.
+        let mut out = String::with_capacity(128 + self.subs.len() * 64);
+        out.push_str(self.help);
+        if !self.subs.is_empty() {
+            out.push_str("\nsubcommands:");
+            for (name, entry) in &self.subs {
+                let kind = match entry.kind {
+                    SubcommandKind::Toggle { .. } => "<on|off>",
+                    SubcommandKind::Choice { .. } => "<choice>",
+                    SubcommandKind::Custom { .. } => "<args...>",
+                };
+                out.push_str(&format!("\n  {name:14} {kind:9}  {}", entry.help));
+            }
+        }
+        out
     }
 
     fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
@@ -545,11 +684,10 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
         let sub_slot = arg_index - 1;
         match &entry.kind {
             SubcommandKind::Toggle { .. } => {
-                if sub_slot == 0 {
-                    ON_OFF_CHOICES
-                } else {
-                    &[]
-                }
+                // Empty by design (see the comment on `ON_OFF_CHOICES`'s old slot
+                // above). Bare invocation is the canonical UX; `on|off` is still
+                // accepted as input but not surfaced as a suggestion.
+                &[]
             }
             SubcommandKind::Choice { choices, .. } => {
                 if sub_slot == 0 {
@@ -587,8 +725,11 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
 
     fn run(&mut self, args: &[&str], ctx: &mut Ctx, out: &mut ConsoleWriter) -> anyhow::Result<()> {
         let Some((sub_name, rest)) = args.split_first() else {
-            // Usage block lists subcommands with their one-line help so `tests` with no
-            // args is self-documenting instead of dumping a bare grammar.
+            // Bare invocation. If `on_bare` is registered, call it ("primary toggle"
+            // pattern); otherwise emit a usage block listing subcommands.
+            if let Some(handler) = self.bare.as_mut() {
+                return handler(ctx);
+            }
             let mut msg = format!("usage: {} <subcommand> <value>; subcommands:", self.name);
             for (name, entry) in &self.subs {
                 msg.push_str(&format!("\n  {name:12} {}", entry.help));
@@ -605,26 +746,30 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
         };
         match &mut entry.kind {
             SubcommandKind::Toggle { handler } => {
-                let value = rest
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("usage: {} {sub_name} <on|off>", self.name))?;
-                let v = match value.to_ascii_lowercase().as_str() {
-                    "on" | "true" | "1" => true,
-                    "off" | "false" | "0" => false,
-                    other => {
-                        return Err(anyhow::anyhow!(
-                            "unknown value `{other}` for `{} {sub_name}` (try on|off)",
-                            self.name
-                        ))
-                    }
+                // Bare subcommand invocation (no value): hand `None` to the handler so
+                // it can flip its field. With a value: parse `on|off|true|false|1|0`
+                // and pass `Some(bool)`.
+                let v: Option<bool> = match rest.first() {
+                    None => None,
+                    Some(value) => match value.to_ascii_lowercase().as_str() {
+                        "on" | "true" | "1" => Some(true),
+                        "off" | "false" | "0" => Some(false),
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "unknown value `{other}` for `{} {sub_name}` (try on|off)",
+                                self.name
+                            ))
+                        }
+                    },
                 };
                 let _ = out;
                 handler(ctx, v)
             }
             SubcommandKind::Choice { handler, .. } => {
-                let value = rest
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("usage: {} {sub_name} <value>", self.name))?;
+                // `Some(value)` with an explicit arg, `None` on bare invocation. The
+                // handler decides what to do on `None` (cycle to next choice is the
+                // canonical pattern; alternatives include "error" or "no-op").
+                let value: Option<&str> = rest.first().copied();
                 let _ = out;
                 handler(ctx, value)
             }
@@ -1234,11 +1379,32 @@ impl<Ctx: 'static> Console<Ctx> {
         match target {
             Some(name) => {
                 if let Some(b) = Builtin::from_name(name) {
+                    // Built-ins only have one-line descriptions; no multi-line variant.
                     self.push_history(HistoryLine::output(format!("{}: {}", b.name(), b.help())));
-                } else if let Some(c) = self.commands.get(name) {
-                    self.push_history(HistoryLine::output(format!("{}: {}", c.name(), c.help())));
                 } else {
-                    self.push_history(HistoryLine::error(format!("no command '{name}'")));
+                    // Materialize the help lines BEFORE pushing to history: `c` borrows
+                    // `self.commands` immutably and `push_history` borrows `self` mutably,
+                    // so the two can't coexist.
+                    let prepared: Option<(String, Vec<String>)> =
+                        self.commands.get(name).map(|c| {
+                            let header_prefix = format!("{}: ", c.name());
+                            let body = c.long_help();
+                            let indent = " ".repeat(c.name().len() + 2);
+                            let mut lines = body.lines();
+                            let first = lines.next().unwrap_or("");
+                            let mut rendered = vec![format!("{header_prefix}{first}")];
+                            for line in lines {
+                                rendered.push(format!("{indent}{line}"));
+                            }
+                            (c.name().to_string(), rendered)
+                        });
+                    if let Some((_name, lines)) = prepared {
+                        for line in lines {
+                            self.push_history(HistoryLine::output(line));
+                        }
+                    } else {
+                        self.push_history(HistoryLine::error(format!("no command '{name}'")));
+                    }
                 }
             }
             None => {
@@ -1868,13 +2034,16 @@ mod tests {
     fn sample_subset() -> SubcommandSet<SubCtx> {
         subcommands::<SubCtx>("tests", "umbrella")
             .toggle("axes", "toggle axes", |c, v| {
-                c.0 = if v { 1 } else { 0 };
-                c.1 = format!("axes={v}");
+                // Bare invocation flips between 1 and 0; explicit on|off sets directly.
+                let on = v.unwrap_or(c.0 != 1);
+                c.0 = if on { 1 } else { 0 };
+                c.1 = format!("axes={on}");
                 Ok(())
             })
             .toggle("cube", "toggle cube", |c, v| {
-                c.0 = if v { 2 } else { 0 };
-                c.1 = format!("cube={v}");
+                let on = v.unwrap_or(c.0 != 2);
+                c.0 = if on { 2 } else { 0 };
+                c.1 = format!("cube={on}");
                 Ok(())
             })
             .choice(
@@ -1882,7 +2051,7 @@ mod tests {
                 "set polytope",
                 &["5cell", "tesseract", "off"],
                 |c, name| {
-                    c.1 = format!("polytope={name}");
+                    c.1 = format!("polytope={}", name.unwrap_or("<bare>"));
                     Ok(())
                 },
             )
@@ -1934,30 +2103,86 @@ mod tests {
         );
     }
 
+    /// Bare toggle invocation (no value) is a flip. The handler receives `None` and
+    /// is expected to invert the current field state. Verifies the
+    /// "`wireframe nearest-active` flips without explicit on|off" UX path the demos
+    /// rely on.
     #[test]
-    fn subcommand_missing_value_errors() {
+    fn subcommand_toggle_bare_invocation_flips() {
         let mut con = Console::<SubCtx>::new();
         con.register(sample_subset());
         let mut ctx: SubCtx = (0, String::new());
+        // First bare invocation: 0 != 1 -> on.
         con.execute("tests axes", &mut ctx);
+        assert_eq!(ctx, (1, "axes=true".into()));
+        // Second bare invocation: 1 == 1 -> off.
+        con.execute("tests axes", &mut ctx);
+        assert_eq!(ctx, (0, "axes=false".into()));
+    }
+
+    /// Bare choice invocation passes `None` to the handler; the handler decides what
+    /// "no value" means (cycle, no-op, error). Pins the framework-level contract that
+    /// the handler is invoked at all.
+    #[test]
+    fn subcommand_choice_bare_invocation_passes_none() {
+        let mut con = Console::<SubCtx>::new();
+        con.register(sample_subset());
+        let mut ctx: SubCtx = (0, String::new());
+        con.execute("tests polytope", &mut ctx);
+        assert_eq!(ctx.1, "polytope=<bare>");
+    }
+
+    /// Bare `SubcommandSet` invocation (no subcommand) calls the registered
+    /// `on_bare` handler instead of returning a usage-block error. Verifies the
+    /// "`wireframe` flips main on/off" UX path.
+    #[test]
+    fn subcommand_bare_runs_on_bare_handler() {
+        let mut con = Console::<SubCtx>::new();
+        con.register(sample_subset().on_bare(|c| {
+            c.1 = "bare!".into();
+            Ok(())
+        }));
+        let mut ctx: SubCtx = (0, String::new());
+        con.execute("tests", &mut ctx);
+        assert_eq!(ctx.1, "bare!");
+    }
+
+    /// Without `on_bare`, bare `SubcommandSet` invocation falls back to the usage
+    /// block (the historical behavior).
+    #[test]
+    fn subcommand_bare_without_handler_emits_usage() {
+        let mut con = Console::<SubCtx>::new();
+        con.register(sample_subset());
+        let mut ctx: SubCtx = (0, String::new());
+        con.execute("tests", &mut ctx);
         let last = con.history.back().unwrap();
         assert_eq!(last.kind, LineKind::Error);
-        assert!(last.text.contains("usage"), "got: {}", last.text);
+        assert!(last.text.contains("subcommands"), "got: {}", last.text);
     }
 
     /// Tab completion at the value slot narrows to ONLY the chosen subcommand's choices.
-    /// This is the load-bearing context-aware-completion test: previously the second-arg
-    /// completion list would have to be the union (`on, off, 5cell, ...`).
+    /// This is the load-bearing context-aware-completion test: the value slot
+    /// completion is narrow to the chosen subcommand's allowed values, not the
+    /// union over all subcommands.
+    ///
+    /// Toggle subcommands deliberately surface NO value-slot suggestions: bare
+    /// invocation flips, so `on|off` is supported as input but not promoted in
+    /// the cycle (avoids implying that one of them is required when it isn't).
+    /// Choice subcommands surface their declared choice list.
     #[test]
     fn subcommand_value_completion_is_context_aware() {
         let mut con = Console::<SubCtx>::new();
         con.register(sample_subset());
 
-        // `tests axes ` -> only on/off in the cycle.
+        // `tests axes ` -> toggle, no suggestions (bare invocation is the UX;
+        // typing `on|off` still works but isn't promoted).
         con.input = "tests axes ".into();
         let ctx = con.completion_context().unwrap();
         let m = con.completion_matches(&ctx);
-        assert_eq!(m, vec!["off".to_string(), "on".to_string()]);
+        assert!(
+            m.is_empty(),
+            "toggle value slot should suggest nothing, got {m:?}"
+        );
 
         // `tests polytope ` -> only polytope names in the cycle, no on/off.
         con.input = "tests polytope ".into();

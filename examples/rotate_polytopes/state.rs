@@ -50,6 +50,38 @@ pub(crate) enum ViewMode {
     Filmstrip,
 }
 
+/// How the parent-wireframe edges are colored. Orthogonal to the alpha-modulation
+/// toggle [`Demo::wireframe_nearest_active`]: the color mode picks the hue, the
+/// nearest-active toggle then modulates alpha on top.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum WireframeColorMode {
+    /// Per-vertex RGB from [`rye_physics::polytope::vertex_color_by_position`]: a
+    /// continuous color field over the polytope's vertex set that flows smoothly
+    /// across the edge graph and reveals symmetry as color gradients. Every vertex
+    /// picks up a distinct hue from its 4D coordinates, so the polytope reads as a
+    /// stylized colorful identity rather than a uniform mass of edges.
+    #[default]
+    Unique,
+    /// Binary green/gray by cell activity: edges that belong to at least one cell
+    /// the slice is *currently* intersecting are bright green; all other edges are
+    /// dim neutral gray. Reads as "which cells of the polytope am I looking at right
+    /// now" at a glance, complementing the gradient `nearest-active` mode (which is
+    /// continuous and shows *how strongly* each cell is being crossed).
+    Active,
+}
+
+impl WireframeColorMode {
+    /// Parse a console-arg spelling (`unique` or `active`). Returns `None` for any
+    /// other input; the caller surfaces a usage error.
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "unique" => Some(WireframeColorMode::Unique),
+            "active" => Some(WireframeColorMode::Active),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RotorTerm + display helpers
 // ---------------------------------------------------------------------------
@@ -211,6 +243,65 @@ pub(crate) struct Demo {
     pub(crate) camera: Camera<EuclideanR3>,
     pub(crate) orbit: OrbitController<EuclideanR3>,
     pub(crate) node: Hyperslice4DNode,
+    /// Rasterizer node for the cross-section perimeter (bright cyan edges around each
+    /// cap polygon). Filled caps are NOT drawn -- the SDF raymarcher already renders the
+    /// section polytope as a solid volume, so the rasterizer's job is to outline the
+    /// boundaries between adjacent cell contributions, not to fill them.
+    pub(crate) section_edges: rye_render::LineRasterNode,
+    /// Rasterizer node for the dim "parent wireframe" overlay: the full polytope's edge
+    /// graph (per body) projected via drop-w. Conveys polytope structure independent of
+    /// which slice is currently shown.
+    pub(crate) parent_wireframe: rye_render::LineRasterNode,
+    /// Whether the cross-section + parent-wireframe overlay renders. Off by default so
+    /// the existing SDF-only demo is unchanged; toggle via the `wireframe on|off` console
+    /// subcommand.
+    pub(crate) wireframe_enabled: bool,
+    /// When `true`, parent-wireframe edges are alpha-graded by how close the current
+    /// `w_slice` is to the midpoint of each cell they belong to: edges of cells the slice
+    /// is *deep in* glow at full alpha, edges of cells the slice doesn't touch fade to the
+    /// dim "context" alpha. As the slice scrubs, brightness propagates through the
+    /// wireframe as a wave, visually identifying which cells are contributing caps at
+    /// each moment. When `false`, every edge uses the same uniform dim alpha (the
+    /// previous behavior).
+    pub(crate) wireframe_nearest_active: bool,
+    /// Base RGB for wireframe edges. Orthogonal to [`Self::wireframe_nearest_active`]:
+    /// the color mode picks the hue, the nearest-active toggle then modulates alpha on
+    /// top.
+    pub(crate) wireframe_color_mode: WireframeColorMode,
+    /// Filled-faces rasterizer for the cross-section of every polychoral body. When
+    /// [`Self::surface_raster_enabled`] is `true`, this replaces the SDF raymarch for the
+    /// six regular convex 4-polytopes: the SDF gets `BodyUniform::default()` for those
+    /// slots (which the kernel skips) and the section's filled cell-caps come through
+    /// here instead. Per-body solid color + face-normal Lambert in the fragment shader.
+    pub(crate) section_faces: rye_render::TriangleRasterNode,
+    /// Shared depth attachment for the rasterizer chain in Shapes view. Sized to the
+    /// swapchain and recreated on resize via [`rye_render::DepthBuffer::ensure`].
+    ///
+    /// Cleared once per frame at the top of the Shapes-view render path
+    /// ([`crate::Demo::ensure_and_clear_shared_depth`]). Two passes consume it:
+    /// - `section_faces` writes depth + color when raster mode is on (no-op in SDF
+    ///   mode, so the buffer stays at the cleared `1.0` value).
+    /// - `parent_wireframe` reads depth (no write) so lines behind a section cap are
+    ///   correctly occluded. In SDF mode the cleared depth makes every wireframe
+    ///   fragment pass the test trivially, preserving the historical visual.
+    pub(crate) section_faces_depth: Option<rye_render::DepthBuffer>,
+    /// Scratch buffers reused across frames + bodies inside `render_section_faces` to
+    /// avoid per-body heap allocations on the 240 fps hot path. Both are cleared at
+    /// the start of each invocation; capacity grows monotonically with the largest
+    /// polychoron's vertex / triangle count seen so far.
+    pub(crate) section_world_vertices_scratch: Vec<glam::Vec4>,
+    pub(crate) section_faces_mesh_scratch: rye_shape::TriangleMesh<3>,
+    /// Selects how the six regular convex 4-polytopes are rendered:
+    /// - `true` (default): rasterized filled cross-section cell caps via
+    ///   [`Self::section_faces`]. Much faster for the 120-cell + 600-cell, exact (no
+    ///   Wolfe-greedy approximation), sidesteps the cell120/600 face-plane BUG in
+    ///   `rye_physics::euclidean_r4`.
+    /// - `false`: SDF raymarch in [`Self::node`]. The historical pre-rasterizer
+    ///   behavior, kept available behind the console toggle for visual comparison.
+    ///
+    /// Smooth-surface shapes (Clifford torus, duocylinder, etc.) ignore this toggle and
+    /// always render via the SDF; they have no polytope topology to section.
+    pub(crate) surface_raster_enabled: bool,
     /// Polytope row built at startup from `--shapes` CLI args (or `DEFAULT_ROW`); drives
     /// both the body uniforms and per-body label lookups in the overlay.
     pub(crate) row: Vec<ShapeEntry>,
@@ -353,40 +444,47 @@ impl Demo {
         }
     }
 
+    /// Build the SDF body uniform for a single row entry, with surface-raster opt-out:
+    /// when raster mode is on AND the entry has polytope topology, the returned uniform
+    /// is `BodyUniform::default()` (kind = Invalid), which the kernel's dispatch chain
+    /// skips. The slot is preserved (so the visual layout doesn't shift); the polychoral
+    /// surface is rendered separately via [`Self::section_faces`] in `main.rs`.
+    ///
+    /// Smooth-surface shapes (Clifford torus, etc.) ignore the raster toggle and always
+    /// produce a live SDF body.
+    fn sdf_body_for_slot(&self, slot: usize, n: usize, rotor: Rotor4) -> BodyUniform {
+        let entry = &self.row[slot];
+        if self.surface_raster_enabled && entry.shape.polytope4().is_some() {
+            return BodyUniform::default();
+        }
+        BodyUniform::polytope_with_rotor(
+            body_position(slot, n),
+            entry.shape.shape_id(),
+            BODY_SIZE,
+            rotor,
+            entry.body_color,
+        )
+    }
+
     /// Drive every body in the row with the same rotor, lets the user directly compare
     /// slice signatures under identical 4D motion.
     pub(crate) fn write_all(&mut self, rotor: Rotor4) {
         let n = self.row.len();
-        for (slot, entry) in self.row.iter().enumerate() {
-            let body = BodyUniform::polytope_with_rotor(
-                body_position(slot, n),
-                entry.shape,
-                BODY_SIZE,
-                rotor,
-                entry.body_color,
-            );
+        for slot in 0..n {
+            let body = self.sdf_body_for_slot(slot, n, rotor);
             self.node.set_body(slot, body);
         }
     }
 
     /// Re-emit every body's uniform from the current row + rotor state. Called after row
-    /// mutations (add/remove/reorder) to resync the GPU side to what the panel shows.
+    /// mutations (add/remove/reorder), rotor changes during spin, and surface-mode
+    /// toggles (since flipping `surface_raster_enabled` redirects polychora between the
+    /// SDF and the raster pipelines).
     pub(crate) fn rebuild_bodies(&mut self) {
         let n = self.row.len();
         let rotor = self.rot_state;
-        let bodies: Vec<BodyUniform> = self
-            .row
-            .iter()
-            .enumerate()
-            .map(|(slot, entry)| {
-                BodyUniform::polytope_with_rotor(
-                    body_position(slot, n),
-                    entry.shape,
-                    BODY_SIZE,
-                    rotor,
-                    entry.body_color,
-                )
-            })
+        let bodies: Vec<BodyUniform> = (0..n)
+            .map(|slot| self.sdf_body_for_slot(slot, n, rotor))
             .collect();
         self.node.set_bodies(&bodies);
     }

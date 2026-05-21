@@ -16,9 +16,13 @@
 //! ## Console commands
 //!
 //! - `tests <target> <value>`: select what renders. `<target>` is one of:
-//!   - `all`, `axes`, `cube`, `widths`, `gradient`, `tilted`: toggle that R³ category;
-//!     `<value>` is `on` or `off`. Use `tests all off` to clear the R³ scene when you only
-//!     want to see the R⁴ polytope.
+//!   - `all`, `axes`, `cube`, `widths`, `gradient`, `tilted`, `triangles`, `section`:
+//!     toggle that category; `<value>` is `on` or `off`. Use `tests all off` to clear
+//!     everything when you only want to see the R⁴ polytope. `triangles` enables a
+//!     filled-triangle pair (red in front, cyan behind the cube) that exercises depth-test
+//!     correctness between the line and triangle pipelines. `section` overlays the active
+//!     polytope's cross-section at world `w = 0` (translucent caps + bright cyan
+//!     perimeter edges); requires a polytope to be set via `tests polytope <name>`.
 //!   - `polytope`: set the R⁴ polytope overlay. `<value>` is one of `5cell`, `tesseract`,
 //!     `16cell`, `24cell`, `120cell`, `600cell` (hyphenated aliases accepted) or `off`. The
 //!     wireframe projects to R³ via `Orthographic { drop_axis: 3 }`, scaled 2.5x, with an
@@ -31,19 +35,26 @@
 use std::borrow::Cow;
 
 use anyhow::Result;
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
 use rye_egui::{Console, ConsoleWriter};
-use rye_math::{EuclideanR3, EuclideanR4, Projection};
-use rye_physics::polytope::Polytope4;
-use rye_render::{device::RenderDevice, LineRasterNode};
-use rye_shape::LineMesh;
+use rye_math::{EuclideanR3, EuclideanR4, Projection, WPlane};
+use rye_physics::polytope::{polytope_section_overlay_with_vertices, Polytope4};
+use rye_render::{
+    device::RenderDevice, DepthBuffer, DepthMode, LineRasterNode, TriangleRasterNode,
+};
+use rye_shape::{LineMesh, TriangleMesh};
 use winit::window::WindowAttributes;
 
 /// R⁴ scale factor for the polytope wireframe. Polytope vertices live on the unit
 /// 3-sphere; scaling up to 2.5 makes the wireframe comfortably visible alongside the R³
 /// test scene without overflowing the cube's ±1.5 extent.
 const POLYTOPE_SCALE: f32 = 2.5;
+
+/// Depth-buffer format for the line raster passes. `Depth32Float` is the simplest precise
+/// choice: 32-bit float depth, no stencil. Universally supported, plenty of precision for
+/// the demo's near=0.1 / far=100 frustum.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Angular speeds (rad/s) of the animated 4D rotation applied to polytope vertices before
 /// drop-w projection. Two independent simple rotations: `XW_RATE` rotates in the xw plane
@@ -68,7 +79,8 @@ fn rotate_4d(p: [f32; 4], t: f32) -> [f32; 4] {
     ]
 }
 
-/// Test-scene toggles. Each maps to a category in [`build_mesh`].
+/// Test-scene toggles. Each maps to a category in [`build_mesh`] (lines) or
+/// [`build_triangle_mesh`] (filled triangles).
 #[derive(Clone, Copy, Debug)]
 struct Toggles {
     axes: bool,
@@ -76,6 +88,17 @@ struct Toggles {
     widths: bool,
     gradient: bool,
     tilted: bool,
+    /// Two opaque filled triangles in the XY plane at z = +2 (red) and z = -2 (cyan). The
+    /// camera sits at z = +8 looking at the origin, so the red triangle is in front of the
+    /// cube wireframe and the cyan triangle behind it. With depth enabled, the cube edges
+    /// must occlude the cyan triangle and the red triangle must occlude the cube edges
+    /// behind it. Visual gate for depth-test correctness between line and triangle pipelines.
+    triangles: bool,
+    /// Overlay the active R⁴ polytope's cross-section at world `w = 0` (post-rotation,
+    /// post-scaling). Translucent white triangles + bright cyan perimeter edges; the cap
+    /// geometry changes shape as the polytope rotates. Off by default since it requires
+    /// a polytope to be active (`polytope <name>`).
+    section: bool,
 }
 
 impl Default for Toggles {
@@ -86,6 +109,8 @@ impl Default for Toggles {
             widths: true,
             gradient: true,
             tilted: true,
+            triangles: false,
+            section: false,
         }
     }
 }
@@ -194,6 +219,42 @@ fn build_mesh(t: Toggles) -> LineMesh<3> {
     mesh
 }
 
+/// Build the optional filled-triangle test scene from the current toggles. Currently just two
+/// triangles flanking the cube along the z-axis -- the smoke test for piece 2's depth-test
+/// correctness. Returns an empty mesh when `t.triangles` is off so the rasterizer is a no-op.
+fn build_triangle_mesh(t: Toggles) -> TriangleMesh<3> {
+    let mut mesh: TriangleMesh<3> = TriangleMesh::default();
+    if !t.triangles {
+        return mesh;
+    }
+
+    // Red triangle in front of the cube (closer to camera at z=8 looking at origin).
+    let red = [0.90_f32, 0.30, 0.30, 1.0];
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.push([-2.0, -1.5, 2.0]);
+    mesh.vertices.push([2.0, -1.5, 2.0]);
+    mesh.vertices.push([0.0, 1.5, 2.0]);
+    mesh.colors.push(red);
+    mesh.colors.push(red);
+    mesh.colors.push(red);
+    mesh.indices.push([base, base + 1, base + 2]);
+
+    // Cyan triangle behind the cube. Same screen-space silhouette so depth ordering is the
+    // only thing distinguishing front from back -- if the cube's back-face edges fail to
+    // occlude the cyan triangle, depth isn't working.
+    let cyan = [0.30_f32, 0.80, 0.90, 1.0];
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.push([-2.0, -1.5, -2.0]);
+    mesh.vertices.push([2.0, -1.5, -2.0]);
+    mesh.vertices.push([0.0, 1.5, -2.0]);
+    mesh.colors.push(cyan);
+    mesh.colors.push(cyan);
+    mesh.colors.push(cyan);
+    mesh.indices.push([base, base + 1, base + 2]);
+
+    mesh
+}
+
 struct Demo {
     space: EuclideanR3,
     camera: Camera<EuclideanR3>,
@@ -203,6 +264,19 @@ struct Demo {
     /// R⁴ rasterizer for the optional polytope wireframe overlay. Separate from the R³ node
     /// so both pipelines can render in sequence against the same color attachment.
     line_raster_r4: LineRasterNode,
+    /// Triangle rasterizer for the filled-triangle test pair (`tests triangles on|off`). Smoke
+    /// test for depth-test correctness between line and triangle pipelines.
+    triangle_raster: TriangleRasterNode,
+    /// Triangle rasterizer for the active polytope's cross-section caps (filled). Translucent
+    /// white per-cell triangulation produced by
+    /// [`rye_physics::polytope::polytope_section_overlay_with_vertices`].
+    section_triangles: TriangleRasterNode,
+    /// Line rasterizer for the active polytope's cross-section perimeter (bright cyan edges
+    /// around each cap polygon). Same pipeline shape as `line_raster_r3`.
+    section_edges: LineRasterNode,
+    /// Shared depth attachment for all line + triangle raster passes. Lazily created on the
+    /// first frame and recreated on resize via [`DepthBuffer::ensure`].
+    depth: Option<DepthBuffer>,
     toggles: Toggles,
     /// Active R⁴ polytope. `None` disables the R⁴ overlay entirely; `Some(p)` uploads `p`'s
     /// `Visualizable<4>` line mesh through the `Orthographic { drop_axis: 3 }` (drop-w)
@@ -223,14 +297,39 @@ struct Demo {
 
 impl Demo {
     fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
+        let depth_mode = DepthMode::ReadWrite {
+            format: DEPTH_FORMAT,
+        };
         let line_raster_r3 = LineRasterNode::new(
             &ctx.rd.device,
             ctx.rd.surface_bundle.config.format,
+            depth_mode,
             ctx.rd.sample_count(),
         );
         let line_raster_r4 = LineRasterNode::new(
             &ctx.rd.device,
             ctx.rd.surface_bundle.config.format,
+            depth_mode,
+            ctx.rd.sample_count(),
+        );
+        let triangle_raster = TriangleRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            depth_mode,
+            rye_render::FragmentShading::Flat,
+            ctx.rd.sample_count(),
+        );
+        let section_triangles = TriangleRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            depth_mode,
+            rye_render::FragmentShading::Flat,
+            ctx.rd.sample_count(),
+        );
+        let section_edges = LineRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            depth_mode,
             ctx.rd.sample_count(),
         );
 
@@ -245,6 +344,10 @@ impl Demo {
             orbit,
             line_raster_r3,
             line_raster_r4,
+            triangle_raster,
+            section_triangles,
+            section_edges,
+            depth: None,
             toggles: Toggles::default(),
             polytope: None,
             samples: 1,
@@ -265,6 +368,14 @@ impl Demo {
             &r3_mesh,
             &Projection::Identity,
             self.samples,
+        );
+
+        let tri_mesh = build_triangle_mesh(self.toggles);
+        self.triangle_raster.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &tri_mesh,
+            &Projection::Identity,
         );
 
         // R⁴ polytope wireframe (if enabled). Vertices are first rotated in R⁴ (so
@@ -303,6 +414,49 @@ impl Demo {
                 self.samples,
             );
         }
+
+        // Cross-section overlay (if enabled, and we actually have a polytope). The section
+        // is taken at world `w = 0` against the SAME rotated + scaled vertex set the
+        // wireframe renders from, so the cap geometry traces the wireframe's current
+        // silhouette at the slice plane. Both outputs are R³ world-space meshes.
+        let (sec_tri, sec_edges) = match (self.toggles.section, self.polytope) {
+            (true, Some(p)) => {
+                let topo = p.topology();
+                let world_vertices: Vec<Vec4> = topo
+                    .vertices
+                    .iter()
+                    .map(|v| {
+                        let rotated = rotate_4d(v.to_array(), self.time);
+                        Vec4::new(
+                            rotated[0] * POLYTOPE_SCALE,
+                            rotated[1] * POLYTOPE_SCALE,
+                            rotated[2] * POLYTOPE_SCALE,
+                            rotated[3] * POLYTOPE_SCALE,
+                        )
+                    })
+                    .collect();
+                polytope_section_overlay_with_vertices(
+                    topo.edges,
+                    topo.cells,
+                    &world_vertices,
+                    WPlane::new(0.0),
+                )
+            }
+            _ => (TriangleMesh::<3>::default(), LineMesh::<3>::default()),
+        };
+        self.section_triangles.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &sec_tri,
+            &Projection::Identity,
+        );
+        self.section_edges.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &sec_edges,
+            &Projection::Identity,
+            self.samples,
+        );
 
         self.dirty = false;
     }
@@ -347,12 +501,23 @@ impl Demo {
             .set_camera(&rd.queue, view_proj, vp_size);
         self.line_raster_r4
             .set_camera(&rd.queue, view_proj, vp_size);
+        self.triangle_raster.set_camera(&rd.queue, view_proj);
+        self.section_triangles.set_camera(&rd.queue, view_proj);
+        self.section_edges.set_camera(&rd.queue, view_proj, vp_size);
 
-        // Clear the framebuffer to a dark slate so the lines are visible. The rasterizer's
-        // pass uses LoadOp::Load, so we need a prior pass to clear; do it inline here via a
-        // bare-bones encoder. (In a real demo, this clear would come from whatever scene
-        // pass runs before the rasterizer; in this test example the rasterizer IS the
-        // scene.)
+        // Lazy / resize-aware depth buffer. The framework doesn't surface a resize hook to
+        // App; comparing dimensions each frame is cheap and avoids the extra trait method.
+        DepthBuffer::ensure(
+            &mut self.depth,
+            &rd.device,
+            DEPTH_FORMAT,
+            (cfg.width, cfg.height),
+            rd.sample_count(),
+        );
+        let depth = self.depth.as_ref().expect("ensured above");
+
+        // Clear color + depth in one pass. The rasterizer's draw uses LoadOp::Load for both
+        // attachments, so both R³ and R⁴ line passes share the same cleared depth buffer.
         let mut clear_encoder = rd
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -375,15 +540,29 @@ impl Demo {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
         }
         rd.queue.submit(Some(clear_encoder.finish()));
 
-        self.line_raster_r3.execute(rd, view)?;
-        self.line_raster_r4.execute(rd, view)?;
+        self.line_raster_r3.execute(rd, view, Some(&depth.view))?;
+        self.triangle_raster.execute(rd, view, Some(&depth.view))?;
+        self.line_raster_r4.execute(rd, view, Some(&depth.view))?;
+        // Section overlay last so its bright cyan edges sit on top of any wireframe edges
+        // that share screen-space pixels; depth-test still occludes section pieces behind
+        // the cube + the R³ scene geometry.
+        self.section_triangles
+            .execute(rd, view, Some(&depth.view))?;
+        self.section_edges.execute(rd, view, Some(&depth.view))?;
         Ok(())
     }
 }
@@ -415,40 +594,71 @@ impl RasterTestApp {
                     "all",
                     "toggle every R³ raster-test category at once",
                     |d, v| {
-                        d.toggles.axes = v;
-                        d.toggles.cube = v;
-                        d.toggles.widths = v;
-                        d.toggles.gradient = v;
-                        d.toggles.tilted = v;
+                        // Bare `tests all` flips based on whether anything is off;
+                        // explicit on|off sets every category at once.
+                        let on = v.unwrap_or(
+                            !(d.toggles.axes
+                                && d.toggles.cube
+                                && d.toggles.widths
+                                && d.toggles.gradient
+                                && d.toggles.tilted
+                                && d.toggles.triangles
+                                && d.toggles.section),
+                        );
+                        d.toggles.axes = on;
+                        d.toggles.cube = on;
+                        d.toggles.widths = on;
+                        d.toggles.gradient = on;
+                        d.toggles.tilted = on;
+                        d.toggles.triangles = on;
+                        d.toggles.section = on;
                         d.dirty = true;
                         Ok(())
                     },
                 )
                 .toggle("axes", "toggle world-axes (R/G/B basis vectors)", |d, v| {
-                    d.toggles.axes = v;
+                    d.toggles.axes = v.unwrap_or(!d.toggles.axes);
                     d.dirty = true;
                     Ok(())
                 })
                 .toggle("cube", "toggle unit-cube wireframe", |d, v| {
-                    d.toggles.cube = v;
+                    d.toggles.cube = v.unwrap_or(!d.toggles.cube);
                     d.dirty = true;
                     Ok(())
                 })
                 .toggle("widths", "toggle width-sweep horizontal lines", |d, v| {
-                    d.toggles.widths = v;
+                    d.toggles.widths = v.unwrap_or(!d.toggles.widths);
                     d.dirty = true;
                     Ok(())
                 })
                 .toggle("gradient", "toggle red-to-blue gradient line", |d, v| {
-                    d.toggles.gradient = v;
+                    d.toggles.gradient = v.unwrap_or(!d.toggles.gradient);
                     d.dirty = true;
                     Ok(())
                 })
                 .toggle("tilted", "toggle tilted-line fan", |d, v| {
-                    d.toggles.tilted = v;
+                    d.toggles.tilted = v.unwrap_or(!d.toggles.tilted);
                     d.dirty = true;
                     Ok(())
                 })
+                .toggle(
+                    "triangles",
+                    "toggle the filled-triangle pair (depth-test smoke test)",
+                    |d, v| {
+                        d.toggles.triangles = v.unwrap_or(!d.toggles.triangles);
+                        d.dirty = true;
+                        Ok(())
+                    },
+                )
+                .toggle(
+                    "section",
+                    "overlay active polytope's cross-section at world w=0",
+                    |d, v| {
+                        d.toggles.section = v.unwrap_or(!d.toggles.section);
+                        d.dirty = true;
+                        Ok(())
+                    },
+                )
                 .choice(
                     "polytope",
                     "set R⁴ polytope overlay (or `off` to clear it)",
@@ -462,6 +672,22 @@ impl RasterTestApp {
                         "600cell",
                     ],
                     |d, name| {
+                        // Bare invocation cycles through the polytope list in declared order
+                        // (off, 5cell, tesseract, 16cell, 24cell, 120cell, 600cell), wrapping.
+                        let Some(name) = name else {
+                            let next = match d.polytope {
+                                None => Some(Polytope4::Pentatope),
+                                Some(Polytope4::Pentatope) => Some(Polytope4::Tesseract),
+                                Some(Polytope4::Tesseract) => Some(Polytope4::Cell16),
+                                Some(Polytope4::Cell16) => Some(Polytope4::Cell24),
+                                Some(Polytope4::Cell24) => Some(Polytope4::Cell120),
+                                Some(Polytope4::Cell120) => Some(Polytope4::Cell600),
+                                Some(Polytope4::Cell600) => None,
+                            };
+                            d.polytope = next;
+                            d.dirty = true;
+                            return Ok(());
+                        };
                         d.polytope = match name.to_ascii_lowercase().as_str() {
                             "off" | "none" => None,
                             "5cell" | "5-cell" | "pentatope" => Some(Polytope4::Pentatope),
