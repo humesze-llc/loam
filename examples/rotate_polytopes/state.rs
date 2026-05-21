@@ -50,6 +50,88 @@ pub(crate) enum ViewMode {
     Filmstrip,
 }
 
+/// How the six regular convex 4-polytopes have their surface rendered.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum SurfaceMode {
+    /// Rasterized filled cross-section cell-caps. The default. Much faster for the 120-cell
+    /// and 600-cell than the SDF, exact (no Wolfe-greedy approximation), and sidesteps the
+    /// cell120/600 face-plane BUG in `rye_physics::euclidean_r4`.
+    #[default]
+    Raster,
+    /// SDF raymarch via [`Demo::node`]. The pre-rasterizer behavior, kept for visual
+    /// comparison. Slower on the 120/600-cell and carries the documented face-plane BUG.
+    Sdf,
+    /// No surface rendered for the polychora. The wireframe overlay (if enabled) still
+    /// shows the polytope's edge graph, but the cap interiors stay empty. Useful for
+    /// inspecting the wireframe + cross-section perimeter on their own without the cap
+    /// fill competing for attention.
+    Off,
+}
+
+impl SurfaceMode {
+    /// Parse the console-arg spelling. Returns `None` for any other input.
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "raster" => Some(SurfaceMode::Raster),
+            "sdf" => Some(SurfaceMode::Sdf),
+            "off" => Some(SurfaceMode::Off),
+            _ => None,
+        }
+    }
+
+    /// `true` when the polychoral SDF dispatch needs to be live (so that body uniforms
+    /// stay populated for the kernel). False for Raster (the rasterizer draws those
+    /// polytopes) and Off (nothing draws them).
+    pub(crate) fn uses_sdf_for_polychora(self) -> bool {
+        matches!(self, SurfaceMode::Sdf)
+    }
+}
+
+/// How the parent wireframe's 4D vertex positions project to R³ for rendering.
+/// Independent of the cross-section's projection (which is always drop-w because the
+/// slice IS a 3-flat and drop-w is the inhabitant's natural view of it).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum WireframeProjection {
+    /// Axis-aligned drop-w: `(x, y, z, w) -> (x, y, z)`. The default. Collapses every
+    /// pair of w-opposite vertices to the same R³ point, so axis-aligned polytopes
+    /// (especially the tesseract) render as visually degenerate "flat" shapes; the
+    /// 5-cell and 24-cell read more naturally because their cells aren't w-aligned.
+    #[default]
+    DropW,
+    /// 4D pinhole perspective from a viewer at `(0, 0, 0, focal_distance)` looking
+    /// in -w. Produces the classical "cube within a cube" tesseract view: +w face
+    /// renders as the outer (larger) shape, -w face as the inner (smaller) shape,
+    /// connecting edges as the frustum lines. Brings axis-aligned polytopes to life
+    /// at the cost of slight distortion on the polytopes that already read well
+    /// under drop-w.
+    WDepth,
+}
+
+impl WireframeProjection {
+    /// Parse the console-arg spelling. Hyphens because the console grammar lexes on
+    /// whitespace and `drop-w` / `w-depth` read as single tokens.
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "drop-w" => Some(WireframeProjection::DropW),
+            "w-depth" => Some(WireframeProjection::WDepth),
+            _ => None,
+        }
+    }
+
+    /// Resolve to a [`rye_math::Projection<4>`]. The focal distance is hardcoded to
+    /// `2.0`, sized to comfortably exceed the unit-circumradius polytope's w-extent
+    /// after the demo's `BODY_SIZE` scaling, so the perspective denominator never
+    /// approaches zero in normal use.
+    pub(crate) fn to_projection(self) -> rye_math::Projection<4> {
+        match self {
+            WireframeProjection::DropW => rye_math::Projection::Identity,
+            WireframeProjection::WDepth => rye_math::Projection::Perspective4D {
+                focal_distance: 2.0,
+            },
+        }
+    }
+}
+
 /// How the parent-wireframe edges are colored. Orthogonal to the alpha-modulation
 /// toggle [`Demo::wireframe_nearest_active`]: the color mode picks the hue, the
 /// nearest-active toggle then modulates alpha on top.
@@ -264,10 +346,19 @@ pub(crate) struct Demo {
     /// each moment. When `false`, every edge uses the same uniform dim alpha (the
     /// previous behavior).
     pub(crate) wireframe_nearest_active: bool,
+    /// Whether the cyan section-perimeter outlines render. Independent of the parent
+    /// wireframe edges; turning this off leaves the polytope's full edge graph visible
+    /// but hides the cap-boundary highlight, useful for inspecting the parent structure
+    /// without the slice's cyan trace competing for attention. On by default.
+    pub(crate) wireframe_perimeter: bool,
     /// Base RGB for wireframe edges. Orthogonal to [`Self::wireframe_nearest_active`]:
     /// the color mode picks the hue, the nearest-active toggle then modulates alpha on
     /// top.
     pub(crate) wireframe_color_mode: WireframeColorMode,
+    /// How the parent wireframe's 4D vertex positions project to R³. The cross-section
+    /// always uses drop-w (mathematically the inhabitant's view of the slice 3-flat);
+    /// this toggle only affects the dim wireframe overlay on top.
+    pub(crate) wireframe_projection: WireframeProjection,
     /// Filled-faces rasterizer for the cross-section of every polychoral body. When
     /// [`Self::surface_raster_enabled`] is `true`, this replaces the SDF raymarch for the
     /// six regular convex 4-polytopes: the SDF gets `BodyUniform::default()` for those
@@ -291,17 +382,10 @@ pub(crate) struct Demo {
     /// polychoron's vertex / triangle count seen so far.
     pub(crate) section_world_vertices_scratch: Vec<glam::Vec4>,
     pub(crate) section_faces_mesh_scratch: rye_shape::TriangleMesh<3>,
-    /// Selects how the six regular convex 4-polytopes are rendered:
-    /// - `true` (default): rasterized filled cross-section cell caps via
-    ///   [`Self::section_faces`]. Much faster for the 120-cell + 600-cell, exact (no
-    ///   Wolfe-greedy approximation), sidesteps the cell120/600 face-plane BUG in
-    ///   `rye_physics::euclidean_r4`.
-    /// - `false`: SDF raymarch in [`Self::node`]. The historical pre-rasterizer
-    ///   behavior, kept available behind the console toggle for visual comparison.
-    ///
-    /// Smooth-surface shapes (Clifford torus, duocylinder, etc.) ignore this toggle and
-    /// always render via the SDF; they have no polytope topology to section.
-    pub(crate) surface_raster_enabled: bool,
+    /// Selects how the six regular convex 4-polytopes are rendered. Smooth-surface shapes
+    /// (Clifford torus, duocylinder, etc.) ignore this and always render via the SDF since
+    /// they have no polytope topology to section.
+    pub(crate) surface_mode: SurfaceMode,
     /// Polytope row built at startup from `--shapes` CLI args (or `DEFAULT_ROW`); drives
     /// both the body uniforms and per-body label lookups in the overlay.
     pub(crate) row: Vec<ShapeEntry>,
@@ -444,17 +528,18 @@ impl Demo {
         }
     }
 
-    /// Build the SDF body uniform for a single row entry, with surface-raster opt-out:
-    /// when raster mode is on AND the entry has polytope topology, the returned uniform
-    /// is `BodyUniform::default()` (kind = Invalid), which the kernel's dispatch chain
-    /// skips. The slot is preserved (so the visual layout doesn't shift); the polychoral
-    /// surface is rendered separately via [`Self::section_faces`] in `main.rs`.
+    /// Build the SDF body uniform for a single row entry, with polychora opt-out based on
+    /// the active [`SurfaceMode`]: when the polychora are being rendered outside the SDF
+    /// (Raster, or Off entirely), the returned uniform is `BodyUniform::default()` (kind =
+    /// Invalid), which the kernel's dispatch chain skips. The slot is preserved (so the
+    /// visual layout doesn't shift); the polychoral surface is rendered separately via
+    /// [`Self::section_faces`] in `main.rs` (Raster) or simply not at all (Off).
     ///
-    /// Smooth-surface shapes (Clifford torus, etc.) ignore the raster toggle and always
-    /// produce a live SDF body.
+    /// Smooth-surface shapes (Clifford torus, etc.) ignore the surface mode and always
+    /// produce a live SDF body; they have no rasterizer path.
     fn sdf_body_for_slot(&self, slot: usize, n: usize, rotor: Rotor4) -> BodyUniform {
         let entry = &self.row[slot];
-        if self.surface_raster_enabled && entry.shape.polytope4().is_some() {
+        if !self.surface_mode.uses_sdf_for_polychora() && entry.shape.polytope4().is_some() {
             return BodyUniform::default();
         }
         BodyUniform::polytope_with_rotor(
@@ -477,9 +562,9 @@ impl Demo {
     }
 
     /// Re-emit every body's uniform from the current row + rotor state. Called after row
-    /// mutations (add/remove/reorder), rotor changes during spin, and surface-mode
-    /// toggles (since flipping `surface_raster_enabled` redirects polychora between the
-    /// SDF and the raster pipelines).
+    /// mutations (add/remove/reorder), rotor changes during spin, and surface-mode changes
+    /// (any time the polychora switch between SDF-live and SDF-inert, which happens at
+    /// every transition involving SDF mode).
     pub(crate) fn rebuild_bodies(&mut self) {
         let n = self.row.len();
         let rotor = self.rot_state;
