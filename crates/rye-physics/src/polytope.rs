@@ -1470,4 +1470,106 @@ mod tests {
             );
         }
     }
+
+    // ----------------- Cross-validation: section perimeter vs SDF surface ---
+    //
+    // The section perimeter is built from intersections of the parent polytope's
+    // *actual* edge graph with the slice hyperplane, so every perimeter vertex
+    // sits on the parent polytope's true surface by construction. For a
+    // mathematically correct SDF, `polytope_sdf_wolfe(perimeter_vertex, ...)`
+    // would therefore return zero (within numerical tolerance).
+    //
+    // The 120-cell and 600-cell SDFs in [`crate::euclidean_r4`] use dual-polytope
+    // vertices as face normals (see the `BUG` comment on `cell120_face_planes`
+    // and `cell600_face_planes`). Those normals are exact for the 24 axial + 16
+    // tesseract-corner orbits but approximate on the 96 golden-ratio orbits, so
+    // the SDF picks up a measurable non-zero value at perimeter vertices that
+    // lie on those orbits' edges. Tests below pin this divergence quantitatively
+    // so a future BUG fix fires here loudly enough to trigger a coordinated
+    // update of both the SDF code and the rotate_polytopes `surface sdf` path.
+    //
+    // No equivalent tests for 5/8/16/24-cell: their face planes aren't exposed
+    // as `pub` helpers, and the rasterized section path is correct by
+    // construction (`polytope_section_with_vertices` operates on the topology
+    // directly, no SDF involvement).
+
+    /// Reconstruct 4D perimeter vertices from the R³ perimeter mesh: every
+    /// section-perimeter vertex sits on the slice hyperplane by construction, so
+    /// its w-coordinate is exactly `slice.w_slice`.
+    fn perimeter_vertices_4d(perim: &rye_shape::LineMesh<3>, w: f32) -> Vec<Vec4> {
+        let mut out = Vec::with_capacity(perim.segments.len() * 2);
+        for (a, b) in &perim.segments {
+            out.push(Vec4::new(a[0], a[1], a[2], w));
+            out.push(Vec4::new(b[0], b[1], b[2], w));
+        }
+        out
+    }
+
+    /// Worst-case |SDF| evaluated at the 120-cell section perimeter at the
+    /// midpoint slice. The 24 + 16 axial/tesseract-corner orbits give SDF ≈ 0
+    /// (face normals exact); the 96 golden-ratio orbits show a bounded
+    /// non-trivial deviation. Pin both ends:
+    /// - Lower bound `> 1e-3`: a BUG fix that makes the SDF exact would drop
+    ///   this to ~0; the assert fires and someone updates the test bound or
+    ///   deletes the test alongside removing the BUG comments.
+    /// - Upper bound `< 0.1`: catches a face-normal regression that would
+    ///   produce a much wider deviation (e.g., swapping normals for the wrong
+    ///   polytope's vertex set, or a basis-rotation introduced upstream).
+    #[test]
+    fn cell120_section_perimeter_diverges_from_sdf_documenting_bug() {
+        use crate::euclidean_r4::{cell120_face_planes, polytope_sdf_wolfe};
+        let slice = rye_math::WPlane::new(0.0);
+        let (_, perim) = polytope4_section(Polytope4::Cell120, slice);
+        let (normals, inradius) = cell120_face_planes();
+
+        let mut max_dev: f32 = 0.0;
+        for p4 in perimeter_vertices_4d(&perim, slice.w_slice) {
+            let d = polytope_sdf_wolfe(p4, &normals, inradius).abs();
+            if d > max_dev {
+                max_dev = d;
+            }
+        }
+        assert!(
+            max_dev > 1e-3,
+            "Cell120 perimeter agrees with SDF surface within {max_dev}; expected \
+             measurable divergence from the documented BUG. Did `cell120_face_planes` \
+             get fixed? If so, delete this test and the BUG comment."
+        );
+        assert!(
+            max_dev < 0.1,
+            "Cell120 SDF divergence {max_dev} exceeds the documented BUG window; \
+             a face-normal regression may have widened the error."
+        );
+    }
+
+    /// Same shape as `cell120_section_perimeter_diverges_from_sdf_documenting_bug`
+    /// for the 600-cell. The 600-cell carries the symmetric BUG: its true face
+    /// normals are the cell centroids of its tetrahedral cells, but the SDF uses
+    /// the 120-cell's vertex set instead.
+    #[test]
+    fn cell600_section_perimeter_diverges_from_sdf_documenting_bug() {
+        use crate::euclidean_r4::{cell600_face_planes, polytope_sdf_wolfe};
+        let slice = rye_math::WPlane::new(0.0);
+        let (_, perim) = polytope4_section(Polytope4::Cell600, slice);
+        let (normals, inradius) = cell600_face_planes();
+
+        let mut max_dev: f32 = 0.0;
+        for p4 in perimeter_vertices_4d(&perim, slice.w_slice) {
+            let d = polytope_sdf_wolfe(p4, &normals, inradius).abs();
+            if d > max_dev {
+                max_dev = d;
+            }
+        }
+        assert!(
+            max_dev > 1e-3,
+            "Cell600 perimeter agrees with SDF surface within {max_dev}; expected \
+             measurable divergence from the documented BUG. Did `cell600_face_planes` \
+             get fixed? If so, delete this test and the BUG comment."
+        );
+        assert!(
+            max_dev < 0.1,
+            "Cell600 SDF divergence {max_dev} exceeds the documented BUG window; \
+             a face-normal regression may have widened the error."
+        );
+    }
 }
