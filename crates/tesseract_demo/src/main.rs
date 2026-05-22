@@ -25,6 +25,7 @@ use rye_app::{
     egui, run_with_config, App, Camera, CameraController, FirstPersonController, FrameCtx,
     OrbitController, RenderCtx, RunConfig, SetupCtx,
 };
+use rye_render::device::RenderDevice;
 use rye_egui::Console;
 use rye_math::{Bivector, Bivector4, EuclideanR3, EuclideanR4, Projection, Rotor, Rotor4};
 use rye_physics::polytope::Polytope4;
@@ -115,6 +116,70 @@ struct TesseractApp {
     perf: rye_app::trace::PerfOverlay,
 }
 
+impl TesseractApp {
+    /// Force GPU compilation of every render pipeline this demo uses by
+    /// running one dummy frame into a 1x1 throwaway texture. The pipelines
+    /// touched are the App's own (currently just `LineRasterNode`); egui's
+    /// and the composite's are intentionally NOT warmed here.
+    ///
+    /// Architectural note: warming lives in the demo (this `impl`), not in
+    /// the trait, because only the demo knows which pipelines it'll touch
+    /// and in what config (target_format / depth / sample_count). A generic
+    /// runner-side warmup would either be too conservative (compile
+    /// nothing) or too aggressive (compile every node-variant the demo
+    /// links). Demos opt in by calling this from `setup`.
+    ///
+    /// Cost: one tiny texture alloc + one extra `queue.submit` at setup
+    /// time. The size of the dummy target is 1x1; pipeline compilation
+    /// doesn't depend on output size, just on the pipeline state
+    /// configuration. The driver compiles for the format we built the
+    /// pipeline against and caches the result for subsequent draws at any
+    /// size.
+    fn warm_pipelines(&mut self, rd: &RenderDevice) {
+        let dummy_tex = rd.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tesseract_demo::warmup"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Must match the pipeline's target format. `target_format()`
+            // returns the sRGB sibling on the composite path (wasm) and the
+            // direct swapchain format otherwise — same value the pipeline
+            // was built with at construction time, so the warmup pass is
+            // format-compatible.
+            format: rd.target_format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = rd
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tesseract_demo::warmup-encoder"),
+            });
+        {
+            let mut ctx = RenderCtx {
+                rd,
+                view: &dummy_view,
+                encoder: &mut encoder,
+            };
+            // `record` is the regular per-frame draw path; running it once
+            // with the current state (identity rotor + initial camera) is
+            // enough to drive the pipeline through its first compile.
+            // Discard any error — warming isn't critical.
+            let _ = self.record(&mut ctx);
+        }
+        rd.queue.submit(Some(encoder.finish()));
+
+        tracing::info!("tesseract_demo: warmed render pipelines");
+    }
+}
+
 impl App for TesseractApp {
     type Space = EuclideanR3;
 
@@ -167,7 +232,7 @@ impl App for TesseractApp {
         rye_app::log::register_command(&mut console);
         let perf = rye_app::trace::PerfOverlay::new();
 
-        Ok(Self {
+        let mut app = Self {
             lines,
             camera,
             orbit,
@@ -187,7 +252,33 @@ impl App for TesseractApp {
             mesh,
             console,
             perf,
-        })
+        };
+
+        // Pipeline warmup: drive every render pipeline this demo will use
+        // through one dummy `record` call into a 1x1 throwaway color
+        // attachment. This forces the GPU driver to materialize the PSO
+        // (pipeline state object) NOW, during setup, instead of stalling
+        // for ~100-500ms the first time each pipeline is drawn against the
+        // real swapchain.
+        //
+        // Architectural note: warming lives in the demo, not the runner,
+        // for two reasons. (1) only the demo knows which pipelines it'll
+        // touch and in what config (target_format / depth / sample_count);
+        // a generic runner-side warmup would either be too conservative
+        // (compile nothing) or too aggressive (compile every node-variant
+        // the demo links). (2) Warming + click-to-start interact: when the
+        // demo is manually-launched, warmup at App::setup runs after the
+        // click, which is precisely the window where a brief loading delay
+        // is acceptable — we don't want to spend that compile budget at
+        // page-load before the user has expressed interest.
+        //
+        // Doesn't warm `ui.paint` (egui owns its pipelines, compiles them
+        // lazily per glyph / shape variant) or `composite` (runner-owned).
+        // If diagnostics still show big spikes after this, the cause isn't
+        // pipeline compilation in the App-owned path.
+        app.warm_pipelines(ctx.rd);
+
+        Ok(app)
     }
 
     fn space(&self) -> &EuclideanR3 {

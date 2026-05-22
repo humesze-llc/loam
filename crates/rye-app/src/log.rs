@@ -49,6 +49,41 @@ const BUFFER_CAP: usize = 2000;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static BUFFER: Mutex<VecDeque<HistoryLine>> = Mutex::new(VecDeque::new());
 
+/// Per-WindowEvent log toggle. When on, the runner emits a `tracing::info!`
+/// for every meaningful WindowEvent it dispatches to `on_event`. Used for
+/// spike-correlation: if the perf overlay reports a 500ms spike, the log
+/// will have any input events that preceded it within the same frame
+/// window, which narrows the cause (resize event? focus change? specific
+/// key press?). Cursor-moves are filtered because they fire at 60Hz+ and
+/// would drown out the signal.
+///
+/// Architectural note: this is a process-global static rather than a field
+/// on `Runner` because the toggle is set from inside a `Console` command
+/// closure that doesn't have access to the runner. The trade-off is that
+/// multi-App tests with their own runners would share the flag, which
+/// doesn't matter for the actual use case (one demo per process).
+static EVENTS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Read by the runner's `window_event` handler. Demos shouldn't need this
+/// directly; toggle via the `log events on|off|toggle` console command.
+pub fn events_enabled() -> bool {
+    EVENTS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Set the per-event log state explicitly. Same caveat as `set_enabled`:
+/// race-prone if toggled from multiple threads, fine for a console
+/// command's single-threaded toggle.
+pub fn set_events_enabled(b: bool) {
+    EVENTS_ENABLED.store(b, Ordering::Relaxed);
+}
+
+/// Toggle and return the new state.
+pub fn toggle_events() -> bool {
+    let new = !events_enabled();
+    set_events_enabled(new);
+    new
+}
+
 /// True when log events should mirror into the console scrollback this frame.
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
@@ -113,9 +148,18 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
             "mirror tracing events into the scrollback (`log [on|off|toggle]`) \
              or echo scrollback to the browser console (`log echo [on|off|toggle]`)",
             |args, _ctx: &mut Ctx, out| {
-                // Distinguish the `echo` subcommand from the legacy on/off/toggle
-                // args. Order matters: `log echo` matches the subcommand path
-                // and the second arg disambiguates within it.
+                // Three subcommand families:
+                //
+                //   log [on|off|toggle]            -> tracing  -> scrollback
+                //   log echo  [on|off|toggle]      -> scrollback -> browser console
+                //   log events [on|off|toggle]     -> per-WindowEvent tracing::info!
+                //
+                // Architectural note: the three are independent toggles so
+                // diagnostic combinations don't fight each other. e.g. during
+                // a spike investigation you'd typically run `log events on +
+                // log echo on` to capture event timestamps + scrollback in the
+                // browser DevTools console; for steady-state debug `log on`
+                // alone mirrors tracing to scrollback without echo-spam.
                 if args.first().copied() == Some("echo") {
                     let new = match args.get(1).copied() {
                         Some("on") => {
@@ -126,7 +170,6 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
                             rye_egui::set_console_echo(false);
                             false
                         }
-                        // Bare `log echo` or `log echo toggle` flips the flag.
                         _ => {
                             let next = !rye_egui::console_echo_enabled();
                             rye_egui::set_console_echo(next);
@@ -138,13 +181,36 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
                     } else {
                         "log echo (scrollback -> browser console): off"
                     });
-                    // On native the echo state has no surface to mirror to;
-                    // flag the no-op so the user knows.
                     #[cfg(not(target_arch = "wasm32"))]
                     out.line(
                         "  (note: `log echo` is a no-op on native; the browser-console \
                          path is wasm32-only)",
                     );
+                    return Ok(());
+                }
+                if args.first().copied() == Some("events") {
+                    let new = match args.get(1).copied() {
+                        Some("on") => {
+                            set_events_enabled(true);
+                            true
+                        }
+                        Some("off") => {
+                            set_events_enabled(false);
+                            false
+                        }
+                        _ => toggle_events(),
+                    };
+                    out.line(if new {
+                        "log events (per-WindowEvent tracing): on"
+                    } else {
+                        "log events (per-WindowEvent tracing): off"
+                    });
+                    if new {
+                        out.line(
+                            "  (cursor-move events are suppressed; non-cursor events \
+                             emit one tracing::info! each as the runner dispatches them)",
+                        );
+                    }
                     return Ok(());
                 }
                 let new = match args.first().copied() {
@@ -166,7 +232,10 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
                 Ok(())
             },
         )
-        .with_args(&[&["on", "off", "toggle", "echo"], &["on", "off", "toggle"]]),
+        .with_args(&[
+            &["on", "off", "toggle", "echo", "events"],
+            &["on", "off", "toggle"],
+        ]),
     );
 }
 

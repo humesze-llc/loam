@@ -870,6 +870,26 @@ impl<A: App> ApplicationHandler for Runner<A> {
             return;
         };
 
+        // Event-correlation diagnostic. When `log events on` has been issued
+        // (see rye_app::log), every meaningful WindowEvent emits a
+        // tracing::info! so the spike investigation can cross-reference
+        // browser events with the spike-warn timestamps. Cursor-moves are
+        // filtered because they fire at 60Hz+ and drown out the signal;
+        // everything else goes through. Lives BEFORE the egui forward so
+        // RedrawRequested doesn't spam (RedrawRequested fires every frame
+        // and would obscure the rare events we care about).
+        if log::events_enabled() {
+            match &ev {
+                // Suppress per-frame noise.
+                WindowEvent::CursorMoved { .. }
+                | WindowEvent::RedrawRequested
+                | WindowEvent::AxisMotion { .. } => {}
+                other => {
+                    tracing::info!("WindowEvent: {other:?}");
+                }
+            }
+        }
+
         // Forward to egui first so it can claim hover/focus/clicks
         // before Rye's own routing translates the event for gameplay.
         // egui consuming the event is informational; Rye still sees it.
