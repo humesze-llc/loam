@@ -483,6 +483,22 @@ impl App for TesseractApp {
                     ui.colored_label(egui::Color32::from_rgb(220, 180, 90), "[paused]");
                 }
             });
+        // Build identifier: short git hash + dirty marker, baked at compile
+        // time via build.rs. Bottom-right corner, faded so it doesn't compete
+        // with the rotating tesseract for attention but is always visible
+        // for "am I looking at a fresh build?" verification across reloads.
+        egui::Area::new(egui::Id::new("tesseract-build-id"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -12.0])
+            .show(ctx, |ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 120, 130),
+                    format!(
+                        "build {}{}",
+                        env!("BUILD_HASH"),
+                        env!("BUILD_DIRTY"),
+                    ),
+                );
+            });
         // Perf overlay: F3-toggle, draws on top of the HUD. Reads
         // `frame_trace::history` for the live FPS / frame-time / between-frames
         // sparkline. Cheap when hidden (just a key-press check).
