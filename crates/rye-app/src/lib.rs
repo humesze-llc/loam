@@ -79,6 +79,7 @@ pub mod capture;
 #[path = "capture_stub.rs"]
 pub mod capture;
 pub mod log;
+pub mod trace;
 
 use winit::{
     application::ApplicationHandler,
@@ -898,19 +899,29 @@ impl<A: App> Runner<A> {
         }
         let Some(rd) = self.rd.as_ref() else { return };
 
+        // Whole-redraw scope. Subsequent named sections sum to less than this; the
+        // delta is the small bits in between (FPS bookkeeping, capture status
+        // publish, etc.). Used by the `trace` console command to surface "total
+        // CPU work this frame" vs. "what's the dominant section."
+        let _frame_scope = rye_time::frame_trace::scope("frame");
+
         // 1. Fixed-timestep ticks.
-        let ticks = self.timestep.advance(Instant::now());
-        let n_ticks = ticks.count();
-        let n_capped = n_ticks.min(self.config.max_ticks_per_frame);
-        let dt = 1.0 / self.config.fixed_hz as f32;
-        if let Some(app) = self.app.as_mut() {
-            for _ in 0..n_capped {
-                let mut tctx = TickCtx {
-                    time: self.start.elapsed().as_secs_f32(),
-                    tick: self.tick_index,
-                };
-                app.tick(dt, &mut tctx);
-                self.tick_index = self.tick_index.wrapping_add(1);
+        let n_capped;
+        {
+            let _scope = rye_time::frame_trace::scope("sim-ticks");
+            let ticks = self.timestep.advance(Instant::now());
+            let n_ticks = ticks.count();
+            n_capped = n_ticks.min(self.config.max_ticks_per_frame);
+            let dt = 1.0 / self.config.fixed_hz as f32;
+            if let Some(app) = self.app.as_mut() {
+                for _ in 0..n_capped {
+                    let mut tctx = TickCtx {
+                        time: self.start.elapsed().as_secs_f32(),
+                        tick: self.tick_index,
+                    };
+                    app.tick(dt, &mut tctx);
+                    self.tick_index = self.tick_index.wrapping_add(1);
+                }
             }
         }
 
@@ -933,30 +944,37 @@ impl<A: App> Runner<A> {
                 ui_has_focus,
                 _non_exhaustive: PhantomData,
             };
-            app.update(&mut fctx);
+            {
+                let _scope = rye_time::frame_trace::scope("app-update");
+                app.update(&mut fctx);
+            }
 
             // Build this frame's UI. egui captures the widgets;
             // `paint` later renders them after `App::render`.
             if let Some(ui) = self.ui.as_mut() {
+                let _scope = rye_time::frame_trace::scope("app-ui");
                 let egui_ctx = ui.begin_frame(win.as_ref()).clone();
                 app.ui(&egui_ctx, &mut fctx);
             }
         }
 
         // 3. Hot-reload poll.
-        let reload_events = self.watcher.as_mut().map(|w| w.poll()).unwrap_or_default();
-        if !reload_events.is_empty() {
-            if let (Some(app), Some(shader_db), Some(rd)) =
-                (self.app.as_mut(), self.shader_db.as_mut(), self.rd.as_ref())
-            {
-                shader_db.apply_events(&reload_events, app.space());
-                let mut ctx = SetupCtx {
-                    rd,
-                    shader_db,
-                    watcher: self.watcher.as_mut(),
-                    time: self.start.elapsed().as_secs_f32(),
-                };
-                app.on_shader_reload(&mut ctx);
+        {
+            let _scope = rye_time::frame_trace::scope("hot-reload");
+            let reload_events = self.watcher.as_mut().map(|w| w.poll()).unwrap_or_default();
+            if !reload_events.is_empty() {
+                if let (Some(app), Some(shader_db), Some(rd)) =
+                    (self.app.as_mut(), self.shader_db.as_mut(), self.rd.as_ref())
+                {
+                    shader_db.apply_events(&reload_events, app.space());
+                    let mut ctx = SetupCtx {
+                        rd,
+                        shader_db,
+                        watcher: self.watcher.as_mut(),
+                        time: self.start.elapsed().as_secs_f32(),
+                    };
+                    app.on_shader_reload(&mut ctx);
+                }
             }
         }
 
@@ -1023,7 +1041,25 @@ impl<A: App> Runner<A> {
             Ok((frame, swap_view)) => {
                 let mut last_err: Option<anyhow::Error> = None;
                 let render_view = rd.msaa_view().unwrap_or(&swap_view);
+
+                // GPU timer start. Tiny dedicated encoder so the timestamp lands in
+                // the queue before any of App::render's submitted work. Two extra
+                // submits per frame (start + end); each is ~one wgpu API call, no
+                // measurable CPU cost. The actual GPU cost (timestamp writes) is
+                // single-digit nanoseconds. No-op when the adapter didn't advertise
+                // TIMESTAMP_QUERY.
+                if let Some(timer) = rd.gpu_timer.as_ref() {
+                    let mut t_enc =
+                        rd.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("rye-app::gpu-timer-start"),
+                            });
+                    timer.write_start(&mut t_enc);
+                    rd.queue.submit(Some(t_enc.finish()));
+                }
+
                 if let Some(app) = self.app.as_mut() {
+                    let _scope = rye_time::frame_trace::scope("app-render");
                     if let Err(e) = app.render(rd, render_view) {
                         tracing::error!("App::render error: {e:#}");
                         last_err = Some(e);
@@ -1044,6 +1080,7 @@ impl<A: App> Runner<A> {
                 }
 
                 if let Some(ui) = self.ui.as_mut() {
+                    let _scope = rye_time::frame_trace::scope("ui-paint");
                     let mut encoder =
                         rd.device
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1077,7 +1114,32 @@ impl<A: App> Runner<A> {
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 capture::publish_status(self.capture.status());
 
-                frame.present();
+                // GPU timer end + resolve. Submitted before `frame.present` so the
+                // GPU sees: [render work, end timestamp, resolve], then the present
+                // synchronization. Resolves the slot into the resolve buffer; the
+                // next `tick()` schedules its `map_async` read.
+                if let Some(timer) = rd.gpu_timer.as_ref() {
+                    let mut t_enc =
+                        rd.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("rye-app::gpu-timer-end"),
+                            });
+                    timer.write_end_and_resolve(&mut t_enc);
+                    rd.queue.submit(Some(t_enc.finish()));
+                }
+
+                {
+                    let _scope = rye_time::frame_trace::scope("present");
+                    frame.present();
+                }
+
+                // Advance the GPU timer's frame index + drain any completed timings
+                // into frame_trace. The slot whose end-timestamp was just resolved
+                // gets its map_async scheduled here; the result lands in frame_trace
+                // 1-2 frames later via the channel.
+                if let Some(timer) = self.rd.as_mut().and_then(|rd| rd.gpu_timer.as_mut()) {
+                    timer.tick();
+                }
                 if let Some(err) = last_err {
                     self.render_error_streak = self.render_error_streak.saturating_add(1);
                     let budget = self.config.render_error_budget;
@@ -1112,5 +1174,10 @@ impl<A: App> Runner<A> {
                 }
             },
         }
+
+        // End the frame's trace. Must happen after _frame_scope drops (i.e. at the
+        // very end of redraw); the surrounding block scope ensures that ordering.
+        drop(_frame_scope);
+        rye_time::frame_trace::end_frame();
     }
 }
