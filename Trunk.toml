@@ -1,0 +1,38 @@
+# Trunk: wasm packager for the rye engine demos.
+#
+# Each demo lives in its own workspace member crate under `crates/<name>/`, with a
+# `Cargo.toml` registering an implicit `[[bin]]` (from `src/main.rs`) and an
+# `index.html` next to the Cargo.toml that points Trunk at it. The dev loop is:
+#   trunk serve crates/polytope_playground/index.html
+# and the release build is:
+#   trunk build --release crates/polytope_playground/index.html
+#
+# Under the hood Trunk runs `cargo build --target wasm32-unknown-unknown` with
+# `--no-default-features` (the `data-cargo-no-default-features` attribute in each
+# index.html). Default features are off because the `capture` feature drags in
+# native-only PNG / GIF / APNG encoder crates that don't build on wasm32. The cfg
+# dispatch in `crates/rye-app/src/lib.rs` and `crates/rye-app/src/capture_stub.rs`
+# keeps the public API surface identical.
+#
+# We promoted `polytope_playground` from `examples/` to a workspace member crate
+# because Trunk's wasm pipeline can only target `[[bin]]`, not `[[example]]`. Other
+# rye demos that need browser builds will follow the same pattern.
+
+[build]
+# Per-build output directory. Each example writes its bundle into
+# `dist/<index-html-parent-folder>` so artifacts from different examples don't
+# clobber each other.
+dist = "dist"
+
+# Root-relative URLs for hosted deploys; override at the command line if you ever
+# need a subpath (`trunk build --public-url /demos/polytope/`).
+public_url = "/"
+
+[serve]
+# Single-address bind on 8081. The default port 8080 collides with VS Code's
+# extension host on Windows (you'll see `os error 10048` if you try to use it).
+# Trunk 0.21's older `address = "127.0.0.1"` field is deprecated; the modern
+# `addresses` accepts a list, but we only ever want one entry locally.
+addresses = ["127.0.0.1"]
+port = 8081
+open = false

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <title>Polytope Playground · Rye</title>
+
+    <!-- `polytope_playground` is a workspace member crate (promoted from the
+         `examples/` tree because Trunk's wasm pipeline can only target `[[bin]]`,
+         not `[[example]]`). The local `Cargo.toml` declares an implicit binary
+         from `src/main.rs`; Trunk picks it up automatically. The
+         `data-cargo-no-default-features` flag drops the `capture` feature on wasm
+         so the native-only encoder crates (image, gif, color_quant, png) stay out
+         of the wasm dep tree. -->
+    <link data-trunk rel="rust"
+          href="Cargo.toml"
+          data-cargo-no-default-features />
+
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: #0e0e12;
+            color: #d8d8df;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                         "Helvetica Neue", Arial, sans-serif;
+            overflow: hidden;
+        }
+        #rye-canvas-host {
+            position: absolute;
+            inset: 0;
+            display: block;
+        }
+        /* winit creates an HTMLCanvasElement; the cfg-gated `attach_canvas_to_dom`
+           helper in rye-app sets its style to 100% / 100% / display:block, so the
+           selector below is a defensive duplicate for older builds + inspector
+           reproducibility. */
+        #rye-canvas-host canvas {
+            width: 100% !important;
+            height: 100% !important;
+            display: block;
+            background: #0e0e12;
+        }
+        #rye-loading {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            opacity: 0.55;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="rye-canvas-host"></div>
+    <div id="rye-loading">Loading polytope playground&hellip;</div>
+    <script>
+        // The wasm runtime appends a canvas to `#rye-canvas-host` once
+        // `RenderDevice::new` resolves. Watch for it and remove the loading
+        // placeholder so the user sees the playground the instant it's ready.
+        const host = document.getElementById("rye-canvas-host");
+        const observer = new MutationObserver(() => {
+            if (host.querySelector("canvas")) {
+                document.getElementById("rye-loading")?.remove();
+                observer.disconnect();
+            }
+        });
+        observer.observe(host, { childList: true });
+    </script>
+</body>
+</html>
