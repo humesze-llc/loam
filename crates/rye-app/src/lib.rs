@@ -80,6 +80,8 @@ pub mod capture;
 pub mod capture;
 pub mod log;
 pub mod trace;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
 
 use winit::{
     application::ApplicationHandler,
