@@ -78,6 +78,7 @@ pub mod capture;
 #[cfg(any(not(feature = "capture"), target_arch = "wasm32"))]
 #[path = "capture_stub.rs"]
 pub mod capture;
+pub mod args;
 pub mod log;
 pub mod trace;
 #[cfg(target_arch = "wasm32")]
