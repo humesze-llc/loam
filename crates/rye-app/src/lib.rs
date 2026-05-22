@@ -178,10 +178,50 @@ pub trait App: Sized + 'static {
     /// stale. Rebuild what you care about.
     fn on_shader_reload(&mut self, _ctx: &mut SetupCtx<'_>) {}
 
-    /// Render this frame. The framework has begun a frame and hands you the surface
-    /// view; do whatever rendering you like. The framework calls `frame.present` after
-    /// this returns.
-    fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> anyhow::Result<()>;
+    /// **Legacy render path.** Implement either this OR [`App::record`]; the runner
+    /// always calls `record`, whose default impl calls this. Each invocation of
+    /// `render` typically creates its own command encoder + queue.submit (per pass
+    /// or per node), so a demo with three nodes pays at least three submits per
+    /// frame. On wasm32, each submit crosses the JS boundary and adds compositor
+    /// latency; the [`App::record`] path lets the runner batch the demo's draws
+    /// with ui-paint + composite into a single per-frame submit.
+    ///
+    /// New demos should override `record` instead. This method remains for
+    /// backwards-compatibility with the broad set of examples that built against
+    /// the original `App` trait; replacing them all in one sweep is bigger than
+    /// the engine's blast-radius budget for now.
+    fn render(&mut self, _rd: &RenderDevice, _view: &wgpu::TextureView) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// **Preferred render path.** The runner owns one command encoder for the entire
+    /// frame, shares it with the demo via [`RenderCtx::encoder`], then continues
+    /// using the same encoder for ui-paint and the wasm-side gamma composite.
+    /// Everything reaches the GPU in a single `queue.submit`.
+    ///
+    /// Default impl falls back to [`App::render`] (the legacy multi-submit path),
+    /// so the migration is opt-in: override `record` to get the single-submit
+    /// behaviour. The runner doesn't care which method you override.
+    ///
+    /// Implementation contract:
+    ///
+    /// - **Do NOT call `encoder.finish()` or `queue.submit(...)`**: the runner
+    ///   does that exactly once at end-of-frame. Submitting prematurely splits
+    ///   the frame's work and defeats the optimization.
+    /// - **Multiple render passes per call are fine**: open a render pass on the
+    ///   encoder, draw, drop the pass; open the next, etc. wgpu serializes them
+    ///   correctly within the same encoder.
+    /// - **Use `ctx.view` as the color target** for the bulk of your scene draws.
+    ///   The runner has already selected the right view (MSAA / scene-target /
+    ///   swapchain) based on platform + capture state.
+    fn record(&mut self, ctx: &mut RenderCtx<'_>) -> anyhow::Result<()> {
+        // Legacy adapter: invoke `render` with the (rd, view) pair, ignoring the
+        // shared encoder. Old demos that override `render` keep working; the
+        // runner still does one extra submit at end-of-frame for ui-paint +
+        // composite, which is a wash with the old code's separate encoders for
+        // those passes (slight net win).
+        self.render(ctx.rd, ctx.view)
+    }
 
     /// Build this frame's egui UI. Called after [`App::update`] and before
     /// [`App::render`]; the framework paints the resulting widgets as a 2D overlay on
@@ -235,6 +275,24 @@ pub struct SetupCtx<'a> {
 pub struct TickCtx {
     pub time: f32,
     pub tick: u64,
+}
+
+/// Render-time context. Handed to [`App::record`] each frame. Owns a shared command
+/// encoder that the demo writes its scene passes into; the runner reuses the same
+/// encoder for ui-paint and the wasm-side composite, then submits it exactly once
+/// at end of frame.
+///
+/// `view` is the color target the demo's main scene passes should write into. It's
+/// the runner's "best target right now": MSAA view on native+MSAA-on, the offscreen
+/// sRGB scene texture on wasm, the swapchain view otherwise. The demo doesn't need
+/// to know which case applies; pipelines built with [`RenderDevice::target_format`]
+/// + [`RenderDevice::sample_count`] match this view automatically.
+pub struct RenderCtx<'a> {
+    pub rd: &'a RenderDevice,
+    pub view: &'a wgpu::TextureView,
+    /// Shared command encoder. Open render passes on it, draw, drop the pass; do
+    /// NOT call `finish()` or `queue.submit`. The runner does that at end of frame.
+    pub encoder: &'a mut wgpu::CommandEncoder,
 }
 
 /// Per-frame context. Visible to [`App::update`] and [`App::on_event`]. Carries the
@@ -1096,11 +1154,12 @@ impl<A: App> Runner<A> {
                     .unwrap_or(&swap_view);
 
                 // GPU timer start. Tiny dedicated encoder so the timestamp lands in
-                // the queue before any of App::render's submitted work. Two extra
-                // submits per frame (start + end); each is ~one wgpu API call, no
-                // measurable CPU cost. The actual GPU cost (timestamp writes) is
-                // single-digit nanoseconds. No-op when the adapter didn't advertise
-                // TIMESTAMP_QUERY.
+                // the queue before any of the frame's submitted work. Stays separate
+                // from the main frame encoder so the start timestamp is on the GPU
+                // BEFORE we begin recording scene passes; merging them would put the
+                // start timestamp at the end of the same submit as the work, ruining
+                // the measurement. Same logic for the end timer below. No-op when
+                // the adapter didn't advertise TIMESTAMP_QUERY.
                 if let Some(timer) = rd.gpu_timer.as_ref() {
                     let mut t_enc =
                         rd.device
@@ -1111,15 +1170,34 @@ impl<A: App> Runner<A> {
                     rd.queue.submit(Some(t_enc.finish()));
                 }
 
+                // THE frame encoder. App::record, ui.paint, and the composite pass
+                // all write into this single encoder; the runner submits it once
+                // before `frame.present`. The capture taps (native only) need
+                // intermediate submits to make readback see the right pixels; those
+                // paths split the encoder mid-frame to maintain correctness, at the
+                // cost of the single-submit win in capture-active frames.
+                let mut encoder =
+                    rd.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("rye-app::frame"),
+                        });
+
                 if let Some(app) = self.app.as_mut() {
-                    let _scope = rye_time::frame_trace::scope("app-render");
-                    if let Err(e) = app.render(rd, render_view) {
-                        tracing::error!("App::render error: {e:#}");
+                    let _scope = rye_time::frame_trace::scope("app-record");
+                    let mut ctx = RenderCtx {
+                        rd,
+                        view: render_view,
+                        encoder: &mut encoder,
+                    };
+                    if let Err(e) = app.record(&mut ctx) {
+                        tracing::error!("App::record error: {e:#}");
                         last_err = Some(e);
                     }
                 }
 
-                // Pre-egui capture tap. Only valid with MSAA off (see above).
+                // Pre-egui capture tap. Only valid with MSAA off. Forces a mid-frame
+                // submit so the GPU has actually drawn the scene before we read it
+                // back; we restart the encoder afterwards for ui+composite.
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 if do_capture && self.capture.wants_pre() {
                     if rd.sample_count() > 1 {
@@ -1128,17 +1206,18 @@ impl<A: App> Runner<A> {
                              set RunConfig::msaa_samples = 1 for diagnostic capture"
                         );
                     } else {
+                        rd.queue.submit(Some(encoder.finish()));
+                        encoder = rd.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("rye-app::frame-post-pre-capture"),
+                            },
+                        );
                         capture_consume(&mut self.capture, rd, &frame.texture, true, capture_now);
                     }
                 }
 
                 if let Some(ui) = self.ui.as_mut() {
                     let _scope = rye_time::frame_trace::scope("ui-paint");
-                    let mut encoder =
-                        rd.device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("rye-app::ui-paint"),
-                            });
                     let viewport = (rd.surface_bundle.size.width, rd.surface_bundle.size.height);
                     let resolve_target = (rd.sample_count() > 1).then_some(&swap_view);
                     ui.paint(
@@ -1150,12 +1229,19 @@ impl<A: App> Runner<A> {
                         win.as_ref(),
                         viewport,
                     );
-                    rd.queue.submit(Some(encoder.finish()));
                 }
 
-                // Post-egui capture tap. Always valid: swapchain has final composite.
+                // Post-egui capture tap. Like the pre-tap, forces a mid-frame submit
+                // before the readback so the composite has actually happened on the
+                // GPU. Restart the encoder for composite (if needed below).
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 if do_capture && self.capture.wants_post() {
+                    rd.queue.submit(Some(encoder.finish()));
+                    encoder = rd.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("rye-app::frame-post-post-capture"),
+                        },
+                    );
                     capture_consume(&mut self.capture, rd, &frame.texture, false, capture_now);
                 }
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
@@ -1168,28 +1254,18 @@ impl<A: App> Runner<A> {
                 capture::publish_status(self.capture.status());
 
                 // Composite pass: sRGB scene texture -> linear swapchain with manual
-                // gamma encoding. No-op on native (where scene_view() is None and
-                // rendering wrote directly into the swapchain in step app-render +
-                // ui-paint). On browser-WebGPU with a linear-only canvas surface,
-                // this is the pass that turns dark-as-night output into native-
-                // matching brightness.
+                // gamma encoding. Writes into the same encoder as everything else
+                // (no separate submit). No-op on native (where scene_view() is None
+                // and rendering wrote directly into the swapchain).
                 if rd.scene_view().is_some() {
                     let _scope = rye_time::frame_trace::scope("composite");
-                    let mut c_enc =
-                        rd.device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("rye-app::composite"),
-                            });
-                    rd.composite_to_swap(&mut c_enc, &swap_view);
-                    rd.queue.submit(Some(c_enc.finish()));
+                    rd.composite_to_swap(&mut encoder, &swap_view);
                 }
 
-                // GPU timer end + resolve. Submitted after composite (so it captures
-                // the full chain incl. gamma pass) but before `frame.present`. The
-                // GPU sees: [render work, composite, end timestamp, resolve], then
-                // the present synchronization. Resolves the slot into the resolve
-                // buffer; the next `tick()` schedules its `map_async` read.
+                // GPU timer end + resolve. Stays in a separate small encoder for the
+                // same reason as the start timer: ordering vs the frame's main work.
                 if let Some(timer) = rd.gpu_timer.as_ref() {
+                    rd.queue.submit(Some(encoder.finish()));
                     let mut t_enc =
                         rd.device
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1197,6 +1273,10 @@ impl<A: App> Runner<A> {
                             });
                     timer.write_end_and_resolve(&mut t_enc);
                     rd.queue.submit(Some(t_enc.finish()));
+                } else {
+                    // Single submit for the whole frame (the path we're optimizing
+                    // for on wasm + native-without-timestamps).
+                    rd.queue.submit(Some(encoder.finish()));
                 }
 
                 {
