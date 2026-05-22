@@ -67,7 +67,7 @@ use rye_render::{
     raymarch::{
         polytope_extended_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL,
     },
-    DepthBuffer, DepthMode, LineRasterNode, TriangleRasterNode, Viewport,
+    DepthBuffer, DepthMode, LineRasterNode, PointRasterNode, TriangleRasterNode, Viewport,
 };
 
 /// Depth-attachment format for the rasterized section-faces pass. 32-bit float gives
@@ -214,6 +214,18 @@ impl Demo {
             ctx.rd.sample_count(),
         );
 
+        // Point-disc rasterizer for the optional vertex + cell-center sprites overlay.
+        // Same depth-attachment setup as the other rasterizer nodes so points respect the
+        // shared section-faces depth buffer (sprites that sit behind a cap get occluded).
+        let points_node = PointRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.surface_bundle.config.format,
+            DepthMode::ReadOnly {
+                format: SECTION_FACES_DEPTH_FORMAT,
+            },
+            ctx.rd.sample_count(),
+        );
+
         // Rasterized cross-section faces: filled cell-caps with face-normal Lambert
         // shading. Uses a depth attachment so caps from different cells of the same
         // polychoron occlude each other correctly when projected to camera space. The
@@ -256,6 +268,12 @@ impl Demo {
             wireframe_color_mode: WireframeColorMode::default(),
             wireframe_projection: WireframeProjection::default(),
             section_faces,
+            points_node,
+            points_enabled: false,
+            points_show_vertices: true,
+            points_show_cell_centers: true,
+            points_size_px: 4.0,
+            points_mesh_scratch: rye_shape::PointMesh::<3>::default(),
             section_faces_depth: None,
             section_world_vertices_scratch: Vec::new(),
             section_faces_mesh_scratch: rye_shape::TriangleMesh::<3>::default(),
@@ -679,6 +697,11 @@ impl Demo {
             if self.wireframe_enabled {
                 self.render_wireframe_overlay(rd, view)?;
             }
+            // Points overlay (vertex markers + cell-center sprites). Drawn last so the
+            // discs sit on top of wireframe edges and section caps at the same depth.
+            if self.points_enabled {
+                self.render_points(rd, view)?;
+            }
             Ok(())
         }
     }
@@ -743,6 +766,97 @@ impl Demo {
     /// depth attachment to resolve front-to-back occlusion correctly. The shared
     /// depth buffer is ensured + cleared at the top of the Shapes-view render path
     /// (see `Demo::ensure_and_clear_shared_depth`); this pass writes into it.
+    /// Build the combined point sprites mesh (vertex markers + cell-center sprites) across
+    /// every polychoral body in the row, upload it, and execute the point-disc raster pass.
+    ///
+    /// Same body-local + perspective + world-translate pattern as the wireframe and section-
+    /// faces paths: each body's vertices and cell centers are computed in body-local 4D,
+    /// projected through `wireframe_projection`, and translated by the body's R³ position so
+    /// the perspective scale doesn't smear the body across its row x-offset.
+    ///
+    /// Coloring: vertex sprites use the same per-vertex position-derived RGB scheme as the
+    /// "unique" wireframe color mode (`vertex_color_by_position`), so vertex sprites visually
+    /// belong with the colored wireframe. Cell-center sprites use a uniform white with
+    /// reduced alpha to read as a secondary structural marker rather than competing with the
+    /// vertex sprites.
+    fn render_points(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
+        let cfg = &rd.surface_bundle.config;
+        let n = self.row.len();
+        let wireframe_projection = self.wireframe_projection.to_projection();
+        // Cell-center sprite color: a dim warm white. Pre-multiplied alpha makes the sprite
+        // read as a "second-tier" marker behind the brighter vertex discs.
+        const CELL_CENTER_COLOR: [f32; 4] = [0.92, 0.88, 0.78, 0.65];
+
+        let mesh = &mut self.points_mesh_scratch;
+        mesh.positions.clear();
+        mesh.colors.clear();
+        mesh.sizes.clear();
+
+        for (slot, entry) in self.row.iter().enumerate() {
+            let Some(polytope) = entry.shape.polytope4() else {
+                continue;
+            };
+            let topo = polytope.topology();
+            let body_pos = body_position(slot, n);
+            let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+
+            if self.points_show_vertices {
+                for v in topo.vertices {
+                    let v_local = BODY_SIZE * self.rot_state.apply(*v);
+                    let v3_local =
+                        <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                            v_local,
+                            &wireframe_projection,
+                        );
+                    let v_world = v3_local + body_pos_r3;
+                    mesh.positions.push(v_world.to_array());
+                    // Color by the canonical (unrotated) vertex position so the sprite hue
+                    // matches its corresponding wireframe edge in `WireframeColorMode::Unique`.
+                    mesh.colors.push(vertex_color_by_position(*v));
+                    mesh.sizes.push(self.points_size_px);
+                }
+            }
+            if self.points_show_cell_centers {
+                for c in polytope.cell_centers() {
+                    let c_local = BODY_SIZE * self.rot_state.apply(c);
+                    let c3_local =
+                        <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                            c_local,
+                            &wireframe_projection,
+                        );
+                    let c_world = c3_local + body_pos_r3;
+                    mesh.positions.push(c_world.to_array());
+                    mesh.colors.push(CELL_CENTER_COLOR);
+                    // Cell-center sprites half-sized so they don't compete visually with the
+                    // brighter vertex discs.
+                    mesh.sizes.push(self.points_size_px * 0.5);
+                }
+            }
+        }
+
+        // Camera matches the wireframe overlay / section faces (same view-projection).
+        let view_dir = self.camera.view();
+        let aspect = cfg.width as f32 / cfg.height as f32;
+        let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
+        let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
+        let view_proj = proj_mat * view_mat;
+        let vp_size = Vec2::new(cfg.width as f32, cfg.height as f32);
+        self.points_node.set_camera(&rd.queue, view_proj, vp_size);
+        self.points_node.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            mesh,
+            &rye_math::Projection::Identity,
+        );
+        let depth_view = self
+            .section_faces_depth
+            .as_ref()
+            .map(|b| &b.view)
+            .expect("shared depth buffer must be ensured before points overlay");
+        self.points_node.execute(rd, view, Some(depth_view))?;
+        Ok(())
+    }
+
     fn render_section_faces(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
         let cfg = &rd.surface_bundle.config;
         let n = self.row.len();
@@ -1205,6 +1319,53 @@ impl RotatePolytopesApp {
                                 WireframeProjection::WDepth => WireframeProjection::DropW,
                             },
                         };
+                        Ok(())
+                    },
+                ),
+        );
+
+        // Points overlay: vertex markers + cell-center sprites. Same SubcommandSet shape as
+        // `wireframe`: bare flips main on/off, subcommands gate per-category visibility, and
+        // a size knob for the disc radius. Off by default so first-launch readers see the
+        // demo's identity (SDF / raster + wireframe) rather than a vertex cloud.
+        c.register(
+            rye_egui::subcommands::<Demo>("points", "vertex + cell-center sprite overlay")
+                .on_bare(|d| {
+                    d.points_enabled = !d.points_enabled;
+                    Ok(())
+                })
+                .toggle(
+                    "vertices",
+                    "render a disc at each polytope vertex (bare flips)",
+                    |d, v| {
+                        d.points_show_vertices = v.unwrap_or(!d.points_show_vertices);
+                        Ok(())
+                    },
+                )
+                .toggle(
+                    "cell-centers",
+                    "render a dim disc at each cell's centroid (bare flips)",
+                    |d, v| {
+                        d.points_show_cell_centers = v.unwrap_or(!d.points_show_cell_centers);
+                        Ok(())
+                    },
+                )
+                .custom(
+                    "size",
+                    "set the disc radius in pixels (e.g. `points size 8`)",
+                    &[],
+                    &[],
+                    |d, rest, _out| {
+                        let Some(token) = rest.first() else {
+                            return Err(anyhow!("usage: points size <pixels>"));
+                        };
+                        let px: f32 = token
+                            .parse()
+                            .map_err(|e| anyhow!("invalid pixel value `{token}`: {e}"))?;
+                        if !(1.0..=64.0).contains(&px) {
+                            return Err(anyhow!("points size {px} out of range; expected 1..=64"));
+                        }
+                        d.points_size_px = px;
                         Ok(())
                     },
                 ),

@@ -141,6 +141,26 @@ impl Polytope4 {
         self.topology().cells.len()
     }
 
+    /// Centroid (mean of vertex positions, in 4D) of every cell. Returned in canonical
+    /// (unit-circumradius) coordinates; rigid-body transforms apply linearly so callers can
+    /// rotate-and-translate the result in 4D. For a regular polytope every centroid has the
+    /// same length (the inradius); the direction is the cell's outward face normal.
+    ///
+    /// Used by the polytope-playground demo to render cell-center sprites alongside vertex
+    /// markers, and by [`Self::face_planes`] internally.
+    pub fn cell_centers(self) -> Vec<Vec4> {
+        let topo = self.topology();
+        topo.cells
+            .iter()
+            .map(|cell| {
+                cell.iter()
+                    .map(|&i| topo.vertices[i as usize])
+                    .sum::<Vec4>()
+                    / cell.len() as f32
+            })
+            .collect()
+    }
+
     /// Face hyperplanes derived from cell topology. For each cell, the cell centroid (mean
     /// of its vertices, in 4D) lies along the polytope's outward radial direction at that
     /// face; normalizing gives the unit face normal, and the centroid's length is the

@@ -365,6 +365,29 @@ pub(crate) struct Demo {
     /// slots (which the kernel skips) and the section's filled cell-caps come through
     /// here instead. Per-body solid color + face-normal Lambert in the fragment shader.
     pub(crate) section_faces: rye_render::TriangleRasterNode,
+    /// Antialiased point-disc rasterizer for vertex markers and cell-center sprites.
+    /// Constructed once during demo setup; uploaded with the combined point mesh each
+    /// frame the points overlay is enabled.
+    pub(crate) points_node: rye_render::PointRasterNode,
+    /// Master toggle for the points overlay. Off by default; the demo's identity is the
+    /// SDF / wireframe / cross-section composition. Enable to layer vertex + cell-center
+    /// sprites on top.
+    pub(crate) points_enabled: bool,
+    /// When [`Self::points_enabled`] is on, render a sprite at each polytope vertex.
+    pub(crate) points_show_vertices: bool,
+    /// When [`Self::points_enabled`] is on, render a sprite at each cell's centroid
+    /// (mean of the cell's vertex positions). The 600 sprites for the 600-cell can read
+    /// as a cluttered point cloud; toggle off independently of vertices for a cleaner
+    /// look when only the polytope's vertex structure matters.
+    pub(crate) points_show_cell_centers: bool,
+    /// Screen-space radius (pixels) for both vertex and cell-center sprites. Single
+    /// uniform size keeps the UX simple; per-category sizes are an easy follow-up if a
+    /// real need emerges.
+    pub(crate) points_size_px: f32,
+    /// Scratch buffer reused across frames + bodies inside `render_points`. Cleared at
+    /// the start of each invocation; capacity grows monotonically with the maximum
+    /// combined vertex + cell-center count across all polychora in the row.
+    pub(crate) points_mesh_scratch: rye_shape::PointMesh<3>,
     /// Shared depth attachment for the rasterizer chain in Shapes view. Sized to the
     /// swapchain and recreated on resize via [`rye_render::DepthBuffer::ensure`].
     ///
