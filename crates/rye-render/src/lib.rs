@@ -12,6 +12,7 @@
 //! The crate stays deliberately small: it hands wgpu primitives to callers rather than
 //! abstracting them behind a higher-level engine API.
 
+pub mod composite;
 pub mod depth;
 pub mod device;
 pub mod gpu_timer;

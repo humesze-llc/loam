@@ -32,6 +32,19 @@ pub struct MsaaTarget {
     pub view: TextureView,
 }
 
+/// Offscreen render target paired with the surface; the texture + a default view of
+/// it. Allocated when the surface format is non-sRGB (the browser-WebGPU case): the
+/// scene + UI render into this texture in sRGB encoding (because the texture format
+/// is `*UnormSrgb`), then the [`crate::composite::CompositeNode`] reads it +
+/// gamma-encodes for write to the linear swapchain. Same shape as [`MsaaTarget`];
+/// kept as a separate struct for the readability of code that branches on it.
+pub struct OffscreenTarget {
+    // Keeps the GPU allocation alive for the lifetime of `view`. Not read directly.
+    #[allow(dead_code)]
+    texture: Texture,
+    pub view: TextureView,
+}
+
 /// All wgpu state the engine carries: shared `Instance`, the chosen `Adapter`, the logical
 /// `Device`, the submission `Queue`, the current surface bundle, and an optional multisampled
 /// color attachment matching the surface. One per app; cloning this is not supported.
@@ -49,6 +62,18 @@ pub struct RenderDevice {
     /// owns the per-frame write_start / write_end_and_resolve / tick lifecycle; this
     /// is also reachable to apps that want sub-pass instrumentation.
     pub gpu_timer: Option<crate::gpu_timer::GpuTimer>,
+    /// Offscreen sRGB scene texture + composite node, allocated when the swapchain
+    /// surface format is non-sRGB (browser-WebGPU on Chrome circa 2026-05). Scene +
+    /// UI render into [`OffscreenTarget::view`]; the composite pass samples it +
+    /// applies the sRGB transfer function + writes to the linear swapchain.
+    /// `None` on native (where the swapchain itself is sRGB and the GPU handles
+    /// gamma encoding on write).
+    scene_target: Option<OffscreenTarget>,
+    composite: Option<crate::composite::CompositeNode>,
+    /// sRGB sibling of `surface_bundle.config.format`. Cached at construction so
+    /// resize can recreate the scene target with the same format. `None` when
+    /// scene_target is `None`.
+    scene_format: Option<TextureFormat>,
 }
 
 impl RenderDevice {
@@ -157,9 +182,48 @@ impl RenderDevice {
 
         surface.configure(&device, &config);
 
-        let sample_count = negotiate_sample_count(&adapter, format, requested_msaa_samples);
+        // Offscreen sRGB scene target + composite. When the swapchain format is
+        // already sRGB (native + the rare browser that advertises sRGB), we render
+        // straight into the swapchain and skip the composite — that's the standard
+        // path. When the swapchain is linear (Chrome WebGPU canvas on 2026-05), we
+        // allocate an sRGB scene texture, redirect rendering into it, and add a
+        // final pass that samples + gamma-encodes for write to the linear swapchain.
+        // The MSAA path doesn't compose with the offscreen scene target in v1
+        // (would need to retarget the MSAA resolve_target from swapchain to scene
+        // texture, and recompute the composite to sample from the resolved scene
+        // texture); we force sample_count = 1 in the offscreen-composite case and
+        // log the override.
+        let needs_composite = !format.is_srgb();
+        let effective_msaa = if needs_composite {
+            if requested_msaa_samples > 1 {
+                tracing::warn!(
+                    "MSAA={requested_msaa_samples}x ignored: composite pass for sRGB \
+                     gamma encoding (browser-WebGPU linear surface) is incompatible \
+                     with MSAA in v1; falling back to sample_count=1",
+                );
+            }
+            1
+        } else {
+            requested_msaa_samples
+        };
+
+        let sample_count = negotiate_sample_count(&adapter, format, effective_msaa);
         let msaa_target = (sample_count > 1)
             .then(|| create_msaa_target(&device, format, size.width, size.height, sample_count));
+
+        let (scene_target, composite, scene_format) = if needs_composite {
+            let scene_fmt = format.add_srgb_suffix();
+            tracing::info!(
+                "non-sRGB surface; rendering through offscreen scene target {scene_fmt:?} \
+                 with composite pass to {format:?} swapchain"
+            );
+            let scene = create_scene_target(&device, scene_fmt, size.width, size.height);
+            let mut comp = crate::composite::CompositeNode::new(&device, format);
+            comp.set_scene_view(&device, &scene.view);
+            (Some(scene), Some(comp), Some(scene_fmt))
+        } else {
+            (None, None, None)
+        };
 
         let gpu_timer = crate::gpu_timer::GpuTimer::new(&device, &queue);
 
@@ -176,12 +240,16 @@ impl RenderDevice {
             sample_count,
             msaa_target,
             gpu_timer,
+            scene_target,
+            composite,
+            scene_format,
         })
     }
 
     /// Reconfigure the surface for the new window size. No-ops on width or height of zero (the
     /// minimized-window case wgpu rejects outright). Recreates the MSAA texture to match the new
-    /// dimensions when MSAA is enabled.
+    /// dimensions when MSAA is enabled, and the offscreen scene texture (rewiring the composite
+    /// pass's bind group) when the wasm-style sRGB-composite path is active.
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width == 0 || new_size.height == 0 {
             return;
@@ -200,6 +268,11 @@ impl RenderDevice {
                 new_size.height,
                 self.sample_count,
             ));
+        }
+        if let (Some(scene_fmt), Some(composite)) = (self.scene_format, self.composite.as_mut()) {
+            let scene = create_scene_target(&self.device, scene_fmt, new_size.width, new_size.height);
+            composite.set_scene_view(&self.device, &scene.view);
+            self.scene_target = Some(scene);
         }
     }
 
@@ -233,6 +306,71 @@ impl RenderDevice {
     pub fn msaa_view(&self) -> Option<&TextureView> {
         self.msaa_target.as_ref().map(|t| &t.view)
     }
+
+    /// View into the offscreen sRGB scene texture, when the composite path is
+    /// active. `None` on native (where the swapchain is sRGB and renders write
+    /// directly into it). The render-target priority chain for the runner is:
+    /// `msaa_view()` first (MSAA on, native path), then `scene_view()` (composite
+    /// path), then the swapchain view directly (native, no MSAA).
+    pub fn scene_view(&self) -> Option<&TextureView> {
+        self.scene_target.as_ref().map(|t| &t.view)
+    }
+
+    /// Format that render pipelines should target. Differs from
+    /// `surface_bundle.config.format` only when the composite path is active: the
+    /// surface itself is the linear swap format (browser-WebGPU's only option) but
+    /// scene + UI pipelines actually write into the sRGB offscreen texture, so
+    /// their `ColorTargetState.format` needs to match THAT. The composite pass
+    /// itself targets the linear swap format and is built with that directly in
+    /// `CompositeNode::new`; downstream consumers shouldn't need to special-case
+    /// it.
+    ///
+    /// Use this in pipeline constructors instead of reading
+    /// `surface_bundle.config.format` directly.
+    pub fn target_format(&self) -> TextureFormat {
+        self.scene_format
+            .unwrap_or(self.surface_bundle.config.format)
+    }
+
+    /// Run the final composite pass: sample the scene texture, gamma-encode in the
+    /// fragment shader, and write to `swap_view`. Caller submits the encoder.
+    /// No-op when `scene_view()` is `None` (native fast path).
+    pub fn composite_to_swap(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        swap_view: &TextureView,
+    ) {
+        if let Some(composite) = self.composite.as_ref() {
+            composite.run(encoder, swap_view);
+        }
+    }
+}
+
+/// Allocate the offscreen scene-target texture used by the sRGB composite path. The
+/// texture is the same dimensions as the surface; `RENDER_ATTACHMENT` so render passes
+/// can target it, `TEXTURE_BINDING` so the composite shader can sample it.
+fn create_scene_target(
+    device: &Device,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+) -> OffscreenTarget {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rye-render::scene_target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    OffscreenTarget { texture, view }
 }
 
 /// Pick the highest sample count supported by the adapter for the given format that is
