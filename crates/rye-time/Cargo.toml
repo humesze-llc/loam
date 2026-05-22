@@ -8,3 +8,7 @@ repository.workspace = true
 description = "Rye time primitives: deterministic fixed-timestep accumulator and tick counter."
 
 [dependencies]
+# `web-time` is a drop-in for `std::time::Instant` / `Duration`: on native it re-exports
+# the std types verbatim; on wasm32 it backs `Instant` with `performance.now()`. Keeping
+# `FixedTimestep` usable in the browser is the only thing that pulls this in.
+web-time = { workspace = true }

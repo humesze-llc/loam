@@ -39,6 +39,13 @@ naga = { version = "27", features = ["wgsl-in"] }
 bytemuck = { version = "1", features = ["derive"] }
 notify = "6"
 
+# `web-time` is a drop-in for `std::time::Instant` / `Duration`: on native it re-exports
+# the std types verbatim; on wasm32 it backs `Instant` with `performance.now()`. Used in
+# place of `std::time::Instant` anywhere the runtime needs wall-clock-ish timing (event
+# loop, FixedTimestep, FPS bookkeeping). Calling `std::time::Instant::now` on wasm32
+# panics, so the swap is mandatory for the browser runtime.
+web-time = "1"
+
 [package]
 name = "rye"
 version.workspace = true

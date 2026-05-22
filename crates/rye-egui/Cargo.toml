@@ -17,10 +17,20 @@ winit.workspace = true
 # internal ABI; mixing minor versions silently breaks at runtime.
 egui = "0.33"
 egui-wgpu = { version = "0.33", default-features = false, features = ["winit"] }
-egui-winit = { version = "0.33", default-features = false, features = ["clipboard", "links"] }
 
 rye-camera = { path = "../rye-camera" }
 rye-math   = { path = "../rye-math" }
+
+# `clipboard` pulls in `arboard`, which doesn't build on wasm32 (no native clipboard
+# crate compiles for the browser); the browser exposes its own clipboard API through
+# the JS interop layer that egui-winit can wire up via its `webbrowser` feature
+# instead. Split the dep into per-target lines so the feature set diverges cleanly:
+# native gets `clipboard + links`, wasm gets `links` only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+egui-winit = { version = "0.33", default-features = false, features = ["clipboard", "links"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+egui-winit = { version = "0.33", default-features = false, features = ["links"] }
 
 [dev-dependencies]
 glam = { workspace = true }

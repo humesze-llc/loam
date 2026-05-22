@@ -1,7 +1,12 @@
 //! Fixed-timestep accumulator.
 
 use std::ops::Range;
-use std::time::{Duration, Instant};
+// `web_time` is a drop-in for `std::time` that works on both native and wasm32. On
+// native it re-exports `std::time::Instant` / `Duration` verbatim; on wasm32 it backs
+// `Instant` with `performance.now()`. `std::time::Instant::now` panics on wasm32, so
+// the swap is mandatory for the browser runtime path.
+use std::time::Duration;
+use web_time::Instant;
 
 /// Default cap on how many simulation ticks we'll run per frame when catching up to
 /// wall-clock time. Excess is dropped to avoid the "spiral of death" where a slow sim
