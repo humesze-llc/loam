@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-    <title>Polytope Playground · Rye</title>
+    <title>Polytope Playground &middot; Rye</title>
 
     <!-- `polytope_playground` is a workspace member crate (promoted from the
          `examples/` tree because Trunk's wasm pipeline can only target `[[bin]]`,
@@ -31,7 +31,9 @@
         #rye-canvas-host {
             position: absolute;
             inset: 0;
-            display: block;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         /* winit creates an HTMLCanvasElement; the cfg-gated `attach_canvas_to_dom`
            helper in rye-app sets its style to 100% / 100% / display:block, so the
@@ -43,35 +45,39 @@
             display: block;
             background: #0e0e12;
         }
-        #rye-loading {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 12px;
-            letter-spacing: 0.12em;
+        /* Click-to-start launch button. Visible until the user opts in; the wasm
+           runtime removes it on click, then the canvas attaches in its place. */
+        .rye-demo-launch {
+            font: inherit;
+            font-size: 14px;
+            letter-spacing: 0.08em;
             text-transform: uppercase;
-            opacity: 0.55;
-            pointer-events: none;
+            color: #d8d8df;
+            background: #1a1a22;
+            border: 1px solid #2a2a35;
+            border-radius: 6px;
+            padding: 14px 28px;
+            cursor: pointer;
+            transition: background 120ms ease, border-color 120ms ease;
+        }
+        .rye-demo-launch:hover {
+            background: #22222d;
+            border-color: #3a3a48;
+        }
+        .rye-demo-launch:active {
+            background: #1a1a22;
         }
     </style>
 </head>
 <body>
-    <div id="rye-canvas-host"></div>
-    <div id="rye-loading">Loading polytope playground&hellip;</div>
-    <script>
-        // The wasm runtime appends a canvas to `#rye-canvas-host` once
-        // `RenderDevice::new` resolves. Watch for it and remove the loading
-        // placeholder so the user sees the playground the instant it's ready.
-        const host = document.getElementById("rye-canvas-host");
-        const observer = new MutationObserver(() => {
-            if (host.querySelector("canvas")) {
-                document.getElementById("rye-loading")?.remove();
-                observer.disconnect();
-            }
-        });
-        observer.observe(host, { childList: true });
-    </script>
+    <!-- `data-mode="manual"` opts into click-to-start. The wasm runtime sees this
+         attribute, installs a one-shot click handler on `#rye-launch`, and only
+         calls `run_with_config` when the button is clicked. Remove the attribute
+         (or set it to anything else) for auto-start on page load. -->
+    <div id="rye-canvas-host" data-mode="manual">
+        <button id="rye-launch" class="rye-demo-launch" type="button">
+            Launch polytope playground
+        </button>
+    </div>
 </body>
 </html>
