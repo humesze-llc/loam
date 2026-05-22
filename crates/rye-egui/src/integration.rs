@@ -87,6 +87,112 @@ impl UiIntegration {
         self.winit_state.on_window_event(window, event)
     }
 
+    /// Force egui-wgpu's lazy pipeline compilation by running one minimal
+    /// frame into a 1×1 dummy attachment. Eliminates the first-paint stall
+    /// the user would otherwise see when the first real frame triggers
+    /// shader-module + pipeline-state-object compilation for text + rect +
+    /// line shape variants.
+    ///
+    /// Called once from the runner's `setup_after_device` so the cost is
+    /// paid during click-to-start / window-create, where a brief delay is
+    /// acceptable. Skipped on `--no-default-features` lean builds (egui
+    /// itself is then a stub).
+    ///
+    /// `target_format` and `sample_count` MUST match the values
+    /// `UiIntegration::new` was constructed with; otherwise the warm-up
+    /// compiles a pipeline variant that doesn't match what the real frame
+    /// will request and no warming actually happens.
+    ///
+    /// Architectural note: lives on `UiIntegration` (not the runner)
+    /// because only this struct knows the egui-wgpu internals (the
+    /// `Renderer`, the context lifecycle). The runner just orchestrates.
+    pub fn warm_pipelines(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        window: &Window,
+        target_format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) {
+        // Dummy 1×1 attachment matching the pipeline's expected format +
+        // sample count. Anything else and egui-wgpu would compile the wrong
+        // pipeline variant (different format / different MSAA), defeating
+        // the warm.
+        let dummy_color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rye-egui::warm color"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let dummy_view = dummy_color.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // MSAA path needs a separate single-sample resolve target. Skip
+        // when sample_count==1 (no resolve happens).
+        let resolve_tex = if sample_count > 1 {
+            Some(device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("rye-egui::warm resolve"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            }))
+        } else {
+            None
+        };
+        let resolve_view = resolve_tex
+            .as_ref()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rye-egui::warm encoder"),
+        });
+
+        // Run one minimal frame. Three widget kinds cover the pipeline
+        // variants egui-wgpu compiles lazily: text (glyph rendering), a
+        // filled rect (background panel), and a line stroke (separator /
+        // painter line). Adding a fourth widget kind here is cheap; the
+        // pipelines that DON'T get touched here will still lazy-compile
+        // when first used, so the trade-off is "what does the demo set
+        // need" vs the warm-up time.
+        let ctx = self.begin_frame(window);
+        let ctx = ctx.clone();
+        egui::Area::new(egui::Id::new("rye-egui::warm"))
+            .show(&ctx, |ui| {
+                ui.label("warm");
+                ui.separator();
+                ui.painter().line_segment(
+                    [egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)],
+                    egui::Stroke::new(1.0, egui::Color32::WHITE),
+                );
+            });
+        self.paint(
+            device,
+            queue,
+            &mut encoder,
+            &dummy_view,
+            resolve_view.as_ref(),
+            window,
+            (1, 1),
+        );
+
+        queue.submit(Some(encoder.finish()));
+    }
+
     /// Drain accumulated input + start a fresh egui frame. Returns the `egui::Context`
     /// for the user's `App::ui` to build against.
     pub fn begin_frame(&mut self, window: &Window) -> &egui::Context {

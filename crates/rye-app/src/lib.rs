@@ -504,12 +504,33 @@ fn setup_after_device<A: App>(
     // scene attachment, since both passes write into the same color attachment and the
     // deferred MSAA resolve happens at the end of the egui paint pass. See
     // [`UiIntegration::paint`]'s `resolve_target` parameter.
-    let ui = UiIntegration::new(
+    let mut ui = UiIntegration::new(
         &rd.device,
         win,
         rd.target_format(),
         rd.sample_count(),
     );
+
+    // Runner-side pipeline warming (N3). Forces lazy pipeline compilation for
+    // egui-wgpu's shape variants and the browser-WebGPU composite pass during
+    // setup, instead of stalling the user's first visible frame for ~50-200ms
+    // per first-touched pipeline. App-owned pipelines are warmed inside the
+    // app's `setup` (e.g. `tesseract_demo::warm_pipelines`); these two cover
+    // the runner-owned ones every demo benefits from.
+    //
+    // Architectural note: lives here (in setup_after_device, after both ui +
+    // rd exist but before the first redraw) so it's truly part of the setup
+    // step, not a per-frame check + first-frame-flag pattern. A demo that
+    // skips the runner (does its own event loop) would also skip this warm,
+    // but no rye demo does that today.
+    ui.warm_pipelines(
+        &rd.device,
+        &rd.queue,
+        win,
+        rd.target_format(),
+        rd.sample_count(),
+    );
+    rd.warm_composite();
 
     Ok(InitArtifacts {
         rd,

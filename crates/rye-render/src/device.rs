@@ -344,6 +344,48 @@ impl RenderDevice {
             composite.run(encoder, swap_view);
         }
     }
+
+    /// Force the composite pipeline through one dummy draw so the GPU driver
+    /// compiles its PSO during setup instead of stalling the first real frame.
+    /// No-op on the native fast path (no composite pipeline exists).
+    ///
+    /// The composite's scene-view binding from construction is reused as-is;
+    /// the dummy target is a 1×1 texture in the swap format that the
+    /// pipeline was built against. One `queue.submit` at warm time.
+    ///
+    /// Architectural note: warming lives on `RenderDevice` (not the runner)
+    /// because only this struct has the composite handle + the matching
+    /// swap format. The runner just calls this once during setup_after_device
+    /// alongside `UiIntegration::warm_pipelines` + `App::warm_pipelines`.
+    pub fn warm_composite(&self) {
+        if self.composite.is_none() {
+            return;
+        }
+        let format = self.surface_bundle.config.format;
+        let dummy = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rye-render::composite::warm dummy"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let dummy_view = dummy.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rye-render::composite::warm encoder"),
+            });
+        self.composite_to_swap(&mut encoder, &dummy_view);
+        self.queue.submit(Some(encoder.finish()));
+    }
 }
 
 /// Allocate the offscreen scene-target texture used by the sRGB composite path. The
