@@ -14,6 +14,7 @@
 
 pub mod depth;
 pub mod device;
+pub mod gpu_timer;
 pub mod graph;
 pub mod lattice;
 pub mod line_raster;

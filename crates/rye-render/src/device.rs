@@ -43,6 +43,12 @@ pub struct RenderDevice {
     pub surface_bundle: SurfaceBundle,
     sample_count: u32,
     msaa_target: Option<MsaaTarget>,
+    /// GPU timestamp query infrastructure. `Some` when the adapter advertised
+    /// `Features::TIMESTAMP_QUERY` and we asked for it at device creation; `None`
+    /// otherwise (no-op for code paths that opt in via `if let Some(t)`). The runner
+    /// owns the per-frame write_start / write_end_and_resolve / tick lifecycle; this
+    /// is also reachable to apps that want sub-pass instrumentation.
+    pub gpu_timer: Option<crate::gpu_timer::GpuTimer>,
 }
 
 impl RenderDevice {
@@ -65,10 +71,31 @@ impl RenderDevice {
             })
             .await?;
 
+        // GPU timer queries. wgpu 27 splits the capability across two features:
+        //   - TIMESTAMP_QUERY: enables `RenderPassDescriptor::timestamp_writes`
+        //     (timestamps attached to a render pass)
+        //   - TIMESTAMP_QUERY_INSIDE_ENCODERS: enables
+        //     `CommandEncoder::write_timestamp` (free-floating in the encoder, our
+        //     current path because App::render owns its own render passes that
+        //     rye-app can't reach into)
+        //
+        // Chrome's WebGPU on the current build (2026-05-22) advertises TIMESTAMP_QUERY
+        // but NOT TIMESTAMP_QUERY_INSIDE_ENCODERS, so requesting the latter would fail
+        // the adapter check; requesting only the former and then calling
+        // write_timestamp panics (validation error -> wgpu panic on wasm). We require
+        // BOTH for the GPU timer to be enabled; otherwise we silently skip it and the
+        // gpu-total section just doesn't appear in `trace summary`.
+        let needed = Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let timestamps_ok = adapter.features().contains(needed);
+        let required_features = if timestamps_ok {
+            needed
+        } else {
+            Features::empty()
+        };
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
                 label: Some("Rye Device"),
-                required_features: Features::empty(),
+                required_features,
                 required_limits: Limits::default(),
                 memory_hints: MemoryHints::default(),
                 trace: Trace::Off,
@@ -77,6 +104,14 @@ impl RenderDevice {
                 experimental_features: Default::default(),
             })
             .await?;
+        if timestamps_ok {
+            tracing::info!("GPU timestamp queries enabled (TIMESTAMP_QUERY + INSIDE_ENCODERS)");
+        } else {
+            tracing::info!(
+                "GPU timestamp queries unavailable (adapter features: {:?})",
+                adapter.features()
+            );
+        }
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
@@ -126,6 +161,8 @@ impl RenderDevice {
         let msaa_target = (sample_count > 1)
             .then(|| create_msaa_target(&device, format, size.width, size.height, sample_count));
 
+        let gpu_timer = crate::gpu_timer::GpuTimer::new(&device, &queue);
+
         Ok(Self {
             instance,
             adapter,
@@ -138,6 +175,7 @@ impl RenderDevice {
             },
             sample_count,
             msaa_target,
+            gpu_timer,
         })
     }
 
