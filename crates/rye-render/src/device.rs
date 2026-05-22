@@ -86,6 +86,25 @@ impl RenderDevice {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
+        tracing::info!(
+            "surface picked format={format:?} (advertised={:?})",
+            caps.formats
+        );
+
+        // Prefer an opaque alpha mode over `PreMultiplied`. On the WebGPU/WebGL surface in
+        // the browser, the adapter advertises `PreMultiplied` first, which tells the
+        // compositor to interpret the shader output as already-multiplied-by-alpha and
+        // composite the canvas over the page underneath. When the page background is dark
+        // (or anything non-white), shader output with an alpha less than 1 ends up
+        // darkened against it. Picking `Opaque` when supported sidesteps the issue
+        // entirely; if the adapter doesn't offer it (rare native edge cases) we accept
+        // whatever it advertises first.
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|m| *m == CompositeAlphaMode::Opaque)
+            .unwrap_or(caps.alpha_modes[0]);
 
         let config = SurfaceConfiguration {
             // COPY_SRC keeps texture readback open for headless screenshot tools and any future
@@ -96,7 +115,7 @@ impl RenderDevice {
             width: size.width,
             height: size.height,
             present_mode: PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
