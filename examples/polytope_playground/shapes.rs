@@ -58,7 +58,7 @@ impl Demo {
             last_row_rect.and_then(|rect| drop_target_idx(ui.ctx(), dragging_shape, rect, row_len));
         let row_rect = egui::ScrollArea::horizontal()
             .auto_shrink([false, true])
-            .id_salt("rotate-polytopes-shapes-scroll")
+            .id_salt("polytope-playground-shapes-scroll")
             .show(ui, |ui| {
                 let row_response =
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {

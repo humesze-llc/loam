@@ -20,7 +20,7 @@
 //!   layer otherwise dims them).
 //!
 //! Together these make a draggable row whose visual feedback is solid through pickup,
-//! mid-drag, and drop. See the `rotate_polytopes` example for an integrated use.
+//! mid-drag, and drop. See the `polytope_playground` example for an integrated use.
 
 use egui::{
     self, emath::TSTransform, vec2, DragAndDrop, Id, LayerId, Order, Rect, Response, Sense, Ui,

@@ -17,12 +17,14 @@ pub mod device;
 pub mod graph;
 pub mod lattice;
 pub mod line_raster;
+pub mod point_raster;
 pub mod raymarch;
 pub mod triangle_raster;
 
 pub use depth::DepthBuffer;
 pub use lattice::Viewport;
 pub use line_raster::{LineRasterNode, LineRasterUniforms};
+pub use point_raster::{PointRasterNode, PointRasterUniforms};
 pub use raymarch::{GeodesicRayMarchNode, RayMarchNode, RayMarchUniforms};
 pub use triangle_raster::{
     FragmentShading, TriangleRasterNode, TriangleRasterUniforms, TriangleVertex,

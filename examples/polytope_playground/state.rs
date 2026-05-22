@@ -365,6 +365,29 @@ pub(crate) struct Demo {
     /// slots (which the kernel skips) and the section's filled cell-caps come through
     /// here instead. Per-body solid color + face-normal Lambert in the fragment shader.
     pub(crate) section_faces: rye_render::TriangleRasterNode,
+    /// Antialiased point-disc rasterizer for vertex markers and cell-center sprites.
+    /// Constructed once during demo setup; uploaded with the combined point mesh each
+    /// frame the points overlay is enabled.
+    pub(crate) points_node: rye_render::PointRasterNode,
+    /// Master toggle for the points overlay. Off by default; the demo's identity is the
+    /// SDF / wireframe / cross-section composition. Enable to layer vertex + cell-center
+    /// sprites on top.
+    pub(crate) points_enabled: bool,
+    /// When [`Self::points_enabled`] is on, render a sprite at each polytope vertex.
+    pub(crate) points_show_vertices: bool,
+    /// When [`Self::points_enabled`] is on, render a sprite at each cell's centroid
+    /// (mean of the cell's vertex positions). The 600 sprites for the 600-cell can read
+    /// as a cluttered point cloud; toggle off independently of vertices for a cleaner
+    /// look when only the polytope's vertex structure matters.
+    pub(crate) points_show_cell_centers: bool,
+    /// Screen-space radius (pixels) for both vertex and cell-center sprites. Single
+    /// uniform size keeps the UX simple; per-category sizes are an easy follow-up if a
+    /// real need emerges.
+    pub(crate) points_size_px: f32,
+    /// Scratch buffer reused across frames + bodies inside `render_points`. Cleared at
+    /// the start of each invocation; capacity grows monotonically with the maximum
+    /// combined vertex + cell-center count across all polychora in the row.
+    pub(crate) points_mesh_scratch: rye_shape::PointMesh<3>,
     /// Shared depth attachment for the rasterizer chain in Shapes view. Sized to the
     /// swapchain and recreated on resize via [`rye_render::DepthBuffer::ensure`].
     ///
@@ -423,6 +446,21 @@ pub(crate) struct Demo {
     /// button; closes via the window's title-bar X (egui's `Window::open(&mut bool)`
     /// flips it).
     pub(crate) show_help: bool,
+    /// Whether the floating `Render` settings modal is open. Off by default; opened
+    /// from the gear button in the bottom overlay. The console is the primary UX for
+    /// changing render settings; this modal is the discoverability aid for new
+    /// readers who haven't found the console yet.
+    pub(crate) show_render_panel: bool,
+    /// Persistent state for the example annotation callout. Anchored to the first
+    /// polychoron-in-row's vertex 0 (the 5-cell's +w apex when the demo opens with
+    /// the default row); leader line + panel position track the anchor each frame as
+    /// the polytope rotates. Off by default; opened from `View > Example callout`
+    /// (and toggleable via the console `callout` command).
+    ///
+    /// Hosts the `rye_egui::callout` primitive added in the M4-close mini-sprint;
+    /// future tutorial / explanation overlays in the playground will instantiate
+    /// additional `CalloutState`s the same way.
+    pub(crate) example_callout: rye_egui::CalloutState,
 
     /// Cached natural overlay width on first frame. Used as the fixed width of the
     /// overlay regardless of the current window size, so resizing the demo window

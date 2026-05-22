@@ -376,6 +376,7 @@ impl TriangleRasterNode {
         rd: &RenderDevice,
         view: &wgpu::TextureView,
         depth_view: Option<&wgpu::TextureView>,
+        viewport: Option<&crate::Viewport>,
     ) -> anyhow::Result<()> {
         match (self.has_depth, depth_view.is_some()) {
             (true, false) => {
@@ -422,6 +423,9 @@ impl TriangleRasterNode {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            if let Some(vp) = viewport {
+                vp.apply(&mut rp);
+            }
             rp.set_pipeline(&self.pipeline);
             rp.set_bind_group(0, &self.bind_group, &[]);
             rp.set_vertex_buffer(0, self.vertex_buf.slice(..));
