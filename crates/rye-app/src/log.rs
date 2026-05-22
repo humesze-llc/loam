@@ -25,18 +25,25 @@
 //! The subscriber init happens automatically inside [`run_with_config`](crate::run_with_config).
 
 use std::collections::VecDeque;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use rye_egui::{cmd, Console, HistoryLine, LineKind};
+use rye_egui::{cmd, Console, HistoryLine};
+#[cfg(not(target_arch = "wasm32"))]
+use rye_egui::LineKind;
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::field::{Field, Visit};
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::Event;
+#[cfg(not(target_arch = "wasm32"))]
 use tracing_subscriber::layer::{Context, Layer};
 
 /// Ring buffer cap. Sized so a busy capture session doesn't blow memory; older lines
 /// drop off the front. Each entry is a short formatted string (~100 chars), so the
 /// total footprint is ~200 KB at full capacity.
+#[cfg(not(target_arch = "wasm32"))]
 const BUFFER_CAP: usize = 2000;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -115,13 +122,20 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
 // ---------------------------------------------------------------------------
 // Tracing Layer
 // ---------------------------------------------------------------------------
+//
+// The layer + its supporting visitors are native-only: on wasm32 we route tracing
+// events through `tracing-wasm` (which writes directly to the browser console with
+// matching severity levels) and never install this layer, so gating the items keeps
+// the wasm build warning-free.
 
 /// Tracing subscriber layer that pushes formatted events into [`BUFFER`].
 ///
 /// Installed automatically by [`crate::run_with_config`]. Always captures; the mirror
 /// to console scrollback is gated by [`ENABLED`].
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ConsoleLayer;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<S> Layer<S> for ConsoleLayer
 where
     S: tracing::Subscriber,
@@ -151,6 +165,7 @@ where
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn push(line: HistoryLine) {
     let Ok(mut buf) = BUFFER.lock() else { return };
     buf.push_back(line);
@@ -162,12 +177,14 @@ fn push(line: HistoryLine) {
 /// Extracts the event's `message` field (the printf-style payload of
 /// `tracing::info!("text {x}")`) and any other key=value fields into a one-liner
 /// suitable for a scrollback row.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct FieldVisitor {
     message: String,
     fields: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {

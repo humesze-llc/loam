@@ -62,9 +62,21 @@
 use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Instant;
+// `web_time::Instant` is a drop-in for `std::time::Instant` that works on both native
+// (re-exports the std type verbatim) and wasm32 (backs it with `performance.now()`).
+// `std::time::Instant::now` panics on wasm32, so the swap is mandatory for the browser
+// runtime path.
+use web_time::Instant;
 
-#[cfg(feature = "capture")]
+// Capture module dispatch: real pipeline on native with `capture` feature on; stub
+// API everywhere else (wasm, or `--no-default-features` lean native builds). The two
+// files expose the same public surface so demos don't need `cfg` gates at their
+// `rye_app::capture::*` call sites.
+#[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+pub mod capture;
+
+#[cfg(any(not(feature = "capture"), target_arch = "wasm32"))]
+#[path = "capture_stub.rs"]
 pub mod capture;
 pub mod log;
 
@@ -297,6 +309,14 @@ pub fn run<A: App>() -> anyhow::Result<()> {
 }
 
 /// Run an app with custom config.
+///
+/// On native the function blocks until the event loop exits, then returns whatever
+/// error the runner deferred (or `Ok(())`). On wasm32 there is no blocking event loop;
+/// the function returns `Ok(())` synchronously after handing the runner off to
+/// `EventLoopExtWebSys::spawn_app`, which keeps a reference alive on the JS heap and
+/// drives the loop via `requestAnimationFrame`. The browser's JS runtime owns
+/// lifecycle from that point; deferred errors are surfaced through `tracing::error!`
+/// (and the console panic hook for unwinding) rather than a return value.
 pub fn run_with_config<A: App>(config: RunConfig) -> anyhow::Result<()> {
     // Compose two tracing layers: the standard fmt layer (writes to stdout) and our
     // ConsoleLayer (pushes events into the in-process ring buffer for the dev
@@ -304,6 +324,17 @@ pub fn run_with_config<A: App>(config: RunConfig) -> anyhow::Result<()> {
     // controls both outputs uniformly. `try_init` is best-effort: if a subscriber is
     // already installed (tests, repeated calls) we silently no-op so the existing
     // sink keeps working.
+    //
+    // On wasm32 stdout doesn't exist and the env-filter has no `RUST_LOG` to read; we
+    // route tracing events into the browser console via `tracing-wasm` instead, and
+    // install the panic hook so a Rust panic surfaces a useful stack trace in
+    // devtools rather than the default `unreachable executed` from `wasm-bindgen`.
+    #[cfg(target_arch = "wasm32")]
+    {
+        console_error_panic_hook::set_once();
+        tracing_wasm::set_as_global_default();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
@@ -322,14 +353,155 @@ pub fn run_with_config<A: App>(config: RunConfig) -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
-    let mut runner = Runner::<A>::new(config);
-    event_loop.run_app(&mut runner)?;
-    runner.finish()
+    let runner = Runner::<A>::new(config);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        // `spawn_app` consumes the runner, parks it on the JS heap, and returns
+        // immediately. Errors from the runner (deferred via `self.deferred_error` on
+        // setup / render failure) are not visible to this call site because there's no
+        // return path to bubble them up to JS; they surface through `tracing::error!`
+        // -> browser console instead.
+        use winit::platform::web::EventLoopExtWebSys;
+        event_loop.spawn_app(runner);
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut runner = runner;
+        event_loop.run_app(&mut runner)?;
+        runner.finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Runner: internal `ApplicationHandler` impl
 // ---------------------------------------------------------------------------
+
+/// Everything the runner needs after device acquisition has completed. Bundled so the
+/// native (synchronous) and wasm32 (async via `spawn_local`) paths can both produce a
+/// single value that the runner installs into its own fields atomically.
+struct InitArtifacts<A: App> {
+    rd: RenderDevice,
+    shader_db: ShaderDb,
+    watcher: Option<AssetWatcher>,
+    ui: UiIntegration,
+    app: A,
+}
+
+/// Sample count is part of the contract between `RenderDevice` (the multisampled scene
+/// attachment) and `UiIntegration` (which builds egui pipelines against the same sample
+/// count). Building `UiIntegration` here, in the same place A::setup runs, keeps that
+/// pairing colocated so the two can't drift.
+///
+/// Free function (not a method on Runner) so it can be called from the wasm `spawn_local`
+/// closure where `&mut Runner` isn't available across the await point.
+fn setup_after_device<A: App>(
+    win: &Arc<Window>,
+    rd: RenderDevice,
+) -> anyhow::Result<InitArtifacts<A>> {
+    let mut shader_db = ShaderDb::new(rd.device.clone());
+
+    // AssetWatcher init failure isn't fatal: apps still work without hot-reload. Log
+    // and proceed. On wasm32 the watcher is a no-op stub (see `rye-asset`'s watcher.rs)
+    // so this always succeeds and the `.warn` branch is dead code in the browser.
+    let mut watcher = match AssetWatcher::new() {
+        Ok(w) => Some(w),
+        Err(e) => {
+            tracing::warn!("AssetWatcher disabled: {e}");
+            None
+        }
+    };
+
+    let mut ctx = SetupCtx {
+        rd: &rd,
+        shader_db: &mut shader_db,
+        watcher: watcher.as_mut(),
+        time: 0.0,
+    };
+    let app = A::setup(&mut ctx).map_err(|e| e.context("App::setup"))?;
+
+    // egui pipelines must be built with the same sample count as the multisampled
+    // scene attachment, since both passes write into the same color attachment and the
+    // deferred MSAA resolve happens at the end of the egui paint pass. See
+    // [`UiIntegration::paint`]'s `resolve_target` parameter.
+    let ui = UiIntegration::new(
+        &rd.device,
+        win,
+        rd.surface_bundle.config.format,
+        rd.sample_count(),
+    );
+
+    Ok(InitArtifacts {
+        rd,
+        shader_db,
+        watcher,
+        ui,
+        app,
+    })
+}
+
+/// On wasm32 the device-acquisition future runs to completion in a JS microtask and
+/// hands its result back to the runner through this slot. The runner polls the slot at
+/// the top of every event-loop callback (window_event + redraw) and installs the
+/// artifacts when they appear.
+///
+/// `Rc<RefCell<...>>` is fine: wasm32 is single-threaded, the future and the runner
+/// never borrow the cell simultaneously (the future borrows it once, on completion, to
+/// move the result in; the runner borrows it on each callback to try to take the
+/// result out).
+#[cfg(target_arch = "wasm32")]
+type PendingInit<A> = std::rc::Rc<
+    std::cell::RefCell<Option<anyhow::Result<InitArtifacts<A>>>>,
+>;
+
+/// Attach the canvas backing the winit window to the page's DOM. Without this the
+/// canvas exists only as a JS object the surface can target but nothing the user can
+/// see; appending it makes the render output visible and lets pointer / keyboard
+/// events flow through.
+///
+/// Host element selection prefers `#rye-canvas-host` when the page provides one
+/// (Trunk-generated pages typically have a dedicated container so CSS can layout
+/// around the canvas); falls back to `<body>` so a minimal page without any host
+/// element still works. Canvas style is set to fill its parent so a flex / grid /
+/// percentage-sized container drives the surface size; the next resize observer
+/// hookup (TODO) will then forward `ResizeObserver` fires to `winit::WindowEvent`.
+#[cfg(target_arch = "wasm32")]
+fn attach_canvas_to_dom(win: &winit::window::Window) -> anyhow::Result<()> {
+    use winit::platform::web::WindowExtWebSys;
+
+    let canvas = win
+        .canvas()
+        .ok_or_else(|| anyhow::anyhow!("winit window has no canvas (wasm32 only)"))?;
+
+    let web_window =
+        web_sys::window().ok_or_else(|| anyhow::anyhow!("no global `window` object"))?;
+    let document = web_window
+        .document()
+        .ok_or_else(|| anyhow::anyhow!("no `document` on global window"))?;
+
+    let host: web_sys::Element = match document.get_element_by_id("rye-canvas-host") {
+        Some(el) => el,
+        None => document
+            .body()
+            .map(Into::into)
+            .ok_or_else(|| anyhow::anyhow!(
+                "no canvas host: page is missing both `#rye-canvas-host` and `<body>`"
+            ))?,
+    };
+
+    // Fill the host. Without these the canvas keeps winit's default intrinsic size
+    // (typically 1024x768) which usually disagrees with the page layout.
+    let style = canvas.style();
+    let _ = style.set_property("width", "100%");
+    let _ = style.set_property("height", "100%");
+    let _ = style.set_property("display", "block");
+
+    host.append_child(&canvas)
+        .map_err(|e| anyhow::anyhow!("append canvas to host: {e:?}"))?;
+
+    Ok(())
+}
 
 struct Runner<A: App> {
     config: RunConfig,
@@ -346,6 +518,12 @@ struct Runner<A: App> {
     ui: Option<UiIntegration>,
     app: Option<A>,
 
+    /// Wasm32-only: present while the spawned device-acquisition future is in flight;
+    /// taken on completion. `None` after the first successful poll (or before `resumed`
+    /// has fired). See `PendingInit` for the design rationale.
+    #[cfg(target_arch = "wasm32")]
+    pending_init: Option<PendingInit<A>>,
+
     minimized: bool,
 
     // FPS bookkeeping.
@@ -361,7 +539,7 @@ struct Runner<A: App> {
     /// render error, so callers can propagate it from `main`.
     deferred_error: Option<anyhow::Error>,
 
-    #[cfg(feature = "capture")]
+    #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
     capture: capture::Capture,
 }
 
@@ -379,6 +557,8 @@ impl<A: App> Runner<A> {
             watcher: None,
             ui: None,
             app: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_init: None,
             minimized: false,
             last_fps_update: Instant::now(),
             frame_count: 0,
@@ -387,7 +567,7 @@ impl<A: App> Runner<A> {
             render_error_streak: 0,
             deferred_error: None,
 
-            #[cfg(feature = "capture")]
+            #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
             capture: capture::Capture::new(),
         }
     }
@@ -395,6 +575,12 @@ impl<A: App> Runner<A> {
     /// Drain any error that the runner deferred during the event loop (setup or render
     /// failures cause `elwt.exit()` so the loop returns `Ok`; we surface the real error
     /// here).
+    ///
+    /// Native-only: on wasm32 the runner is consumed by
+    /// `EventLoopExtWebSys::spawn_app` and its lifetime is owned by the JS heap, so
+    /// there's no return path to surface deferred errors through. They bubble up via
+    /// `tracing::error!` -> the browser console instead.
+    #[cfg(not(target_arch = "wasm32"))]
     fn finish(self) -> anyhow::Result<()> {
         match self.deferred_error {
             Some(err) => Err(err),
@@ -405,6 +591,61 @@ impl<A: App> Runner<A> {
     fn time(&self) -> f32 {
         self.start.elapsed().as_secs_f32()
     }
+
+    /// Install artifacts produced by `setup_after_device`. Shared by both the native
+    /// synchronous path (called from `resumed` directly) and the wasm32 async path
+    /// (called from `poll_pending_init` when the future resolves).
+    fn install_init(&mut self, win: Arc<Window>, artifacts: InitArtifacts<A>) {
+        self.window = Some(win.clone());
+        self.rd = Some(artifacts.rd);
+        self.shader_db = Some(artifacts.shader_db);
+        self.watcher = artifacts.watcher;
+        self.ui = Some(artifacts.ui);
+        self.app = Some(artifacts.app);
+        self.minimized = false;
+        self.start = Instant::now();
+        self.last_fps_update = Instant::now();
+
+        win.set_visible(true);
+        win.request_redraw();
+    }
+
+    /// Wasm32-only: try to install the deferred init artifacts. Returns `true` if the
+    /// state transitioned from Loading -> Ready (or Loading -> Failed) on this call.
+    /// Called at the top of every event-loop callback so the runner can finish
+    /// constructing its state as soon as `RenderDevice::new` resolves.
+    #[cfg(target_arch = "wasm32")]
+    fn poll_pending_init(&mut self, elwt: &ActiveEventLoop) -> bool {
+        let Some(cell) = self.pending_init.as_ref() else {
+            return false;
+        };
+        let Some(result) = cell.borrow_mut().take() else {
+            return false;
+        };
+        // Drop the shared cell now that we've consumed its payload; the future itself
+        // has already completed.
+        self.pending_init = None;
+        let Some(win) = self.window.clone() else {
+            // Shouldn't happen: `resumed` always sets `self.window` before spawning the
+            // future, but be defensive.
+            self.deferred_error = Some(anyhow::anyhow!(
+                "wasm init future resolved with no window present",
+            ));
+            elwt.exit();
+            return true;
+        };
+        match result {
+            Ok(artifacts) => {
+                self.install_init(win, artifacts);
+                true
+            }
+            Err(e) => {
+                self.deferred_error = Some(e);
+                elwt.exit();
+                true
+            }
+        }
+    }
 }
 
 /// Read back `texture` and hand the pixels to the capture state machine, which
@@ -412,7 +653,7 @@ impl<A: App> Runner<A> {
 /// Logs and swallows errors so a transient capture failure doesn't abort the render
 /// loop. Free function (not a method on Runner) so the borrow checker can see that
 /// `&mut capture` and `&rd` are disjoint borrows.
-#[cfg(feature = "capture")]
+#[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
 fn capture_consume(
     capture: &mut capture::Capture,
     rd: &RenderDevice,
@@ -440,6 +681,67 @@ fn capture_consume(
 }
 
 impl<A: App> ApplicationHandler for Runner<A> {
+    #[cfg(target_arch = "wasm32")]
+    fn resumed(&mut self, elwt: &ActiveEventLoop) {
+        // Wasm32 init is a two-phase dance:
+        //
+        //   1. Synchronous prelude: create the winit `Window` (this is sync on every
+        //      platform; on wasm it constructs an `HtmlCanvasElement` but does NOT
+        //      attach it to the DOM, so we do that explicitly). Then we hand a clone
+        //      of `Arc<Window>` to the async tail.
+        //   2. Async tail: `RenderDevice::new` awaits `request_adapter` /
+        //      `request_device`, both of which are JS-promise-backed on wasm. We hand
+        //      that future to `wasm_bindgen_futures::spawn_local` and write the
+        //      eventual `InitArtifacts` into a shared `Rc<RefCell<...>>` slot.
+        //
+        // `poll_pending_init` (called at the top of every event-loop callback) then
+        // drains the slot and installs the artifacts into `self`.
+        //
+        // `with_prevent_default(false)` tells winit not to call
+        // `event.preventDefault()` on every keyboard / mouse / wheel event the canvas
+        // receives. Default-on capture made Ctrl+R / F12 / Ctrl+Shift+I unreachable
+        // (the canvas swallowed them before browser chrome could see them); turning
+        // it off means winit only consumes the events it actually translates into
+        // `WindowEvent`s. App-relevant keys (Esc, arrows, etc.) still flow through
+        // the input system because winit listens on those passively.
+        use winit::platform::web::WindowAttributesExtWebSys;
+        let attrs = self.config.window.clone().with_prevent_default(false);
+        let win = match elwt.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                self.deferred_error = Some(anyhow::anyhow!("create_window: {e}"));
+                elwt.exit();
+                return;
+            }
+        };
+
+        if let Err(e) = attach_canvas_to_dom(&win) {
+            self.deferred_error = Some(e.context("attach canvas to DOM"));
+            elwt.exit();
+            return;
+        }
+
+        let msaa = self.config.msaa_samples;
+        let win_for_future = win.clone();
+        let cell: PendingInit<A> = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let cell_for_future = cell.clone();
+
+        self.window = Some(win);
+        self.pending_init = Some(cell);
+
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = async {
+                let rd = RenderDevice::new(win_for_future.clone(), msaa)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("RenderDevice::new: {e:#}"))?;
+                setup_after_device::<A>(&win_for_future, rd)
+            }
+            .await;
+            *cell_for_future.borrow_mut() = Some(result);
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn resumed(&mut self, elwt: &ActiveEventLoop) {
         let win = match elwt.create_window(self.config.window.clone()) {
             Ok(w) => Arc::new(w),
@@ -462,57 +764,16 @@ impl<A: App> ApplicationHandler for Runner<A> {
         // for debugging negotiated MSAA count; the actual count is in `rd.sample_count()`
         // tracing::info!("scale_factor: {}, msaa: {}x", win.scale_factor(), rd.sample_count());
 
-        let mut shader_db = ShaderDb::new(rd.device.clone());
-
-        // AssetWatcher init failure isn't fatal: apps still work
-        // without hot-reload. Log and proceed.
-        let mut watcher = match AssetWatcher::new() {
-            Ok(w) => Some(w),
-            Err(e) => {
-                tracing::warn!("AssetWatcher disabled: {e}");
-                None
-            }
-        };
-
-        let mut ctx = SetupCtx {
-            rd: &rd,
-            shader_db: &mut shader_db,
-            watcher: watcher.as_mut(),
-            time: 0.0,
-        };
-        let app = match A::setup(&mut ctx) {
+        let artifacts = match setup_after_device::<A>(&win, rd) {
             Ok(a) => a,
             Err(e) => {
-                self.deferred_error = Some(e.context("App::setup"));
+                self.deferred_error = Some(e);
                 elwt.exit();
                 return;
             }
         };
 
-        // egui pipelines must be built with the same sample count as
-        // the multisampled scene attachment, since both passes write
-        // into the same color attachment and the deferred MSAA
-        // resolve happens at the end of the egui paint pass. See
-        // [`UiIntegration::paint`]'s `resolve_target` parameter.
-        let ui = UiIntegration::new(
-            &rd.device,
-            &win,
-            rd.surface_bundle.config.format,
-            rd.sample_count(),
-        );
-
-        self.window = Some(win.clone());
-        self.rd = Some(rd);
-        self.shader_db = Some(shader_db);
-        self.watcher = watcher;
-        self.ui = Some(ui);
-        self.app = Some(app);
-        self.minimized = false;
-        self.start = Instant::now();
-        self.last_fps_update = Instant::now();
-
-        win.set_visible(true);
-        win.request_redraw();
+        self.install_init(win, artifacts);
     }
 
     fn window_event(
@@ -521,6 +782,11 @@ impl<A: App> ApplicationHandler for Runner<A> {
         _id: winit::window::WindowId,
         ev: WindowEvent,
     ) {
+        // Wasm32: drain the deferred-init slot if the spawned device-acquisition future
+        // has resolved. On native this is a no-op (the slot doesn't exist).
+        #[cfg(target_arch = "wasm32")]
+        let _installed = self.poll_pending_init(elwt);
+
         let Some(win) = self.window.clone() else {
             return;
         };
@@ -610,6 +876,19 @@ impl<A: App> ApplicationHandler for Runner<A> {
             }
         }
     }
+
+    /// Fires after every event batch when `ControlFlow::Poll` is set. On wasm32 we use
+    /// it to drain the deferred-init slot: the spawned device-acquisition future may
+    /// have resolved between callbacks, and without a user-driven event the runner
+    /// would otherwise sit idle. Once installed, the normal redraw cycle takes over.
+    fn about_to_wait(&mut self, _elwt: &ActiveEventLoop) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.pending_init.is_some() {
+                self.poll_pending_init(_elwt);
+            }
+        }
+    }
 }
 
 impl<A: App> Runner<A> {
@@ -693,7 +972,7 @@ impl<A: App> Runner<A> {
                 // Append capture status when active. 1 Hz refresh matches the title
                 // update cadence and gives the user a visible recording counter without
                 // wiring it through the demo's UI.
-                #[cfg(feature = "capture")]
+                #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 let title = match self.capture.status() {
                     Some(status) => format!("{title} [{status}]").into(),
                     None => title,
@@ -705,7 +984,7 @@ impl<A: App> Runner<A> {
         // 5. Drain any queued capture requests + update the state machine BEFORE the
         // render pass. Requests come from console commands and hotkey binds; they're
         // applied here so this frame can honor them.
-        #[cfg(feature = "capture")]
+        #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
         {
             let requests = capture::drain_requests();
             if !requests.is_empty() {
@@ -735,9 +1014,9 @@ impl<A: App> Runner<A> {
         //     when MSAA is on). This is what DWM receives.
         // FPS-gate decides whether either tap fires this frame. Computed once before the
         // render pass so the same `now` is used to schedule the next capture interval.
-        #[cfg(feature = "capture")]
+        #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
         let capture_now = Instant::now();
-        #[cfg(feature = "capture")]
+        #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
         let do_capture = self.capture.should_capture(capture_now);
 
         match rd.begin_frame() {
@@ -752,7 +1031,7 @@ impl<A: App> Runner<A> {
                 }
 
                 // Pre-egui capture tap. Only valid with MSAA off (see above).
-                #[cfg(feature = "capture")]
+                #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 if do_capture && self.capture.wants_pre() {
                     if rd.sample_count() > 1 {
                         tracing::warn!(
@@ -785,17 +1064,17 @@ impl<A: App> Runner<A> {
                 }
 
                 // Post-egui capture tap. Always valid: swapchain has final composite.
-                #[cfg(feature = "capture")]
+                #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 if do_capture && self.capture.wants_post() {
                     capture_consume(&mut self.capture, rd, &frame.texture, false, capture_now);
                 }
-                #[cfg(feature = "capture")]
+                #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 if do_capture {
                     self.capture.advance_frame(capture_now);
                 }
                 // Publish status every frame so the panel + window title stay current
                 // even when do_capture is false (FPS-gated idle frames between writes).
-                #[cfg(feature = "capture")]
+                #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 capture::publish_status(self.capture.status());
 
                 frame.present();

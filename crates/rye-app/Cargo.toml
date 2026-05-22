@@ -17,12 +17,21 @@ capture = ["dep:image", "dep:gif", "dep:color_quant", "dep:png"]
 [dependencies]
 anyhow.workspace = true
 glam.workspace = true
-pollster = "0.3"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+# Wall-clock primitives that work on both native (re-exports `std::time::Instant`) and
+# wasm32 (backed by `performance.now()`). Used for the event-loop FPS counter, frame
+# timestamps, and capture timing.
+web-time = { workspace = true }
 
+# Encoder crates are optional + only meaningful on native (the wasm build routes
+# capture through `capture_stub.rs`, which doesn't reference any of these). They stay
+# under `[dependencies]` so the `capture = ["dep:image", ...]` feature definition
+# resolves cleanly; the actual code that uses them sits behind
+# `cfg(all(feature = "capture", not(target_arch = "wasm32")))` in `capture.rs`. Wasm
+# builds opt out via `--no-default-features` (which trunk does for us via Trunk.toml).
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 gif = { version = "0.13", optional = true }
 color_quant = { version = "1.1", optional = true }
@@ -36,3 +45,31 @@ rye-render = { path = "../rye-render" }
 rye-shader = { path = "../rye-shader" }
 rye-time   = { path = "../rye-time" }
 rye-egui   = { path = "../rye-egui" }
+
+# Native-only async bridge: `pollster::block_on` synchronously awaits the
+# `wgpu::Instance::request_adapter` future for `RenderDevice::new`. On wasm there's no
+# blocking primitive; `run_with_config` uses `wasm_bindgen_futures::spawn_local`
+# instead, declared in the wasm target-specific block below.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.3"
+
+# Wasm-only deps. `wasm-bindgen-futures` bridges `Future` -> JS microtask queue for the
+# device-acquisition path. `console_error_panic_hook` surfaces Rust panics in the
+# browser dev console with a useful trace instead of `unreachable executed`.
+# `tracing-wasm` routes `tracing::*` events to the right console severity levels.
+# `web-sys` provides the typed JS bindings for `window.location` (URL params via the
+# Args trait), `Performance.now()` (high-res timing in the absence of `Instant`), and
+# the canvas attachment for `winit`'s web event loop.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+tracing-wasm = "0.2"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Location",
+    "UrlSearchParams",
+    "Performance",
+] }
