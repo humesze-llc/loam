@@ -31,6 +31,12 @@ egui-winit = { version = "0.33", default-features = false, features = ["clipboar
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 egui-winit = { version = "0.33", default-features = false, features = ["links"] }
+# `web-sys` (with the `console` feature) is used by the Console's optional
+# scrollback echo path (`log echo on`): `web_sys::console::log_1` lets the
+# in-canvas console mirror its lines to the browser's DevTools console
+# without routing through `tracing` (which would create a feedback loop with
+# `rye_app::log`'s tracing -> scrollback mirror).
+web-sys = { version = "0.3", features = ["console"] }
 
 [dev-dependencies]
 glam = { workspace = true }

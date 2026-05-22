@@ -52,6 +52,42 @@ pub const ANIM_DURATION_SECS: f32 = 0.15;
 /// convention: enough scrollback visible, scene visible below.
 pub const PANEL_HEIGHT_FRACTION: f32 = 0.5;
 
+/// Runtime flag controlling whether new scrollback lines also echo to the
+/// browser DevTools console (via direct `console.log`, NOT through `tracing`).
+///
+/// Off by default. On wasm32 the path is `Console::push_history` ->
+/// `web_sys::console::log_1`; on native the flag has no effect because the
+/// native log subscriber already prints to stderr. Toggled via the `log echo`
+/// console subcommand registered by `rye_app::log`. Process-global because the
+/// typical demo has one Console; multi-Console demos would share the toggle.
+#[cfg(target_arch = "wasm32")]
+static ECHO_TO_BROWSER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable / disable scrollback echo to the browser DevTools console (wasm32
+/// only). See [`ECHO_TO_BROWSER`] for the architectural rationale. On native
+/// this is a no-op so demos can call it unconditionally during command setup.
+pub fn set_console_echo(enabled: bool) {
+    #[cfg(target_arch = "wasm32")]
+    ECHO_TO_BROWSER.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = enabled;
+}
+
+/// Returns the current scrollback-echo state. Always `false` on native (the
+/// native log path is fundamentally different and doesn't go through this
+/// flag).
+pub fn console_echo_enabled() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        ECHO_TO_BROWSER.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // History line types
 // ---------------------------------------------------------------------------
@@ -1081,6 +1117,24 @@ impl<Ctx: 'static> Console<Ctx> {
     }
 
     fn push_history(&mut self, line: HistoryLine) {
+        // Optional echo to the browser DevTools console. Off by default; demos
+        // toggle it via `log echo on` for debugging the in-canvas console
+        // text from outside (the canvas's pixels aren't selectable, so without
+        // this the user can't copy command output for paste-back to a chat /
+        // bug report).
+        //
+        // Architectural note: this deliberately bypasses `tracing` and calls
+        // `web_sys::console::log_1` directly. `tracing::info!` would conflict
+        // with the existing `log on` feature (tracing -> scrollback via
+        // `rye_app::log::ConsoleLayer`) — running both directions through
+        // tracing creates a feedback loop where each emitted event lands in
+        // the scrollback, gets re-echoed, lands again, ad infinitum. The
+        // direct console.log path is feedback-free because no Rust subscriber
+        // consumes it.
+        #[cfg(target_arch = "wasm32")]
+        if ECHO_TO_BROWSER.load(std::sync::atomic::Ordering::Relaxed) {
+            web_sys::console::log_1(&line.text.as_str().into());
+        }
         self.history.push_back(line);
         while self.history.len() > MAX_HISTORY_LINES {
             self.history.pop_front();

@@ -86,16 +86,67 @@ pub fn pump_into<Ctx: 'static>(console: &mut Console<Ctx>) {
     }
 }
 
-/// Register the `log` console command on the given console:
-/// - `log` / `log toggle`: flip the mirror state
-/// - `log on`: enable mirroring
-/// - `log off`: disable mirroring
+/// Register the `log` console command. Two independent toggles:
+///
+/// - **`log [on|off|toggle]`** controls **tracing -> scrollback**: when on, any
+///   `tracing::info!` / `warn!` / `error!` event the app emits also appears in
+///   the in-canvas console scrollback. Useful for surfacing background events
+///   (capture status, hot-reload notifications, framework warnings) where the
+///   user has the console open.
+/// - **`log echo [on|off|toggle]`** controls **scrollback -> browser**: when
+///   on, every line added to the in-canvas scrollback (command output, user
+///   prompts, error lines, even the `log on`-mirrored tracing events) also
+///   echoes to the browser DevTools console via `web_sys::console::log_1`.
+///   wasm32 only; native does nothing because stderr / stdout already covers
+///   the same need.
+///
+/// Architectural note: the two directions deliberately use different
+/// transports (tracing for in, raw `console.log` for out). Routing both
+/// through tracing would create a feedback loop: a tracing event would land
+/// in the scrollback, get re-emitted to tracing, land again, ad infinitum.
+/// The asymmetric transport is the simplest invariant that breaks the loop
+/// without per-line origin tagging.
 pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
     console.register(
         cmd(
             "log",
-            "mirror tracing events into the console scrollback",
+            "mirror tracing events into the scrollback (`log [on|off|toggle]`) \
+             or echo scrollback to the browser console (`log echo [on|off|toggle]`)",
             |args, _ctx: &mut Ctx, out| {
+                // Distinguish the `echo` subcommand from the legacy on/off/toggle
+                // args. Order matters: `log echo` matches the subcommand path
+                // and the second arg disambiguates within it.
+                if args.first().copied() == Some("echo") {
+                    let new = match args.get(1).copied() {
+                        Some("on") => {
+                            rye_egui::set_console_echo(true);
+                            true
+                        }
+                        Some("off") => {
+                            rye_egui::set_console_echo(false);
+                            false
+                        }
+                        // Bare `log echo` or `log echo toggle` flips the flag.
+                        _ => {
+                            let next = !rye_egui::console_echo_enabled();
+                            rye_egui::set_console_echo(next);
+                            next
+                        }
+                    };
+                    out.line(if new {
+                        "log echo (scrollback -> browser console): on"
+                    } else {
+                        "log echo (scrollback -> browser console): off"
+                    });
+                    // On native the echo state has no surface to mirror to;
+                    // flag the no-op so the user knows.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    out.line(
+                        "  (note: `log echo` is a no-op on native; the browser-console \
+                         path is wasm32-only)",
+                    );
+                    return Ok(());
+                }
                 let new = match args.first().copied() {
                     Some("on") => {
                         set_enabled(true);
@@ -108,14 +159,14 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
                     _ => toggle(),
                 };
                 out.line(if new {
-                    "log mirror: on"
+                    "log mirror (tracing -> scrollback): on"
                 } else {
-                    "log mirror: off"
+                    "log mirror (tracing -> scrollback): off"
                 });
                 Ok(())
             },
         )
-        .with_args(&[&["on", "off", "toggle"]]),
+        .with_args(&[&["on", "off", "toggle", "echo"], &["on", "off", "toggle"]]),
     );
 }
 

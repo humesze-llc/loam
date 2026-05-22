@@ -75,7 +75,8 @@ mod world;
 
 pub use bivector_matrix::{bivector_matrix, cell_text as bivector_matrix_cell_text};
 pub use console::{
-    cmd, subcommands, Command, Console, ConsoleWriter, HistoryLine, LineKind, SubcommandSet,
+    cmd, console_echo_enabled, set_console_echo, subcommands, Command, Console, ConsoleWriter,
+    HistoryLine, LineKind, SubcommandSet,
 };
 pub use floating::{
     callout, floating_panel, floating_panel_builder, sticky_menu, CalloutState,
