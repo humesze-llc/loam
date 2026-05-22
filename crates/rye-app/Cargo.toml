@@ -81,4 +81,16 @@ web-sys = { version = "0.3", features = [
     "Performance",
     "Event",
     "EventTarget",
+    # Worker-mode (Phase A onward). See OFFSCREEN_CANVAS_WORKERS.md.
+    # - DedicatedWorkerGlobalScope: type to detect "am I in a worker?"
+    #   and to call requestAnimationFrame inside the worker.
+    # - Worker: main-thread handle for spawning + posting messages.
+    # - OffscreenCanvas: the transferable rendering target.
+    # - MessageEvent / MessagePort: postMessage wiring.
+    "DedicatedWorkerGlobalScope",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "OffscreenCanvas",
+    "MessageEvent",
 ] }

@@ -1,0 +1,35 @@
+//! Wasm32-only support code. Subdivided as the worker-mode plumbing grew
+//! beyond what a single file could hold.
+//!
+//! - [`launch`]: click-to-start container + the original page-startup
+//!   helpers (`is_manual_mode`, `wait_for_launch`).
+//! - [`worker`] (Phase A onward): OffscreenCanvas + Web Worker mode for
+//!   GC-isolated rendering. See `docs/devlog/context/OFFSCREEN_CANVAS_WORKERS.md`
+//!   for the architectural design.
+//!
+//! Detection helpers ([`is_worker_context`], plus the heap sampler that
+//! `rye-time::frame_trace` registers) live at the module root so the
+//! `rye_app::wasm::*` import path stays flat for the common cases.
+
+pub mod launch;
+pub mod worker;
+
+// Re-export the click-to-start surface at the wasm module level so existing
+// `rye_app::wasm::is_manual_mode(...)` and `rye_app::wasm::wait_for_launch(...)`
+// call sites continue to work after the wasm.rs -> wasm/launch.rs move.
+pub use launch::{is_manual_mode, js_heap_sampler, wait_for_launch};
+
+/// Returns true when the wasm binary is executing inside a
+/// `DedicatedWorkerGlobalScope` (i.e., a Web Worker), false on the main
+/// page thread. The same wasm binary serves both contexts; this check
+/// lets `main` branch into worker entry vs main-thread launcher.
+///
+/// Implementation: dyn-cast the global object to `DedicatedWorkerGlobalScope`.
+/// In a worker the global is the worker scope; on the main thread it's the
+/// Window. The cast succeeds in exactly one case and that's the answer.
+pub fn is_worker_context() -> bool {
+    use wasm_bindgen::JsCast;
+    js_sys::global()
+        .dyn_into::<web_sys::DedicatedWorkerGlobalScope>()
+        .is_ok()
+}
