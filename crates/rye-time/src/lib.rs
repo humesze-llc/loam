@@ -40,5 +40,6 @@
 //! ```
 
 mod fixed_timestep;
+pub mod frame_trace;
 
 pub use fixed_timestep::{FixedTimestep, DEFAULT_MAX_CATCH_UP};
