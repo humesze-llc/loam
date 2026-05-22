@@ -155,7 +155,7 @@ impl Demo {
             });
         let mut node = Hyperslice4DNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             &module,
             ctx.rd.sample_count(),
         );
@@ -193,7 +193,7 @@ impl Demo {
         // the intended "outline of this cap" visual.
         let section_edges = LineRasterNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             DepthMode::ReadOnly {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
@@ -207,7 +207,7 @@ impl Demo {
         // trivially passes everywhere -- the SDF visual stays unchanged.
         let parent_wireframe = LineRasterNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             DepthMode::ReadOnly {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
@@ -219,7 +219,7 @@ impl Demo {
         // shared section-faces depth buffer (sprites that sit behind a cap get occluded).
         let points_node = PointRasterNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             DepthMode::ReadOnly {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
@@ -233,7 +233,7 @@ impl Demo {
         // surface mode is `Raster`); see `Demo::render_section_faces` in this file.
         let section_faces = TriangleRasterNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             DepthMode::ReadWrite {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },

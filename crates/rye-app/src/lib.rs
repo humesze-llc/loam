@@ -431,7 +431,7 @@ fn setup_after_device<A: App>(
     let ui = UiIntegration::new(
         &rd.device,
         win,
-        rd.surface_bundle.config.format,
+        rd.target_format(),
         rd.sample_count(),
     );
 
@@ -1042,7 +1042,17 @@ impl<A: App> Runner<A> {
         match rd.begin_frame() {
             Ok((frame, swap_view)) => {
                 let mut last_err: Option<anyhow::Error> = None;
-                let render_view = rd.msaa_view().unwrap_or(&swap_view);
+                // Render-target priority chain:
+                //   1. MSAA view (native, MSAA on): scene + UI render multisampled,
+                //      resolve at egui paint pass's resolve_target = swap_view.
+                //   2. Scene view (browser, non-sRGB swap): scene + UI render into
+                //      an offscreen sRGB texture; a composite pass at end-of-frame
+                //      samples it and gamma-encodes for write to swap_view.
+                //   3. Swap view directly (native, MSAA off).
+                let render_view = rd
+                    .msaa_view()
+                    .or(rd.scene_view())
+                    .unwrap_or(&swap_view);
 
                 // GPU timer start. Tiny dedicated encoder so the timestamp lands in
                 // the queue before any of App::render's submitted work. Two extra
@@ -1116,10 +1126,28 @@ impl<A: App> Runner<A> {
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 capture::publish_status(self.capture.status());
 
-                // GPU timer end + resolve. Submitted before `frame.present` so the
-                // GPU sees: [render work, end timestamp, resolve], then the present
-                // synchronization. Resolves the slot into the resolve buffer; the
-                // next `tick()` schedules its `map_async` read.
+                // Composite pass: sRGB scene texture -> linear swapchain with manual
+                // gamma encoding. No-op on native (where scene_view() is None and
+                // rendering wrote directly into the swapchain in step app-render +
+                // ui-paint). On browser-WebGPU with a linear-only canvas surface,
+                // this is the pass that turns dark-as-night output into native-
+                // matching brightness.
+                if rd.scene_view().is_some() {
+                    let _scope = rye_time::frame_trace::scope("composite");
+                    let mut c_enc =
+                        rd.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("rye-app::composite"),
+                            });
+                    rd.composite_to_swap(&mut c_enc, &swap_view);
+                    rd.queue.submit(Some(c_enc.finish()));
+                }
+
+                // GPU timer end + resolve. Submitted after composite (so it captures
+                // the full chain incl. gamma pass) but before `frame.present`. The
+                // GPU sees: [render work, composite, end timestamp, resolve], then
+                // the present synchronization. Resolves the slot into the resolve
+                // buffer; the next `tick()` schedules its `map_async` read.
                 if let Some(timer) = rd.gpu_timer.as_ref() {
                     let mut t_enc =
                         rd.device
