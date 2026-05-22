@@ -296,12 +296,19 @@ impl PerfOverlay {
 
         let cadence_mean = mean(&cadence);
         let cadence_p99 = percentile(&cadence, 0.99);
-        let cadence_max = max_dur(&cadence);
         let frame_mean = mean(&frames);
         let frame_p99 = percentile(&frames, 0.99);
         let idle_mean = mean(&idles);
         let idle_p99 = percentile(&idles, 0.99);
-        let idle_max = max_dur(&idles);
+
+        // Session-lifetime maxima. Distinct from `max_dur(&cadence)` which is
+        // bounded by the rolling window's contents: a 1-second freeze that
+        // happened 5 seconds ago has already aged out of the window's 120
+        // frames, so a window-only "max" lies. `max_ever` survives the entire
+        // session and is the answer to "what's the worst this has ever been?"
+        let cadence_max_ever = frame_trace::max_ever("between-frames");
+        let idle_max_ever = frame_trace::max_ever("idle");
+        let frame_max_ever = frame_trace::max_ever("frame");
 
         let fps = if cadence_mean.as_secs_f32() > 0.0 {
             1.0 / cadence_mean.as_secs_f32()
@@ -331,35 +338,80 @@ impl PerfOverlay {
                         // first should equal the sum of the latter two in the
                         // long run; differences = scope-uncovered work in
                         // redraw (FPS bookkeeping, capture, etc.).
+                        //
+                        // The `worst` column is session-lifetime — survives the
+                        // rolling window so multi-second spikes that happened
+                        // minutes ago are still visible. Colored red when it's
+                        // pathological (>= 100ms = ~6 vsync) so the user's eye
+                        // catches "this has been bad" at a glance.
                         ui.label(
                             egui::RichText::new(format!(
-                                "total  {:>5.1}  p99 {:>5.1}  max {:>5.1}  ms",
+                                "total  {:>5.1}  p99 {:>5.1}  ms",
                                 cadence_mean.as_secs_f32() * 1000.0,
                                 cadence_p99.as_secs_f32() * 1000.0,
-                                cadence_max.as_secs_f32() * 1000.0,
                             ))
                             .font(mono.clone())
                             .color(label_color),
                         );
                         ui.label(
                             egui::RichText::new(format!(
-                                "idle   {:>5.1}  p99 {:>5.1}  max {:>5.1}  ms",
+                                "idle   {:>5.1}  p99 {:>5.1}  ms",
                                 idle_mean.as_secs_f32() * 1000.0,
                                 idle_p99.as_secs_f32() * 1000.0,
-                                idle_max.as_secs_f32() * 1000.0,
                             ))
                             .font(mono.clone())
                             .color(label_color),
                         );
                         ui.label(
                             egui::RichText::new(format!(
-                                "frame  {:>5.2}  p99 {:>5.2}                ms",
+                                "frame  {:>5.2}  p99 {:>5.2}  ms",
                                 frame_mean.as_secs_f32() * 1000.0,
                                 frame_p99.as_secs_f32() * 1000.0,
                             ))
-                            .font(mono)
+                            .font(mono.clone())
                             .color(label_color),
                         );
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("worst-ever (session)")
+                                .font(mono.clone())
+                                .color(egui::Color32::from_rgb(140, 150, 160)),
+                        );
+                        let worst_color = |d: Duration| {
+                            let ms = d.as_secs_f32() * 1000.0;
+                            if ms >= 100.0 {
+                                egui::Color32::from_rgb(220, 100, 80)
+                            } else if ms >= 50.0 {
+                                egui::Color32::from_rgb(220, 180, 90)
+                            } else {
+                                label_color
+                            }
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "total  {:>6.1} ms",
+                                cadence_max_ever.as_secs_f32() * 1000.0,
+                            ))
+                            .font(mono.clone())
+                            .color(worst_color(cadence_max_ever)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "idle   {:>6.1} ms",
+                                idle_max_ever.as_secs_f32() * 1000.0,
+                            ))
+                            .font(mono.clone())
+                            .color(worst_color(idle_max_ever)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "frame  {:>6.1} ms",
+                                frame_max_ever.as_secs_f32() * 1000.0,
+                            ))
+                            .font(mono)
+                            .color(worst_color(frame_max_ever)),
+                        );
+                        ui.separator();
                         draw_sparkline(ui, &cadence);
                     });
             });
@@ -380,10 +432,6 @@ fn mean(samples: &[Duration]) -> Duration {
         return Duration::ZERO;
     }
     samples.iter().sum::<Duration>() / samples.len() as u32
-}
-
-fn max_dur(samples: &[Duration]) -> Duration {
-    samples.iter().copied().max().unwrap_or(Duration::ZERO)
 }
 
 fn percentile(samples: &[Duration], q: f32) -> Duration {

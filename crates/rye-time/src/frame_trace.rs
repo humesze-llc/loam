@@ -98,6 +98,36 @@ thread_local! {
     /// to compute `frame` (CPU work) separately from `idle` (everything in the
     /// browser/RAF/vsync gap that we don't control).
     static CURRENT_FRAME_START: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// Session-lifetime maxima per section name. Distinct lifecycle from
+    /// [`TRACER::history`]: the rolling window is the recent-distribution
+    /// signal (drops samples as frames age out), while `MAX_EVER` is the
+    /// outlier-visibility signal that survives indefinitely.
+    ///
+    /// Architectural note: a 1-second freeze inserts ONE entry into the rolling
+    /// window. With a 120-frame window at 50fps (= 2.4s of history), spikes that
+    /// happen sparser than ~once-per-second fall out of the window before a
+    /// human notices the demo stuttered. `MAX_EVER` is the answer to "what's
+    /// the worst this has ever been?" — independent of when the user opened
+    /// the perf overlay. Cleared only by [`clear_max_ever`].
+    static MAX_EVER: RefCell<std::collections::HashMap<&'static str, Duration>> =
+        RefCell::new(std::collections::HashMap::new());
+    /// Threshold above which `end_frame` emits a `tracing::warn!` naming the
+    /// offending section + its elapsed time + the frame index. Default chosen
+    /// to catch user-visible stalls (>= 50ms ≈ 3 vsync intervals at 60Hz)
+    /// without flooding on common 25ms variance.
+    ///
+    /// Architectural note: tracing::warn! goes to console.warn on wasm
+    /// (selectable + copyable in DevTools) and to stderr on native; both are
+    /// the right surfaces for "something just went pathological for one
+    /// frame." If this becomes too chatty under load, raise the threshold or
+    /// add a "first N per session" gate rather than turning it off.
+    static SPIKE_THRESHOLD: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::from_millis(50)) };
+    /// Strictly-increasing frame counter for the spike log message, so a
+    /// human reading three "spike at frame 1247" messages can tell they're
+    /// genuinely separate events vs. one redraw firing the warn multiple
+    /// times.
+    static FRAME_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// RAII guard returned from [`scope`]. Records elapsed time on drop. Holding one of
@@ -176,6 +206,22 @@ pub fn end_frame() {
     });
     let frame_start = CURRENT_FRAME_START.with(|c| c.take());
 
+    // Advance the strictly-increasing frame counter once per end_frame. Cheap
+    // (single Cell write) and gives the spike-log a way to name the frame.
+    let frame_index = FRAME_COUNTER.with(|c| {
+        let n = c.get();
+        c.set(n.wrapping_add(1));
+        n
+    });
+
+    // Collect the frame's sections for max_ever + spike-log AFTER the borrow_mut
+    // below drops; doing this inside the same borrow would force a clone path
+    // through `current.sections`. We snapshot the section names + durations
+    // before rotating history.
+    let threshold = SPIKE_THRESHOLD.with(|c| c.get());
+    let mut new_max: Vec<(&'static str, Duration)> = Vec::new();
+    let mut over_threshold: Vec<(&'static str, Duration)> = Vec::new();
+
     TRACER.with(|t| {
         let mut t = t.borrow_mut();
         if let Some(last_end) = last_end {
@@ -196,6 +242,21 @@ pub fn end_frame() {
                 });
             }
         }
+
+        // Pre-scan the just-completed frame so the post-borrow code can update
+        // MAX_EVER + emit warnings without holding the TRACER borrow.
+        // Architectural note: doing this inside the borrow would force MAX_EVER
+        // updates to also be under that borrow's lifetime, and a future
+        // `tracing::warn!` subscriber that re-enters `frame_trace` would
+        // deadlock. Keeping the two RefCells independent costs an extra Vec
+        // walk per frame (cheap; same length as the frame's section count).
+        for section in &t.current.sections {
+            new_max.push((section.name, section.elapsed));
+            if section.elapsed > threshold {
+                over_threshold.push((section.name, section.elapsed));
+            }
+        }
+
         let cap = t.capacity;
         let frame = std::mem::take(&mut t.current);
         if t.history.len() >= cap {
@@ -203,6 +264,28 @@ pub fn end_frame() {
         }
         t.history.push_back(frame);
     });
+
+    // Now update MAX_EVER (a separate RefCell, so no nested-borrow risk).
+    MAX_EVER.with(|m| {
+        let mut m = m.borrow_mut();
+        for (name, elapsed) in new_max {
+            let entry = m.entry(name).or_insert(Duration::ZERO);
+            if elapsed > *entry {
+                *entry = elapsed;
+            }
+        }
+    });
+
+    // Emit spike warnings outside the trace borrows so a tracing subscriber
+    // that re-enters frame_trace (e.g. for its own scope) doesn't conflict
+    // with our state. Common case is zero entries per frame; only allocates
+    // strings on the actual spike path.
+    for (name, elapsed) in over_threshold {
+        tracing::warn!(
+            "frame_trace spike: section='{name}' elapsed={:.1}ms frame={frame_index}",
+            elapsed.as_secs_f32() * 1000.0,
+        );
+    }
 }
 
 /// Set the rolling window size. Truncates older frames if shrinking.
@@ -231,6 +314,49 @@ pub fn last_frame() -> Option<FrameTrace> {
     TRACER.with(|t| t.borrow().history.back().cloned())
 }
 
+/// Session-lifetime maximum elapsed time recorded for `name` across every
+/// frame since program start (or last [`clear_max_ever`]).
+///
+/// Use this when the rolling window's `max` may have already aged out a spike.
+/// A page that runs for an hour with a single 500ms freeze will still report
+/// the 500ms via `max_ever("between-frames")` long after the 120-frame window
+/// has rotated past it. Returns `Duration::ZERO` for never-seen sections.
+#[cfg(feature = "frame-trace")]
+pub fn max_ever(name: &'static str) -> Duration {
+    MAX_EVER.with(|m| m.borrow().get(name).copied().unwrap_or(Duration::ZERO))
+}
+
+/// All session-lifetime maxima, name -> duration. Sorted by descending
+/// duration so the worst offenders sort to the top of caller-rendered tables.
+#[cfg(feature = "frame-trace")]
+pub fn all_max_ever() -> Vec<(&'static str, Duration)> {
+    MAX_EVER.with(|m| {
+        let mut out: Vec<(&'static str, Duration)> =
+            m.borrow().iter().map(|(k, v)| (*k, *v)).collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out
+    })
+}
+
+/// Reset session-lifetime maxima. Doesn't touch the rolling window. Useful
+/// after the user navigates into a new mode + wants to start measuring fresh.
+#[cfg(feature = "frame-trace")]
+pub fn clear_max_ever() {
+    MAX_EVER.with(|m| m.borrow_mut().clear());
+}
+
+/// Set the threshold above which `end_frame` logs a `tracing::warn!`. Default
+/// is 50ms. Pass `Duration::MAX` to disable spike logging entirely.
+///
+/// Architectural note: the threshold is process-global because spikes are
+/// a single concept regardless of which scope produced them. Per-section
+/// thresholds would clutter the API for a use case (silencing chatty
+/// sections) that hasn't materialized.
+#[cfg(feature = "frame-trace")]
+pub fn set_spike_threshold(threshold: Duration) {
+    SPIKE_THRESHOLD.with(|c| c.set(threshold));
+}
+
 /// Push a section produced outside the normal `scope` lifecycle. Used by the GPU
 /// timer path: a GPU timestamp's wall-clock delta arrives via `map_async` callback,
 /// outside the scope-on-drop flow, but it conceptually belongs to the current frame.
@@ -252,6 +378,22 @@ pub fn record_external(name: &'static str, elapsed: Duration) {
 /// Feature-OFF stub: drops the section, no-op.
 #[cfg(not(feature = "frame-trace"))]
 pub fn record_external(_name: &'static str, _elapsed: Duration) {}
+
+#[cfg(not(feature = "frame-trace"))]
+pub fn max_ever(_name: &'static str) -> Duration {
+    Duration::ZERO
+}
+
+#[cfg(not(feature = "frame-trace"))]
+pub fn all_max_ever() -> Vec<(&'static str, Duration)> {
+    Vec::new()
+}
+
+#[cfg(not(feature = "frame-trace"))]
+pub fn clear_max_ever() {}
+
+#[cfg(not(feature = "frame-trace"))]
+pub fn set_spike_threshold(_threshold: Duration) {}
 
 /// Aggregate stats across the rolling window for one section name.
 #[derive(Clone, Debug)]
