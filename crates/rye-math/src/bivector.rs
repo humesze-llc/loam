@@ -1634,7 +1634,7 @@ mod tests {
         }
     }
 
-    /// The rotate_polytopes demo's update loop:
+    /// The polytope_playground demo's update loop:
     ///   per frame at 60 Hz: orientation = (omega * dt).exp() * orientation
     /// Over N steps with constant `omega`, the result must equal the closed-form
     /// `(omega * N * dt).exp()` within float tolerance. Catches both additive
@@ -1642,7 +1642,7 @@ mod tests {
     /// bivectors that include w-mixing planes.
     ///
     /// `omega = e_xy + e_xz + e_xw + e_yz` is the exact bivector the failing-screenshot
-    /// rotate_polytopes run had active. Regression gate for the issue #37 fix in `Rotor4::mul`
+    /// polytope_playground run had active. Regression gate for the issue #37 fix in `Rotor4::mul`
     /// (the e14·e24 / e24·e14 pair's signs in the e12 output were swapped). Pre-fix drift was
     /// ~1.3%; post-fix it sits at f32 noise (~5e-7).
     #[test]
@@ -1709,7 +1709,7 @@ mod tests {
         );
     }
 
-    /// Vertex-level invariant for the rotate-polytopes "are the shapes growing?" question: a
+    /// Vertex-level invariant for the polytope-playground "are the shapes growing?" question: a
     /// unit-radius polytope vertex started at `(1, 0, 0, 0)` must stay at radius 1 after
     /// sustained integration. Length drift here would expand the rendered cross-section even for
     /// pure 3D rotations. Tests **raw** composition without intermediate `.normalize()` to catch
@@ -1744,7 +1744,7 @@ mod tests {
 
     /// Same 900-step integration but **with `.normalize()` after each composition**, mirroring
     /// the actual integrator path in `rye_physics::euclidean_r4::integrate_orientation`. If this
-    /// fails, the rotate-polytopes "shapes growing" symptom is the visible bug; if this passes,
+    /// fails, the polytope-playground "shapes growing" symptom is the visible bug; if this passes,
     /// the integrator's existing normalize handles the algebraic drift the previous test catches
     /// and the visual issue is somewhere else (cross-section shape change, dispatcher inverse
     /// rotor, etc.).

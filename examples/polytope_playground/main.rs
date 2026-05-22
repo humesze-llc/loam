@@ -150,7 +150,7 @@ impl Demo {
             .rd
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("rotate_polytopes shader"),
+                label: Some("polytope_playground shader"),
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
         let mut node = Hyperslice4DNode::new(
@@ -297,6 +297,11 @@ impl Demo {
             t_slider_max: T_SLIDER_INITIAL,
             expanded: false,
             show_help: false,
+            show_render_panel: false,
+            example_callout: rye_egui::CalloutState {
+                window_pos: egui::Pos2::new(220.0, 120.0),
+                open: false,
+            },
             overlay_pinned_width: None,
             show_formula: false,
             show_controls: true,
@@ -461,11 +466,11 @@ impl Demo {
         // font) plus a small visual margin. egui::Area's anchor
         // is screen-relative, not content-rect-relative, so the
         // offset must include the menu bar height manually.
-        egui::Area::new(egui::Id::new("rotate-polytopes-title"))
+        egui::Area::new(egui::Id::new("polytope-playground-title"))
             .anchor(egui::Align2::LEFT_TOP, [20.0, 50.0])
             .show(ctx, |ui| {
                 ui.add(egui::Label::new(
-                    egui::RichText::new("4D Polytope Rotation")
+                    egui::RichText::new("Polytope Playground")
                         .size(22.0)
                         .strong()
                         .color(egui::Color32::WHITE),
@@ -498,7 +503,7 @@ impl Demo {
             // formula and combo-name labels wrap inside.
             const FORMULA_POPUP_W: f32 = 320.0;
             egui::Window::new("formula")
-                .id(egui::Id::new("rotate-polytopes-formula"))
+                .id(egui::Id::new("polytope-playground-formula"))
                 .title_bar(false)
                 .resizable(false)
                 .collapsible(false)
@@ -538,6 +543,89 @@ impl Demo {
 
         // Modal help window (opened by the `?` button).
         self.render_help_window(ctx);
+        // Floating render-settings modal (opened by the gear button in the bottom
+        // overlay; off by default so the scene fills the window for first-launch
+        // viewing).
+        self.render_render_panel(ctx);
+        // Example annotation callout (off by default; toggle via View > Example
+        // callout). Demonstrates the rye_egui::callout primitive against the first
+        // polychoron in the row.
+        self.render_example_callout(ctx, frame);
+    }
+
+    /// Demonstrate the `rye_egui::callout` primitive against the first polychoron in
+    /// the row. The anchor follows vertex 0 of that polytope's canonical topology
+    /// through the current rotor + body position + wireframe projection chain,
+    /// reprojected per frame so the line tracks live as the polytope rotates. No-op
+    /// when the row is empty or contains no polychora.
+    fn render_example_callout(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
+        if !self.example_callout.open {
+            return;
+        }
+        // Find the first polychoron in the row; its vertex 0 is the anchor target.
+        let Some((slot, entry)) = self
+            .row
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.shape.polytope4().is_some())
+        else {
+            return;
+        };
+        let polytope = entry.shape.polytope4().expect("filter guarantees Some");
+        let topo = polytope.topology();
+        let canonical_v0 = topo.vertices[0];
+        let v_local_4d = BODY_SIZE * self.rot_state.apply(canonical_v0);
+        let v_local_r3 = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+            v_local_4d,
+            &self.wireframe_projection.to_projection(),
+        );
+        let n = self.row.len();
+        let body_pos = body_position(slot, n);
+        let world_pos = v_local_r3 + Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+
+        // Reproject world R³ -> screen pixels via the same camera the rasterizer
+        // chain uses. `world_to_screen` does the perspective + NDC + viewport-flip
+        // math; it returns `None` when the anchor is offscreen (behind the camera or
+        // outside the viewing frustum), in which case the callout draws nothing.
+        let view_dir = self.camera.view();
+        let cfg = &frame.rd.surface_bundle.config;
+        let ppp = ctx.pixels_per_point();
+        let vp_w = (cfg.width as f32 / ppp).round() as u32;
+        let vp_h = (cfg.height as f32 / ppp).round() as u32;
+        let Some(screen_pos) = rye_egui::world_to_screen(
+            world_pos,
+            &view_dir,
+            60.0_f32.to_radians(),
+            (vp_w, vp_h),
+            0.1,
+            100.0,
+        ) else {
+            return;
+        };
+
+        let title = format!("{} vertex 0", entry.label);
+        rye_egui::callout(
+            ctx,
+            "polytope-playground-example-callout",
+            screen_pos,
+            &mut self.example_callout,
+            &title,
+            |ui| {
+                ui.label(
+                    "Example callout: this leader line tracks vertex 0 of the first \
+                     polychoron in the row as it rotates through 4D. Drag the panel \
+                     anywhere; the line keeps the anchor live. Same primitive \
+                     (rye_egui::callout) is the foundation for future tutorial \
+                     overlays in Polytope Playground.",
+                );
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Anchor coordinates").strong());
+                ui.label(format!(
+                    "world R³: ({:.2}, {:.2}, {:.2})",
+                    world_pos.x, world_pos.y, world_pos.z
+                ));
+            },
+        );
     }
 
     pub(crate) fn on_event(&mut self, ev: &winit::event::WindowEvent, _ctx: &mut FrameCtx<'_>) {
@@ -580,10 +668,9 @@ impl Demo {
     }
 
     pub(crate) fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
-        // Scene renders to the full window. The bottom controls
-        // overlay floats on top; `BottomOverlay` is an Area, not
-        // a docked panel, so the scene viewport doesn't need to
-        // skip a bottom strip.
+        // Scene renders to the full window. The bottom controls overlay floats on top
+        // (Area, not a docked panel; doesn't reserve pixels); the Render settings modal
+        // is also free-floating, so the scene viewport is always the framebuffer.
         let cfg = &rd.surface_bundle.config;
         let viewport = Viewport::full([cfg.width, cfg.height]);
         if self.view_mode == ViewMode::Filmstrip {
@@ -853,7 +940,7 @@ impl Demo {
             .as_ref()
             .map(|b| &b.view)
             .expect("shared depth buffer must be ensured before points overlay");
-        self.points_node.execute(rd, view, Some(depth_view))?;
+        self.points_node.execute(rd, view, Some(depth_view), None)?;
         Ok(())
     }
 
@@ -942,7 +1029,8 @@ impl Demo {
             combined,
             &rye_math::Projection::Identity,
         );
-        self.section_faces.execute(rd, view, Some(&depth.view))?;
+        self.section_faces
+            .execute(rd, view, Some(&depth.view), None)?;
         Ok(())
     }
 
@@ -1182,8 +1270,10 @@ impl Demo {
             .as_ref()
             .map(|b| &b.view)
             .expect("shared depth buffer must be ensured before wireframe overlay");
-        self.section_edges.execute(rd, view, Some(depth_view))?;
-        self.parent_wireframe.execute(rd, view, Some(depth_view))?;
+        self.section_edges
+            .execute(rd, view, Some(depth_view), None)?;
+        self.parent_wireframe
+            .execute(rd, view, Some(depth_view), None)?;
         Ok(())
     }
 
@@ -1191,7 +1281,7 @@ impl Demo {
         // Window title is now decorative, all live state is in the
         // overlay. Keep the title static so OS task switchers show
         // a stable label.
-        std::borrow::Cow::Borrowed("rotate polytopes")
+        std::borrow::Cow::Borrowed("polytope playground")
     }
 }
 
@@ -1488,7 +1578,7 @@ impl App for RotatePolytopesApp {
 fn main() -> Result<()> {
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("rotate polytopes")
+            .with_title("polytope playground")
             .with_visible(false),
         ..RunConfig::default()
     };
@@ -1499,7 +1589,7 @@ fn main() -> Result<()> {
 // Layout regression tests
 // ---------------------------------------------------------------------------
 //
-// `cargo test --example rotate_polytopes` to run.
+// `cargo test --example polytope_playground` to run.
 //
 // These tests headless-render the shape row through `egui::Context::run`
 // and inspect the actual placed-rect positions of every card and the
@@ -1782,7 +1872,7 @@ mod drag_tests {
     /// `Id::new` for stable per-row-index keys.
     #[test]
     fn id_new_starts_drag() {
-        let id = egui::Id::new(("rotate-polytopes-shape-card-test", 0_usize));
+        let id = egui::Id::new(("polytope-playground-shape-card-test", 0_usize));
         let ctx = drive_drag(id);
         assert!(
             ctx.is_being_dragged(id),

@@ -554,15 +554,19 @@ impl Demo {
         }
         rd.queue.submit(Some(clear_encoder.finish()));
 
-        self.line_raster_r3.execute(rd, view, Some(&depth.view))?;
-        self.triangle_raster.execute(rd, view, Some(&depth.view))?;
-        self.line_raster_r4.execute(rd, view, Some(&depth.view))?;
+        self.line_raster_r3
+            .execute(rd, view, Some(&depth.view), None)?;
+        self.triangle_raster
+            .execute(rd, view, Some(&depth.view), None)?;
+        self.line_raster_r4
+            .execute(rd, view, Some(&depth.view), None)?;
         // Section overlay last so its bright cyan edges sit on top of any wireframe edges
         // that share screen-space pixels; depth-test still occludes section pieces behind
         // the cube + the R³ scene geometry.
         self.section_triangles
-            .execute(rd, view, Some(&depth.view))?;
-        self.section_edges.execute(rd, view, Some(&depth.view))?;
+            .execute(rd, view, Some(&depth.view), None)?;
+        self.section_edges
+            .execute(rd, view, Some(&depth.view), None)?;
         Ok(())
     }
 }

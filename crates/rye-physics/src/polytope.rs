@@ -451,7 +451,7 @@ pub fn polytope_section_overlay_with_vertices(
 ///
 /// For position-based per-vertex coloring (the wireframe scheme), use
 /// [`vertex_color_by_position`] directly when building your own mesh; the wireframe
-/// path in `rotate_polytopes` is the reference consumer.
+/// path in `polytope_playground` is the reference consumer.
 ///
 /// Performance: 600-cell midpoint slice produces ~24-60 active cells × tetrahedral cap
 /// (3-point) × 3 fan-triangles ≈ 200-500 triangles per body per frame. The cost is
@@ -1596,7 +1596,7 @@ mod tests {
     // the SDF picks up a measurable non-zero value at perimeter vertices that
     // lie on those orbits' edges. Tests below pin this divergence quantitatively
     // so a future BUG fix fires here loudly enough to trigger a coordinated
-    // update of both the SDF code and the rotate_polytopes `surface sdf` path.
+    // update of both the SDF code and the polytope_playground `surface sdf` path.
     //
     // No equivalent tests for 5/8/16/24-cell: their face planes aren't exposed
     // as `pub` helpers, and the rasterized section path is correct by

@@ -17,7 +17,7 @@
 //! ## Hyperplane representation
 //!
 //! For flat R⁴ at v1 we use an axis-aligned `w`-slice ([`WPlane`]): the simplest case, which
-//! is also what the rotate_polytopes demo sweeps. Arbitrary-normal hyperplanes for R⁴ and
+//! is also what the polytope_playground demo sweeps. Arbitrary-normal hyperplanes for R⁴ and
 //! geodesic hyperplanes for curved spaces are additive extensions; the trait has no
 //! commitment to a specific hyperplane geometry beyond `type Hyperplane`.
 //!

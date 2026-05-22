@@ -418,7 +418,7 @@ impl LineRasterNode {
 
     /// Render the uploaded line mesh onto `view`. `LoadOp::Load` preserves the existing color
     /// attachment contents; the rasterizer composes with whatever ran before it (the
-    /// raymarcher's scene render in `rotate_polytopes`, or a dedicated clear pass).
+    /// raymarcher's scene render in `polytope_playground`, or a dedicated clear pass).
     ///
     /// `depth_view` is required when the pipeline was created with `Some(depth_format)` and
     /// must be `None` otherwise. Mismatch panics with a descriptive message rather than
@@ -428,6 +428,7 @@ impl LineRasterNode {
         rd: &RenderDevice,
         view: &wgpu::TextureView,
         depth_view: Option<&wgpu::TextureView>,
+        viewport: Option<&crate::Viewport>,
     ) -> anyhow::Result<()> {
         match (self.has_depth, depth_view.is_some()) {
             (true, false) => {
@@ -478,6 +479,9 @@ impl LineRasterNode {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            if let Some(vp) = viewport {
+                vp.apply(&mut rp);
+            }
             rp.set_pipeline(&self.pipeline);
             rp.set_bind_group(0, &self.bind_group, &[]);
             rp.set_vertex_buffer(0, self.corner_buf.slice(..));

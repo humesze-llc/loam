@@ -446,6 +446,21 @@ pub(crate) struct Demo {
     /// button; closes via the window's title-bar X (egui's `Window::open(&mut bool)`
     /// flips it).
     pub(crate) show_help: bool,
+    /// Whether the floating `Render` settings modal is open. Off by default; opened
+    /// from the gear button in the bottom overlay. The console is the primary UX for
+    /// changing render settings; this modal is the discoverability aid for new
+    /// readers who haven't found the console yet.
+    pub(crate) show_render_panel: bool,
+    /// Persistent state for the example annotation callout. Anchored to the first
+    /// polychoron-in-row's vertex 0 (the 5-cell's +w apex when the demo opens with
+    /// the default row); leader line + panel position track the anchor each frame as
+    /// the polytope rotates. Off by default; opened from `View > Example callout`
+    /// (and toggleable via the console `callout` command).
+    ///
+    /// Hosts the `rye_egui::callout` primitive added in the M4-close mini-sprint;
+    /// future tutorial / explanation overlays in the playground will instantiate
+    /// additional `CalloutState`s the same way.
+    pub(crate) example_callout: rye_egui::CalloutState,
 
     /// Cached natural overlay width on first frame. Used as the fixed width of the
     /// overlay regardless of the current window size, so resizing the demo window

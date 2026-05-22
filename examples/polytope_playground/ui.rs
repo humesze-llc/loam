@@ -15,8 +15,11 @@ use rye_egui::{
 };
 use rye_math::{Bivector, Rotor4};
 
-use crate::consts::{CONTROL_H, CONTROL_W, MINI_BUTTON_W, PLAY_PAUSE_W, W_RANGE};
-use crate::state::{DeferredAction, Demo, RotationMode, RotorTerm, ViewMode};
+use crate::consts::{CONTROL_H, CONTROL_W, PLAY_PAUSE_W, W_RANGE};
+use crate::state::{
+    DeferredAction, Demo, RotationMode, RotorTerm, SurfaceMode, ViewMode, WireframeColorMode,
+    WireframeProjection,
+};
 
 impl Demo {
     /// Expanded section of the bottom overlay. Two tab rows
@@ -92,7 +95,7 @@ impl Demo {
     /// The File menu is intentionally absent until persistence
     /// and `Quit` via `ViewportCommand::Close` are wired.
     pub(crate) fn render_menu_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("rotate-polytopes-menu-bar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("polytope-playground-menu-bar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("Edit", |ui| {
                     if ui.button("Reset orientation").clicked() {
@@ -108,123 +111,219 @@ impl Demo {
                         ui.close_kind(egui::UiKind::Menu);
                     }
                 });
-                ui.menu_button("View", |ui| {
+                rye_egui::sticky_menu(ui, "View", |ui| {
+                    // Sticky toggles: clicking each checkbox does NOT close the dropdown
+                    // (per `sticky_menu`'s `CloseOnClickOutside` semantics), so the user
+                    // can flip multiple visibility flags without reopening.
                     ui.checkbox(&mut self.show_controls, "Rotation controls (H)");
                     ui.checkbox(&mut self.show_formula, "Formula popup");
+                    ui.checkbox(&mut self.example_callout.open, "Example callout");
                     ui.separator();
+                    // One-shot action: opens the About window and the menu should fold
+                    // away. `Popup::close_all(ctx)` cooperates with the sticky-popup
+                    // default to give the user an "explicit close" path for entries that
+                    // aren't sticky toggles.
                     if ui.button("About this program").clicked() {
                         self.show_help = true;
-                        ui.close_kind(egui::UiKind::Menu);
+                        egui::Popup::close_all(ui.ctx());
                     }
                 });
             });
         });
     }
 
-    pub(crate) fn render_help_window(&mut self, ctx: &egui::Context) {
-        if !self.show_help {
-            return;
+    /// Floating `Render` settings modal. Surfaces the same toggles the console exposes
+    /// (`surface`, `wireframe`, `points`) so new readers can discover the rendering modes
+    /// without typing commands. Each control writes through the same Demo fields the
+    /// console handlers do; the two interfaces stay in lockstep automatically.
+    ///
+    /// Off by default; opened via the gear button in the bottom overlay. Hosted in
+    /// [`rye_egui::floating_panel`] for consistency with the engine's other floating
+    /// surfaces (the help modal migrates to the same primitive in the same sprint).
+    pub(crate) fn render_render_panel(&mut self, ctx: &egui::Context) {
+        // Snapshot fields the panel can mutate so we can detect a surface-mode change and
+        // call `rebuild_bodies()` AFTER the panel closes its borrow. Doing the rebuild
+        // inside the closure would need `&mut self` while `&mut self.show_render_panel`
+        // is still active.
+        let prev_surface = self.surface_mode;
+        // Destructure-borrow the fields the panel writes so the closure doesn't capture
+        // a whole `&mut self`. This sidesteps the borrow conflict with `show_render_panel`
+        // and lets the closure remain a plain `FnOnce(&mut Ui)`.
+        let Self {
+            show_render_panel,
+            surface_mode,
+            wireframe_enabled,
+            wireframe_perimeter,
+            wireframe_nearest_active,
+            wireframe_color_mode,
+            wireframe_projection,
+            points_enabled,
+            points_show_vertices,
+            points_show_cell_centers,
+            points_size_px,
+            ..
+        } = self;
+        rye_egui::floating_panel(
+            ctx,
+            "polytope-playground-render",
+            "Render",
+            show_render_panel,
+            |ui| {
+                ui.label(egui::RichText::new("Surface").strong());
+                ui.radio_value(surface_mode, SurfaceMode::Raster, "Raster (default)");
+                ui.radio_value(surface_mode, SurfaceMode::Sdf, "SDF raymarch");
+                ui.radio_value(surface_mode, SurfaceMode::Off, "Off");
+                ui.separator();
+
+                ui.label(egui::RichText::new("Wireframe").strong());
+                ui.checkbox(wireframe_enabled, "Enabled");
+                ui.add_enabled_ui(*wireframe_enabled, |ui| {
+                    ui.checkbox(wireframe_perimeter, "Section perimeter (cyan)");
+                    ui.checkbox(wireframe_nearest_active, "Nearest-active gradient");
+                    ui.horizontal(|ui| {
+                        ui.label("Color");
+                        ui.radio_value(wireframe_color_mode, WireframeColorMode::Unique, "Unique");
+                        ui.radio_value(wireframe_color_mode, WireframeColorMode::Active, "Active");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Projection");
+                        ui.radio_value(wireframe_projection, WireframeProjection::DropW, "Drop-w");
+                        ui.radio_value(
+                            wireframe_projection,
+                            WireframeProjection::WDepth,
+                            "W-depth",
+                        );
+                    });
+                });
+                ui.separator();
+
+                ui.label(egui::RichText::new("Points").strong());
+                ui.checkbox(points_enabled, "Enabled");
+                ui.add_enabled_ui(*points_enabled, |ui| {
+                    ui.checkbox(points_show_vertices, "Vertex markers");
+                    ui.checkbox(points_show_cell_centers, "Cell centers");
+                    ui.horizontal(|ui| {
+                        ui.label("Size (px)");
+                        ui.add(
+                            egui::DragValue::new(points_size_px)
+                                .range(1.0..=32.0)
+                                .speed(0.25),
+                        );
+                    });
+                });
+            },
+        );
+        // The destructure-borrow's lifetime ended above; safe to call `&mut self`
+        // methods again. Replay the console handler's `rebuild_bodies()` whenever the
+        // user flipped surface mode through the panel, so the SDF kernel's body list
+        // stays in sync with the new mode (`BodyKind::Invalid` for inert polychora).
+        if self.surface_mode != prev_surface {
+            self.rebuild_bodies();
         }
-        let mut open = self.show_help;
-        egui::Window::new("About 4D Polytope Rotation")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .movable(true)
-            .default_size(egui::vec2(560.0, 460.0))
-            .default_pos(egui::pos2(80.0, 80.0))
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("What this program shows");
-                    ui.label(
-                        "You're looking at 3D cross-sections of four-dimensional \
+    }
+
+    pub(crate) fn render_help_window(&mut self, ctx: &egui::Context) {
+        rye_egui::floating_panel_builder(
+            ctx,
+            "polytope-playground-about",
+            "About Polytope Playground",
+            &mut self.show_help,
+        )
+        .resizable(true)
+        .collapsible(false)
+        .default_size(560.0, 460.0)
+        .default_pos(egui::pos2(80.0, 80.0))
+        .show(|ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("What this program shows");
+                ui.label(
+                    "You're looking at 3D cross-sections of four-dimensional \
                          polytopes. As they rotate through 4D space their cross-\
                          sections morph in characteristic ways; the point of the \
                          demo is to make 4D shape intuition reachable from 3D.",
-                    );
-                    ui.add_space(8.0);
+                );
+                ui.add_space(8.0);
 
-                    ui.heading("3D cross-sections, briefly");
-                    ui.label(
-                        "A cross-section is what you get when a higher-\
+                ui.heading("3D cross-sections, briefly");
+                ui.label(
+                    "A cross-section is what you get when a higher-\
                          dimensional object passes through a lower-dimensional \
                          space. A 3D apple intersecting a 2D table gives a 2D \
                          shape (a circle, an oval) that changes as the apple \
                          moves. One dimension up: a 4D polytope passing through \
                          3D gives a 3D shape that changes with the slicing w. \
                          That's what the w slider scrubs.",
-                    );
-                    ui.add_space(8.0);
+                );
+                ui.add_space(8.0);
 
-                    ui.heading("The shapes");
-                    ui.label("All six convex regular 4-polytopes (\"polychora\") ship:");
-                    ui.label("• 5-cell (pentachoron); 5 tetrahedra; the 4D simplex.");
-                    ui.label("• 8-cell (tesseract); 8 cubes; the 4D cube.");
-                    ui.label(
-                        "• 16-cell (hexadecachoron); 16 tetrahedra; the 4D analog \
+                ui.heading("The shapes");
+                ui.label("All six convex regular 4-polytopes (\"polychora\") ship:");
+                ui.label("• 5-cell (pentachoron); 5 tetrahedra; the 4D simplex.");
+                ui.label("• 8-cell (tesseract); 8 cubes; the 4D cube.");
+                ui.label(
+                    "• 16-cell (hexadecachoron); 16 tetrahedra; the 4D analog \
                          of the octahedron.",
-                    );
-                    ui.label(
-                        "• 24-cell (icositetrachoron); 24 octahedra; uniquely 4D, \
+                );
+                ui.label(
+                    "• 24-cell (icositetrachoron); 24 octahedra; uniquely 4D, \
                          no 3D analog.",
-                    );
-                    ui.label("• 120-cell (hecatonicosachoron); 120 dodecahedra.");
-                    ui.label(
-                        "• 600-cell (hexacosichoron); 600 tetrahedra; the 4D \
+                );
+                ui.label("• 120-cell (hecatonicosachoron); 120 dodecahedra.");
+                ui.label(
+                    "• 600-cell (hexacosichoron); 600 tetrahedra; the 4D \
                          analog of the icosahedron.",
-                    );
-                    ui.add_space(8.0);
+                );
+                ui.add_space(8.0);
 
-                    ui.heading("Rotation");
-                    ui.label(
-                        "4D rotations are generated by bivectors (2-planes), not \
+                ui.heading("Rotation");
+                ui.label(
+                    "4D rotations are generated by bivectors (2-planes), not \
                          axes. There are six independent planes: xy, xz, xw, yz, \
                          yw, zw. The three w-involving planes pull a visible \
                          axis through the hidden 4th dimension and produce the \
                          interesting cross-section morphs; the three pure-3D \
                          planes rotate the cross-section as a rigid 3D shape.",
-                    );
-                    ui.label(
-                        "Active-set mode: each plane has a checkbox (include in \
+                );
+                ui.label(
+                    "Active-set mode: each plane has a checkbox (include in \
                          spin) and a -180..=180° slider (the rotor's component \
                          in that plane). Composer mode: build a sequence of \
                          exp(scalar · planes) terms via chips or the typed \
                          formula bar.",
-                    );
-                    ui.add_space(8.0);
+                );
+                ui.add_space(8.0);
 
-                    ui.heading("Views");
-                    ui.label(
-                        "Shapes view: a row of polytopes side-by-side at one \
+                ui.heading("Views");
+                ui.label(
+                    "Shapes view: a row of polytopes side-by-side at one \
                          w-slice. Drag-and-drop to reorder. Filmstrip view: one \
                          polytope rendered N times across w-slices fanning out \
                          by ±BODY_SIZE around the slider's value, so the centre \
                          cell tracks w.",
-                    );
-                    ui.add_space(8.0);
+                );
+                ui.add_space(8.0);
 
-                    ui.heading("Keyboard");
-                    ui.label("• Space / T: toggle continuous spin.");
-                    ui.label("• Up / Down arrows: scrub w with the keyboard.");
-                    ui.label("• 1..6: toggle a plane in the Active set.");
-                    ui.label("• H: expand / collapse the controls panel.");
-                    ui.label("• R: full reset.");
-                    ui.label("• Esc: exit.");
-                    ui.add_space(8.0);
+                ui.heading("Keyboard");
+                ui.label("• Space / T: toggle continuous spin.");
+                ui.label("• Up / Down arrows: scrub w with the keyboard.");
+                ui.label("• 1..6: toggle a plane in the Active set.");
+                ui.label("• H: expand / collapse the controls panel.");
+                ui.label("• R: full reset.");
+                ui.label("• Esc: exit.");
+                ui.add_space(8.0);
 
-                    ui.heading("Mouse");
-                    ui.label("• Drag in the viewport: orbit camera.");
-                    ui.label(
-                        "• Right-click on any value label (w, t, plane angle, \
+                ui.heading("Mouse");
+                ui.label("• Drag in the viewport: orbit camera.");
+                ui.label(
+                    "• Right-click on any value label (w, t, plane angle, \
                          scalar): typed-edit popup.",
-                    );
-                    ui.label(
-                        "• Drag the controls panel by its frame to move it; \
+                );
+                ui.label(
+                    "• Drag the controls panel by its frame to move it; \
                          drag the formula popup the same way.",
-                    );
-                });
+                );
             });
-        self.show_help = open;
+        });
     }
 
     /// Unified controls overlay. `egui::Window` with
@@ -247,8 +346,8 @@ impl Demo {
 
         let default_bottom_centre = egui::pos2(screen.center().x, screen.bottom() - pad);
 
-        egui::Window::new("rotate-polytopes-overlay")
-            .id(egui::Id::new("rotate-polytopes-overlay"))
+        egui::Window::new("polytope-playground-overlay")
+            .id(egui::Id::new("polytope-playground-overlay"))
             .title_bar(false)
             .resizable(false)
             .collapsible(false)
@@ -406,11 +505,20 @@ impl Demo {
                 {
                     self.expanded = !self.expanded;
                 }
+                // Gear + `?`: matching `CONTROL_W × CONTROL_H` so the utility buttons in
+                // the row read as a single coherent set with the chevron + play / step
+                // buttons. (Pre-sprint `?` was sized `MINI_BUTTON_W` square, odd one
+                // out; bumped along with the new gear for visual consistency.)
+                let util_size = egui::vec2(CONTROL_W, CONTROL_H);
                 if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("?").strong())
-                            .min_size(egui::vec2(MINI_BUTTON_W, MINI_BUTTON_W)),
-                    )
+                    .add(egui::Button::new(egui::RichText::new("⚙").strong()).min_size(util_size))
+                    .on_hover_text("Render settings")
+                    .clicked()
+                {
+                    self.show_render_panel = !self.show_render_panel;
+                }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("?").strong()).min_size(util_size))
                     .on_hover_text("About this program")
                     .clicked()
                 {

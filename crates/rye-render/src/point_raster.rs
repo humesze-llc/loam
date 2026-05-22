@@ -366,6 +366,7 @@ impl PointRasterNode {
         rd: &RenderDevice,
         view: &wgpu::TextureView,
         depth_view: Option<&wgpu::TextureView>,
+        viewport: Option<&crate::Viewport>,
     ) -> anyhow::Result<()> {
         match (self.has_depth, depth_view.is_some()) {
             (true, false) => panic!(
@@ -408,6 +409,9 @@ impl PointRasterNode {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            if let Some(vp) = viewport {
+                vp.apply(&mut rp);
+            }
             rp.set_pipeline(&self.pipeline);
             rp.set_bind_group(0, &self.bind_group, &[]);
             rp.set_vertex_buffer(0, self.corner_buf.slice(..));
