@@ -28,6 +28,7 @@ rye-physics = { path = "../rye-physics" }
 rye-render  = { path = "../rye-render" }
 rye-scene   = { path = "../rye-scene" }
 rye-shape   = { path = "../rye-shape" }
+rye-time    = { path = "../rye-time" }
 
 [features]
 # Default to capture-on for native dev (matches the previous `cargo run --example`

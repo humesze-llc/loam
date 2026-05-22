@@ -762,12 +762,15 @@ impl Demo {
             result
         } else {
             {
-                let u = self.node.uniforms_mut();
-                u.resolution = viewport.resolution_f32();
-                u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+                let _scope = rye_time::frame_trace::scope("pp-sdf");
+                {
+                    let u = self.node.uniforms_mut();
+                    u.resolution = viewport.resolution_f32();
+                    u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+                }
+                self.node.flush_uniforms(&rd.queue);
+                self.node.execute_in_viewport(rd, view, viewport)?;
             }
-            self.node.flush_uniforms(&rd.queue);
-            self.node.execute_in_viewport(rd, view, viewport)?;
             // Shared depth attachment for the rasterized section pass + the parent
             // wireframe's depth-test. Ensured + cleared once per Shapes-view frame so
             // the order is: SDF (color only) -> section_faces (writes depth + color
@@ -776,17 +779,23 @@ impl Demo {
             // wireframe fragment pass the depth-test trivially -- visual unchanged.
             self.ensure_and_clear_shared_depth(rd)?;
             if matches!(self.surface_mode, SurfaceMode::Raster) {
+                let _scope = rye_time::frame_trace::scope("pp-section-faces");
                 self.render_section_faces(rd, view)?;
             }
             // Cross-section + parent-wireframe overlay (when toggled). Only in Shapes
             // view since Filmstrip's per-cell viewport composition would require
             // per-cell depth-clear + per-cell uploads that aren't worth the v1 plumbing.
             if self.wireframe_enabled {
+                // pp-wireframe is the project-memory-flagged hot path
+                // (`project_polychoral_raster_perf`). Want a per-frame number here so
+                // we can confirm (or refute) that hypothesis with browser data.
+                let _scope = rye_time::frame_trace::scope("pp-wireframe");
                 self.render_wireframe_overlay(rd, view)?;
             }
             // Points overlay (vertex markers + cell-center sprites). Drawn last so the
             // discs sit on top of wireframe edges and section caps at the same depth.
             if self.points_enabled {
+                let _scope = rye_time::frame_trace::scope("pp-points");
                 self.render_points(rd, view)?;
             }
             Ok(())
@@ -1512,6 +1521,13 @@ impl RotatePolytopesApp {
         // Framework-provided log mirror: `log on|off|toggle` toggles whether
         // `tracing::*` events show up in the console scrollback.
         rye_app::log::register_command(&mut c);
+
+        // Framework-provided frame-timing surface: `trace [summary|last|clear|cap N]`.
+        // The runner is already recording per-section scopes on every redraw; this
+        // command lets the user read them. Surfaces the slowest hot-path sections,
+        // which is the data we need to drive M4.5 v2 perf decisions (pipeline
+        // warming, wireframe caching).
+        rye_app::trace::register_command(&mut c);
 
         c
     }
