@@ -406,6 +406,12 @@ pub fn run_with_config<A: App>(config: RunConfig) -> anyhow::Result<()> {
     {
         console_error_panic_hook::set_once();
         tracing_wasm::set_as_global_default();
+        // Wire `performance.memory.usedJSHeapSize` (Chromium-only) into
+        // frame_trace so each completed frame carries a signed heap delta and
+        // spike-warns include `heap_delta=+24.5MB` style annotations. On
+        // Firefox / Safari the sampler returns `None` and the field stays
+        // empty (no misleading reads).
+        rye_time::frame_trace::set_heap_sampler(wasm::js_heap_sampler);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

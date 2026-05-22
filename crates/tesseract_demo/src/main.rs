@@ -20,16 +20,26 @@
 //! ~3.6 MB) and have fewer compile stalls on first frame.
 
 use anyhow::Result;
-use glam::{Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat4, Vec2, Vec3};
 use rye_app::{
     egui, run_with_config, App, Camera, CameraController, FirstPersonController, FrameCtx,
     OrbitController, RenderCtx, RunConfig, SetupCtx,
 };
+
+// Per-frame allocation telemetry. Wraps the system allocator with a counter
+// pair that surfaces in `frame_trace` + PerfOverlay. ~5-10ns per allocation
+// on native, ~10-20ns on wasm32 (atomic ops are cheaper there); negligible
+// next to the per-frame interop cost we're hunting. Steady-state goal is
+// "0 allocs/frame" in the overlay after the perf-hardening pass; without
+// this telemetry we'd be flying blind on whether we're hitting it.
+#[global_allocator]
+static GLOBAL: rye_time::alloc::CountingAllocator<std::alloc::System> =
+    rye_time::alloc::CountingAllocator::new(std::alloc::System);
 use rye_render::device::RenderDevice;
 use rye_egui::Console;
-use rye_math::{Bivector, Bivector4, EuclideanR3, EuclideanR4, Projection, Rotor, Rotor4};
+use rye_math::{Bivector, Bivector4, EuclideanR3, Rotor4};
 use rye_physics::polytope::Polytope4;
-use rye_render::{line_raster::LineRasterNode, DepthMode, Viewport};
+use rye_render::{LineRasterStaticR4Node, DepthMode, Viewport};
 use rye_shape::LineMesh;
 use winit::window::WindowAttributes;
 
@@ -72,7 +82,16 @@ struct TesseractApp {
     /// Single render pipeline for the whole demo. `DepthMode::Off` because
     /// nothing else writes depth; the wireframe sits on a clean
     /// `LoadOp::Clear` color attachment with no z-buffer fight to manage.
-    lines: LineRasterNode,
+    ///
+    /// `LineRasterStaticR4Node` (vs the dynamic-upload `LineRasterNode`)
+    /// keeps the mesh on the GPU between frames. Per-frame work is just a
+    /// 144-byte uniform write carrying rotor + view*proj + viewport + focal.
+    /// This was the perf-hardening N1 change (2026-05-22): eliminates one
+    /// `queue.write_buffer` JS-interop call per frame on wasm32 (the
+    /// instance-buffer upload that used to fire from `lines.upload`) AND
+    /// removes the two `Vec::with_capacity` allocations the upload path
+    /// did inside `LineRasterNode::upload`.
+    lines: LineRasterStaticR4Node,
     /// Camera state. Same `EuclideanR3` flavor polytope_playground uses; the
     /// 4D rotation is on the geometry side (via the rotor), not the camera.
     camera: Camera<EuclideanR3>,
@@ -98,11 +117,9 @@ struct TesseractApp {
     /// integration but `omega` itself stays so unpausing resumes the same
     /// spin direction and speed.
     paused: bool,
-    /// Pre-allocated buffer for the rotated tesseract vertices. Re-used each
-    /// frame so we don't allocate inside the hot path.
-    rotated_verts: Vec<Vec4>,
-    /// Pre-allocated buffer for the LineMesh segments. Same lifecycle.
-    mesh: LineMesh<4>,
+    // No per-frame vertex / mesh scratch state: the canonical R⁴ edge mesh is
+    // uploaded ONCE at setup, then the GPU vertex shader applies the rotor +
+    // Perspective4D projection every frame from a uniform.
     /// Dev console: backtick to open, hosts `trace [summary|last|dump|clear|cap]`
     /// and `log [on|off]`. `()` as the Ctx because none of the registered
     /// commands need demo state. The trace command is the diagnostic path for
@@ -202,12 +219,30 @@ impl App for TesseractApp {
         // variant skips the depth attachment entirely; the pipeline doesn't
         // declare a depth-stencil state and the render pass omits the
         // attachment. Smallest possible footprint.
-        let lines = LineRasterNode::new(
+        let mut lines = LineRasterStaticR4Node::new(
             &ctx.rd.device,
             ctx.rd.target_format(),
             DepthMode::Off,
             ctx.rd.sample_count(),
         );
+
+        // Build the canonical R⁴ edge mesh ONCE. Vertices are at the
+        // tesseract's natural unit-circumradius positions, scaled by
+        // POLYTOPE_SCALE for comfortable viewing distance. The rotor is
+        // applied each frame inside the vertex shader, so the mesh uploaded
+        // here is the identity-orientation reference.
+        let mut canonical = LineMesh::<4>::default();
+        canonical.segments.reserve(topo.edges.len());
+        canonical.colors.reserve(topo.edges.len());
+        canonical.widths.reserve(topo.edges.len());
+        for &[i, j] in topo.edges {
+            let a = topo.vertices[i as usize] * POLYTOPE_SCALE;
+            let b = topo.vertices[j as usize] * POLYTOPE_SCALE;
+            canonical.segments.push((a.to_array(), b.to_array()));
+            canonical.colors.push((EDGE_COLOR, EDGE_COLOR));
+            canonical.widths.push(EDGE_WIDTH_PX);
+        }
+        lines.upload_mesh(&ctx.rd.device, &ctx.rd.queue, &canonical);
 
         // Orbit start: look from slightly above + behind the cube.
         let mut camera = Camera::<EuclideanR3>::at_origin();
@@ -217,15 +252,6 @@ impl App for TesseractApp {
 
         let free_roam = FirstPersonController::<EuclideanR3>::new(0.0, 0.0);
         let free_roam_pos = camera.position;
-
-        // Pre-size buffers so the first-frame upload doesn't have to grow
-        // them. Tesseract: 16 vertices, 32 edges.
-        let mut rotated_verts = Vec::with_capacity(topo.vertices.len());
-        rotated_verts.resize(topo.vertices.len(), Vec4::ZERO);
-        let mut mesh = LineMesh::<4>::default();
-        mesh.segments.reserve(topo.edges.len());
-        mesh.colors.reserve(topo.edges.len());
-        mesh.widths.reserve(topo.edges.len());
 
         let mut console = Console::<()>::new();
         rye_app::trace::register_command(&mut console);
@@ -248,8 +274,6 @@ impl App for TesseractApp {
             // Perspective4D).
             omega: Bivector4::basis(2) * spin_rate,
             paused,
-            rotated_verts,
-            mesh,
             console,
             perf,
         };
@@ -383,60 +407,24 @@ impl App for TesseractApp {
     }
 
     fn record(&mut self, ctx: &mut RenderCtx<'_>) -> Result<()> {
-        let topo = Polytope4::Tesseract.topology();
-
-        // 1. Apply the current 4D rotor to every vertex. Scale to the demo's
-        // viewing size after rotation so the rotor stays unit-norm.
-        for (i, &v) in topo.vertices.iter().enumerate() {
-            self.rotated_verts[i] = self.rotor.apply(v) * POLYTOPE_SCALE;
-        }
-
-        // 2. Build the LineMesh from rotated vertex pairs + edge topology.
-        // Reusing the same vectors avoids per-frame allocation.
-        self.mesh.segments.clear();
-        self.mesh.colors.clear();
-        self.mesh.widths.clear();
-        for &[i, j] in topo.edges {
-            let a = self.rotated_verts[i as usize];
-            let b = self.rotated_verts[j as usize];
-            self.mesh
-                .segments
-                .push((a.to_array(), b.to_array()));
-            self.mesh.colors.push((EDGE_COLOR, EDGE_COLOR));
-            self.mesh.widths.push(EDGE_WIDTH_PX);
-        }
-
-        // 3. Upload + project. `Projection::Perspective4D` projects each 4D
-        // point to R³ by scaling x/y/z by `focal_distance / (focal_distance -
-        // w)`, the standard pinhole formula. The line rasterizer tessellates
-        // each segment in R⁴ (where flat-Euclidean tessellation is just the
-        // endpoints), then projects every tessellation sample to R³.
-        let projection = Projection::<4>::Perspective4D {
-            focal_distance: FOCAL_DISTANCE,
-        };
-        self.lines.upload::<EuclideanR4, 4>(
-            &ctx.rd.device,
-            &ctx.rd.queue,
-            &self.mesh,
-            &projection,
-            1, // flat space; one sample per segment is exact.
-        );
-
-        // 4. Camera uniforms. Standard perspective projection from R³ to
-        // clip; aspect from the surface size.
+        // Per-frame work is now a single uniform write. The static mesh
+        // uploaded at setup is reused unchanged; the GPU vertex shader
+        // applies rotor -> Perspective4D -> view*proj per vertex.
         let cfg = &ctx.rd.surface_bundle.config;
         let aspect = cfg.width as f32 / cfg.height.max(1) as f32;
         let proj = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.05, 100.0);
         let view_dir = self.camera.view();
         let view_m = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
-        self.lines.set_camera(
+        self.lines.set_transform(
             &ctx.rd.queue,
+            self.rotor,
             proj * view_m,
             Vec2::new(cfg.width as f32, cfg.height as f32),
+            FOCAL_DISTANCE,
         );
 
-        // 5. Clear pass into the shared encoder. Could fuse into the line raster
-        // pass by giving LineRasterNode a LoadOp::Clear variant; saves one pass
+        // Clear pass into the shared encoder. Could fuse into the line raster
+        // pass by giving the rasterizer a LoadOp::Clear variant; saves one pass
         // per frame but adds API surface for one demo. Defer until justified by
         // another demo.
         {
@@ -462,7 +450,7 @@ impl App for TesseractApp {
             });
         }
 
-        // 6. Line raster pass into the same encoder. `LoadOp::Load` preserves
+        // Line raster pass into the same encoder. `LoadOp::Load` preserves
         // the clear above. No depth, no resolve. The runner submits the
         // encoder once at end of frame (along with ui-paint + composite).
         let viewport = Viewport::full([cfg.width, cfg.height]);

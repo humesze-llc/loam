@@ -271,6 +271,13 @@ impl PerfOverlay {
 
     /// Render the overlay. Call once per frame from `App::ui`. Handles the
     /// toggle key internally so the demo doesn't need to forward F3.
+    ///
+    /// Zero-alloc per call: history is read via [`frame_trace::with_history`]
+    /// borrow, samples are accumulated into a fixed-size stack buffer
+    /// ([`MAX_WINDOW`] cap), and percentile sorting happens in-place. The
+    /// previous `Vec<FrameTrace>::clone` per frame was ~120-130 allocations on
+    /// its own and was swamping the NH3 alloc telemetry. Now the overlay
+    /// contributes zero allocations to the steady-state alloc count.
     pub fn show(&mut self, ctx: &rye_egui::egui::Context) {
         use rye_egui::egui;
 
@@ -282,24 +289,66 @@ impl PerfOverlay {
             return;
         }
 
-        let history = frame_trace::history();
-        if history.is_empty() {
+        // Single pass over the rolling history through `with_history`'s borrow.
+        // Stack-bound accumulators only. Cap the window at MAX_WINDOW so the
+        // stack buffer below never overflows.
+        let window = self.window.min(MAX_WINDOW);
+        let mut cadence = StackBuf::new();
+        let mut frames_buf = StackBuf::new();
+        let mut idles = StackBuf::new();
+        let mut heap_count = 0usize;
+        let mut heap_peak = 0i64;
+        let mut heap_net = 0i64;
+        let mut alloc_frames = 0usize;
+        let mut alloc_count_sum: u64 = 0;
+        let mut alloc_peak_bytes: u64 = 0;
+        let mut alloc_net_bytes: i64 = 0;
+        let mut any = false;
+
+        frame_trace::with_history(|history| {
+            let start = history.len().saturating_sub(window);
+            for frame in history.iter().skip(start) {
+                any = true;
+                for section in &frame.sections {
+                    match section.name {
+                        "between-frames" => cadence.push(section.elapsed),
+                        "frame" => frames_buf.push(section.elapsed),
+                        "idle" => idles.push(section.elapsed),
+                        _ => {}
+                    }
+                }
+                if let Some(d) = frame.heap_delta_bytes {
+                    heap_count += 1;
+                    if d > heap_peak {
+                        heap_peak = d;
+                    }
+                    heap_net = heap_net.saturating_add(d);
+                }
+                if let Some(a) = frame.allocs {
+                    alloc_frames += 1;
+                    alloc_count_sum = alloc_count_sum.saturating_add(a.alloc_count);
+                    if a.alloc_bytes > alloc_peak_bytes {
+                        alloc_peak_bytes = a.alloc_bytes;
+                    }
+                    alloc_net_bytes = alloc_net_bytes.saturating_add(a.net_bytes);
+                }
+            }
+        });
+
+        if !any {
             return;
         }
 
-        let start = history.len().saturating_sub(self.window);
-        let recent = &history[start..];
-
-        let cadence: Vec<Duration> = collect_section(recent, "between-frames");
-        let frames: Vec<Duration> = collect_section(recent, "frame");
-        let idles: Vec<Duration> = collect_section(recent, "idle");
-
-        let cadence_mean = mean(&cadence);
-        let cadence_p99 = percentile(&cadence, 0.99);
-        let frame_mean = mean(&frames);
-        let frame_p99 = percentile(&frames, 0.99);
-        let idle_mean = mean(&idles);
-        let idle_p99 = percentile(&idles, 0.99);
+        // Reductions on the stack buffers. `.percentile` mutates the buffer
+        // (sorts in-place); subsequent reads must use `.mean` BEFORE the sort
+        // if they want unsorted-order semantics. Mean doesn't care about
+        // order so it's order-independent; we call it first to be explicit.
+        let cadence_mean = cadence.mean();
+        let cadence_p99 = cadence.percentile(0.99);
+        let frame_mean = frames_buf.mean();
+        let frame_p99 = frames_buf.percentile(0.99);
+        let idle_mean = idles.mean();
+        let idle_p99 = idles.percentile(0.99);
 
         // Session-lifetime maxima. Distinct from `max_dur(&cadence)` which is
         // bounded by the rolling window's contents: a 1-second freeze that
@@ -408,40 +457,184 @@ impl PerfOverlay {
                                 "frame  {:>6.1} ms",
                                 frame_max_ever.as_secs_f32() * 1000.0,
                             ))
-                            .font(mono)
+                            .font(mono.clone())
                             .color(worst_color(frame_max_ever)),
                         );
+                        // Alloc section. Visible when the demo opted in via
+                        // CountingAllocator. Three rows: mean allocs/frame
+                        // (steady-state allocation rate; target = 0), peak
+                        // bytes per frame (worst spike), and net bytes
+                        // across the window (catches steady leaks the per-
+                        // frame mean might smear into the noise). All three
+                        // matter: a frame with 200 1-byte allocs vs. 1
+                        // 200-byte alloc looks identical in byte-count but
+                        // very different in JS-interop cost on wasm.
+                        if alloc_frames > 0 {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("allocs (Rust heap)")
+                                    .font(mono.clone())
+                                    .color(egui::Color32::from_rgb(140, 150, 160)),
+                            );
+                            let mean_count = alloc_count_sum / alloc_frames as u64;
+                            let count_color = |n: u64| {
+                                if n >= 1_000 {
+                                    egui::Color32::from_rgb(220, 100, 80)
+                                } else if n >= 100 {
+                                    egui::Color32::from_rgb(220, 180, 90)
+                                } else if n >= 10 {
+                                    egui::Color32::from_rgb(180, 200, 130)
+                                } else {
+                                    egui::Color32::from_rgb(120, 200, 130)
+                                }
+                            };
+                            let byte_color = |bytes: i64| {
+                                let mb = bytes.abs() as f32 / (1024.0 * 1024.0);
+                                if mb >= 10.0 {
+                                    egui::Color32::from_rgb(220, 100, 80)
+                                } else if mb >= 1.0 {
+                                    egui::Color32::from_rgb(220, 180, 90)
+                                } else {
+                                    label_color
+                                }
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "mean  {:>6} allocs/frame",
+                                    mean_count,
+                                ))
+                                .font(mono.clone())
+                                .color(count_color(mean_count)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "peak  {:>+6.2} KB/frame",
+                                    alloc_peak_bytes as f32 / 1024.0,
+                                ))
+                                .font(mono.clone())
+                                .color(byte_color(alloc_peak_bytes as i64)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "net   {:>+6.2} MB / window",
+                                    alloc_net_bytes as f32 / (1024.0 * 1024.0),
+                                ))
+                                .font(mono.clone())
+                                .color(byte_color(alloc_net_bytes)),
+                            );
+                        }
+                        // Heap section (Chromium only). When no samples are
+                        // present (Firefox / native) we skip it entirely
+                        // rather than showing zeroes the reader might
+                        // misread as "no allocations." Two rows: peak
+                        // per-frame growth (correlates with the spike-warn
+                        // log lines) and net growth across the window
+                        // (catches steady-state per-frame leaks).
+                        if heap_count > 0 {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("heap (Chromium)")
+                                    .font(mono.clone())
+                                    .color(egui::Color32::from_rgb(140, 150, 160)),
+                            );
+                            let heap_color = |bytes: i64| {
+                                let mb = bytes.abs() as f32 / (1024.0 * 1024.0);
+                                if mb >= 10.0 {
+                                    egui::Color32::from_rgb(220, 100, 80)
+                                } else if mb >= 2.0 {
+                                    egui::Color32::from_rgb(220, 180, 90)
+                                } else {
+                                    label_color
+                                }
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "peak  {:>+6.2} MB/frame",
+                                    heap_peak as f32 / (1024.0 * 1024.0),
+                                ))
+                                .font(mono.clone())
+                                .color(heap_color(heap_peak)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "net   {:>+6.2} MB / window",
+                                    heap_net as f32 / (1024.0 * 1024.0),
+                                ))
+                                .font(mono.clone())
+                                .color(heap_color(heap_net)),
+                            );
+                        }
                         ui.separator();
-                        draw_sparkline(ui, &cadence);
+                        draw_sparkline(ui, cadence.as_slice());
                     });
             });
     }
 }
 
-fn collect_section(frames: &[frame_trace::FrameTrace], name: &str) -> Vec<Duration> {
-    frames
-        .iter()
-        .flat_map(|f| f.sections.iter())
-        .filter(|s| s.name == name)
-        .map(|s| s.elapsed)
-        .collect()
+/// Maximum window size the PerfOverlay supports for percentile statistics.
+/// Drives the inline stack array in [`StackBuf`]; oversized windows are
+/// clamped to this value. 256 × 16 B/Duration = 4 KB on stack per buffer;
+/// three buffers (cadence, frame, idle) = 12 KB. Comfortably inside the
+/// 1 MB main-thread stack on every supported target.
+///
+/// Architectural note: the cap exists ONLY to keep the stack buffer fixed-
+/// size; the actual rolling-window capacity in `frame_trace` is independent
+/// and can be larger. If a user configures `with_window(>MAX_WINDOW)` we
+/// silently use the cap; the alternative (heap-allocating to match the
+/// requested window) defeats the zero-alloc property the overlay exists to
+/// enable.
+pub const MAX_WINDOW: usize = 256;
+
+/// Fixed-capacity stack-allocated sample buffer. Zero-allocation alternative
+/// to `Vec<Duration>` for per-frame UI use. Push silently drops samples once
+/// `len` reaches `MAX_WINDOW`; the caller is expected to cap its iteration
+/// window to match.
+#[derive(Clone)]
+struct StackBuf {
+    samples: [Duration; MAX_WINDOW],
+    len: usize,
 }
 
-fn mean(samples: &[Duration]) -> Duration {
-    if samples.is_empty() {
-        return Duration::ZERO;
+impl StackBuf {
+    fn new() -> Self {
+        Self {
+            samples: [Duration::ZERO; MAX_WINDOW],
+            len: 0,
+        }
     }
-    samples.iter().sum::<Duration>() / samples.len() as u32
-}
 
-fn percentile(samples: &[Duration], q: f32) -> Duration {
-    if samples.is_empty() {
-        return Duration::ZERO;
+    fn push(&mut self, d: Duration) {
+        if self.len < MAX_WINDOW {
+            self.samples[self.len] = d;
+            self.len += 1;
+        }
     }
-    let mut sorted: Vec<Duration> = samples.to_vec();
-    sorted.sort();
-    let idx = ((sorted.len() as f32 * q) as usize).min(sorted.len() - 1);
-    sorted[idx]
+
+    fn as_slice(&self) -> &[Duration] {
+        &self.samples[..self.len]
+    }
+
+    fn mean(&self) -> Duration {
+        if self.len == 0 {
+            return Duration::ZERO;
+        }
+        let sum: Duration = self.samples[..self.len].iter().sum();
+        sum / self.len as u32
+    }
+
+    /// `q`-percentile over the window. Order-preserving on `self`: clones the
+    /// sample range into a stack-local array and sorts THAT, leaving the
+    /// caller's buffer in its original (time-ordered) state. The sparkline
+    /// downstream needs the original order; the percentile readout doesn't.
+    fn percentile(&self, q: f32) -> Duration {
+        if self.len == 0 {
+            return Duration::ZERO;
+        }
+        let mut local: [Duration; MAX_WINDOW] = self.samples;
+        local[..self.len].sort();
+        let idx = ((self.len as f32 * q) as usize).min(self.len - 1);
+        local[idx]
+    }
 }
 
 fn draw_sparkline(ui: &mut rye_egui::egui::Ui, gaps: &[Duration]) {

@@ -803,6 +803,34 @@ impl From<Rotor4> for [f32; 8] {
     }
 }
 
+impl Rotor4 {
+    /// Materialize this rotor as a 4×4 rotation matrix, columns being the
+    /// rotor applied to the canonical basis vectors e₁, e₂, e₃, e₄. Output
+    /// layout is `[col0, col1, col2, col3]` (column-major), which matches
+    /// both glam's `Mat4` storage and WGSL's `mat4x4<f32>` upload convention
+    /// — `bytemuck::cast` directly into a GPU uniform slot without
+    /// transposition.
+    ///
+    /// Cost: four [`Rotor::apply`] calls (~120 flops total). Negligible
+    /// relative to a single per-vertex shader-side rotor sandwich, and
+    /// keeps the WGSL side a plain `mat4x4<f32> * vec4<f32>` multiply
+    /// instead of porting the full Clifford reduction. Use when the host
+    /// computes the rotor on CPU (deterministic sim, rotor integration)
+    /// and the shader needs to apply it per vertex.
+    ///
+    /// Textbook reference: any rotation in O(4) can be encoded as four
+    /// images of an orthonormal basis; this is the standard "matrix from
+    /// rotation operator" construction (e.g. Hestenes, *New Foundations
+    /// for Classical Mechanics*, 2nd ed., §2.5).
+    pub fn to_mat4(&self) -> [[f32; 4]; 4] {
+        let c0 = <Self as Rotor>::apply(self, Vec4::new(1.0, 0.0, 0.0, 0.0));
+        let c1 = <Self as Rotor>::apply(self, Vec4::new(0.0, 1.0, 0.0, 0.0));
+        let c2 = <Self as Rotor>::apply(self, Vec4::new(0.0, 0.0, 1.0, 0.0));
+        let c3 = <Self as Rotor>::apply(self, Vec4::new(0.0, 0.0, 0.0, 1.0));
+        [c0.to_array(), c1.to_array(), c2.to_array(), c3.to_array()]
+    }
+}
+
 impl Mul for Rotor4 {
     type Output = Self;
     /// Geometric product of two 4D rotors, expanded in the even-graded basis
@@ -1136,6 +1164,45 @@ mod tests {
         let id = r * r.inverse();
         assert_close(id.a, 1.0);
         assert_close(id.b, 0.0);
+    }
+
+    #[test]
+    fn rotor4_to_mat4_agrees_with_apply() {
+        // Build a non-trivial 4D rotation (xy + zw simple plane) and check
+        // that the matrix columns equal the rotor's image of each basis vector,
+        // AND that applying the matrix to a few test vectors matches applying
+        // the rotor directly.
+        let b = Bivector4 {
+            xy: 0.7,
+            xz: 0.0,
+            xw: 0.0,
+            yz: 0.0,
+            yw: 0.0,
+            zw: 0.3,
+        };
+        let r: Rotor4 = b.exp();
+        let m = r.to_mat4();
+
+        // Column 0 should be R(e1).
+        let e1 = Vec4::new(1.0, 0.0, 0.0, 0.0);
+        let img1 = <Rotor4 as Rotor>::apply(&r, e1);
+        assert_close(m[0][0], img1.x);
+        assert_close(m[0][1], img1.y);
+        assert_close(m[0][2], img1.z);
+        assert_close(m[0][3], img1.w);
+
+        // Random-ish vector: matrix-vector product should equal R-apply.
+        let v = Vec4::new(0.6, -0.4, 0.2, 0.9);
+        // Column-major mat4: result = sum_i col_i * v[i].
+        let row = |k: usize| {
+            m[0][k] * v.x + m[1][k] * v.y + m[2][k] * v.z + m[3][k] * v.w
+        };
+        let by_matrix = Vec4::new(row(0), row(1), row(2), row(3));
+        let by_rotor = <Rotor4 as Rotor>::apply(&r, v);
+        assert!(
+            (by_matrix - by_rotor).length() < 1e-5,
+            "matrix application {by_matrix:?} should match rotor application {by_rotor:?}"
+        );
     }
 
     #[test]

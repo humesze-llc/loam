@@ -65,6 +65,11 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 tracing-wasm = "0.2"
+# `js-sys` provides `Reflect` so the heap sampler can read the non-standard
+# `performance.memory.usedJSHeapSize` property without a typed binding (web-sys
+# does not surface it because it's Chrome/Edge-only). Used by
+# `wasm::js_heap_sampler` and registered into `rye-time::frame_trace` at startup.
+js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Window",
     "Document",

@@ -39,6 +39,7 @@
 //! }
 //! ```
 
+pub mod alloc;
 mod fixed_timestep;
 pub mod frame_trace;
 

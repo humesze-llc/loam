@@ -49,9 +49,26 @@ pub struct Section {
 }
 
 /// All sections recorded inside one redraw cycle. `Default` produces an empty trace.
+///
+/// `heap_delta_bytes` is the JS heap growth observed inside this frame, sampled at
+/// `begin_frame` and again at `end_frame`. Only populated when a host has
+/// registered a [`HeapSampler`] via [`set_heap_sampler`] AND the runtime exposes
+/// the underlying API (Chrome / Edge expose `performance.memory.usedJSHeapSize`;
+/// Firefox + native return `None`). Positive values indicate growth, negative
+/// values indicate that a GC happened inside the frame and reclaimed some heap.
+///
+/// `allocs` is the per-frame allocation delta observed by the
+/// [`crate::alloc::CountingAllocator`] wrapper. Only populated when a demo
+/// installs that allocator as its `#[global_allocator]`. The fields cover net
+/// bytes (signed), bytes allocated (unsigned), and the alloc/dealloc call
+/// counts, which together let the PerfOverlay show "we're allocating 1.2 MB
+/// across 3,400 calls per frame" — both numbers matter when chasing the
+/// per-frame-interop-leak pattern characterized 2026-05-22.
 #[derive(Clone, Debug, Default)]
 pub struct FrameTrace {
     pub sections: Vec<Section>,
+    pub heap_delta_bytes: Option<i64>,
+    pub allocs: Option<crate::alloc::AllocDelta>,
 }
 
 impl FrameTrace {
@@ -86,6 +103,19 @@ impl Tracer {
     }
 }
 
+/// Function pointer registered by the host to sample the JS heap in bytes. On
+/// wasm32 + Chromium, the host wires this to read
+/// `performance.memory.usedJSHeapSize` via wasm-bindgen + Reflect; on Firefox +
+/// native, no sampler is set (the field stays `None`) and `heap_delta_bytes`
+/// on every `FrameTrace` is `None`.
+///
+/// Architectural note: keeping the sampler as a function-pointer slot
+/// registered from outside means `rye-time` doesn't depend on `js-sys` /
+/// `web-sys` for this functionality — the host crate (`rye-app`) owns the
+/// platform-specific access and registers a callback. Keeps the leaf crate's
+/// dep graph small.
+pub type HeapSampler = fn() -> Option<u64>;
+
 #[cfg(feature = "frame-trace")]
 thread_local! {
     static TRACER: RefCell<Tracer> = RefCell::new(Tracer::new(DEFAULT_CAPACITY));
@@ -98,6 +128,18 @@ thread_local! {
     /// to compute `frame` (CPU work) separately from `idle` (everything in the
     /// browser/RAF/vsync gap that we don't control).
     static CURRENT_FRAME_START: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// JS heap snapshot at `begin_frame`. Paired with the `end_frame` snapshot
+    /// to produce `heap_delta_bytes` on the completed `FrameTrace`. `None`
+    /// until the host registers a [`HeapSampler`] via [`set_heap_sampler`].
+    static CURRENT_FRAME_HEAP_START: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// CountingAllocator snapshot at `begin_frame`. Paired with the
+    /// `end_frame` snapshot to produce `allocs` on the completed
+    /// `FrameTrace`. `None` until the demo installs the wrapper.
+    static CURRENT_FRAME_ALLOC_START: std::cell::Cell<Option<crate::alloc::AllocSnapshot>> = const { std::cell::Cell::new(None) };
+    /// Optional host-registered JS heap sampler. Set once at startup by the
+    /// host; called from `begin_frame` + `end_frame`. Cell because function
+    /// pointers are Copy.
+    static HEAP_SAMPLER: std::cell::Cell<Option<HeapSampler>> = const { std::cell::Cell::new(None) };
     /// Session-lifetime maxima per section name. Distinct lifecycle from
     /// [`TRACER::history`]: the rolling window is the recent-distribution
     /// signal (drops samples as frames age out), while `MAX_EVER` is the
@@ -168,6 +210,21 @@ pub fn scope(name: &'static str) -> Scope {
     }
 }
 
+/// Register the host's JS heap sampler. Called once at startup; subsequent calls
+/// overwrite. On wasm32 + Chromium the host wires this to
+/// `performance.memory.usedJSHeapSize` via wasm-bindgen Reflect; on Firefox +
+/// native the host either doesn't call this or registers a sampler that returns
+/// `None`, leaving every `FrameTrace::heap_delta_bytes` as `None`.
+///
+/// Once registered, [`begin_frame`] + [`end_frame`] snapshot the heap and the
+/// signed delta is attached to each completed `FrameTrace`. The spike-warn log
+/// message also includes the delta when present, so a 500ms freeze with a
+/// matching 30 MB heap jump reads as "GC pressure" at a glance.
+#[cfg(feature = "frame-trace")]
+pub fn set_heap_sampler(sampler: HeapSampler) {
+    HEAP_SAMPLER.with(|s| s.set(Some(sampler)));
+}
+
 /// Mark the start of a frame's work. Pairs with [`end_frame`] to compute the `idle`
 /// section (time the browser/event loop spent before handing us this frame). Called
 /// by the runner at the top of each `redraw`, BEFORE opening the `frame` scope.
@@ -175,9 +232,18 @@ pub fn scope(name: &'static str) -> Scope {
 /// Without this signal, `end_frame` can only measure total cadence
 /// (`between-frames`); it can't tell how much of that was our CPU work vs. how much
 /// was the browser doing something else.
+///
+/// Also snapshots the JS heap (via the registered [`HeapSampler`], if any) so
+/// [`end_frame`] can compute a per-frame heap delta.
 #[cfg(feature = "frame-trace")]
 pub fn begin_frame() {
     CURRENT_FRAME_START.with(|c| c.set(Some(Instant::now())));
+    let sampler = HEAP_SAMPLER.with(|s| s.get());
+    CURRENT_FRAME_HEAP_START.with(|c| c.set(sampler.and_then(|f| f())));
+    // Alloc counters are global atomics in `crate::alloc`; a `current_snapshot`
+    // call is four `Relaxed` loads + a bool check, so ~ns. Returns None when
+    // the demo hasn't installed the CountingAllocator wrapper.
+    CURRENT_FRAME_ALLOC_START.with(|c| c.set(crate::alloc::current_snapshot()));
 }
 
 /// Push the in-flight frame into history and start a new one. Called once per redraw
@@ -206,6 +272,28 @@ pub fn end_frame() {
     });
     let frame_start = CURRENT_FRAME_START.with(|c| c.take());
 
+    // Pair the begin_frame heap snapshot with a fresh sample here. Either may be
+    // None (sampler not registered, or platform doesn't expose the API); we only
+    // compute a delta when both samples exist. Stored as signed i64 so a GC
+    // mid-frame can show as negative.
+    let heap_start = CURRENT_FRAME_HEAP_START.with(|c| c.take());
+    let sampler = HEAP_SAMPLER.with(|s| s.get());
+    let heap_end = sampler.and_then(|f| f());
+    let heap_delta_bytes: Option<i64> = match (heap_start, heap_end) {
+        (Some(a), Some(b)) => Some((b as i64).saturating_sub(a as i64)),
+        _ => None,
+    };
+
+    // Same pattern for alloc counters. Both endpoints come from the global
+    // atomic counters; if the wrapper isn't installed, both are None and we
+    // leave `allocs` unset on the frame.
+    let alloc_start = CURRENT_FRAME_ALLOC_START.with(|c| c.take());
+    let alloc_end = crate::alloc::current_snapshot();
+    let alloc_delta: Option<crate::alloc::AllocDelta> = match (alloc_start, alloc_end) {
+        (Some(a), Some(b)) => Some(crate::alloc::delta(a, b)),
+        _ => None,
+    };
+
     // Advance the strictly-increasing frame counter once per end_frame. Cheap
     // (single Cell write) and gives the spike-log a way to name the frame.
     let frame_index = FRAME_COUNTER.with(|c| {
@@ -224,6 +312,11 @@ pub fn end_frame() {
 
     TRACER.with(|t| {
         let mut t = t.borrow_mut();
+        // Attach the per-frame heap delta before the frame rolls into history.
+        // None when no sampler is registered or the platform doesn't expose
+        // the API; otherwise signed bytes (negative on GC mid-frame).
+        t.current.heap_delta_bytes = heap_delta_bytes;
+        t.current.allocs = alloc_delta;
         if let Some(last_end) = last_end {
             let between_frames = now.saturating_duration_since(last_end);
             t.current.sections.push(Section {
@@ -279,10 +372,25 @@ pub fn end_frame() {
     // Emit spike warnings outside the trace borrows so a tracing subscriber
     // that re-enters frame_trace (e.g. for its own scope) doesn't conflict
     // with our state. Common case is zero entries per frame; only allocates
-    // strings on the actual spike path.
+    // strings on the actual spike path. The heap-delta and allocs suffixes
+    // are appended only when their respective signals are wired AND produced
+    // valid endpoints; on platforms without them the fields stay absent so
+    // the log doesn't show misleading "heap=0" / "allocs=0" reads.
     for (name, elapsed) in over_threshold {
+        let heap_suffix = heap_delta_bytes
+            .map(|d| format!(" heap_delta={:+.2}MB", d as f64 / (1024.0 * 1024.0)))
+            .unwrap_or_default();
+        let alloc_suffix = alloc_delta
+            .map(|d| {
+                format!(
+                    " allocs={} ({:+.2}MB net)",
+                    d.alloc_count,
+                    d.net_bytes as f64 / (1024.0 * 1024.0),
+                )
+            })
+            .unwrap_or_default();
         tracing::warn!(
-            "frame_trace spike: section='{name}' elapsed={:.1}ms frame={frame_index}",
+            "frame_trace spike: section='{name}' elapsed={:.1}ms frame={frame_index}{heap_suffix}{alloc_suffix}",
             elapsed.as_secs_f32() * 1000.0,
         );
     }
@@ -302,9 +410,30 @@ pub fn set_capacity(capacity: usize) {
 
 /// Snapshot the rolling history. Allocates; intended for the (occasional) display
 /// path, not the hot path. Returns frames in oldest-to-newest order.
+///
+/// Prefer [`with_history`] in per-frame callers (e.g. PerfOverlay): cloning the
+/// whole history once a frame at 60fps is ~120 allocations/frame on its own,
+/// which is enough to swamp the actual demo's allocation rate when reading
+/// the alloc telemetry.
 #[cfg(feature = "frame-trace")]
 pub fn history() -> Vec<FrameTrace> {
     TRACER.with(|t| t.borrow().history.iter().cloned().collect())
+}
+
+/// Run `f` with a borrow of the rolling history. Zero-allocation read path:
+/// per-frame callers (PerfOverlay) iterate refs and accumulate scalars on the
+/// stack without cloning the VecDeque or its `Vec<Section>` payloads.
+///
+/// `f` must NOT call back into `frame_trace` mutators (`scope`, `end_frame`,
+/// `record_external`) while the borrow is held — that would deadlock the
+/// `RefCell`. Reading via `last_frame`, `max_ever`, etc. is fine because
+/// those use separate cells / re-entry-safe paths.
+///
+/// Returns whatever `f` returns so callers can pipe through stack-only
+/// reductions (sums, means, max) without intermediate Vecs.
+#[cfg(feature = "frame-trace")]
+pub fn with_history<R>(f: impl FnOnce(&std::collections::VecDeque<FrameTrace>) -> R) -> R {
+    TRACER.with(|t| f(&t.borrow().history))
 }
 
 /// Snapshot only the last completed frame. Cheaper than [`history`] when the caller
@@ -395,6 +524,9 @@ pub fn clear_max_ever() {}
 #[cfg(not(feature = "frame-trace"))]
 pub fn set_spike_threshold(_threshold: Duration) {}
 
+#[cfg(not(feature = "frame-trace"))]
+pub fn set_heap_sampler(_sampler: HeapSampler) {}
+
 /// Aggregate stats across the rolling window for one section name.
 #[derive(Clone, Debug)]
 pub struct SectionStats {
@@ -474,6 +606,12 @@ pub fn history() -> Vec<FrameTrace> {
 }
 
 #[cfg(not(feature = "frame-trace"))]
+pub fn with_history<R>(f: impl FnOnce(&std::collections::VecDeque<FrameTrace>) -> R) -> R {
+    let empty = std::collections::VecDeque::new();
+    f(&empty)
+}
+
+#[cfg(not(feature = "frame-trace"))]
 pub fn last_frame() -> Option<FrameTrace> {
     None
 }
@@ -530,6 +668,33 @@ mod tests {
             end_frame();
         }
         assert!(history().len() <= 3, "history should be capped");
+    }
+
+    #[test]
+    fn heap_sampler_populates_delta_on_completed_frame() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Thread-local atomic counter so the synthetic sampler returns
+        // strictly-increasing values without needing real perf.memory. Two
+        // calls inside one frame: one in begin_frame, one in end_frame; the
+        // delta should equal the per-call increment.
+        static FAKE_HEAP: AtomicU64 = AtomicU64::new(1_000_000);
+        fn fake_sampler() -> Option<u64> {
+            Some(FAKE_HEAP.fetch_add(4096, Ordering::SeqCst) + 4096)
+        }
+        FAKE_HEAP.store(1_000_000, Ordering::SeqCst);
+        set_heap_sampler(fake_sampler);
+        // Drain any pre-existing in-flight frame from prior tests so the
+        // begin/end pair below produces the heap-delta-bearing frame.
+        end_frame();
+        begin_frame();
+        end_frame();
+        let frame = last_frame().expect("end_frame should produce a frame");
+        let delta = frame
+            .heap_delta_bytes
+            .expect("sampler is registered; delta should be Some");
+        // begin captured first, end captured second; both incremented the
+        // counter by 4096. Delta = end - begin = 4096.
+        assert_eq!(delta, 4096, "expected one-increment delta, got {delta}");
     }
 
     #[test]

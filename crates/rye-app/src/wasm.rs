@@ -52,7 +52,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use wasm_bindgen::prelude::Closure;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, JsValue};
 
 /// Returns true if the page opted into click-to-start by setting
 /// `data-mode="manual"` on the host element with the given id. Returns false on
@@ -104,4 +104,36 @@ pub fn wait_for_launch(button_id: &str, on_click: impl FnOnce() + 'static) -> Re
     // which is fine because click-to-start happens at most once per page load.
     cb.forget();
     Ok(())
+}
+
+/// Sample the V8 JS heap size in bytes, or `None` if the runtime doesn't expose
+/// `performance.memory.usedJSHeapSize`. Chromium browsers (Chrome / Edge) expose
+/// it as a non-standard extension; Firefox + Safari do not, and there the
+/// returned value is `None` so the caller can fall back to "no heap signal."
+///
+/// Intended to be registered into `rye_time::frame_trace::set_heap_sampler` at
+/// startup so each frame gets a heap delta attached for spike correlation. The
+/// underlying property is bucketed by V8 to a ~25-100ms resolution; this is
+/// fine for catching multi-MB jumps that correlate with major GC pauses, less
+/// fine for spotting single-object allocations. Don't read short-term changes
+/// here as authoritative.
+///
+/// Architectural note: `js_sys::Reflect` is the right tool because `web-sys`
+/// doesn't surface `Performance::memory` (it's not in the standard). Reflect
+/// gracefully degrades to `None` on Firefox via the `is_undefined` check.
+pub fn js_heap_sampler() -> Option<u64> {
+    let window = web_sys::window()?;
+    let performance = window.performance()?;
+    let perf_val: &JsValue = performance.as_ref();
+    let memory = js_sys::Reflect::get(perf_val, &JsValue::from_str("memory")).ok()?;
+    if memory.is_undefined() || memory.is_null() {
+        return None;
+    }
+    let used = js_sys::Reflect::get(&memory, &JsValue::from_str("usedJSHeapSize")).ok()?;
+    let bytes = used.as_f64()?;
+    if bytes.is_finite() && bytes >= 0.0 {
+        Some(bytes as u64)
+    } else {
+        None
+    }
 }
