@@ -1,0 +1,38 @@
+[package]
+name = "polytope_playground"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Polytope Playground: interactive 4D rotation over Polytope4 with active-set and composer rotor UIs. Native + wasm32."
+
+# Promoted from `examples/polytope_playground/` to a workspace member crate so it can
+# be built as a `[[bin]]` target (a requirement for Trunk's wasm pipeline; Trunk can't
+# target `[[example]]`). The `cargo run --example polytope_playground` workflow is
+# replaced by `cargo run -p polytope_playground` (or just `cargo run --bin
+# polytope_playground` from the workspace root); the index.html lives at
+# `crates/polytope_playground/index.html` and is the Trunk entry point.
+
+[dependencies]
+anyhow.workspace = true
+glam.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+
+rye-app     = { path = "../rye-app", default-features = false }
+rye-camera  = { path = "../rye-camera" }
+rye-egui    = { path = "../rye-egui" }
+rye-math    = { path = "../rye-math" }
+rye-physics = { path = "../rye-physics" }
+rye-render  = { path = "../rye-render" }
+rye-scene   = { path = "../rye-scene" }
+rye-shape   = { path = "../rye-shape" }
+
+[features]
+# Default to capture-on for native dev (matches the previous `cargo run --example`
+# behavior, which inherited rye-app's default features). The wasm build at
+# `index.html` opts out via `data-cargo-no-default-features`, dropping the native-only
+# encoder crates and routing console commands through `capture_stub.rs`.
+default = ["capture"]
+capture = ["rye-app/capture"]
