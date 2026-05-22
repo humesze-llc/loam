@@ -15,6 +15,7 @@ members = [
   "crates/rye-text",
   "crates/rye-egui",
   "crates/polytope_playground",
+  "crates/tesseract_demo",
 ]
 resolver = "2"
 

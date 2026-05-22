@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <title>Tesseract &middot; Rye</title>
+
+    <!-- Standalone workspace crate; Trunk picks up the implicit `[[bin]]` from
+         `src/main.rs`. `data-cargo-no-default-features` drops the `capture`
+         feature on wasm so native-only encoder crates stay out of the dep tree. -->
+    <link data-trunk rel="rust"
+          href="Cargo.toml"
+          data-cargo-no-default-features />
+
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: #0e0e12;
+            color: #d8d8df;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                         "Helvetica Neue", Arial, sans-serif;
+            overflow: hidden;
+        }
+        #rye-canvas-host {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #rye-canvas-host canvas {
+            width: 100% !important;
+            height: 100% !important;
+            display: block;
+            background: #0e0e12;
+        }
+        .rye-demo-launch {
+            font: inherit;
+            font-size: 14px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #d8d8df;
+            background: #1a1a22;
+            border: 1px solid #2a2a35;
+            border-radius: 6px;
+            padding: 14px 28px;
+            cursor: pointer;
+            transition: background 120ms ease, border-color 120ms ease;
+        }
+        .rye-demo-launch:hover {
+            background: #22222d;
+            border-color: #3a3a48;
+        }
+        .rye-demo-launch:active {
+            background: #1a1a22;
+        }
+    </style>
+</head>
+<body>
+    <div id="rye-canvas-host" data-mode="manual">
+        <button id="rye-launch" class="rye-demo-launch" type="button">
+            Launch tesseract demo
+        </button>
+    </div>
+</body>
+</html>
