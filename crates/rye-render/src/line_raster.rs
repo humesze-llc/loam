@@ -416,13 +416,83 @@ impl LineRasterNode {
         self.instance_count = needed_capacity;
     }
 
-    /// Render the uploaded line mesh onto `view`. `LoadOp::Load` preserves the existing color
-    /// attachment contents; the rasterizer composes with whatever ran before it (the
-    /// raymarcher's scene render in `polytope_playground`, or a dedicated clear pass).
+    /// Record a render pass that draws the uploaded line mesh into `view`, using the
+    /// caller-supplied `encoder`. **Does NOT call `encoder.finish()` or
+    /// `queue.submit`** — those are the caller's responsibility, typically the
+    /// runner batching multiple passes into one submit per frame (the
+    /// `App::record` path).
     ///
-    /// `depth_view` is required when the pipeline was created with `Some(depth_format)` and
-    /// must be `None` otherwise. Mismatch panics with a descriptive message rather than
-    /// surfacing a less-readable wgpu validation error.
+    /// `LoadOp::Load` preserves the existing color attachment contents; the
+    /// rasterizer composes with whatever ran before it.
+    ///
+    /// `depth_view` is required when the pipeline was created with
+    /// `Some(depth_format)` and must be `None` otherwise. Mismatch panics with a
+    /// descriptive message rather than surfacing a less-readable wgpu validation
+    /// error.
+    pub fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        depth_view: Option<&wgpu::TextureView>,
+        viewport: Option<&crate::Viewport>,
+    ) {
+        match (self.has_depth, depth_view.is_some()) {
+            (true, false) => {
+                panic!(
+                    "LineRasterNode::record: pipeline was created with a depth format but \
+                     no depth view was provided"
+                )
+            }
+            (false, true) => {
+                panic!(
+                    "LineRasterNode::record: pipeline was created without a depth format but \
+                     a depth view was provided"
+                )
+            }
+            _ => {}
+        }
+        if self.instance_count == 0 {
+            return;
+        }
+        let depth_attachment = depth_view.map(|dv| RenderPassDepthStencilAttachment {
+            view: dv,
+            depth_ops: Some(Operations {
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+            }),
+            stencil_ops: None,
+        });
+        let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("line_raster pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: depth_attachment,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        if let Some(vp) = viewport {
+            vp.apply(&mut rp);
+        }
+        rp.set_pipeline(&self.pipeline);
+        rp.set_bind_group(0, &self.bind_group, &[]);
+        rp.set_vertex_buffer(0, self.corner_buf.slice(..));
+        rp.set_vertex_buffer(1, self.instance_buf.slice(..));
+        rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        rp.draw_indexed(0..6, 0, 0..self.instance_count);
+    }
+
+    /// Legacy wrapper: builds its own encoder + submits. Kept for backwards
+    /// compatibility with demos still on the multi-submit `App::render` path.
+    /// New code should prefer [`Self::record`] called from inside
+    /// [`App::record`](rye_app::App::record), which lets the runner share one
+    /// encoder across the whole frame.
     pub fn execute(
         &self,
         rd: &RenderDevice,
@@ -430,65 +500,10 @@ impl LineRasterNode {
         depth_view: Option<&wgpu::TextureView>,
         viewport: Option<&crate::Viewport>,
     ) -> anyhow::Result<()> {
-        match (self.has_depth, depth_view.is_some()) {
-            (true, false) => {
-                panic!(
-                    "LineRasterNode::execute: pipeline was created with a depth format but \
-                     no depth view was provided"
-                )
-            }
-            (false, true) => {
-                panic!(
-                    "LineRasterNode::execute: pipeline was created without a depth format but \
-                     a depth view was provided"
-                )
-            }
-            _ => {}
-        }
-        if self.instance_count == 0 {
-            return Ok(());
-        }
         let mut encoder = rd.device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("line_raster encoder"),
         });
-        {
-            let depth_attachment = depth_view.map(|dv| RenderPassDepthStencilAttachment {
-                view: dv,
-                // `Load` matches the color attachment: the caller is responsible for clearing
-                // depth (typically in the same clear pass that clears color). This lets
-                // multiple LineRasterNode / TriangleRasterNode draws share one depth buffer
-                // within a frame without each clearing it.
-                depth_ops: Some(Operations {
-                    load: LoadOp::Load,
-                    store: StoreOp::Store,
-                }),
-                stencil_ops: None,
-            });
-            let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("line_raster pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: depth_attachment,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            if let Some(vp) = viewport {
-                vp.apply(&mut rp);
-            }
-            rp.set_pipeline(&self.pipeline);
-            rp.set_bind_group(0, &self.bind_group, &[]);
-            rp.set_vertex_buffer(0, self.corner_buf.slice(..));
-            rp.set_vertex_buffer(1, self.instance_buf.slice(..));
-            rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            rp.draw_indexed(0..6, 0, 0..self.instance_count);
-        }
+        self.record(&mut encoder, view, depth_view, viewport);
         rd.queue.submit(Some(encoder.finish()));
         Ok(())
     }
