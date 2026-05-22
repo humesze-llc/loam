@@ -121,6 +121,18 @@ impl App for TesseractApp {
     fn setup(ctx: &mut SetupCtx<'_>) -> Result<Self> {
         let topo = Polytope4::Tesseract.topology();
 
+        // Args: `?spin_rate=N` overrides the default rotation speed (rad/s),
+        // `?paused=true|1` starts paused. Both useful for blog embeds where
+        // the page author wants a specific static snapshot or a slower
+        // animation for screen-recording. Native users can pass the same as
+        // `--spin_rate=0.2 --paused=true`.
+        let args = rye_app::args::Args::current();
+        let spin_rate = args.parse::<f32>("spin_rate").unwrap_or(SPIN_RATE);
+        let paused = args
+            .get("paused")
+            .map(|v| matches!(v, "true" | "1" | "yes"))
+            .unwrap_or(false);
+
         // One pipeline, no depth. The line rasterizer's `DepthMode::Off`
         // variant skips the depth attachment entirely; the pipeline doesn't
         // declare a depth-stencil state and the render pass omits the
@@ -164,12 +176,13 @@ impl App for TesseractApp {
             free_roam_pos,
             rotor: Rotor4::IDENTITY,
             // `Bivector4::basis(2)` is the xw plane in `Plane4`'s ordering
-            // (0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw). Times SPIN_RATE = rad/sec
-            // omega in the xw plane (sweeps vertex w-coordinates through the
-            // projection's inner-vs-outer mapping, which is the actual visible
-            // signature of 4D rotation under Perspective4D).
-            omega: Bivector4::basis(2) * SPIN_RATE,
-            paused: false,
+            // (0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw). Times the args-or-default
+            // spin rate = rad/sec omega in the xw plane (sweeps vertex
+            // w-coordinates through the projection's inner-vs-outer mapping,
+            // which is the actual visible signature of 4D rotation under
+            // Perspective4D).
+            omega: Bivector4::basis(2) * spin_rate,
+            paused,
             rotated_verts,
             mesh,
             console,
