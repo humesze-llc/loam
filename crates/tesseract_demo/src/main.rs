@@ -23,12 +23,11 @@ use anyhow::Result;
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use rye_app::{
     egui, run_with_config, App, Camera, CameraController, FirstPersonController, FrameCtx,
-    OrbitController, RunConfig, SetupCtx,
+    OrbitController, RenderCtx, RunConfig, SetupCtx,
 };
 use rye_egui::Console;
 use rye_math::{Bivector, Bivector4, EuclideanR3, EuclideanR4, Projection, Rotor, Rotor4};
 use rye_physics::polytope::Polytope4;
-use rye_render::device::RenderDevice;
 use rye_render::{line_raster::LineRasterNode, DepthMode, Viewport};
 use rye_shape::LineMesh;
 use winit::window::WindowAttributes;
@@ -229,9 +228,17 @@ impl App for TesseractApp {
         }
     }
 
-    fn on_event(&mut self, ev: &winit::event::WindowEvent, _ctx: &mut FrameCtx<'_>) {
+    fn on_event(&mut self, ev: &winit::event::WindowEvent, ctx: &mut FrameCtx<'_>) {
         use winit::event::{ElementState, KeyEvent, WindowEvent};
         use winit::keyboard::{KeyCode, PhysicalKey};
+        // Gate app-level hotkeys on egui NOT having keyboard focus. Without this,
+        // typing `trace` in the console fires our `KeyT` handler and toggles
+        // pause — silently freezing the animation while the user just wanted to
+        // run a console command. `ui_has_focus` is the runner's flag for "an
+        // egui widget (TextEdit, the console, etc.) is consuming keyboard."
+        if ctx.ui_has_focus {
+            return;
+        }
         if let WindowEvent::KeyboardInput {
             event:
                 KeyEvent {
@@ -271,7 +278,7 @@ impl App for TesseractApp {
         }
     }
 
-    fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
+    fn record(&mut self, ctx: &mut RenderCtx<'_>) -> Result<()> {
         let topo = Polytope4::Tesseract.topology();
 
         // 1. Apply the current 4D rotor to every vertex. Scale to the demo's
@@ -304,8 +311,8 @@ impl App for TesseractApp {
             focal_distance: FOCAL_DISTANCE,
         };
         self.lines.upload::<EuclideanR4, 4>(
-            &rd.device,
-            &rd.queue,
+            &ctx.rd.device,
+            &ctx.rd.queue,
             &self.mesh,
             &projection,
             1, // flat space; one sample per segment is exact.
@@ -313,31 +320,26 @@ impl App for TesseractApp {
 
         // 4. Camera uniforms. Standard perspective projection from R³ to
         // clip; aspect from the surface size.
-        let cfg = &rd.surface_bundle.config;
+        let cfg = &ctx.rd.surface_bundle.config;
         let aspect = cfg.width as f32 / cfg.height.max(1) as f32;
         let proj = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.05, 100.0);
         let view_dir = self.camera.view();
         let view_m = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
         self.lines.set_camera(
-            &rd.queue,
+            &ctx.rd.queue,
             proj * view_m,
             Vec2::new(cfg.width as f32, cfg.height as f32),
         );
 
-        // 5. Clear the color attachment + draw the lines in one pass. No
-        // pre-pass exists in this demo so this is the first write to the
-        // swapchain (or to the offscreen sRGB scene target on wasm; the
-        // composite handles the gamma either way).
-        let mut encoder = rd
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tesseract_demo::clear"),
-            });
+        // 5. Clear pass into the shared encoder. Could fuse into the line raster
+        // pass by giving LineRasterNode a LoadOp::Clear variant; saves one pass
+        // per frame but adds API surface for one demo. Defer until justified by
+        // another demo.
         {
-            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let _clear = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tesseract_demo::clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
+                    view: ctx.view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -355,12 +357,13 @@ impl App for TesseractApp {
                 occlusion_query_set: None,
             });
         }
-        rd.queue.submit(Some(encoder.finish()));
 
-        // Line rasterizer: `LoadOp::Load`, so the clear above is the
-        // backdrop. No depth, no resolve.
+        // 6. Line raster pass into the same encoder. `LoadOp::Load` preserves
+        // the clear above. No depth, no resolve. The runner submits the
+        // encoder once at end of frame (along with ui-paint + composite).
         let viewport = Viewport::full([cfg.width, cfg.height]);
-        self.lines.execute(rd, view, None, Some(&viewport))?;
+        self.lines
+            .record(ctx.encoder, ctx.view, None, Some(&viewport));
         Ok(())
     }
 
