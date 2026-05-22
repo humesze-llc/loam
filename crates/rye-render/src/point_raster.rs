@@ -10,8 +10,9 @@
 //! - **Vertex buffer**: 4 sprite-corner indices (`0u32`, `1`, `2`, `3`). Static, shared across
 //!   all points.
 //! - **Index buffer**: `[0u32, 1, 2, 2, 1, 3]`. Static, two triangles per quad.
-//! - **Instance buffer**: per-point [`PointInstance`] data (position, color, radius in pixels).
-//!   Re-uploaded when the point mesh changes via [`PointRasterNode::upload`].
+//! - **Instance buffer**: per-point `PointInstance` data (position, color, radius in pixels).
+//!   `PointInstance` is module-private; consumers go through [`PointRasterNode::upload`]
+//!   which converts a [`rye_shape::PointMesh`] into instance records internally.
 //! - **Uniform buffer**: [`PointRasterUniforms`] (view-projection matrix + viewport size). Same
 //!   shape as [`crate::line_raster::LineRasterUniforms`]; kept as a distinct type so the two
 //!   pipelines can diverge later without binary churn.
