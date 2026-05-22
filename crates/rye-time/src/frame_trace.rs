@@ -89,6 +89,15 @@ impl Tracer {
 #[cfg(feature = "frame-trace")]
 thread_local! {
     static TRACER: RefCell<Tracer> = RefCell::new(Tracer::new(DEFAULT_CAPACITY));
+    /// Timestamp of the last `end_frame` call. Combined with the next frame's
+    /// `begin_frame` + `end_frame` to decompose total cadence into our work
+    /// (`frame`) + browser idle time (`idle`); both are recorded explicitly so
+    /// readers don't have to mentally subtract.
+    static LAST_FRAME_END: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// Timestamp of the current frame's `begin_frame` call. Used by `end_frame`
+    /// to compute `frame` (CPU work) separately from `idle` (everything in the
+    /// browser/RAF/vsync gap that we don't control).
+    static CURRENT_FRAME_START: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 /// RAII guard returned from [`scope`]. Records elapsed time on drop. Holding one of
@@ -129,12 +138,64 @@ pub fn scope(name: &'static str) -> Scope {
     }
 }
 
+/// Mark the start of a frame's work. Pairs with [`end_frame`] to compute the `idle`
+/// section (time the browser/event loop spent before handing us this frame). Called
+/// by the runner at the top of each `redraw`, BEFORE opening the `frame` scope.
+///
+/// Without this signal, `end_frame` can only measure total cadence
+/// (`between-frames`); it can't tell how much of that was our CPU work vs. how much
+/// was the browser doing something else.
+#[cfg(feature = "frame-trace")]
+pub fn begin_frame() {
+    CURRENT_FRAME_START.with(|c| c.set(Some(Instant::now())));
+}
+
 /// Push the in-flight frame into history and start a new one. Called once per redraw
-/// cycle by the runner. Excess frames beyond `capacity` are dropped from the front.
+/// cycle by the runner, AFTER all the frame's scopes have closed.
+///
+/// Records two synthetic sections per frame (in addition to the explicit scopes the
+/// runner + demo opened):
+///
+/// - **`between-frames`**: total wall-clock between successive `end_frame` calls.
+///   Equal to `1 / fps`. Useful as a sanity check; if the perf overlay says 50fps
+///   the mean should be ~20ms.
+/// - **`idle`**: time from the last `end_frame` until this frame's `begin_frame`.
+///   That's the gap when our code wasn't running — browser RAF scheduling, vsync
+///   alignment, JS GC, tab throttling. This is what dominates `between-frames` on
+///   wasm (per the 2026-05-22 diagnosis); separating it explicitly means the perf
+///   overlay can show "where is time going?" without mental subtraction.
+///
+/// The first frame after startup records neither (no prior end to measure from).
 #[cfg(feature = "frame-trace")]
 pub fn end_frame() {
+    let now = Instant::now();
+    let last_end = LAST_FRAME_END.with(|cell| {
+        let prev = cell.get();
+        cell.set(Some(now));
+        prev
+    });
+    let frame_start = CURRENT_FRAME_START.with(|c| c.take());
+
     TRACER.with(|t| {
         let mut t = t.borrow_mut();
+        if let Some(last_end) = last_end {
+            let between_frames = now.saturating_duration_since(last_end);
+            t.current.sections.push(Section {
+                name: "between-frames",
+                elapsed: between_frames,
+            });
+            // `idle` is between the previous end_frame and this frame's begin_frame.
+            // If begin_frame wasn't called (e.g. the runner is mid-migration to the
+            // new API), we silently skip the idle section rather than emitting a
+            // bogus value.
+            if let Some(frame_start) = frame_start {
+                let idle = frame_start.saturating_duration_since(last_end);
+                t.current.sections.push(Section {
+                    name: "idle",
+                    elapsed: idle,
+                });
+            }
+        }
         let cap = t.capacity;
         let frame = std::mem::take(&mut t.current);
         if t.history.len() >= cap {
@@ -258,6 +319,9 @@ pub fn scope(_name: &'static str) -> Scope {
 
 #[cfg(not(feature = "frame-trace"))]
 pub fn end_frame() {}
+
+#[cfg(not(feature = "frame-trace"))]
+pub fn begin_frame() {}
 
 #[cfg(not(feature = "frame-trace"))]
 pub fn set_capacity(_capacity: usize) {}

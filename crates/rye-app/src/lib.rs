@@ -246,6 +246,17 @@ pub struct FrameCtx<'a> {
     pub fps: f32,
     pub n_ticks: usize,
     pub tick: u64,
+    /// Wall-clock seconds since the previous `App::update` call. Use this for
+    /// variable-rate visual animation (camera smoothing, hover bobs, particles,
+    /// continuous rotors driven by user-perceived time). For deterministic sim
+    /// state that must be lockstep-reproducible, use [`App::tick`] instead;
+    /// `tick`'s `dt` is the fixed-timestep interval regardless of frame rate.
+    ///
+    /// First call after setup gets `dt = 1.0 / RunConfig::fixed_hz` as a sensible
+    /// fallback (no prior frame to measure from). Subsequent calls reflect actual
+    /// elapsed time, so a 50fps frame gets dt ≈ 0.02 and a stutter-frame at
+    /// 15fps gets dt ≈ 0.066.
+    pub dt: f32,
     /// `true` if egui is consuming pointer or keyboard input this frame (a widget is
     /// hovered, focused, or accepting text). Gameplay code should gate movement /
     /// mouselook on `!ctx.ui_has_focus` so typing into a settings field doesn't also
@@ -534,6 +545,11 @@ struct Runner<A: App> {
     frame_count: u32,
     fps: f32,
 
+    /// Timestamp of the previous `App::update` call, used to compute `FrameCtx::dt`
+    /// (wall-clock elapsed since the last update). `None` before the first frame so
+    /// the first `dt` falls back to the fixed-timestep interval.
+    last_update_at: Option<Instant>,
+
     tick_index: u64,
     /// Consecutive `App::render` failures since the last successful frame. Compared
     /// against `RunConfig::render_error_budget`.
@@ -566,6 +582,7 @@ impl<A: App> Runner<A> {
             last_fps_update: Instant::now(),
             frame_count: 0,
             fps: 0.0,
+            last_update_at: None,
             tick_index: 0,
             render_error_streak: 0,
             deferred_error: None,
@@ -872,6 +889,11 @@ impl<A: App> ApplicationHandler for Runner<A> {
                     fps,
                     n_ticks: 0,
                     tick,
+                    // dt isn't meaningful for input events (they fire whenever the OS
+                    // delivers, not on a frame cadence). Zero is the least-surprising
+                    // value; apps that integrate continuous state should do that work
+                    // in `update`, not `on_event`.
+                    dt: 0.0,
                     ui_has_focus,
                     _non_exhaustive: PhantomData,
                 };
@@ -900,6 +922,12 @@ impl<A: App> Runner<A> {
             return;
         }
         let Some(rd) = self.rd.as_ref() else { return };
+
+        // Mark frame start for `idle` measurement. `end_frame` subtracts this from
+        // the previous `end_frame` timestamp to get `idle` (browser/RAF gap, not
+        // our work) — separate from `between-frames` (total cadence, our work +
+        // idle combined).
+        rye_time::frame_trace::begin_frame();
 
         // Whole-redraw scope. Subsequent named sections sum to less than this; the
         // delta is the small bits in between (FPS bookkeeping, capture status
@@ -935,6 +963,18 @@ impl<A: App> Runner<A> {
         // before this frame's UI runs.
         let ui_has_focus = self.ui.as_ref().is_some_and(|u| u.ui_has_focus());
         let input = self.input.take_frame();
+
+        // Compute dt (wall-clock seconds since previous update). First frame after
+        // setup has no prior `last_update_at`, so we seed with the fixed-timestep
+        // interval — better than 0.0, which would zero out any dt-driven animation
+        // on its very first integration step.
+        let now_inst = Instant::now();
+        let dt = match self.last_update_at {
+            Some(prev) => now_inst.saturating_duration_since(prev).as_secs_f32(),
+            None => 1.0 / self.config.fixed_hz as f32,
+        };
+        self.last_update_at = Some(now_inst);
+
         if let Some(app) = self.app.as_mut() {
             let mut fctx = FrameCtx {
                 rd,
@@ -943,6 +983,7 @@ impl<A: App> Runner<A> {
                 fps: self.fps,
                 n_ticks: n_capped,
                 tick: self.tick_index,
+                dt,
                 ui_has_focus,
                 _non_exhaustive: PhantomData,
             };
