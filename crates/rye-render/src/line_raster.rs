@@ -133,6 +133,12 @@ pub struct LineRasterNode {
     /// requires the matching depth view. Tracks the depth-or-not API contract so callers
     /// don't silently get mismatched render passes.
     has_depth: bool,
+    /// Per-call scratch for the instances vector built inside [`Self::upload`].
+    /// Persisted on the node so the Vec's heap capacity is reused across calls;
+    /// `clear()` empties the logical length without freeing the buffer, and the
+    /// next push series reuses the same allocation. Drops per-frame alloc count
+    /// for dynamic-mesh users (polytope_playground) by 1.
+    instances_scratch: Vec<LineInstance>,
 }
 
 impl LineRasterNode {
@@ -325,6 +331,7 @@ impl LineRasterNode {
             instance_count: 0,
             instance_capacity,
             has_depth: depth.is_active(),
+            instances_scratch: Vec::new(),
         }
     }
 
@@ -358,9 +365,22 @@ impl LineRasterNode {
         S: RasterizableSpace<N>,
     {
         let samples = samples_per_segment.max(1);
+        // `tess_buf` stays local because it's generic over `S::Point` and the
+        // node-level scratch field can't pick a single type. For flat spaces
+        // (the common case) `samples = 1` so this Vec stays at capacity 2; the
+        // allocation cost is tiny (~64 bytes) and short-lived. Once a curved-
+        // space user shows real cost here, lift it into a type-erased scratch
+        // (`Vec<u8>` with `bytemuck::cast_slice_mut`) on the node.
         let mut tess_buf: Vec<S::Point> = Vec::with_capacity(samples + 1);
 
-        let mut instances: Vec<LineInstance> = Vec::with_capacity(mesh.segments.len() * samples);
+        // `instances_scratch` is the node-owned scratch: `clear()` preserves
+        // the heap capacity allocated in previous calls, so the steady-state
+        // hot path does zero allocations after the first frame's growth.
+        // Avoids the ~80-bytes-per-segment Vec allocation that the previous
+        // call-local `Vec::with_capacity` did per upload.
+        self.instances_scratch.clear();
+        self.instances_scratch
+            .reserve(mesh.segments.len() * samples);
 
         for ((seg, (color_a, color_b)), &width) in mesh
             .segments
@@ -384,7 +404,7 @@ impl LineRasterNode {
                 let c1 = lerp_color(*color_a, *color_b, t1);
                 let q0 = S::project_point(tess_buf[i], projection);
                 let q1 = S::project_point(tess_buf[i + 1], projection);
-                instances.push(LineInstance {
+                self.instances_scratch.push(LineInstance {
                     start_pos: q0.to_array(),
                     _pad0: 0.0,
                     end_pos: q1.to_array(),
@@ -397,7 +417,7 @@ impl LineRasterNode {
             }
         }
 
-        let needed_capacity = instances.len() as u32;
+        let needed_capacity = self.instances_scratch.len() as u32;
         if needed_capacity > self.instance_capacity {
             // Grow buffer; round up to next power of two to amortize re-allocations.
             let new_cap = needed_capacity.next_power_of_two().max(16);
@@ -410,8 +430,12 @@ impl LineRasterNode {
             self.instance_capacity = new_cap;
         }
 
-        if !instances.is_empty() {
-            queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&instances));
+        if !self.instances_scratch.is_empty() {
+            queue.write_buffer(
+                &self.instance_buf,
+                0,
+                bytemuck::cast_slice(&self.instances_scratch),
+            );
         }
         self.instance_count = needed_capacity;
     }
