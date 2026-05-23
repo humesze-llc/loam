@@ -138,11 +138,34 @@ where
 {
     let data: JsValue = event.data();
 
-    // `init` is the only kind that touches A. Everything else lives in
-    // the non-generic messages module.
+    // `init` and `start` are both special-cased: `init` needs A (spawns
+    // the async wgpu setup with the App type) and `start` needs to fire
+    // BEFORE the RAF loop exists (so we can't route it through the
+    // per-frame queue — that queue only drains inside the loop).
     let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
         .ok()
         .and_then(|v| v.as_string());
+    if kind.as_deref() == Some("start") {
+        // Three orderings to handle:
+        //  1. Init done, kickoff stashed: invoke it now.
+        //  2. Init still running: stash the request; init_renderer will
+        //     self-trigger once the kickoff is ready.
+        //  3. Already started (kickoff consumed): no-op.
+        if let Some(kickoff) = RAF_KICKOFF.with(|k| k.borrow_mut().take()) {
+            tracing::info!("rye_app::wasm::worker: Start received, kicking off RAF loop");
+            kickoff();
+        } else {
+            // Either case 2 (init still running) or case 3 (already
+            // started). Setting the flag covers case 2; case 3 is
+            // harmless (init_renderer doesn't re-read the flag after
+            // first consume).
+            START_REQUESTED.with(|s| s.set(true));
+            tracing::info!(
+                "rye_app::wasm::worker: Start received before kickoff ready; queued"
+            );
+        }
+        return Ok(());
+    }
     if kind.as_deref() == Some("init") {
         let canvas = js_sys::Reflect::get(&data, &JsValue::from_str("canvas"))
             .map_err(|e| anyhow!("init missing 'canvas' field: {e:?}"))?
@@ -256,16 +279,28 @@ where
     // can plumb DPR explicitly through the init message.
     let pixels_per_point = 1.0; // see comment above; minor cosmetic issue.
 
-    let runner = WorkerRunner::<A>::setup(
+    let mut runner = WorkerRunner::<A>::setup(
         rd,
         canvas_for_runner,
         width,
         height,
         pixels_per_point,
     )
-        .await
-        .context("WorkerRunner::setup")?;
-    tracing::info!("rye_app::wasm::worker: WorkerRunner setup complete; starting RAF loop");
+    .await
+    .context("WorkerRunner::setup")?;
+
+    // Render exactly ONE preview frame. The launch overlay on main side
+    // uses `backdrop-filter: blur(...)` to blur whatever's rendered on
+    // the canvas; this single frame becomes the blurred preview the
+    // viewer sees BEFORE clicking. After this call, the canvas backing
+    // store holds the demo's initial state — same content the worker
+    // would render on the very first RAF tick if it had started, just
+    // displayed via the placeholder canvas instead of through a live
+    // RAF loop.
+    runner.frame().context("preview frame")?;
+    tracing::info!(
+        "rye_app::wasm::worker: preview frame rendered; awaiting Start to begin RAF loop"
+    );
 
     // Self-referential RAF closure. Captures the runner via Rc<RefCell>
     // and re-schedules itself each frame. Standard wasm-bindgen pattern.
@@ -292,23 +327,66 @@ where
         }
     }) as Box<dyn FnMut(f64)>));
 
-    // Kick off the first frame (dropping the borrow before we leak the Rc).
-    {
-        let first_cb = raf_cb.borrow();
-        let first = first_cb
-            .as_ref()
-            .expect("RAF closure populated above");
-        scope
-            .request_animation_frame(first.as_ref().unchecked_ref())
-            .map_err(|e| anyhow!("request_animation_frame: {e:?}"))?;
+    // Stash the RAF kickoff in the thread_local so the `Start` message
+    // handler (in `apply_message`) can invoke it when the user clicks.
+    // We don't kick off RAF here — the launch overlay is still visible
+    // and we want the canvas to keep showing the preview frame until
+    // the user opts in.
+    let scope_for_kickoff = scope.clone();
+    let raf_cb_for_kickoff = raf_cb.clone();
+    let kickoff: Box<dyn FnOnce()> = Box::new(move || {
+        let cb_ref = raf_cb_for_kickoff.borrow();
+        if let Some(cb) = cb_ref.as_ref() {
+            if let Err(e) =
+                scope_for_kickoff.request_animation_frame(cb.as_ref().unchecked_ref())
+            {
+                tracing::error!("rye_app::wasm::worker: RAF kickoff failed: {e:?}");
+            }
+        }
+    });
+    RAF_KICKOFF.with(|k| *k.borrow_mut() = Some(kickoff));
+
+    // If a Start landed during setup (user clicked the overlay before
+    // wgpu init completed), self-trigger now. Without this, the click
+    // would have dropped the Start (kickoff wasn't ready yet) and the
+    // overlay-removed-but-demo-frozen state would be permanent.
+    if START_REQUESTED.with(|s| s.replace(false)) {
+        if let Some(kickoff) = RAF_KICKOFF.with(|k| k.borrow_mut().take()) {
+            tracing::info!(
+                "rye_app::wasm::worker: Start was requested during init; kicking off now"
+            );
+            kickoff();
+        }
     }
 
     // Both `raf_cb` and `runner` need to outlive this function so the
-    // closure stays valid for subsequent RAF callbacks.
+    // closure + runner state survive across RAF callbacks (and the
+    // wait-for-Start window before the first RAF tick).
     Box::leak(Box::new(raf_cb));
     Box::leak(Box::new(runner));
 
     Ok(())
+}
+
+thread_local! {
+    /// Pending one-shot "kick off the RAF loop" closure. Populated by
+    /// `init_renderer` after the preview frame; consumed by
+    /// `handle_message` on the `Start` variant. `None` after
+    /// consumption (subsequent Start messages no-op).
+    ///
+    /// Uses `Box<dyn FnOnce>` because the kickoff captures owned
+    /// closure-state (the `Rc<RefCell<Closure>>` for the RAF callback
+    /// + the scope clone) and is intentionally consumable once.
+    static RAF_KICKOFF: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+
+    /// Set to `true` if a Start message arrives BEFORE `init_renderer`
+    /// has finished stashing the kickoff. Without this, an
+    /// over-eager click during the ~200ms wgpu+egui setup window
+    /// would drop the Start and freeze the demo on its preview
+    /// frame (overlay already removed by the click handler, no RAF
+    /// loop started). `init_renderer` checks this at the end of
+    /// setup and self-triggers if it's been set.
+    static START_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Per-worker lifecycle state: owns the RenderDevice + the user's App
@@ -456,6 +534,18 @@ where
         match msg {
             InputMessage::Resize { width, height } => {
                 self.resize(width, height);
+                // Render one frame at the new size so the preview
+                // refreshes (no CSS-stretched display). When the RAF
+                // loop is already running this is just one extra frame
+                // before the next RAF tick — harmless. When we're in
+                // pre-Start preview mode, this is the only frame that
+                // happens, and it's what the launch overlay's
+                // backdrop-filter blurs.
+                if let Err(e) = self.frame() {
+                    tracing::error!(
+                        "rye_app::wasm::worker: post-resize frame failed: {e:#}"
+                    );
+                }
             }
             InputMessage::MouseMove { x, y, .. } => {
                 self.input.cursor_moved(x as f64, y as f64);
@@ -500,6 +590,13 @@ where
             InputMessage::Visibility(_) => {
                 // Visibility isn't load-bearing for tesseract_demo right
                 // now; Phase B+ could pause continuous animation here.
+            }
+            InputMessage::Start => {
+                // Handled directly by `handle_message` (special-cased
+                // alongside `init`) because Start has to fire BEFORE
+                // the RAF loop starts; the per-frame queue only drains
+                // inside that loop, so routing through it would
+                // deadlock.
             }
         }
     }

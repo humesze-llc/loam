@@ -67,49 +67,69 @@
             display: block;
             background: #0e0e12;
         }
+        /* Launch overlay: covers the entire host so clicking anywhere
+           triggers the worker's Start signal. The worker has already
+           rendered ONE preview frame into the canvas underneath;
+           `backdrop-filter: blur(...)` blurs that frame so the viewer
+           sees a softened preview of the demo's first frame (not a
+           gradient placeholder). On click the overlay is removed,
+           revealing the live canvas, and the worker's RAF loop starts. */
         .rye-demo-launch {
-            /* Overlay the canvas with the launch button. Worker-mode
-               removes the button on click; the canvas underneath is
-               revealed when rendering starts. */
             position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             font: inherit;
             font-size: 14px;
             letter-spacing: 0.08em;
             text-transform: uppercase;
             color: #d8d8df;
-            background: #1a1a22;
-            border: 1px solid #2a2a35;
-            border-radius: 6px;
-            padding: 14px 28px;
+            background: rgba(14, 14, 18, 0.35);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            border: none;
             cursor: pointer;
-            transition: background 120ms ease, border-color 120ms ease;
+            transition: background 200ms ease, opacity 200ms ease;
+        }
+        .rye-demo-launch::after {
+            /* Outlined chip around the text so it reads as interactive
+               without dominating the preview. */
+            content: 'Click anywhere to launch';
+            display: inline-block;
+            padding: 14px 28px;
+            border: 1px solid rgba(200, 200, 220, 0.5);
+            border-radius: 6px;
+            background: rgba(20, 20, 28, 0.55);
         }
         .rye-demo-launch:hover {
-            background: #22222d;
-            border-color: #3a3a48;
+            background: rgba(14, 14, 18, 0.25);
+        }
+        .rye-demo-launch:hover::after {
+            background: rgba(28, 28, 38, 0.65);
+            border-color: rgba(220, 220, 240, 0.7);
         }
         .rye-demo-launch:active {
-            background: #1a1a22;
+            background: rgba(14, 14, 18, 0.4);
         }
     </style>
 </head>
 <body>
     <div id="rye-canvas-host" data-mode="manual">
-        <!-- Phase A: explicit `<canvas>` element so the main thread can
-             `transferControlToOffscreen()` it before spawning the worker.
-             Pre-N5 code path (winit-driven main-thread mode) created the
-             canvas dynamically; worker mode needs it in the DOM up front so
-             the click handler can grab it by id. Width/height attributes
-             are required: a 0×0 canvas can't be configured as a wgpu
-             surface. CSS scales the displayed size but the backing
-             dimensions stay as set. -->
+        <!-- Explicit `<canvas>` in the DOM up front so the main thread
+             can `transferControlToOffscreen()` it on click. Width/height
+             attributes are a fallback; the launcher recomputes the
+             physical-pixel size at click time from CSS dimensions × DPR
+             before transferring. -->
         <canvas id="rye-canvas" width="1280" height="800"></canvas>
-        <button id="rye-launch" class="rye-demo-launch" type="button">
-            Launch tesseract demo
-        </button>
+        <!-- Full-overlay launch button. Click anywhere in the host
+             triggers the spawn (the button covers the canvas). On click
+             the button removes itself; the canvas underneath becomes
+             visible and the worker takes over rendering. The button's
+             label is supplied by CSS (`::after`) so the markup stays
+             demo-agnostic. -->
+        <button id="rye-launch" class="rye-demo-launch" type="button"
+                aria-label="Launch demo"></button>
     </div>
 </body>
 </html>

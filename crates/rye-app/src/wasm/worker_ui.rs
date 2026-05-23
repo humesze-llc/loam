@@ -158,8 +158,12 @@ impl WorkerUi {
             InputMessage::Focus(focused) => {
                 self.raw_events.push(egui::Event::WindowFocused(*focused));
             }
-            // Resize handled by the runner directly (not an egui event).
-            InputMessage::Resize { .. } | InputMessage::Visibility(_) => {}
+            // Non-egui-relevant variants: Resize is handled by the
+            // runner; Visibility hasn't been wired up; Start fires
+            // outside the frame loop entirely (handled in handle_message).
+            InputMessage::Resize { .. }
+            | InputMessage::Visibility(_)
+            | InputMessage::Start => {}
         }
     }
 

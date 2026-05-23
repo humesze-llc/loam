@@ -74,6 +74,14 @@ pub enum InputMessage {
 
     /// Page visibility (tab-in-foreground) state changed.
     Visibility(bool),
+
+    /// Begin the continuous RAF loop. Sent by main thread after the
+    /// user clicks the launch overlay. Before this arrives, the worker
+    /// has already initialized + rendered ONE preview frame (so the
+    /// launch overlay can blur the demo's actual first frame instead
+    /// of a gradient placeholder); the RAF loop only starts once
+    /// `Start` lands.
+    Start,
 }
 
 thread_local! {
@@ -152,6 +160,7 @@ pub fn parse_non_init(data: &JsValue) -> Result<Option<InputMessage>> {
         "visibility" => {
             InputMessage::Visibility(read_bool_field(data, "visible").unwrap_or(false))
         }
+        "start" => InputMessage::Start,
         _ => return Ok(None), // unknown kind; caller decides to warn or ignore
     };
 

@@ -33,32 +33,22 @@ pub fn launch_on_click(host_id: &str, button_id: &str, canvas_id: &str) -> Resul
     // errors are visible. Worker side installs its own (separate JS heap).
     super::worker::install_logging_idempotent();
 
-    let document = web_sys::window()
-        .and_then(|w| w.document())
-        .ok_or_else(|| anyhow!("no document on global window"))?;
-    let button = document
-        .get_element_by_id(button_id)
-        .ok_or_else(|| anyhow!("no element with id '{button_id}'"))?
-        .dyn_into::<HtmlButtonElement>()
-        .map_err(|_| anyhow!("element '{button_id}' is not a button"))?;
-    let canvas_id_owned = canvas_id.to_string();
-    let host_id_owned = host_id.to_string();
-    let button_for_handler = button.clone();
-
-    let on_click = Closure::once(Box::new(move || {
-        // Remove the launch button so a frantic double-click can't fire
-        // twice (canvas can only be transferred once).
-        button_for_handler.remove();
-        if let Err(e) = spawn_worker(&canvas_id_owned, &host_id_owned) {
-            tracing::error!("rye_app::wasm::worker: spawn_worker failed: {e:#}");
-        }
-    }) as Box<dyn FnOnce()>);
-
-    button
-        .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())
-        .map_err(|e| anyhow!("add_event_listener: {e:?}"))?;
-    on_click.forget();
-
+    // Spawn the worker IMMEDIATELY on page load (not on click). The
+    // worker initializes wgpu + renders a single preview frame, then
+    // idles. The launch button is now a full-cover overlay that
+    // displays "click anywhere to launch" with a `backdrop-filter:
+    // blur(...)` applied over the canvas underneath — so the viewer
+    // sees a blurred preview of the demo's first frame, not a dark
+    // placeholder. When the user clicks, the click handler posts a
+    // `Start` message to the worker (kicks off its RAF loop) AND
+    // removes the launch overlay (revealing the live canvas).
+    //
+    // Trade-off: the wasm bundle + a worker spawn happen at page-load
+    // time, which costs bandwidth + memory before the viewer has shown
+    // interest. For single-demo blog pages that's fine; for pages
+    // embedding many demos at once, a future IntersectionObserver-based
+    // lazy-spawn would be the right answer (NH6 in the perf plan).
+    let _ = spawn_worker_for_preview(canvas_id, host_id, button_id)?;
     Ok(())
 }
 
@@ -78,9 +68,15 @@ fn read_wasm_bundle_url() -> Result<String> {
         .ok_or_else(|| anyhow!("__rye_wasm_url is not a string; demo's index.html must set it"))
 }
 
-/// Spawn the worker, transfer the canvas, post the init message.
-/// Called from the launch button's click handler.
-fn spawn_worker(canvas_id: &str, _host_id: &str) -> Result<()> {
+/// Spawn the worker, transfer the canvas, post the init message, AND
+/// wire the launch-overlay click handler that posts the `Start`
+/// message + removes the overlay on click. Called once at page load
+/// from `launch_on_click`.
+fn spawn_worker_for_preview(
+    canvas_id: &str,
+    _host_id: &str,
+    button_id: &str,
+) -> Result<()> {
     let document = web_sys::window()
         .and_then(|w| w.document())
         .ok_or_else(|| anyhow!("no document on global window"))?;
@@ -89,6 +85,11 @@ fn spawn_worker(canvas_id: &str, _host_id: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("no element with id '{canvas_id}'"))?
         .dyn_into::<HtmlCanvasElement>()
         .map_err(|_| anyhow!("element '{canvas_id}' is not a canvas"))?;
+    let launch_overlay = document
+        .get_element_by_id(button_id)
+        .ok_or_else(|| anyhow!("no element with id '{button_id}'"))?
+        .dyn_into::<HtmlButtonElement>()
+        .map_err(|_| anyhow!("element '{button_id}' is not a button"))?;
 
     // Size the canvas's pixel backing-store to match its DISPLAYED size
     // × device pixel ratio. The HTML's `width`/`height` attributes are a
@@ -155,12 +156,29 @@ fn spawn_worker(canvas_id: &str, _host_id: &str) -> Result<()> {
     let worker = Worker::new_with_options(&blob_url, &opts)
         .map_err(|e| anyhow!("Worker::new: {e:?}"))?;
 
+    // Shared state for the ready handshake + the click-before-ready race:
+    // - `worker_ready`: set to true once the worker has posted `ready`
+    //   and main has posted `init` back. Once true, the click handler
+    //   can post Start immediately.
+    // - `pending_start`: set by the click handler if the user clicks
+    //   BEFORE the worker is ready. The on_ready handler reads this
+    //   and posts Start as part of its own sequence.
+    //
+    // Without this, an eager click during the wasm-bundle-download
+    // window posts Start to a Worker that hasn't yet installed its
+    // `message` listener; Firefox drops the message and the demo
+    // never starts. Same root cause as the init handshake.
+    let worker_ready: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+    let pending_start: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+
     // Wait for the worker to signal it's ready (handler installed) before
     // posting the Init message. Without this handshake, the Init might
     // arrive before the worker's listener exists — Firefox empirically
     // drops such messages despite the spec implying queue semantics.
     let worker_for_ready = worker.clone();
     let offscreen_for_ready = offscreen.clone();
+    let worker_ready_for_ready = worker_ready.clone();
+    let pending_start_for_ready = pending_start.clone();
     let on_ready = Closure::wrap(Box::new(move |event: MessageEvent| {
         let data: JsValue = event.data();
         let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
@@ -190,6 +208,23 @@ fn spawn_worker(canvas_id: &str, _host_id: &str) -> Result<()> {
 
         if let Err(e) = worker_for_ready.post_message_with_transfer(&msg, &transfer) {
             tracing::error!("rye_app::wasm::worker: postMessage init failed: {e:?}");
+            return;
+        }
+
+        // The worker is now listening; subsequent click-Start posts are
+        // safe. If the user already clicked while we were waiting for
+        // ready, send the queued Start now.
+        worker_ready_for_ready.set(true);
+        if pending_start_for_ready.replace(false) {
+            tracing::info!(
+                "rye_app::wasm::worker: click occurred before ready; posting queued Start"
+            );
+            let start_msg = build_msg("start");
+            if let Err(e) = worker_for_ready.post_message(&start_msg) {
+                tracing::error!(
+                    "rye_app::wasm::worker: postMessage queued Start failed: {e:?}"
+                );
+            }
         }
     }) as Box<dyn FnMut(MessageEvent)>);
     worker
@@ -203,6 +238,89 @@ fn spawn_worker(canvas_id: &str, _host_id: &str) -> Result<()> {
     // (or via the worker's handle_message queue) and applied on first frame.
     install_dom_input_forwarders(&worker, &canvas)
         .context("install_dom_input_forwarders")?;
+
+    // Launch-overlay click handler. Spam-click defensive:
+    // - FnMut closure (not `Closure::once`) so repeat invocations are
+    //   guaranteed to be safe no-ops via the `fired` Cell guard. The
+    //   `Closure::once` variant relies on internal `Option::take`
+    //   semantics that aren't visibly diagnostic when they swallow
+    //   repeat clicks; the explicit Cell is easier to reason about.
+    // - Post Start FIRST, then disable + hide the overlay. If the post
+    //   fails (worker terminated, etc.), the overlay stays visible so
+    //   a retry click can fire again — better than "overlay gone and
+    //   nothing happens".
+    // - Set `pointer-events: none` on the overlay BEFORE removal so
+    //   any pending click events queued by the browser don't fire on
+    //   the not-yet-removed element.
+    {
+        let worker_for_click = worker.clone();
+        let overlay_for_click = launch_overlay.clone();
+        let worker_ready_for_click = worker_ready.clone();
+        let pending_start_for_click = pending_start.clone();
+        let fired: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+        let on_click = Closure::wrap(Box::new(move || {
+            if fired.get() {
+                tracing::debug!(
+                    "rye_app::wasm::worker: launch click ignored (already fired)"
+                );
+                return;
+            }
+            fired.set(true);
+
+            // If the worker isn't ready yet, QUEUE the Start intent.
+            // The on_ready handler will send Start as soon as the
+            // worker comes online. Firefox empirically drops messages
+            // sent to a Worker before its listener is installed, so we
+            // must not post Start during that window.
+            if !worker_ready_for_click.get() {
+                pending_start_for_click.set(true);
+                tracing::info!(
+                    "rye_app::wasm::worker: launch click before worker ready; \
+                     queued Start for on_ready handler"
+                );
+            } else {
+                tracing::info!("rye_app::wasm::worker: launch click; posting Start");
+                let msg = build_msg("start");
+                if let Err(e) = worker_for_click.post_message(&msg) {
+                    // Keep the overlay visible so the user can retry. Reset
+                    // `fired` so a subsequent click can try again.
+                    fired.set(false);
+                    tracing::error!(
+                        "rye_app::wasm::worker: postMessage Start failed: {e:?}; \
+                         overlay retained for retry"
+                    );
+                    return;
+                }
+            }
+
+            // Hide via pointer-events first (in case any queued clicks
+            // are still in-flight after our handler runs), THEN remove
+            // from the DOM on the next microtask. The
+            // pointer-events-none style alone would be sufficient to
+            // ignore subsequent clicks; the .remove() is cosmetic
+            // (the canvas underneath is what the viewer should see).
+            let style = overlay_for_click.style();
+            let _ = style.set_property("pointer-events", "none");
+            let _ = style.set_property("opacity", "0");
+            // Defer the actual DOM removal so the opacity transition
+            // (configured in CSS) can play out. 200ms matches the CSS
+            // `transition: opacity 200ms ease`.
+            let overlay_for_remove = overlay_for_click.clone();
+            let remove_cb = Closure::once_into_js(Box::new(move || {
+                overlay_for_remove.remove();
+            }) as Box<dyn FnOnce()>);
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    remove_cb.unchecked_ref(),
+                    200,
+                );
+            }
+        }) as Box<dyn FnMut()>);
+        launch_overlay
+            .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("launch overlay click listener: {e:?}"))?;
+        on_click.forget();
+    }
 
     // Keep the Worker alive. Dropping it would terminate. Box::leak is the
     // wasm-bindgen idiom for "this lives forever in this page."
@@ -232,26 +350,86 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
         .document()
         .ok_or_else(|| anyhow!("no document on window"))?;
 
-    // Resize: compute the canvas's pixel dimensions (CSS size × DPR) and
-    // post to worker. Resize fires on the WINDOW; we re-query the canvas
-    // size each fire because CSS recalc may not have settled by event time.
+    // Resize: DEBOUNCED. Drag-to-resize fires the DOM event 30-60×/sec;
+    // each event would trigger a wgpu `surface.configure()` on the worker
+    // side, which recreates the swap chain + scene texture + composite
+    // bind group (heavy + JS-allocating). Even at one reconfigure per
+    // browser-frame the worker can't keep up; mid-drag the tab gets
+    // genuinely stuck (we hit a hard freeze + crash during testing).
+    //
+    // The fix is debouncing, not just rate-limiting: wait until the user
+    // has STOPPED resizing (~100ms of no events) before committing the
+    // new size. During the drag the canvas backing-store stays at its
+    // old size — CSS scales it visually so the demo stretches briefly
+    // but no GPU work happens. Once the drag settles, one resize
+    // message is sent and the worker reconfigures once.
+    //
+    // 100ms ≈ 6 frames at 60Hz: long enough to coalesce a sustained
+    // drag, short enough that the final commit feels responsive.
+    const RESIZE_DEBOUNCE_FRAMES: u32 = 6;
     {
-        let worker = worker.clone();
-        let canvas = canvas.clone();
-        let window_for_dpr = window.clone();
+        // Shared state: `Some((w, h, frames_since_last_event))` while
+        // a resize is in flight; `None` when settled. Each new event
+        // resets the frame counter to 0 so a continuous drag never
+        // commits an intermediate size.
+        let pending: Rc<RefCell<Option<(u32, u32, u32)>>> = Rc::new(RefCell::new(None));
+        let pending_for_listener = pending.clone();
+        let canvas_for_listener = canvas.clone();
+        let window_for_listener = window.clone();
         let cb = Closure::wrap(Box::new(move || {
-            let dpr = window_for_dpr.device_pixel_ratio() as f32;
-            let w = (canvas.client_width() as f32 * dpr).max(1.0) as u32;
-            let h = (canvas.client_height() as f32 * dpr).max(1.0) as u32;
-            let msg = build_msg("resize");
-            set_msg_u32(&msg, "width", w);
-            set_msg_u32(&msg, "height", h);
-            let _ = worker.post_message(&msg);
+            let dpr = window_for_listener.device_pixel_ratio() as f32;
+            let w = (canvas_for_listener.client_width() as f32 * dpr).max(1.0) as u32;
+            let h = (canvas_for_listener.client_height() as f32 * dpr).max(1.0) as u32;
+            *pending_for_listener.borrow_mut() = Some((w, h, 0));
         }) as Box<dyn FnMut()>);
         window
             .add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref())
             .map_err(|e| anyhow!("window resize listener: {e:?}"))?;
         cb.forget();
+
+        // rAF tick: advance the debounce countdown. When idle for the
+        // threshold, commit the final size to the worker.
+        let worker_for_raf = worker.clone();
+        let pending_for_raf = pending.clone();
+        let window_for_raf = window.clone();
+        let raf_cb: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+        let raf_cb_for_closure = raf_cb.clone();
+        *raf_cb.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+            let commit = {
+                let mut p = pending_for_raf.borrow_mut();
+                match p.as_mut() {
+                    Some((_, _, frames)) => {
+                        *frames += 1;
+                        if *frames >= RESIZE_DEBOUNCE_FRAMES {
+                            let (w, h, _) = p.take().expect("just matched Some");
+                            Some((w, h))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            };
+            if let Some((w, h)) = commit {
+                let msg = build_msg("resize");
+                set_msg_u32(&msg, "width", w);
+                set_msg_u32(&msg, "height", h);
+                let _ = worker_for_raf.post_message(&msg);
+            }
+            let cb_ref = raf_cb_for_closure.borrow();
+            if let Some(cb) = cb_ref.as_ref() {
+                let _ = window_for_raf
+                    .request_animation_frame(cb.as_ref().unchecked_ref());
+            }
+        }) as Box<dyn FnMut()>));
+        {
+            let first_cb = raf_cb.borrow();
+            let first = first_cb.as_ref().expect("RAF cb populated above");
+            window
+                .request_animation_frame(first.as_ref().unchecked_ref())
+                .map_err(|e| anyhow!("resize rAF init: {e:?}"))?;
+        }
+        Box::leak(Box::new(raf_cb));
     }
 
     // Mouse move on the canvas. rAF-COALESCED: a DOM mouse-move can fire
