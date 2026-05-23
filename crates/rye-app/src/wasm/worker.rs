@@ -43,6 +43,7 @@ use web_sys::{
 
 use crate::{App, FrameCtx, RenderCtx, SetupCtx};
 use rye_asset::AssetWatcher;
+use rye_egui::egui;
 use rye_input::InputState;
 use rye_render::device::RenderDevice;
 use rye_shader::ShaderDb;
@@ -401,9 +402,23 @@ where
         rd.sample_count()
     );
 
-    // Construct the App via the shared `SetupCtx` shape. AssetWatcher on
-    // wasm32 is a no-op stub; ShaderDb is straightforward.
-    let runner = WorkerRunner::<A>::setup(rd, canvas_for_runner)
+    // Device pixel ratio for the worker's egui. We don't have direct
+    // access to `window.devicePixelRatio` from inside the worker
+    // (workers have no Window); the main thread sent us a value via
+    // the init message (already applied to canvas dimensions). Recover
+    // it from width / canvas.client_width if needed; for now, derive
+    // it as width / css_logical_width assumption (1x equivalent) and
+    // accept that worker mode shows egui at 1pt:1px scale. Phase B+
+    // can plumb DPR explicitly through the init message.
+    let pixels_per_point = 1.0; // see comment above; minor cosmetic issue.
+
+    let runner = WorkerRunner::<A>::setup(
+        rd,
+        canvas_for_runner,
+        width,
+        height,
+        pixels_per_point,
+    )
         .await
         .context("WorkerRunner::setup")?;
     tracing::info!("rye_app::wasm::worker: WorkerRunner setup complete; starting RAF loop");
@@ -458,6 +473,249 @@ where
 ///
 /// Phase B1 scope: drives `App::update` + `App::record` only. No egui,
 /// no input (Phase B3 + B4 add those).
+/// Worker-side egui integration: parallel to `rye_egui::UiIntegration`
+/// but without `egui_winit` (which depends on `web_sys::Window` and
+/// panics in `WorkerGlobalScope`). Translates `InputMessage` directly
+/// into `egui::RawInput::events` instead.
+///
+/// Owns the egui-wgpu `Renderer`, the `egui::Context`, and a per-frame
+/// `RawInput` accumulator. Mirror the `UiIntegration::begin_frame` +
+/// `paint` lifecycle so the App's existing `ui` method works unchanged.
+struct WorkerUi {
+    ctx: egui::Context,
+    renderer: egui_wgpu::Renderer,
+    /// Accumulates events between frames. Drained into `begin_pass` at
+    /// the start of each frame; populated by `record_input` whenever
+    /// an `InputMessage` arrives from main.
+    raw_events: Vec<egui::Event>,
+    /// Current modifier state. Updated on each key event so subsequent
+    /// pointer/key events carry the right `Modifiers`.
+    modifiers: egui::Modifiers,
+    /// Canvas pixel dimensions + DPR. Egui works in "points" (CSS-pixel
+    /// equivalents), wgpu in pixels — `pixels_per_point` is the conversion.
+    width_px: u32,
+    height_px: u32,
+    pixels_per_point: f32,
+    /// `wants_pointer_input || wants_keyboard_input` from the last
+    /// completed frame. Fed back to the App via `FrameCtx::ui_has_focus`
+    /// so gameplay code (camera, hotkeys) can avoid double-handling
+    /// events egui consumed.
+    wants_input: bool,
+}
+
+impl WorkerUi {
+    fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        sample_count: u32,
+        width_px: u32,
+        height_px: u32,
+        pixels_per_point: f32,
+    ) -> Self {
+        let ctx = egui::Context::default();
+        let renderer = egui_wgpu::Renderer::new(
+            device,
+            target_format,
+            egui_wgpu::RendererOptions {
+                msaa_samples: sample_count,
+                ..Default::default()
+            },
+        );
+        Self {
+            ctx,
+            renderer,
+            raw_events: Vec::new(),
+            modifiers: egui::Modifiers::default(),
+            width_px,
+            height_px,
+            pixels_per_point,
+            wants_input: false,
+        }
+    }
+
+    /// Translate one InputMessage into zero or more egui events.
+    /// Updates `modifiers` as a side effect on key events.
+    fn record_input(&mut self, msg: &InputMessage) {
+        match msg {
+            InputMessage::MouseMove { x, y, .. } => {
+                let pos = self.point(*x, *y);
+                self.raw_events.push(egui::Event::PointerMoved(pos));
+            }
+            InputMessage::MouseButton {
+                x,
+                y,
+                button,
+                pressed,
+            } => {
+                let pos = self.point(*x, *y);
+                if let Some(b) = egui_button_from_dom(*button) {
+                    self.raw_events.push(egui::Event::PointerButton {
+                        pos,
+                        button: b,
+                        pressed: *pressed,
+                        modifiers: self.modifiers,
+                    });
+                }
+            }
+            InputMessage::MouseWheel { dx, dy } => {
+                // egui's MouseWheel unit is points (its "lines"-equivalent).
+                // The DOM->lines conversion already happened on main thread.
+                self.raw_events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(-*dx, -*dy), // egui convention: up = +y
+                    modifiers: self.modifiers,
+                });
+            }
+            InputMessage::Key {
+                code,
+                key,
+                pressed,
+                repeat,
+                ctrl,
+                shift,
+                alt,
+                meta,
+            } => {
+                // Update modifier state. Egui's Modifiers carries each
+                // boolean independently; we keep them current here.
+                self.modifiers = egui::Modifiers {
+                    alt: *alt,
+                    ctrl: *ctrl,
+                    shift: *shift,
+                    mac_cmd: *meta,
+                    command: *ctrl || *meta,
+                };
+                // Emit a Key event when the physical code maps to an
+                // egui::Key. Unknown codes are silently dropped (the
+                // App's hotkey routing covers them via InputState).
+                if let Some(egui_key) = egui_key_from_code(code) {
+                    self.raw_events.push(egui::Event::Key {
+                        key: egui_key,
+                        physical_key: Some(egui_key),
+                        pressed: *pressed,
+                        repeat: *repeat,
+                        modifiers: self.modifiers,
+                    });
+                }
+                // Emit a Text event for printable keys on press. Filters
+                // modifier-only chords (Ctrl+C etc.) so they don't
+                // accidentally insert text. `key.len() == 1` is a rough
+                // "is this a single printable character" check that
+                // works for ASCII + common Latin codepoints; multi-codepoint
+                // logical keys ("ArrowUp", "Shift") are filtered out.
+                if *pressed
+                    && !*ctrl
+                    && !*alt
+                    && !*meta
+                    && key.chars().count() == 1
+                    && !key.starts_with(char::is_control)
+                {
+                    self.raw_events.push(egui::Event::Text(key.clone()));
+                }
+            }
+            InputMessage::Focus(focused) => {
+                self.raw_events.push(egui::Event::WindowFocused(*focused));
+            }
+            // Resize handled by the runner directly (not an egui event).
+            InputMessage::Resize { .. } | InputMessage::Visibility(_) => {}
+        }
+    }
+
+    /// Convert canvas-relative CSS pixels to egui points. Egui works in
+    /// logical (DPI-independent) coordinates, so we divide by
+    /// `pixels_per_point`. The InputMessage carries CSS pixels already
+    /// (DOM `MouseEvent.offsetX/Y` are in CSS pixels), but we treat them
+    /// as such even though the canvas backing-store is in physical
+    /// pixels — egui's `screen_rect` is given in points to match.
+    fn point(&self, x: f32, y: f32) -> egui::Pos2 {
+        egui::pos2(x, y)
+    }
+
+    /// Begin a frame: take the accumulated raw input, set screen rect +
+    /// pixels-per-point, return the Context for the App's `ui` method.
+    fn begin_frame(&mut self) -> &egui::Context {
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(
+                    self.width_px as f32 / self.pixels_per_point,
+                    self.height_px as f32 / self.pixels_per_point,
+                ),
+            )),
+            events: std::mem::take(&mut self.raw_events),
+            modifiers: self.modifiers,
+            viewport_id: egui::ViewportId::ROOT,
+            time: None,
+            ..egui::RawInput::default()
+        };
+        self.ctx.begin_pass(raw_input);
+        &self.ctx
+    }
+
+    /// Finish the frame + paint into `view` via the supplied encoder.
+    /// Mirrors `UiIntegration::paint` but without the winit
+    /// `handle_platform_output` step (no cursor / clipboard routing yet).
+    fn paint(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        resolve_target: Option<&wgpu::TextureView>,
+    ) {
+        let full_output = self.ctx.end_pass();
+        self.wants_input =
+            self.ctx.wants_pointer_input() || self.ctx.wants_keyboard_input();
+
+        let primitives = self
+            .ctx
+            .tessellate(full_output.shapes, self.pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.width_px, self.height_px],
+            pixels_per_point: self.pixels_per_point,
+        };
+
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.renderer
+                .update_texture(device, queue, *id, image_delta);
+        }
+        self.renderer
+            .update_buffers(device, queue, encoder, &primitives, &screen);
+
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rye_app::wasm::worker::egui-paint"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            // egui-wgpu requires a `'static` lifetime on the pass; this
+            // is the standard wasm-bindgen / egui-wgpu idiom.
+            self.renderer
+                .render(&mut pass.forget_lifetime(), &primitives, &screen);
+        }
+
+        for id in &full_output.textures_delta.free {
+            self.renderer.free_texture(id);
+        }
+    }
+
+    fn resize(&mut self, width: u32, height: u32, dpr: f32) {
+        self.width_px = width;
+        self.height_px = height;
+        self.pixels_per_point = dpr;
+    }
+}
+
 struct WorkerRunner<A: App + 'static>
 where
     A::Space: 'static,
@@ -477,6 +735,15 @@ where
     /// the FrameInput shape rye-camera + rye-input expect. Fed by
     /// `apply_message`, drained by `take_frame` once per frame.
     input: InputState,
+    /// Worker-side egui integration (parallel to rye-egui's UiIntegration
+    /// but without winit dependency). Receives raw events from
+    /// `apply_message` and paints into the same encoder as App::record.
+    ui: WorkerUi,
+    /// Pixel dimensions stored separately so we don't have to round-trip
+    /// through RenderDevice to give egui the right `size_in_pixels`.
+    width_px: u32,
+    height_px: u32,
+    pixels_per_point: f32,
     start: web_time::Instant,
     last_update_at: Option<web_time::Instant>,
     tick_index: u64,
@@ -488,10 +755,16 @@ where
     A::Space: 'static,
 {
     /// Construct the runner: build ShaderDb + AssetWatcher (wasm stub) +
-    /// invoke `A::setup`. Async because `A::setup` may itself await on
-    /// asset loading or device-feature probes; in practice for the
-    /// existing demos it's synchronous and returns immediately.
-    async fn setup(rd: RenderDevice, canvas: OffscreenCanvas) -> Result<Self> {
+    /// WorkerUi + invoke `A::setup`. Async because `A::setup` may itself
+    /// await on asset loading or device-feature probes; in practice for
+    /// the existing demos it's synchronous and returns immediately.
+    async fn setup(
+        rd: RenderDevice,
+        canvas: OffscreenCanvas,
+        width_px: u32,
+        height_px: u32,
+        pixels_per_point: f32,
+    ) -> Result<Self> {
         let mut shader_db = ShaderDb::new(rd.device.clone());
         // AssetWatcher init failure isn't fatal: demos work without hot-
         // reload. On wasm32 the watcher is a no-op stub so Ok(_) always.
@@ -509,6 +782,22 @@ where
             time: 0.0,
         };
         let app = A::setup(&mut ctx).map_err(|e| e.context("App::setup"))?;
+
+        // WorkerUi is constructed AFTER A::setup so the App's own
+        // pipeline-warming (running inside setup) finishes first.
+        // egui-wgpu's pipeline compilation happens lazily on first
+        // paint; we accept that cost on the first real frame for now
+        // (N3-style warming for the worker-side egui pipelines is a
+        // follow-up).
+        let ui = WorkerUi::new(
+            &rd.device,
+            rd.target_format(),
+            rd.sample_count(),
+            width_px,
+            height_px,
+            pixels_per_point,
+        );
+
         Ok(Self {
             rd,
             canvas,
@@ -516,6 +805,10 @@ where
             watcher,
             app,
             input: InputState::default(),
+            ui,
+            width_px,
+            height_px,
+            pixels_per_point,
             start: web_time::Instant::now(),
             last_update_at: None,
             tick_index: 0,
@@ -524,10 +817,10 @@ where
     }
 
     /// Update the OffscreenCanvas pixel backing-store size + reconfigure
-    /// the wgpu surface. Called by the worker's message handler in
-    /// response to an `InputMessage::Resize` from the main thread.
-    /// Zero-sized resizes are no-ops (mirrors RenderDevice::resize's
-    /// defensive check).
+    /// the wgpu surface + update egui's screen rect. Called by the
+    /// worker's message handler in response to an `InputMessage::Resize`
+    /// from the main thread. Zero-sized resizes are no-ops (mirrors
+    /// RenderDevice::resize's defensive check).
     fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -536,6 +829,9 @@ where
         self.canvas.set_height(height);
         self.rd
             .resize(winit::dpi::PhysicalSize::new(width, height));
+        self.width_px = width;
+        self.height_px = height;
+        self.ui.resize(width, height, self.pixels_per_point);
         tracing::info!("rye_app::wasm::worker: resized to {width}x{height}");
     }
 
@@ -551,6 +847,11 @@ where
     /// worker mode yet; the camera + WASD axes will because those go
     /// through `FrameInput`.
     fn apply_message(&mut self, msg: InputMessage) {
+        // Fan out to egui FIRST so egui sees the event even if it's
+        // also consumed by InputState below. Egui filters based on
+        // pointer position vs widget bounds; double-feeding is fine.
+        self.ui.record_input(&msg);
+
         match msg {
             InputMessage::Resize { width, height } => {
                 self.resize(width, height);
@@ -631,6 +932,7 @@ where
         // InputMessage events. `take_frame` returns the drained snapshot
         // and resets per-tick deltas (mouse motion + scroll).
         let input = self.input.take_frame();
+        let ui_has_focus = self.ui.wants_input;
         {
             let _scope = rye_time::frame_trace::scope("app-update");
             let mut fctx = FrameCtx {
@@ -641,10 +943,17 @@ where
                 n_ticks: 0,
                 tick: self.tick_index,
                 dt,
-                ui_has_focus: false,
+                ui_has_focus,
                 _non_exhaustive: PhantomData,
             };
             self.app.update(&mut fctx);
+
+            // App::ui — egui frame begin, App builds widgets, paint happens
+            // after the scene render below. Same lifecycle as the windowed
+            // runner: begin_frame -> ctx clone -> App::ui -> paint at end.
+            let egui_ctx = self.ui.begin_frame().clone();
+            let _scope = rye_time::frame_trace::scope("app-ui");
+            self.app.ui(&egui_ctx, &mut fctx);
         }
 
         // begin_frame -> record -> composite -> submit -> present.
@@ -673,6 +982,21 @@ where
                 encoder: &mut encoder,
             };
             self.app.record(&mut ctx).context("App::record")?;
+        }
+
+        // egui paint into the same encoder, overlaid on the scene. MSAA
+        // resolve target is the swap view when MSAA is on (sample_count
+        // is 1 for the current worker config so resolve_target is None).
+        {
+            let _scope = rye_time::frame_trace::scope("ui-paint");
+            let resolve_target = (self.rd.sample_count() > 1).then_some(&swap_view);
+            self.ui.paint(
+                &self.rd.device,
+                &self.rd.queue,
+                &mut encoder,
+                render_view,
+                resolve_target,
+            );
         }
 
         // Composite pass when the swap is non-sRGB (browser-WebGPU).
@@ -1188,6 +1512,91 @@ fn set_msg_string(obj: &js_sys::Object, key: &str, v: &str) {
 // ---------------------------------------------------------------------------
 // Winit-type translation helpers
 // ---------------------------------------------------------------------------
+
+/// Map a DOM `MouseEvent.button` index to an `egui::PointerButton`.
+/// `None` for buttons egui doesn't recognize (4=Back, 5=Forward —
+/// egui's Extra1/Extra2 cover those but their semantics differ).
+fn egui_button_from_dom(button: u8) -> Option<egui::PointerButton> {
+    match button {
+        0 => Some(egui::PointerButton::Primary),
+        1 => Some(egui::PointerButton::Middle),
+        2 => Some(egui::PointerButton::Secondary),
+        3 => Some(egui::PointerButton::Extra1),
+        4 => Some(egui::PointerButton::Extra2),
+        _ => None,
+    }
+}
+
+/// Map a DOM `KeyboardEvent.code` string to an `egui::Key`. Partial
+/// mapping mirroring `winit_keycode_from_str` above; egui has fewer
+/// key variants so unmapped codes are dropped silently. Coverage
+/// focuses on what tesseract_demo + future demos plausibly need
+/// inside egui widgets: arrows, text-editing keys, function keys,
+/// alpha + digits.
+fn egui_key_from_code(code: &str) -> Option<egui::Key> {
+    let by_letter = match code {
+        "KeyA" => Some(egui::Key::A), "KeyB" => Some(egui::Key::B),
+        "KeyC" => Some(egui::Key::C), "KeyD" => Some(egui::Key::D),
+        "KeyE" => Some(egui::Key::E), "KeyF" => Some(egui::Key::F),
+        "KeyG" => Some(egui::Key::G), "KeyH" => Some(egui::Key::H),
+        "KeyI" => Some(egui::Key::I), "KeyJ" => Some(egui::Key::J),
+        "KeyK" => Some(egui::Key::K), "KeyL" => Some(egui::Key::L),
+        "KeyM" => Some(egui::Key::M), "KeyN" => Some(egui::Key::N),
+        "KeyO" => Some(egui::Key::O), "KeyP" => Some(egui::Key::P),
+        "KeyQ" => Some(egui::Key::Q), "KeyR" => Some(egui::Key::R),
+        "KeyS" => Some(egui::Key::S), "KeyT" => Some(egui::Key::T),
+        "KeyU" => Some(egui::Key::U), "KeyV" => Some(egui::Key::V),
+        "KeyW" => Some(egui::Key::W), "KeyX" => Some(egui::Key::X),
+        "KeyY" => Some(egui::Key::Y), "KeyZ" => Some(egui::Key::Z),
+        _ => None,
+    };
+    if by_letter.is_some() {
+        return by_letter;
+    }
+    let by_digit = match code {
+        "Digit0" => Some(egui::Key::Num0), "Digit1" => Some(egui::Key::Num1),
+        "Digit2" => Some(egui::Key::Num2), "Digit3" => Some(egui::Key::Num3),
+        "Digit4" => Some(egui::Key::Num4), "Digit5" => Some(egui::Key::Num5),
+        "Digit6" => Some(egui::Key::Num6), "Digit7" => Some(egui::Key::Num7),
+        "Digit8" => Some(egui::Key::Num8), "Digit9" => Some(egui::Key::Num9),
+        _ => None,
+    };
+    if by_digit.is_some() {
+        return by_digit;
+    }
+    let by_fn = match code {
+        "F1" => Some(egui::Key::F1),  "F2" => Some(egui::Key::F2),
+        "F3" => Some(egui::Key::F3),  "F4" => Some(egui::Key::F4),
+        "F5" => Some(egui::Key::F5),  "F6" => Some(egui::Key::F6),
+        "F7" => Some(egui::Key::F7),  "F8" => Some(egui::Key::F8),
+        "F9" => Some(egui::Key::F9),  "F10" => Some(egui::Key::F10),
+        "F11" => Some(egui::Key::F11), "F12" => Some(egui::Key::F12),
+        _ => None,
+    };
+    if by_fn.is_some() {
+        return by_fn;
+    }
+    match code {
+        "Space" => Some(egui::Key::Space),
+        "Enter" => Some(egui::Key::Enter),
+        "Escape" => Some(egui::Key::Escape),
+        "Tab" => Some(egui::Key::Tab),
+        "Backspace" => Some(egui::Key::Backspace),
+        "Delete" => Some(egui::Key::Delete),
+        "ArrowUp" => Some(egui::Key::ArrowUp),
+        "ArrowDown" => Some(egui::Key::ArrowDown),
+        "ArrowLeft" => Some(egui::Key::ArrowLeft),
+        "ArrowRight" => Some(egui::Key::ArrowRight),
+        "Home" => Some(egui::Key::Home),
+        "End" => Some(egui::Key::End),
+        "PageUp" => Some(egui::Key::PageUp),
+        "PageDown" => Some(egui::Key::PageDown),
+        "Backquote" => Some(egui::Key::Backtick),
+        "Minus" => Some(egui::Key::Minus),
+        "Equal" => Some(egui::Key::Equals),
+        _ => None,
+    }
+}
 
 /// Map a DOM `MouseEvent.button` index to a `winit::event::MouseButton`.
 /// The DOM convention is 0=primary, 1=middle, 2=secondary; winit uses

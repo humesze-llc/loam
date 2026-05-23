@@ -46,6 +46,12 @@ rye-shader = { path = "../rye-shader" }
 rye-time   = { path = "../rye-time" }
 rye-egui   = { path = "../rye-egui" }
 
+# Direct dep so the worker-mode `WorkerUi` (N5 Phase B4) can use
+# `egui_wgpu::Renderer` without going through rye-egui's `UiIntegration`
+# (which is winit-coupled). Same version rye-egui pulls in to keep the
+# egui type universe consistent across the workspace.
+egui-wgpu  = { version = "0.33", default-features = false }
+
 # Native-only async bridge: `pollster::block_on` synchronously awaits the
 # `wgpu::Instance::request_adapter` future for `RenderDevice::new`. On wasm there's no
 # blocking primitive; `run_with_config` uses `wasm_bindgen_futures::spawn_local`
