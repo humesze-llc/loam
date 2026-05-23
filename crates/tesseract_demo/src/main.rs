@@ -518,16 +518,30 @@ impl App for TesseractApp {
 fn main() -> Result<()> {
     #[cfg(target_arch = "wasm32")]
     {
+        // Worker side: the wasm binary was instantiated by the Blob-URL
+        // bootstrap inside a fresh Worker. Run the Phase A worker entry
+        // (clear-loop), then exit `main`. The worker stays alive via the
+        // RAF closure leaked inside `worker::run`. Tracing + panic hook
+        // are installed by `worker::run` itself (worker has its own JS
+        // heap so we initialize independently of the main thread).
+        if rye_app::wasm::is_worker_context() {
+            return rye_app::wasm::worker::run();
+        }
+
+        // Main thread: wire the launch button to spawn the worker on
+        // click. The button + canvas + host element come from the demo's
+        // index.html. The actual App lifecycle (Phase B onward) will run
+        // inside the worker; for Phase A the worker only renders a
+        // cycling clear-color.
         const HOST_ID: &str = "rye-canvas-host";
         const BUTTON_ID: &str = "rye-launch";
+        const CANVAS_ID: &str = "rye-canvas";
         if rye_app::wasm::is_manual_mode(HOST_ID) {
-            rye_app::wasm::wait_for_launch(BUTTON_ID, || {
-                if let Err(e) = launch_app() {
-                    tracing::error!("tesseract_demo launch failed: {e:#}");
-                }
-            })?;
-            return Ok(());
+            return rye_app::wasm::worker::launch_on_click(HOST_ID, BUTTON_ID, CANVAS_ID);
         }
+        // No `data-mode="manual"` on the host element: fall through to
+        // the legacy main-thread auto-launch path. Useful for native or
+        // for wasm demos that haven't migrated to worker mode yet.
     }
     launch_app()
 }

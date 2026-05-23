@@ -93,4 +93,11 @@ web-sys = { version = "0.3", features = [
     "WorkerType",
     "OffscreenCanvas",
     "MessageEvent",
+    # Blob + Url: used to construct an inline ESM bootstrap for the worker
+    # (so we don't have to ship a separate worker_bootstrap.js file per
+    # demo + the bootstrap can reference the trunk-hashed wasm URL at
+    # spawn time).
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
 ] }

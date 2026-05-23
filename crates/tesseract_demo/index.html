@@ -12,6 +12,35 @@
           href="Cargo.toml"
           data-cargo-no-default-features />
 
+    <!-- Worker-mode wasm-URL capture. Trunk injects an inline
+         `<script type="module">` (immediately above this comment in the
+         source order) that contains the import path to the hashed wasm
+         bundle. The deferred-execution semantics of `type="module"` mean
+         the script's BODY runs at DOMContentLoaded; but its textContent
+         is in the DOM as soon as parsed, so this synchronous script can
+         regex-extract the URL right now.
+
+         Trunk also adds `<link rel="modulepreload" href="...">` for the
+         same URL, but those are appended at the END of `<head>` (below
+         this script), so they're not in the DOM yet at the time this
+         script runs. Don't query them.
+
+         Why not use Trunk's `data-initializer`: would require a separate
+         JS file shipped with each demo. The 6-line regex below is the
+         minimum-friction Phase A solution; revisit if multi-demo demos
+         start to share a real initializer anyway. -->
+    <script>
+      (function () {
+        for (const s of document.querySelectorAll('script[type="module"]')) {
+          const m = s.textContent.match(/from\s*['"]([^'"]*tesseract_demo[-_][^'"]*\.js)['"]/);
+          if (m) {
+            window.__rye_wasm_url = new URL(m[1], document.baseURI).href;
+            return;
+          }
+        }
+      })();
+    </script>
+
     <style>
         html, body {
             margin: 0;
@@ -27,17 +56,21 @@
         #rye-canvas-host {
             position: absolute;
             inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
         }
         #rye-canvas-host canvas {
-            width: 100% !important;
-            height: 100% !important;
+            width: 100%;
+            height: 100%;
             display: block;
             background: #0e0e12;
         }
         .rye-demo-launch {
+            /* Overlay the canvas with the launch button. Worker-mode
+               removes the button on click; the canvas underneath is
+               revealed when rendering starts. */
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
             font: inherit;
             font-size: 14px;
             letter-spacing: 0.08em;
@@ -61,6 +94,15 @@
 </head>
 <body>
     <div id="rye-canvas-host" data-mode="manual">
+        <!-- Phase A: explicit `<canvas>` element so the main thread can
+             `transferControlToOffscreen()` it before spawning the worker.
+             Pre-N5 code path (winit-driven main-thread mode) created the
+             canvas dynamically; worker mode needs it in the DOM up front so
+             the click handler can grab it by id. Width/height attributes
+             are required: a 0×0 canvas can't be configured as a wgpu
+             surface. CSS scales the displayed size but the backing
+             dimensions stay as set. -->
+        <canvas id="rye-canvas" width="1280" height="800"></canvas>
         <button id="rye-launch" class="rye-demo-launch" type="button">
             Launch tesseract demo
         </button>
