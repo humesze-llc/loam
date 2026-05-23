@@ -31,6 +31,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use wasm_bindgen::prelude::Closure;
@@ -42,9 +43,90 @@ use web_sys::{
 
 use crate::{App, FrameCtx, RenderCtx, SetupCtx};
 use rye_asset::AssetWatcher;
-use rye_input::FrameInput;
+use rye_input::InputState;
 use rye_render::device::RenderDevice;
 use rye_shader::ShaderDb;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+use winit::keyboard::{KeyCode, PhysicalKey};
+
+// ---------------------------------------------------------------------------
+// InputMessage: typed protocol between main thread and worker
+// ---------------------------------------------------------------------------
+
+/// Per-frame inputs the main thread forwards to the worker. Each variant
+/// corresponds to a `kind` string in the postMessage JS object payload.
+/// The worker-side `handle_message` parses these and pushes them onto
+/// a thread_local queue; `WorkerRunner::frame` drains the queue at the
+/// top of each frame and applies the events.
+///
+/// Why an enum (vs raw JS objects passed through to the App): keeps the
+/// worker-side App code allocation-free for high-frequency events
+/// (mouse-move at 60Hz; if we serialized/deserialized JSON per event,
+/// every mouse motion would allocate strings).
+#[derive(Debug)]
+pub enum InputMessage {
+    /// New canvas pixel dimensions. Sent by main thread on window resize
+    /// (DPR-multiplied to physical pixels). Triggers a wgpu surface
+    /// reconfigure on the next frame.
+    Resize { width: u32, height: u32 },
+
+    /// Pointer moved to (x, y) in canvas-local CSS pixels (the worker
+    /// applies DPR if needed). `buttons` is the standard `MouseEvent.buttons`
+    /// bitmask (1=primary, 2=secondary, 4=middle).
+    MouseMove { x: f32, y: f32, buttons: u8 },
+
+    /// Pointer button transitioned. `button` is the standard
+    /// `MouseEvent.button` (0=primary, 1=middle, 2=secondary).
+    MouseButton {
+        x: f32,
+        y: f32,
+        button: u8,
+        pressed: bool,
+    },
+
+    /// Wheel delta in lines (after the browser's pixel/line normalization).
+    /// `dx`/`dy` follow DOM convention: positive = right/down.
+    MouseWheel { dx: f32, dy: f32 },
+
+    /// Keyboard key transitioned. `code` is the physical-key code (e.g.
+    /// "KeyT", "Space"); `key` is the logical key (e.g. "t", " ").
+    /// Phase B3 uses `code` for gameplay hotkeys + `key` for text input.
+    Key {
+        code: String,
+        key: String,
+        pressed: bool,
+        repeat: bool,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+    },
+
+    /// Window focus state changed.
+    Focus(bool),
+
+    /// Page visibility (tab-in-foreground) state changed.
+    Visibility(bool),
+}
+
+thread_local! {
+    /// Per-worker queue of inbound input messages, drained at the top of
+    /// every frame by `WorkerRunner::frame`. Using a thread_local because
+    /// the message handler closure doesn't have direct access to the
+    /// runner (the runner is constructed asynchronously, after the first
+    /// init message arrives).
+    static MESSAGE_QUEUE: RefCell<VecDeque<InputMessage>> = RefCell::new(VecDeque::new());
+}
+
+fn enqueue(msg: InputMessage) {
+    MESSAGE_QUEUE.with(|q| q.borrow_mut().push_back(msg));
+}
+
+/// Drain all queued messages. Returns them in arrival order so the
+/// runner can apply them sequentially. Called once per frame.
+fn drain_messages() -> Vec<InputMessage> {
+    MESSAGE_QUEUE.with(|q| q.borrow_mut().drain(..).collect())
+}
 
 /// Worker entry. Generic over the demo's `App` type so the same worker
 /// scaffolding drives whatever lifecycle the demo defines.
@@ -161,6 +243,69 @@ where
             });
             Ok(())
         }
+        Some("resize") => {
+            let width = read_u32_field(&data, "width").unwrap_or(0);
+            let height = read_u32_field(&data, "height").unwrap_or(0);
+            enqueue(InputMessage::Resize { width, height });
+            Ok(())
+        }
+        Some("mouse_move") => {
+            let x = read_f32_field(&data, "x").unwrap_or(0.0);
+            let y = read_f32_field(&data, "y").unwrap_or(0.0);
+            let buttons = read_u32_field(&data, "buttons").unwrap_or(0) as u8;
+            enqueue(InputMessage::MouseMove { x, y, buttons });
+            Ok(())
+        }
+        Some("mouse_button") => {
+            let x = read_f32_field(&data, "x").unwrap_or(0.0);
+            let y = read_f32_field(&data, "y").unwrap_or(0.0);
+            let button = read_u32_field(&data, "button").unwrap_or(0) as u8;
+            let pressed = read_bool_field(&data, "pressed").unwrap_or(false);
+            enqueue(InputMessage::MouseButton {
+                x,
+                y,
+                button,
+                pressed,
+            });
+            Ok(())
+        }
+        Some("mouse_wheel") => {
+            let dx = read_f32_field(&data, "dx").unwrap_or(0.0);
+            let dy = read_f32_field(&data, "dy").unwrap_or(0.0);
+            enqueue(InputMessage::MouseWheel { dx, dy });
+            Ok(())
+        }
+        Some("key") => {
+            let code = read_string_field(&data, "code").unwrap_or_default();
+            let key = read_string_field(&data, "key").unwrap_or_default();
+            let pressed = read_bool_field(&data, "pressed").unwrap_or(false);
+            let repeat = read_bool_field(&data, "repeat").unwrap_or(false);
+            let ctrl = read_bool_field(&data, "ctrl").unwrap_or(false);
+            let shift = read_bool_field(&data, "shift").unwrap_or(false);
+            let alt = read_bool_field(&data, "alt").unwrap_or(false);
+            let meta = read_bool_field(&data, "meta").unwrap_or(false);
+            enqueue(InputMessage::Key {
+                code,
+                key,
+                pressed,
+                repeat,
+                ctrl,
+                shift,
+                alt,
+                meta,
+            });
+            Ok(())
+        }
+        Some("focus") => {
+            let focused = read_bool_field(&data, "focused").unwrap_or(false);
+            enqueue(InputMessage::Focus(focused));
+            Ok(())
+        }
+        Some("visibility") => {
+            let visible = read_bool_field(&data, "visible").unwrap_or(false);
+            enqueue(InputMessage::Visibility(visible));
+            Ok(())
+        }
         Some(other) => {
             tracing::warn!("rye_app::wasm::worker: unknown message kind '{other}'");
             Ok(())
@@ -174,6 +319,25 @@ fn read_u32_field(obj: &JsValue, key: &str) -> Option<u32> {
         .ok()
         .and_then(|v| v.as_f64())
         .map(|f| f as u32)
+}
+
+fn read_f32_field(obj: &JsValue, key: &str) -> Option<f32> {
+    js_sys::Reflect::get(obj, &JsValue::from_str(key))
+        .ok()
+        .and_then(|v| v.as_f64())
+        .map(|f| f as f32)
+}
+
+fn read_bool_field(obj: &JsValue, key: &str) -> Option<bool> {
+    js_sys::Reflect::get(obj, &JsValue::from_str(key))
+        .ok()
+        .and_then(|v| v.as_bool())
+}
+
+fn read_string_field(obj: &JsValue, key: &str) -> Option<String> {
+    js_sys::Reflect::get(obj, &JsValue::from_str(key))
+        .ok()
+        .and_then(|v| v.as_string())
 }
 
 /// Phase B1: build `RenderDevice` from the worker-owned OffscreenCanvas,
@@ -202,6 +366,13 @@ where
     // The OffscreenCanvas IS the surface target. wgpu 27 supports this via
     // `SurfaceTarget::OffscreenCanvas`; the resulting Surface behaves like
     // a regular swapchain-backed surface from then on.
+    //
+    // We clone the canvas reference (cheap: it's a JsValue ref-count bump,
+    // not a pixel copy) so the WorkerRunner can keep its own handle for
+    // resize calls. The clone has SHARED ownership of the same underlying
+    // browser-owned OffscreenCanvas; mutations on one are visible on the
+    // other.
+    let canvas_for_runner = canvas.clone();
     let surface = instance
         .create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas))
         .context("create_surface from OffscreenCanvas")?;
@@ -232,7 +403,7 @@ where
 
     // Construct the App via the shared `SetupCtx` shape. AssetWatcher on
     // wasm32 is a no-op stub; ShaderDb is straightforward.
-    let runner = WorkerRunner::<A>::setup(rd)
+    let runner = WorkerRunner::<A>::setup(rd, canvas_for_runner)
         .await
         .context("WorkerRunner::setup")?;
     tracing::info!("rye_app::wasm::worker: WorkerRunner setup complete; starting RAF loop");
@@ -292,11 +463,20 @@ where
     A::Space: 'static,
 {
     rd: RenderDevice,
+    /// Held so resize can update the canvas's pixel backing-store dimensions
+    /// before reconfiguring the wgpu surface. Without setting `width`/`height`
+    /// on the OffscreenCanvas, the underlying backing wouldn't track the new
+    /// surface configuration and the render would silently stretch/scissor.
+    canvas: OffscreenCanvas,
     #[allow(dead_code)] // held alive for App's runtime; lookups via ShaderDb come in Phase B3+
     shader_db: ShaderDb,
     #[allow(dead_code)] // wasm stub today; native parity in case the trait grows
     watcher: Option<AssetWatcher>,
     app: A,
+    /// Input accumulator that converts our typed InputMessage stream into
+    /// the FrameInput shape rye-camera + rye-input expect. Fed by
+    /// `apply_message`, drained by `take_frame` once per frame.
+    input: InputState,
     start: web_time::Instant,
     last_update_at: Option<web_time::Instant>,
     tick_index: u64,
@@ -311,7 +491,7 @@ where
     /// invoke `A::setup`. Async because `A::setup` may itself await on
     /// asset loading or device-feature probes; in practice for the
     /// existing demos it's synchronous and returns immediately.
-    async fn setup(rd: RenderDevice) -> Result<Self> {
+    async fn setup(rd: RenderDevice, canvas: OffscreenCanvas) -> Result<Self> {
         let mut shader_db = ShaderDb::new(rd.device.clone());
         // AssetWatcher init failure isn't fatal: demos work without hot-
         // reload. On wasm32 the watcher is a no-op stub so Ok(_) always.
@@ -331,9 +511,11 @@ where
         let app = A::setup(&mut ctx).map_err(|e| e.context("App::setup"))?;
         Ok(Self {
             rd,
+            canvas,
             shader_db,
             watcher,
             app,
+            input: InputState::default(),
             start: web_time::Instant::now(),
             last_update_at: None,
             tick_index: 0,
@@ -341,12 +523,99 @@ where
         })
     }
 
-    /// One frame: dt, App::update, begin_frame, App::record, composite,
-    /// submit, present. Wraps `rye_time::frame_trace::scope` so the same
-    /// telemetry the windowed-mode runner emits is available here.
+    /// Update the OffscreenCanvas pixel backing-store size + reconfigure
+    /// the wgpu surface. Called by the worker's message handler in
+    /// response to an `InputMessage::Resize` from the main thread.
+    /// Zero-sized resizes are no-ops (mirrors RenderDevice::resize's
+    /// defensive check).
+    fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.canvas.set_width(width);
+        self.canvas.set_height(height);
+        self.rd
+            .resize(winit::dpi::PhysicalSize::new(width, height));
+        tracing::info!("rye_app::wasm::worker: resized to {width}x{height}");
+    }
+
+    /// Apply one `InputMessage`. Resize updates the surface; the other
+    /// variants route into `InputState` for the App's per-frame
+    /// `FrameInput`. Phase B4 will also fan these out to egui via
+    /// `RawInput` so HUD widgets can respond.
+    ///
+    /// `App::on_event` (the path that handles winit `WindowEvent`s, e.g.
+    /// tesseract_demo's KeyF / KeyT / Space / KeyR hotkeys) is deliberately
+    /// NOT plumbed here — constructing winit's `KeyEvent` requires private
+    /// platform-specific fields. Tesseract_demo's HOTKEYS won't work in
+    /// worker mode yet; the camera + WASD axes will because those go
+    /// through `FrameInput`.
+    fn apply_message(&mut self, msg: InputMessage) {
+        match msg {
+            InputMessage::Resize { width, height } => {
+                self.resize(width, height);
+            }
+            InputMessage::MouseMove { x, y, .. } => {
+                self.input.cursor_moved(x as f64, y as f64);
+            }
+            InputMessage::MouseButton {
+                button, pressed, ..
+            } => {
+                let button = mouse_button_from_dom(button);
+                let state = if pressed {
+                    ElementState::Pressed
+                } else {
+                    ElementState::Released
+                };
+                self.input.mouse_input(button, state);
+            }
+            InputMessage::MouseWheel { dx, dy } => {
+                self.input
+                    .mouse_wheel(MouseScrollDelta::LineDelta(dx, dy));
+            }
+            InputMessage::Key {
+                ref code, pressed, ..
+            } => {
+                if let Some(code) = winit_keycode_from_str(code) {
+                    let state = if pressed {
+                        ElementState::Pressed
+                    } else {
+                        ElementState::Released
+                    };
+                    self.input.key_input(PhysicalKey::Code(code), state);
+                }
+                // Hotkey routing via App::on_event deferred (see fn doc).
+            }
+            InputMessage::Focus(focused) => {
+                if !focused {
+                    // Mirror rye-input's focus-loss convention: drop held
+                    // buttons + invalidate cursor delta so re-focus doesn't
+                    // snap.
+                    self.input.release_buttons();
+                    self.input.cursor_invalidated();
+                }
+            }
+            InputMessage::Visibility(_) => {
+                // Visibility isn't load-bearing for tesseract_demo right
+                // now; Phase B+ could pause continuous animation here.
+            }
+        }
+    }
+
+    /// One frame: drain input queue, dt, App::update, begin_frame,
+    /// App::record, composite, submit, present. Wraps
+    /// `rye_time::frame_trace::scope` so the same telemetry the windowed
+    /// runner emits is available here.
     fn frame(&mut self) -> Result<()> {
         rye_time::frame_trace::begin_frame();
         let _frame_scope = rye_time::frame_trace::scope("frame");
+
+        // Drain queued input messages. Phase B2 only handles `Resize`;
+        // Phase B3 will add the mouse/keyboard variants here (routed
+        // into `InputState`) and Phase B4 will fan them out to egui too.
+        for msg in drain_messages() {
+            self.apply_message(msg);
+        }
 
         // dt: wall-clock since previous update. First frame falls back
         // to 1/60 so the App doesn't see a 0 dt that breaks integrators.
@@ -358,13 +627,15 @@ where
         self.last_update_at = Some(now);
         self.tick_index = self.tick_index.wrapping_add(1);
 
-        // App::update with an empty FrameInput (Phase B3 will plumb real
-        // input from main-thread InputMessage events).
+        // App::update with the FrameInput accumulated from this frame's
+        // InputMessage events. `take_frame` returns the drained snapshot
+        // and resets per-tick deltas (mouse motion + scroll).
+        let input = self.input.take_frame();
         {
             let _scope = rye_time::frame_trace::scope("app-update");
             let mut fctx = FrameCtx {
                 rd: &self.rd,
-                input: FrameInput::default(),
+                input,
                 time: self.start.elapsed().as_secs_f32(),
                 fps: 0.0, // Phase B1: skip FPS bookkeeping; not used by tesseract_demo.
                 n_ticks: 0,
@@ -521,18 +792,32 @@ fn spawn_worker(canvas_id: &str, _host_id: &str) -> Result<()> {
         .dyn_into::<HtmlCanvasElement>()
         .map_err(|_| anyhow!("element '{canvas_id}' is not a canvas"))?;
 
-    // Read the canvas's current pixel dimensions. CSS-sized canvases use
-    // these attributes; if they're zero, the worker would create a 0×0
-    // surface, which wgpu rejects. The page is responsible for sizing the
-    // canvas before launch.
-    let width = canvas.width();
-    let height = canvas.height();
+    // Size the canvas's pixel backing-store to match its DISPLAYED size
+    // × device pixel ratio. The HTML's `width`/`height` attributes are a
+    // pre-launch fallback; we compute the actual rendering size here
+    // because CSS may have stretched the canvas to fill its container
+    // (and Trunk serves a sized container with `width: 100%`). Without
+    // this step the backing store stays at the HTML attribute size and
+    // CSS stretches the rendered image, producing the squashed aspect
+    // the original main-thread path didn't have (winit recomputed the
+    // canvas size dynamically from the host element).
+    let window = web_sys::window().ok_or_else(|| anyhow!("no global window"))?;
+    let dpr = window.device_pixel_ratio() as f32;
+    let css_w = canvas.client_width().max(1) as f32;
+    let css_h = canvas.client_height().max(1) as f32;
+    let width = (css_w * dpr).round() as u32;
+    let height = (css_h * dpr).round() as u32;
     if width == 0 || height == 0 {
         return Err(anyhow!(
-            "canvas '{canvas_id}' has zero dimensions ({width}x{height}); set width/height \
-             attributes or CSS before launch"
+            "canvas '{canvas_id}' has zero displayed dimensions ({css_w}x{css_h}); \
+             container must have layout dimensions before launch"
         ));
     }
+    canvas.set_width(width);
+    canvas.set_height(height);
+    tracing::info!(
+        "rye_app::wasm::worker: canvas sized to {width}x{height} (CSS {css_w}x{css_h} × DPR {dpr})"
+    );
 
     let offscreen = canvas
         .transfer_control_to_offscreen()
@@ -640,9 +925,371 @@ fn spawn_worker(canvas_id: &str, _host_id: &str) -> Result<()> {
         .map_err(|e| anyhow!("worker.addEventListener('message'): {e:?}"))?;
     on_ready.forget();
 
+    // Forward DOM events (resize / mouse / keyboard / focus / visibility)
+    // from the page to the worker. Installed BEFORE the worker is fully
+    // ready so events during the setup window get queued by the browser
+    // (or via our handle_message queue) and applied on first frame.
+    install_dom_input_forwarders(&worker, &canvas)
+        .context("install_dom_input_forwarders")?;
+
     // Keep the Worker alive. Dropping it would terminate. Box::leak is the
     // wasm-bindgen idiom for "this lives forever in this page."
     Box::leak(Box::new(worker));
 
     Ok(())
+}
+
+/// Install all the DOM event listeners that forward main-thread events to
+/// the worker via postMessage. Each listener constructs a typed JS object
+/// (`{kind: "...", ...}`) the worker-side `handle_message` parses into an
+/// `InputMessage` variant.
+///
+/// Listeners attached:
+/// - `window`: resize, focus, blur, visibilitychange
+/// - `canvas` (the placeholder post-transfer): mousemove, mousedown,
+///   mouseup, wheel
+/// - `document`: keydown, keyup (keyboard listeners on document so we
+///   capture keys regardless of which element has focus, matching
+///   game-style input expectations)
+///
+/// All listeners use `Closure::wrap` + `forget()` to leak themselves into
+/// the JS heap, since they live for the page's lifetime. Demos that close
+/// the worker would need explicit teardown — not a Phase B concern.
+fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> Result<()> {
+    let window = web_sys::window().ok_or_else(|| anyhow!("no window"))?;
+    let document = window
+        .document()
+        .ok_or_else(|| anyhow!("no document on window"))?;
+
+    // Resize: compute the canvas's pixel dimensions (CSS size × DPR) and
+    // post to worker. Resize fires on the WINDOW; we re-query the canvas
+    // size each fire because CSS recalc may not have settled by event time.
+    {
+        let worker = worker.clone();
+        let canvas = canvas.clone();
+        let window_for_dpr = window.clone();
+        let cb = Closure::wrap(Box::new(move || {
+            let dpr = window_for_dpr.device_pixel_ratio() as f32;
+            let w = (canvas.client_width() as f32 * dpr).max(1.0) as u32;
+            let h = (canvas.client_height() as f32 * dpr).max(1.0) as u32;
+            let msg = build_msg("resize");
+            set_msg_u32(&msg, "width", w);
+            set_msg_u32(&msg, "height", h);
+            let _ = worker.post_message(&msg);
+        }) as Box<dyn FnMut()>);
+        window
+            .add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("window resize listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    // Mouse move on the canvas. rAF-COALESCED: a DOM mouse-move can fire
+    // hundreds of times per second; forwarding each one is a JS-object
+    // allocation per event + a postMessage. At sustained drag speeds
+    // that's enough to overwhelm the JS heap and crash the browser tab
+    // (we hit this empirically during Phase B3 testing).
+    //
+    // Coalesce: the listener writes the latest mouse position into a
+    // shared RefCell. A separate rAF loop checks for a pending mouse-
+    // move once per browser-frame and posts ONE message with the
+    // latest position. Result: at most 60 mouse-move postMessages per
+    // second regardless of input device frequency.
+    //
+    // `MouseEvent.offsetX/Y` are canvas-relative; `buttons` is the
+    // held-button bitmask. DPR scaling happens worker-side so the same
+    // coords work whether the user has zoomed or not.
+    {
+        // Shared latest-position state. None when no pending move.
+        let pending: Rc<RefCell<Option<(f32, f32, u32)>>> = Rc::new(RefCell::new(None));
+        let pending_for_listener = pending.clone();
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
+            *pending_for_listener.borrow_mut() = Some((
+                ev.offset_x() as f32,
+                ev.offset_y() as f32,
+                ev.buttons() as u32,
+            ));
+        }) as Box<dyn FnMut(web_sys::MouseEvent)>);
+        canvas
+            .add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("mousemove listener: {e:?}"))?;
+        cb.forget();
+
+        // rAF loop that drains `pending` once per frame.
+        let worker_for_raf = worker.clone();
+        let pending_for_raf = pending.clone();
+        let window_for_raf = window.clone();
+        let raf_cb: Rc<RefCell<Option<Closure<dyn FnMut()>>>> =
+            Rc::new(RefCell::new(None));
+        let raf_cb_for_closure = raf_cb.clone();
+        *raf_cb.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+            if let Some((x, y, buttons)) = pending_for_raf.borrow_mut().take() {
+                let msg = build_msg("mouse_move");
+                set_msg_f32(&msg, "x", x);
+                set_msg_f32(&msg, "y", y);
+                set_msg_u32(&msg, "buttons", buttons);
+                let _ = worker_for_raf.post_message(&msg);
+            }
+            let cb_ref = raf_cb_for_closure.borrow();
+            if let Some(cb) = cb_ref.as_ref() {
+                let _ = window_for_raf
+                    .request_animation_frame(cb.as_ref().unchecked_ref());
+            }
+        }) as Box<dyn FnMut()>));
+        {
+            let first_cb = raf_cb.borrow();
+            let first = first_cb.as_ref().expect("RAF cb populated above");
+            window
+                .request_animation_frame(first.as_ref().unchecked_ref())
+                .map_err(|e| anyhow!("mousemove rAF init: {e:?}"))?;
+        }
+        Box::leak(Box::new(raf_cb));
+    }
+
+    // Mouse down / up: same shape, different `pressed` flag.
+    for (event_name, pressed) in [("mousedown", true), ("mouseup", false)] {
+        let worker = worker.clone();
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
+            let msg = build_msg("mouse_button");
+            set_msg_f32(&msg, "x", ev.offset_x() as f32);
+            set_msg_f32(&msg, "y", ev.offset_y() as f32);
+            set_msg_u32(&msg, "button", ev.button() as u32);
+            set_msg_bool(&msg, "pressed", pressed);
+            let _ = worker.post_message(&msg);
+        }) as Box<dyn FnMut(web_sys::MouseEvent)>);
+        canvas
+            .add_event_listener_with_callback(event_name, cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("{event_name} listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    // Wheel: WheelEvent's delta is per-mode (pixels / lines / pages).
+    // Normalize to lines (the rye-input convention) by checking deltaMode.
+    {
+        let worker = worker.clone();
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::WheelEvent| {
+            // delta_mode: 0=pixels, 1=lines, 2=pages. Most browsers use
+            // pixels; convert to lines using a 100px = 1 line heuristic
+            // (matches winit's web backend convention).
+            let (dx, dy) = match ev.delta_mode() {
+                1 => (ev.delta_x() as f32, ev.delta_y() as f32),
+                _ => (ev.delta_x() as f32 / 100.0, ev.delta_y() as f32 / 100.0),
+            };
+            ev.prevent_default(); // page-scroll suppression while interacting
+            let msg = build_msg("mouse_wheel");
+            set_msg_f32(&msg, "dx", dx);
+            set_msg_f32(&msg, "dy", dy);
+            let _ = worker.post_message(&msg);
+        }) as Box<dyn FnMut(web_sys::WheelEvent)>);
+        canvas
+            .add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("wheel listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    // Keyboard: listen on document so keys reach us regardless of which
+    // element has focus (game convention). The placeholder canvas can't
+    // take keyboard focus by default; alternatives would require setting
+    // tabindex + focus(), which adds page-author friction we'd rather
+    // avoid for Phase B.
+    for (event_name, pressed) in [("keydown", true), ("keyup", false)] {
+        let worker = worker.clone();
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::KeyboardEvent| {
+            let msg = build_msg("key");
+            set_msg_string(&msg, "code", &ev.code());
+            set_msg_string(&msg, "key", &ev.key());
+            set_msg_bool(&msg, "pressed", pressed);
+            set_msg_bool(&msg, "repeat", ev.repeat());
+            set_msg_bool(&msg, "ctrl", ev.ctrl_key());
+            set_msg_bool(&msg, "shift", ev.shift_key());
+            set_msg_bool(&msg, "alt", ev.alt_key());
+            set_msg_bool(&msg, "meta", ev.meta_key());
+            let _ = worker.post_message(&msg);
+        }) as Box<dyn FnMut(web_sys::KeyboardEvent)>);
+        document
+            .add_event_listener_with_callback(event_name, cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("{event_name} listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    // Focus / blur on window for the camera-style "release held buttons
+    // on focus loss" behaviour rye-input expects.
+    for (event_name, focused) in [("focus", true), ("blur", false)] {
+        let worker = worker.clone();
+        let cb = Closure::wrap(Box::new(move || {
+            let msg = build_msg("focus");
+            set_msg_bool(&msg, "focused", focused);
+            let _ = worker.post_message(&msg);
+        }) as Box<dyn FnMut()>);
+        window
+            .add_event_listener_with_callback(event_name, cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("{event_name} listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    // Page-visibility on document: tabs being backgrounded should pause
+    // continuous animation (camera spin, etc.) so we're not wasting CPU.
+    {
+        let worker = worker.clone();
+        let document_for_query = document.clone();
+        let cb = Closure::wrap(Box::new(move || {
+            let visible = document_for_query.visibility_state()
+                != web_sys::VisibilityState::Hidden;
+            let msg = build_msg("visibility");
+            set_msg_bool(&msg, "visible", visible);
+            let _ = worker.post_message(&msg);
+        }) as Box<dyn FnMut()>);
+        document
+            .add_event_listener_with_callback("visibilitychange", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("visibilitychange listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers for constructing typed postMessage payloads on main thread.
+// ---------------------------------------------------------------------------
+
+fn build_msg(kind: &str) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str("kind"),
+        &JsValue::from_str(kind),
+    );
+    obj
+}
+
+fn set_msg_u32(obj: &js_sys::Object, key: &str, v: u32) {
+    let _ = js_sys::Reflect::set(
+        obj,
+        &JsValue::from_str(key),
+        &JsValue::from_f64(v as f64),
+    );
+}
+
+fn set_msg_f32(obj: &js_sys::Object, key: &str, v: f32) {
+    let _ = js_sys::Reflect::set(
+        obj,
+        &JsValue::from_str(key),
+        &JsValue::from_f64(v as f64),
+    );
+}
+
+fn set_msg_bool(obj: &js_sys::Object, key: &str, v: bool) {
+    let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), &JsValue::from_bool(v));
+}
+
+fn set_msg_string(obj: &js_sys::Object, key: &str, v: &str) {
+    let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), &JsValue::from_str(v));
+}
+
+// ---------------------------------------------------------------------------
+// Winit-type translation helpers
+// ---------------------------------------------------------------------------
+
+/// Map a DOM `MouseEvent.button` index to a `winit::event::MouseButton`.
+/// The DOM convention is 0=primary, 1=middle, 2=secondary; winit uses
+/// named variants.
+fn mouse_button_from_dom(button: u8) -> MouseButton {
+    match button {
+        0 => MouseButton::Left,
+        1 => MouseButton::Middle,
+        2 => MouseButton::Right,
+        3 => MouseButton::Back,
+        4 => MouseButton::Forward,
+        other => MouseButton::Other(other as u16),
+    }
+}
+
+/// Map a DOM `KeyboardEvent.code` string to a `winit::keyboard::KeyCode`.
+/// Partial mapping focused on the keys rye demos actually use today
+/// (WASD + modifiers + the hotkey set + arrow keys + function keys 1-12
+/// + digits). Returns `None` for unmapped codes; the caller drops the
+/// event silently.
+///
+/// Growing this table: each new code we want to support adds one line.
+/// Stays in worker.rs for now because it's the only consumer; if a
+/// second crate ever needs the same translation, lift into rye-input.
+fn winit_keycode_from_str(code: &str) -> Option<KeyCode> {
+    // Letters A-Z. Done as a single match arm because the cases are
+    // mechanical + writing them out gives the compiler the chance to
+    // jump-table optimize.
+    let by_letter = match code {
+        "KeyA" => Some(KeyCode::KeyA), "KeyB" => Some(KeyCode::KeyB),
+        "KeyC" => Some(KeyCode::KeyC), "KeyD" => Some(KeyCode::KeyD),
+        "KeyE" => Some(KeyCode::KeyE), "KeyF" => Some(KeyCode::KeyF),
+        "KeyG" => Some(KeyCode::KeyG), "KeyH" => Some(KeyCode::KeyH),
+        "KeyI" => Some(KeyCode::KeyI), "KeyJ" => Some(KeyCode::KeyJ),
+        "KeyK" => Some(KeyCode::KeyK), "KeyL" => Some(KeyCode::KeyL),
+        "KeyM" => Some(KeyCode::KeyM), "KeyN" => Some(KeyCode::KeyN),
+        "KeyO" => Some(KeyCode::KeyO), "KeyP" => Some(KeyCode::KeyP),
+        "KeyQ" => Some(KeyCode::KeyQ), "KeyR" => Some(KeyCode::KeyR),
+        "KeyS" => Some(KeyCode::KeyS), "KeyT" => Some(KeyCode::KeyT),
+        "KeyU" => Some(KeyCode::KeyU), "KeyV" => Some(KeyCode::KeyV),
+        "KeyW" => Some(KeyCode::KeyW), "KeyX" => Some(KeyCode::KeyX),
+        "KeyY" => Some(KeyCode::KeyY), "KeyZ" => Some(KeyCode::KeyZ),
+        _ => None,
+    };
+    if by_letter.is_some() {
+        return by_letter;
+    }
+
+    let by_digit = match code {
+        "Digit0" => Some(KeyCode::Digit0), "Digit1" => Some(KeyCode::Digit1),
+        "Digit2" => Some(KeyCode::Digit2), "Digit3" => Some(KeyCode::Digit3),
+        "Digit4" => Some(KeyCode::Digit4), "Digit5" => Some(KeyCode::Digit5),
+        "Digit6" => Some(KeyCode::Digit6), "Digit7" => Some(KeyCode::Digit7),
+        "Digit8" => Some(KeyCode::Digit8), "Digit9" => Some(KeyCode::Digit9),
+        _ => None,
+    };
+    if by_digit.is_some() {
+        return by_digit;
+    }
+
+    let by_fn = match code {
+        "F1" => Some(KeyCode::F1),  "F2" => Some(KeyCode::F2),
+        "F3" => Some(KeyCode::F3),  "F4" => Some(KeyCode::F4),
+        "F5" => Some(KeyCode::F5),  "F6" => Some(KeyCode::F6),
+        "F7" => Some(KeyCode::F7),  "F8" => Some(KeyCode::F8),
+        "F9" => Some(KeyCode::F9),  "F10" => Some(KeyCode::F10),
+        "F11" => Some(KeyCode::F11), "F12" => Some(KeyCode::F12),
+        _ => None,
+    };
+    if by_fn.is_some() {
+        return by_fn;
+    }
+
+    // Everything else: catch-all of the common control + arrow keys.
+    match code {
+        "Space" => Some(KeyCode::Space),
+        "Enter" => Some(KeyCode::Enter),
+        "Escape" => Some(KeyCode::Escape),
+        "Tab" => Some(KeyCode::Tab),
+        "Backspace" => Some(KeyCode::Backspace),
+        "Delete" => Some(KeyCode::Delete),
+        "Backquote" => Some(KeyCode::Backquote),
+        "Minus" => Some(KeyCode::Minus),
+        "Equal" => Some(KeyCode::Equal),
+        "BracketLeft" => Some(KeyCode::BracketLeft),
+        "BracketRight" => Some(KeyCode::BracketRight),
+        "Semicolon" => Some(KeyCode::Semicolon),
+        "Quote" => Some(KeyCode::Quote),
+        "Comma" => Some(KeyCode::Comma),
+        "Period" => Some(KeyCode::Period),
+        "Slash" => Some(KeyCode::Slash),
+        "Backslash" => Some(KeyCode::Backslash),
+        "ShiftLeft" => Some(KeyCode::ShiftLeft),
+        "ShiftRight" => Some(KeyCode::ShiftRight),
+        "ControlLeft" => Some(KeyCode::ControlLeft),
+        "ControlRight" => Some(KeyCode::ControlRight),
+        "AltLeft" => Some(KeyCode::AltLeft),
+        "AltRight" => Some(KeyCode::AltRight),
+        "ArrowUp" => Some(KeyCode::ArrowUp),
+        "ArrowDown" => Some(KeyCode::ArrowDown),
+        "ArrowLeft" => Some(KeyCode::ArrowLeft),
+        "ArrowRight" => Some(KeyCode::ArrowRight),
+        _ => None,
+    }
 }

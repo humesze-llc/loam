@@ -100,4 +100,10 @@ web-sys = { version = "0.3", features = [
     "Blob",
     "BlobPropertyBag",
     "Url",
+    # DOM event types we forward to the worker from main thread (Phase B3).
+    "MouseEvent",
+    "KeyboardEvent",
+    "WheelEvent",
+    "FocusEvent",
+    "VisibilityState",
 ] }
