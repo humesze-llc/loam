@@ -192,6 +192,13 @@ impl<S: Space<Point = Vec3, Vector = Vec3>> CameraController<S> for OrbitControl
 pub struct FirstPersonController<S: Space> {
     pub yaw: f32,
     pub pitch: f32,
+    /// When `true`, integrate [`FrameInput::mouse_raw_delta`] instead of
+    /// `mouse_delta`. Pair with a grabbed cursor (see `rye_app::cursor`):
+    /// the OS reports raw device motion that doesn't cap at the screen
+    /// edge, so a fast horizontal flick can yaw the camera arbitrarily far
+    /// without the cursor "running out of room." Default off (uses the
+    /// clamped delta), which is what the orbit-mode camera consumers want.
+    pub use_raw_delta: bool,
     _marker: PhantomData<S>,
 }
 
@@ -200,6 +207,7 @@ impl<S: Space<Point = Vec3, Vector = Vec3>> FirstPersonController<S> {
         Self {
             yaw,
             pitch: pitch.clamp(FIRST_PERSON_MIN_PITCH, FIRST_PERSON_MAX_PITCH),
+            use_raw_delta: false,
             _marker: PhantomData,
         }
     }
@@ -207,8 +215,13 @@ impl<S: Space<Point = Vec3, Vector = Vec3>> FirstPersonController<S> {
 
 impl<S: Space<Point = Vec3, Vector = Vec3>> CameraController<S> for FirstPersonController<S> {
     fn advance(&mut self, input: FrameInput, camera: &mut Camera<S>, _space: &S, _dt: f32) {
-        self.yaw -= input.mouse_delta.x * FIRST_PERSON_MOUSE_SENSITIVITY;
-        self.pitch = (self.pitch - input.mouse_delta.y * FIRST_PERSON_MOUSE_SENSITIVITY)
+        let delta = if self.use_raw_delta {
+            input.mouse_raw_delta
+        } else {
+            input.mouse_delta
+        };
+        self.yaw -= delta.x * FIRST_PERSON_MOUSE_SENSITIVITY;
+        self.pitch = (self.pitch - delta.y * FIRST_PERSON_MOUSE_SENSITIVITY)
             .clamp(FIRST_PERSON_MIN_PITCH, FIRST_PERSON_MAX_PITCH);
 
         let yaw_q = Quat::from_rotation_y(self.yaw);

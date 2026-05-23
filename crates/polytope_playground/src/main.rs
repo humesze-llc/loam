@@ -272,6 +272,7 @@ impl Demo {
             free_roam,
             free_roam_pos,
             camera_mode: CameraMode::default(),
+            cursor_grabbed: false,
             node,
             section_edges,
             parent_wireframe,
@@ -436,10 +437,14 @@ impl Demo {
                     self.orbit
                         .advance(ctx.input, &mut self.camera, &EuclideanR3, dt_secs);
                 }
-                CameraMode::FreeRoam => {
-                    // Mouse-look + WASD translation. Mirror tesseract_demo's
-                    // pattern: controller handles look; we integrate position
-                    // here from the drained input axes.
+                // Freecam advances only while the cursor is grabbed. Alt
+                // releases the grab for UI interaction; while ungrabbed,
+                // the camera holds still so the user can click + drag UI
+                // widgets without the scene panning underneath them.
+                CameraMode::FreeRoam if self.cursor_grabbed => {
+                    // Mouse-look + WASD translation. Controller handles
+                    // look (consuming raw mouse delta via use_raw_delta);
+                    // position integrates from the drained input axes.
                     self.free_roam
                         .advance(ctx.input, &mut self.camera, &EuclideanR3, dt_secs);
                     const FREECAM_SPEED: f32 = 4.5; // units/sec
@@ -451,6 +456,10 @@ impl Demo {
                         self.free_roam_pos += delta * FREECAM_SPEED * dt_secs;
                         self.camera.position = self.free_roam_pos;
                     }
+                }
+                CameraMode::FreeRoam => {
+                    // Cursor released (Alt held the toggle): no-op so the
+                    // user can interact with UI without the scene moving.
                 }
             }
         }
@@ -671,13 +680,36 @@ impl Demo {
             KeyCode::ArrowRight => self.slider_right_held = pressed,
             KeyCode::KeyR if pressed => self.reset(),
             KeyCode::KeyH if pressed => self.show_controls = !self.show_controls,
-            KeyCode::KeyT | KeyCode::Space if pressed => {
-                // Pause / resume only, DO NOT touch rot_state. The
-                // bodies keep their current orientation when paused
-                // and resume from there when toggled back on. Both
-                // T (legacy) and Space (media-player convention)
-                // bind to the same toggle.
+            KeyCode::KeyT if pressed => {
+                // Pause / resume only, DO NOT touch rot_state. The bodies
+                // keep their current orientation when paused and resume
+                // from there when toggled back on.
                 self.rotate = !self.rotate;
+            }
+            // Space ALSO toggles rotation, but only outside freecam mode.
+            // In freecam Space is bound to the move-up axis (Space = +1
+            // on `FrameInput::move_up`); rotating-on-Space would conflict.
+            // T remains the always-available rotation toggle for freecam
+            // users.
+            KeyCode::Space
+                if pressed && !matches!(self.camera_mode, CameraMode::FreeRoam) =>
+            {
+                self.rotate = !self.rotate;
+            }
+            // Alt toggles the cursor grab while in freecam: hidden +
+            // confined for mouse-look, visible + free for UI interaction.
+            // Mode stays FreeRoam either way; only the grab flips. Outside
+            // freecam Alt is a no-op (cursor is never grabbed there).
+            KeyCode::AltLeft | KeyCode::AltRight
+                if pressed && matches!(self.camera_mode, CameraMode::FreeRoam) =>
+            {
+                self.cursor_grabbed = !self.cursor_grabbed;
+                if self.cursor_grabbed {
+                    rye_app::cursor::request_grab();
+                } else {
+                    rye_app::cursor::request_release();
+                }
+                self.free_roam.use_raw_delta = self.cursor_grabbed;
             }
             // Plane toggles. Sum-of-bivectors composition is
             // commutative, so the order in which planes are toggled
@@ -1594,18 +1626,27 @@ impl RotatePolytopesApp {
                         CameraMode::Orbit => {
                             // Reset orbit so the camera returns to a known
                             // framing around (0, 0, 0) regardless of where
-                            // freecam left it.
+                            // freecam left it. Release the cursor grab; the
+                            // UI is interactive again, mouse-look is off.
                             demo.orbit = OrbitController::default();
                             demo.orbit.set_orbit(9.5, -0.25);
+                            demo.cursor_grabbed = false;
+                            demo.free_roam.use_raw_delta = false;
+                            rye_app::cursor::request_release();
                             out.line("camera: orbit (reset to world origin)");
                         }
                         CameraMode::FreeRoam => {
                             // Seed freecam from the camera's current pose so
                             // the toggle feels continuous instead of
-                            // teleporting.
+                            // teleporting. Grab the cursor so panning works
+                            // past the screen edge; user presses Alt to
+                            // release for UI access.
                             demo.free_roam_pos = demo.camera.position;
+                            demo.cursor_grabbed = true;
+                            demo.free_roam.use_raw_delta = true;
+                            rye_app::cursor::request_grab();
                             out.line(
-                                "camera: freecam (WASD + Space/Shift; drag to look)",
+                                "camera: freecam (WASD + Space/Shift; mouse-look; Alt to free cursor)",
                             );
                         }
                     }

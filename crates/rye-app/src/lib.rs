@@ -79,6 +79,7 @@ pub mod args;
 #[cfg(any(not(feature = "capture"), target_arch = "wasm32"))]
 #[path = "capture_stub.rs"]
 pub mod capture;
+pub mod cursor;
 pub mod fps;
 pub mod frame_pacing;
 pub mod keymap;
@@ -1138,6 +1139,23 @@ impl<A: App> ApplicationHandler for Runner<A> {
             }
         }
     }
+
+    /// Device-level events (mouse motion independent of cursor position,
+    /// raw scroll wheel, etc.). The only one we currently consume is
+    /// `MouseMotion`, which gives uncapped deltas that don't stop when the
+    /// cursor hits the screen edge. Routed into `InputState::accumulate_raw_motion`
+    /// so consumers (camera controllers, primarily) that grab the cursor can
+    /// read it via `FrameInput::mouse_raw_delta`.
+    fn device_event(
+        &mut self,
+        _elwt: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        ev: winit::event::DeviceEvent,
+    ) {
+        if let winit::event::DeviceEvent::MouseMotion { delta } = ev {
+            self.input.accumulate_raw_motion(delta.0, delta.1);
+        }
+    }
 }
 
 impl<A: App> Runner<A> {
@@ -1167,6 +1185,30 @@ impl<A: App> Runner<A> {
             };
             let _ = rd.set_present_mode(target);
         }
+
+        // Pending cursor grab requests from `rye_app::cursor`. Native only;
+        // browser Pointer Lock requires a recent user gesture that console
+        // commands don't satisfy, so wasm freecam currently has the
+        // cursor-escape limitation documented in the cursor module. Confined
+        // mode (not Locked) keeps the cursor pinned inside the window while
+        // letting the OS report raw motion via DeviceEvent::MouseMotion.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(grab) = cursor::take_pending() {
+            use winit::window::CursorGrabMode;
+            let grab_mode = if grab {
+                CursorGrabMode::Confined
+            } else {
+                CursorGrabMode::None
+            };
+            // Confined mode is widely supported on Windows + macOS + Linux/X11.
+            // Fall back to Locked if Confined isn't accepted; either gives us
+            // the raw-delta behavior we need.
+            if win.set_cursor_grab(grab_mode).is_err() && grab {
+                let _ = win.set_cursor_grab(CursorGrabMode::Locked);
+            }
+            win.set_cursor_visible(!grab);
+        }
+
         let Some(rd) = self.rd.as_ref() else { return };
 
         // Frame-rate cap. The `fps` console command pokes

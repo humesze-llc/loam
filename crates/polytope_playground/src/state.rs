@@ -354,6 +354,14 @@ pub(crate) struct Demo {
     /// Active camera control mode. Default `Orbit` matches the long-standing
     /// behavior; `FreeRoam` is opt-in via the `camera` console command.
     pub(crate) camera_mode: CameraMode,
+    /// Whether the cursor is currently grabbed (hidden + confined to the
+    /// window). Set to `true` when entering FreeRoam; toggleable within
+    /// FreeRoam via Alt for UI access. Reset to `false` when leaving
+    /// FreeRoam. Drives both the runtime cursor visibility (via
+    /// `rye_app::cursor::request_*`) and the `FirstPersonController`'s
+    /// `use_raw_delta` flag (raw motion past the screen edge keeps panning
+    /// alive when the cursor is grabbed).
+    pub(crate) cursor_grabbed: bool,
     pub(crate) node: Hyperslice4DNode,
     /// Rasterizer node for the cross-section perimeter (bright cyan edges around each
     /// cap polygon). Filled caps are NOT drawn -- the SDF raymarcher already renders the
