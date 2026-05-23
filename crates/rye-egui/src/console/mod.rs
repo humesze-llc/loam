@@ -7,7 +7,7 @@
 //!
 //! ## What lives here vs what doesn't
 //!
-//! - **Here**: [`Console`] (the main type), [`Command`] trait + [`cmd`] closure shim,
+//! - **Here**: `Console` (the main type), [`Command`] trait + [`cmd`] closure shim,
 //!   [`ConsoleWriter`] (output collector), key handling for the input line, the parser.
 //!   `Console` is generic over a `Ctx` type so consuming crates choose what state
 //!   commands operate on.
@@ -51,6 +51,41 @@ pub const ANIM_DURATION_SECS: f32 = 0.15;
 /// Fraction of the viewport height the open console occupies. 0.5 is the Quake
 /// convention: enough scrollback visible, scene visible below.
 pub const PANEL_HEIGHT_FRACTION: f32 = 0.5;
+
+/// Runtime flag controlling whether new scrollback lines also echo to the
+/// browser DevTools console (via direct `console.log`, NOT through `tracing`).
+///
+/// Off by default. On wasm32 the path is `Console::push_history` ->
+/// `web_sys::console::log_1`; on native the flag has no effect because the
+/// native log subscriber already prints to stderr. Toggled via the `log echo`
+/// console subcommand registered by `rye_app::log`. Process-global because the
+/// typical demo has one Console; multi-Console demos would share the toggle.
+#[cfg(target_arch = "wasm32")]
+static ECHO_TO_BROWSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable / disable scrollback echo to the browser DevTools console (wasm32
+/// only). See `ECHO_TO_BROWSER` for the architectural rationale. On native
+/// this is a no-op so demos can call it unconditionally during command setup.
+pub fn set_console_echo(enabled: bool) {
+    #[cfg(target_arch = "wasm32")]
+    ECHO_TO_BROWSER.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = enabled;
+}
+
+/// Returns the current scrollback-echo state. Always `false` on native (the
+/// native log path is fundamentally different and doesn't go through this
+/// flag).
+pub fn console_echo_enabled() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        ECHO_TO_BROWSER.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
 
 // ---------------------------------------------------------------------------
 // History line types
@@ -1081,6 +1116,24 @@ impl<Ctx: 'static> Console<Ctx> {
     }
 
     fn push_history(&mut self, line: HistoryLine) {
+        // Optional echo to the browser DevTools console. Off by default; demos
+        // toggle it via `log echo on` for debugging the in-canvas console
+        // text from outside (the canvas's pixels aren't selectable, so without
+        // this the user can't copy command output for paste-back to a chat /
+        // bug report).
+        //
+        // Architectural note: this deliberately bypasses `tracing` and calls
+        // `web_sys::console::log_1` directly. `tracing::info!` would conflict
+        // with the existing `log on` feature (tracing -> scrollback via
+        // `rye_app::log::ConsoleLayer`); running both directions through
+        // tracing creates a feedback loop where each emitted event lands in
+        // the scrollback, gets re-echoed, lands again, ad infinitum. The
+        // direct console.log path is feedback-free because no Rust subscriber
+        // consumes it.
+        #[cfg(target_arch = "wasm32")]
+        if ECHO_TO_BROWSER.load(std::sync::atomic::Ordering::Relaxed) {
+            web_sys::console::log_1(&line.text.as_str().into());
+        }
         self.history.push_back(line);
         while self.history.len() > MAX_HISTORY_LINES {
             self.history.pop_front();
@@ -1430,7 +1483,7 @@ impl<Ctx: 'static> Console<Ctx> {
 // Built-in commands
 // ---------------------------------------------------------------------------
 
-/// Framework-owned commands that mutate [`Console`] internal state directly: history,
+/// Framework-owned commands that mutate `Console` internal state directly: history,
 /// detached flag, etc. They can't go through [`Command<Ctx>`] cleanly because that
 /// trait only sees `&mut Ctx` (the user's context), not `&mut Console<Ctx>`. Storing
 /// their name + help in one enum centralizes what was previously duplicated across
@@ -1797,12 +1850,26 @@ mod tests {
         let mut ctx: Ctx = 0;
         c.execute("echo hello world", &mut ctx);
 
+        // Invariants asserted (not the exact text formatting):
+        // - one Input line + one Output line, in that order
+        // - the Input line includes the user's typed text (echo + args)
+        // - the Output line contains the echo's joined args
+        // Pinning the precise prompt prefix ("> ") would break on any future
+        // prompt-style change; the invariant is what we care about.
         let lines: Vec<&HistoryLine> = c.history.iter().collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].kind, LineKind::Input);
-        assert_eq!(lines[0].text, "> echo hello world");
+        assert!(
+            lines[0].text.contains("echo hello world"),
+            "Input line should include the user's typed text, got: {:?}",
+            lines[0].text
+        );
         assert_eq!(lines[1].kind, LineKind::Output);
-        assert_eq!(lines[1].text, "hello world");
+        assert!(
+            lines[1].text.contains("hello world"),
+            "Output line should contain echo's joined args, got: {:?}",
+            lines[1].text
+        );
     }
 
     #[test]

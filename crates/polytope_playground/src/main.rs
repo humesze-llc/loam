@@ -55,7 +55,7 @@
 
 use anyhow::{anyhow, Result};
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use rye_app::{egui, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
 use rye_egui::Console;
 use rye_math::WPlane;
 use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
@@ -155,7 +155,7 @@ impl Demo {
             });
         let mut node = Hyperslice4DNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             &module,
             ctx.rd.sample_count(),
         );
@@ -193,7 +193,7 @@ impl Demo {
         // the intended "outline of this cap" visual.
         let section_edges = LineRasterNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             DepthMode::ReadOnly {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
@@ -207,7 +207,7 @@ impl Demo {
         // trivially passes everywhere -- the SDF visual stays unchanged.
         let parent_wireframe = LineRasterNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             DepthMode::ReadOnly {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
@@ -219,7 +219,7 @@ impl Demo {
         // shared section-faces depth buffer (sprites that sit behind a cap get occluded).
         let points_node = PointRasterNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             DepthMode::ReadOnly {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
@@ -233,7 +233,7 @@ impl Demo {
         // surface mode is `Raster`); see `Demo::render_section_faces` in this file.
         let section_faces = TriangleRasterNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             DepthMode::ReadWrite {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
@@ -762,12 +762,15 @@ impl Demo {
             result
         } else {
             {
-                let u = self.node.uniforms_mut();
-                u.resolution = viewport.resolution_f32();
-                u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+                let _scope = rye_time::frame_trace::scope("pp-sdf");
+                {
+                    let u = self.node.uniforms_mut();
+                    u.resolution = viewport.resolution_f32();
+                    u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+                }
+                self.node.flush_uniforms(&rd.queue);
+                self.node.execute_in_viewport(rd, view, viewport)?;
             }
-            self.node.flush_uniforms(&rd.queue);
-            self.node.execute_in_viewport(rd, view, viewport)?;
             // Shared depth attachment for the rasterized section pass + the parent
             // wireframe's depth-test. Ensured + cleared once per Shapes-view frame so
             // the order is: SDF (color only) -> section_faces (writes depth + color
@@ -776,17 +779,23 @@ impl Demo {
             // wireframe fragment pass the depth-test trivially -- visual unchanged.
             self.ensure_and_clear_shared_depth(rd)?;
             if matches!(self.surface_mode, SurfaceMode::Raster) {
+                let _scope = rye_time::frame_trace::scope("pp-section-faces");
                 self.render_section_faces(rd, view)?;
             }
             // Cross-section + parent-wireframe overlay (when toggled). Only in Shapes
             // view since Filmstrip's per-cell viewport composition would require
             // per-cell depth-clear + per-cell uploads that aren't worth the v1 plumbing.
             if self.wireframe_enabled {
+                // pp-wireframe is the project-memory-flagged hot path
+                // (`project_polychoral_raster_perf`). Want a per-frame number here so
+                // we can confirm (or refute) that hypothesis with browser data.
+                let _scope = rye_time::frame_trace::scope("pp-wireframe");
                 self.render_wireframe_overlay(rd, view)?;
             }
             // Points overlay (vertex markers + cell-center sprites). Drawn last so the
             // discs sit on top of wireframe edges and section caps at the same depth.
             if self.points_enabled {
+                let _scope = rye_time::frame_trace::scope("pp-points");
                 self.render_points(rd, view)?;
             }
             Ok(())
@@ -1513,6 +1522,15 @@ impl RotatePolytopesApp {
         // `tracing::*` events show up in the console scrollback.
         rye_app::log::register_command(&mut c);
 
+        // Framework-provided frame-timing surface: `trace [summary|last|clear|cap N]`.
+        // The runner is already recording per-section scopes on every redraw; this
+        // command lets the user read them. Surfaces the slowest hot-path sections,
+        // which is the data we need to drive M4.5 v2 perf decisions (pipeline
+        // warming, wireframe caching).
+        rye_app::trace::register_command(&mut c);
+        rye_app::fps::register_command(&mut c);
+        rye_app::vsync::register_command(&mut c);
+
         c
     }
 }
@@ -1576,13 +1594,17 @@ impl App for RotatePolytopesApp {
 }
 
 fn main() -> Result<()> {
-    let config = RunConfig {
+    // `rye_app::run` handles native + wasm dispatch (worker context vs
+    // main-thread launch-on-click vs main-thread auto-launch fallback)
+    // based on the page's `data-mode` attribute and the WasmConfig IDs.
+    // Default WasmConfig uses our standard layout (`rye-canvas-host` /
+    // `rye-launch` / `rye-canvas`); the demo's `index.html` matches.
+    rye_app::run::<RotatePolytopesApp>(RunConfig {
         window: WindowAttributes::default()
             .with_title("polytope playground")
             .with_visible(false),
         ..RunConfig::default()
-    };
-    run_with_config::<RotatePolytopesApp>(config)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1773,32 +1795,37 @@ mod drag_tests {
     /// movement. We thread a monotonic clock so each frame's input
     /// has `time = N * 50ms`; well past the default click duration.
     fn pointer_press(time: f64, pos: egui::Pos2) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen());
-        input.time = Some(time);
-        input.events.push(egui::Event::PointerMoved(pos));
-        input.events.push(egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: Default::default(),
-        });
-        input
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(time),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        }
     }
 
     fn pointer_move(time: f64, pos: egui::Pos2) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen());
-        input.time = Some(time);
-        input.events.push(egui::Event::PointerMoved(pos));
-        input
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(time),
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        }
     }
 
     fn warmup_input(time: f64) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen());
-        input.time = Some(time);
-        input
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(time),
+            ..Default::default()
+        }
     }
 
     /// Simulate "click on card, then drag past the drag threshold"
@@ -1898,12 +1925,14 @@ mod drag_tests {
     /// headless `Context::run` (Area-routed input doesn't seem to
     /// reach the interaction step the same way it does in a real
     /// winit-driven loop). Instead we verify that:
-    /// 1. Rendering the same source closure in two `Area`s with
-    ///    different layers does NOT trigger the debug-assert when
-    ///    ids are scoped per-ui (`make_persistent_id`).
-    /// 2. The IDs actually ARE distinct between the two passes.
-    /// The first part; running this test without panic in debug
-    ///; is what catches a regression to globally-stable ids.
+    ///
+    ///   1. Rendering the same source closure in two `Area`s with
+    ///      different layers does NOT trigger the debug-assert when
+    ///      ids are scoped per-ui (`make_persistent_id`).
+    ///   2. The IDs actually ARE distinct between the two passes.
+    ///
+    /// The first part (running this test without panic in debug) is
+    /// what catches a regression to globally-stable ids.
     #[test]
     fn make_persistent_id_per_pass_avoids_layer_collision() {
         let ctx = egui::Context::default();
@@ -2081,18 +2110,20 @@ mod drag_tests {
         let drag_total = total_during_drag;
         let dragged_id = ctx.dragged_id();
         // Release.
-        let mut release_input = egui::RawInput::default();
-        release_input.screen_rect = Some(screen());
-        release_input.time = Some(0.6);
-        release_input
-            .events
-            .push(egui::Event::PointerMoved(target_pos));
-        release_input.events.push(egui::Event::PointerButton {
-            pos: target_pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: Default::default(),
-        });
+        let release_input = egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(0.6),
+            events: vec![
+                egui::Event::PointerMoved(target_pos),
+                egui::Event::PointerButton {
+                    pos: target_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
         let _ = ctx.run(release_input, |c| {
             render_during_drag(c, &mut total_during_drag)
         });

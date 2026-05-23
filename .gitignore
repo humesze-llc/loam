@@ -37,3 +37,6 @@ scripts/
 *.apng
 *.gif
 /out.*
+
+# Trunk wasm build output (per-demo bundles emit into ./dist; rebuild any time)
+/dist/

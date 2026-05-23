@@ -21,6 +21,11 @@ bytemuck.workspace = true
 rye-math    = { path = "../rye-math" }
 rye-physics = { path = "../rye-physics" }
 rye-shape   = { path = "../rye-shape" }
+# Frame-trace integration: `gpu_timer` callbacks push `gpu-total` sections through
+# `rye_time::frame_trace::record_external` so they appear in `trace summary` next
+# to the CPU sections. Default features pull in the frame-trace cargo feature; on
+# `--no-default-features` builds the calls are no-ops (still compile).
+rye-time    = { path = "../rye-time" }
 
 [dev-dependencies]
 naga.workspace = true

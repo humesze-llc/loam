@@ -12,11 +12,14 @@
 //! The crate stays deliberately small: it hands wgpu primitives to callers rather than
 //! abstracting them behind a higher-level engine API.
 
+pub mod composite;
 pub mod depth;
 pub mod device;
+pub mod gpu_timer;
 pub mod graph;
 pub mod lattice;
 pub mod line_raster;
+pub mod line_raster_static_r4;
 pub mod point_raster;
 pub mod raymarch;
 pub mod triangle_raster;
@@ -24,6 +27,7 @@ pub mod triangle_raster;
 pub use depth::DepthBuffer;
 pub use lattice::Viewport;
 pub use line_raster::{LineRasterNode, LineRasterUniforms};
+pub use line_raster_static_r4::{LineRasterStaticR4Node, LineRasterStaticR4Uniforms};
 pub use point_raster::{PointRasterNode, PointRasterUniforms};
 pub use raymarch::{GeodesicRayMarchNode, RayMarchNode, RayMarchUniforms};
 pub use triangle_raster::{

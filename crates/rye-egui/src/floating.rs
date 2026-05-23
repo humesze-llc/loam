@@ -18,8 +18,9 @@
 //!   on the egui side, all in screen-space overlays so no GPU pipeline changes are
 //!   needed.
 //!
-//! See `docs/devlog/context/CALLOUTS_AND_BILLBOARDS.md` for the design rationale and
-//! the bigger picture (projection-billboard sibling lands in M5+M6).
+//! All three primitives stay in screen-space egui overlays (no GPU pipeline
+//! changes). A projection-billboard sibling (world-anchored 3D quads with
+//! egui content rendered to a texture) is a future addition.
 
 use egui::{Context, Id, Painter, Pos2, Rect, Stroke, Ui, Window};
 
@@ -116,7 +117,9 @@ impl<'a> FloatingPanelBuilder<'a> {
 /// is invoked only while `*open == true`, so callers don't need to wrap the call.
 ///
 /// ```ignore
-/// rye_egui::floating_panel(ctx, "polytope-playground-render", "Render", &mut self.show_render_panel, |ui| {
+/// rye_egui::floating_panel(
+///     ctx, "polytope-playground-render", "Render",
+///     &mut self.show_render_panel, |ui| {
 ///     ui.label("Surface");
 ///     ui.radio_value(&mut self.surface_mode, SurfaceMode::Raster, "Raster");
 ///     // ...

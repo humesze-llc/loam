@@ -51,7 +51,8 @@ use crate::{EuclideanR3, EuclideanR4};
 ///   every pair of w-opposite vertices collapses to the same R³ point, and Perspective4D
 ///   separates them.
 ///
-/// Future variants under consideration: R⁴-specific `Schlegel`, `Stereographic`, `Hyperslice`.
+/// Future variants under consideration: R⁴-specific `Schlegel`,
+/// `Stereographic`, `Hyperslice`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Projection<const N: usize> {
     /// Pass through: take the first 3 components, zero-pad if `N < 3`, truncate if `N > 3`.

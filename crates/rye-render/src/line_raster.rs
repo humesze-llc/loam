@@ -133,6 +133,12 @@ pub struct LineRasterNode {
     /// requires the matching depth view. Tracks the depth-or-not API contract so callers
     /// don't silently get mismatched render passes.
     has_depth: bool,
+    /// Per-call scratch for the instances vector built inside [`Self::upload`].
+    /// Persisted on the node so the Vec's heap capacity is reused across calls;
+    /// `clear()` empties the logical length without freeing the buffer, and the
+    /// next push series reuses the same allocation. Drops per-frame alloc count
+    /// for dynamic-mesh users (polytope_playground) by 1.
+    instances_scratch: Vec<LineInstance>,
 }
 
 impl LineRasterNode {
@@ -325,6 +331,7 @@ impl LineRasterNode {
             instance_count: 0,
             instance_capacity,
             has_depth: depth.is_active(),
+            instances_scratch: Vec::new(),
         }
     }
 
@@ -358,9 +365,22 @@ impl LineRasterNode {
         S: RasterizableSpace<N>,
     {
         let samples = samples_per_segment.max(1);
+        // `tess_buf` stays local because it's generic over `S::Point` and the
+        // node-level scratch field can't pick a single type. For flat spaces
+        // (the common case) `samples = 1` so this Vec stays at capacity 2; the
+        // allocation cost is tiny (~64 bytes) and short-lived. Once a curved-
+        // space user shows real cost here, lift it into a type-erased scratch
+        // (`Vec<u8>` with `bytemuck::cast_slice_mut`) on the node.
         let mut tess_buf: Vec<S::Point> = Vec::with_capacity(samples + 1);
 
-        let mut instances: Vec<LineInstance> = Vec::with_capacity(mesh.segments.len() * samples);
+        // `instances_scratch` is the node-owned scratch: `clear()` preserves
+        // the heap capacity allocated in previous calls, so the steady-state
+        // hot path does zero allocations after the first frame's growth.
+        // Avoids the ~80-bytes-per-segment Vec allocation that the previous
+        // call-local `Vec::with_capacity` did per upload.
+        self.instances_scratch.clear();
+        self.instances_scratch
+            .reserve(mesh.segments.len() * samples);
 
         for ((seg, (color_a, color_b)), &width) in mesh
             .segments
@@ -384,7 +404,7 @@ impl LineRasterNode {
                 let c1 = lerp_color(*color_a, *color_b, t1);
                 let q0 = S::project_point(tess_buf[i], projection);
                 let q1 = S::project_point(tess_buf[i + 1], projection);
-                instances.push(LineInstance {
+                self.instances_scratch.push(LineInstance {
                     start_pos: q0.to_array(),
                     _pad0: 0.0,
                     end_pos: q1.to_array(),
@@ -397,7 +417,7 @@ impl LineRasterNode {
             }
         }
 
-        let needed_capacity = instances.len() as u32;
+        let needed_capacity = self.instances_scratch.len() as u32;
         if needed_capacity > self.instance_capacity {
             // Grow buffer; round up to next power of two to amortize re-allocations.
             let new_cap = needed_capacity.next_power_of_two().max(16);
@@ -410,19 +430,93 @@ impl LineRasterNode {
             self.instance_capacity = new_cap;
         }
 
-        if !instances.is_empty() {
-            queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&instances));
+        if !self.instances_scratch.is_empty() {
+            queue.write_buffer(
+                &self.instance_buf,
+                0,
+                bytemuck::cast_slice(&self.instances_scratch),
+            );
         }
         self.instance_count = needed_capacity;
     }
 
-    /// Render the uploaded line mesh onto `view`. `LoadOp::Load` preserves the existing color
-    /// attachment contents; the rasterizer composes with whatever ran before it (the
-    /// raymarcher's scene render in `polytope_playground`, or a dedicated clear pass).
+    /// Record a render pass that draws the uploaded line mesh into `view`, using the
+    /// caller-supplied `encoder`. **Does NOT call `encoder.finish()` or
+    /// `queue.submit`**; those are the caller's responsibility, typically the
+    /// runner batching multiple passes into one submit per frame (the
+    /// `App::record` path).
     ///
-    /// `depth_view` is required when the pipeline was created with `Some(depth_format)` and
-    /// must be `None` otherwise. Mismatch panics with a descriptive message rather than
-    /// surfacing a less-readable wgpu validation error.
+    /// `LoadOp::Load` preserves the existing color attachment contents; the
+    /// rasterizer composes with whatever ran before it.
+    ///
+    /// `depth_view` is required when the pipeline was created with
+    /// `Some(depth_format)` and must be `None` otherwise. Mismatch panics with a
+    /// descriptive message rather than surfacing a less-readable wgpu validation
+    /// error.
+    pub fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        depth_view: Option<&wgpu::TextureView>,
+        viewport: Option<&crate::Viewport>,
+    ) {
+        match (self.has_depth, depth_view.is_some()) {
+            (true, false) => {
+                panic!(
+                    "LineRasterNode::record: pipeline was created with a depth format but \
+                     no depth view was provided"
+                )
+            }
+            (false, true) => {
+                panic!(
+                    "LineRasterNode::record: pipeline was created without a depth format but \
+                     a depth view was provided"
+                )
+            }
+            _ => {}
+        }
+        if self.instance_count == 0 {
+            return;
+        }
+        let depth_attachment = depth_view.map(|dv| RenderPassDepthStencilAttachment {
+            view: dv,
+            depth_ops: Some(Operations {
+                load: LoadOp::Load,
+                store: StoreOp::Store,
+            }),
+            stencil_ops: None,
+        });
+        let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("line_raster pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: depth_attachment,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        if let Some(vp) = viewport {
+            vp.apply(&mut rp);
+        }
+        rp.set_pipeline(&self.pipeline);
+        rp.set_bind_group(0, &self.bind_group, &[]);
+        rp.set_vertex_buffer(0, self.corner_buf.slice(..));
+        rp.set_vertex_buffer(1, self.instance_buf.slice(..));
+        rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        rp.draw_indexed(0..6, 0, 0..self.instance_count);
+    }
+
+    /// Legacy wrapper: builds its own encoder + submits. Kept for backwards
+    /// compatibility with demos still on the multi-submit `App::render` path.
+    /// New code should prefer `Self::record` called from inside
+    /// `App::record`, which lets the runner share one
+    /// encoder across the whole frame.
     pub fn execute(
         &self,
         rd: &RenderDevice,
@@ -430,65 +524,10 @@ impl LineRasterNode {
         depth_view: Option<&wgpu::TextureView>,
         viewport: Option<&crate::Viewport>,
     ) -> anyhow::Result<()> {
-        match (self.has_depth, depth_view.is_some()) {
-            (true, false) => {
-                panic!(
-                    "LineRasterNode::execute: pipeline was created with a depth format but \
-                     no depth view was provided"
-                )
-            }
-            (false, true) => {
-                panic!(
-                    "LineRasterNode::execute: pipeline was created without a depth format but \
-                     a depth view was provided"
-                )
-            }
-            _ => {}
-        }
-        if self.instance_count == 0 {
-            return Ok(());
-        }
         let mut encoder = rd.device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("line_raster encoder"),
         });
-        {
-            let depth_attachment = depth_view.map(|dv| RenderPassDepthStencilAttachment {
-                view: dv,
-                // `Load` matches the color attachment: the caller is responsible for clearing
-                // depth (typically in the same clear pass that clears color). This lets
-                // multiple LineRasterNode / TriangleRasterNode draws share one depth buffer
-                // within a frame without each clearing it.
-                depth_ops: Some(Operations {
-                    load: LoadOp::Load,
-                    store: StoreOp::Store,
-                }),
-                stencil_ops: None,
-            });
-            let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("line_raster pass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Load,
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: depth_attachment,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            if let Some(vp) = viewport {
-                vp.apply(&mut rp);
-            }
-            rp.set_pipeline(&self.pipeline);
-            rp.set_bind_group(0, &self.bind_group, &[]);
-            rp.set_vertex_buffer(0, self.corner_buf.slice(..));
-            rp.set_vertex_buffer(1, self.instance_buf.slice(..));
-            rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            rp.draw_indexed(0..6, 0, 0..self.instance_count);
-        }
+        self.record(&mut encoder, view, depth_view, viewport);
         rd.queue.submit(Some(encoder.finish()));
         Ok(())
     }

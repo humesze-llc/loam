@@ -480,8 +480,8 @@ pub fn polytope_body_r4(
 
 // ---------------------------------------------------------------------------
 // 4D regular polytopes. Six exist in 4D (five analogues of the Platonic solids plus the 24-cell
-// which has no 3D counterpart). The four most physically useful for games — 5-cell, tesseract,
-// 16-cell, 24-cell — are generated here. The 120-cell (600 vertices) and 600-cell (120 vertices)
+// which has no 3D counterpart). The four most physically useful for games; 5-cell, tesseract,
+// 16-cell, 24-cell; are generated here. The 120-cell (600 vertices) and 600-cell (120 vertices)
 // land when a demo actually needs them.
 //
 // Every generator returns vertices centered at the origin and scaled so the circumradius
@@ -831,7 +831,7 @@ pub fn cell600_face_planes() -> (Vec<Vec4>, f32) {
 /// `|p - q|` subject to the active plane constraints, so the chained projections find the global
 /// Voronoi-region closest point.
 pub fn polytope_sdf_wolfe(p: Vec4, face_normals: &[Vec4], inradius: f32) -> f32 {
-    // Phase 1: max plane distance.
+    // Stage 1: max plane distance.
     let mut max_d = f32::NEG_INFINITY;
     let mut active_idx = [0usize; 4];
     for (i, n) in face_normals.iter().enumerate() {
