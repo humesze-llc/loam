@@ -47,8 +47,8 @@ use rye_egui::egui;
 use rye_input::InputState;
 use rye_render::device::RenderDevice;
 use rye_shader::ShaderDb;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::event::{ElementState, MouseScrollDelta};
+use winit::keyboard::PhysicalKey;
 
 // ---------------------------------------------------------------------------
 // InputMessage: typed protocol between main thread and worker
@@ -548,7 +548,7 @@ impl WorkerUi {
                 pressed,
             } => {
                 let pos = self.point(*x, *y);
-                if let Some(b) = egui_button_from_dom(*button) {
+                if let Some(b) = crate::keymap::mouse_button_egui(*button) {
                     self.raw_events.push(egui::Event::PointerButton {
                         pos,
                         button: b,
@@ -588,7 +588,7 @@ impl WorkerUi {
                 // Emit a Key event when the physical code maps to an
                 // egui::Key. Unknown codes are silently dropped (the
                 // App's hotkey routing covers them via InputState).
-                if let Some(egui_key) = egui_key_from_code(code) {
+                if let Some(egui_key) = crate::keymap::keycode_egui(code) {
                     self.raw_events.push(egui::Event::Key {
                         key: egui_key,
                         physical_key: Some(egui_key),
@@ -862,7 +862,7 @@ where
             InputMessage::MouseButton {
                 button, pressed, ..
             } => {
-                let button = mouse_button_from_dom(button);
+                let button = crate::keymap::mouse_button_winit(button);
                 let state = if pressed {
                     ElementState::Pressed
                 } else {
@@ -877,7 +877,7 @@ where
             InputMessage::Key {
                 ref code, pressed, ..
             } => {
-                if let Some(code) = winit_keycode_from_str(code) {
+                if let Some(code) = crate::keymap::keycode_winit(code) {
                     let state = if pressed {
                         ElementState::Pressed
                     } else {
@@ -1509,196 +1509,3 @@ fn set_msg_string(obj: &js_sys::Object, key: &str, v: &str) {
     let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), &JsValue::from_str(v));
 }
 
-// ---------------------------------------------------------------------------
-// Winit-type translation helpers
-// ---------------------------------------------------------------------------
-
-/// Map a DOM `MouseEvent.button` index to an `egui::PointerButton`.
-/// `None` for buttons egui doesn't recognize (4=Back, 5=Forward —
-/// egui's Extra1/Extra2 cover those but their semantics differ).
-fn egui_button_from_dom(button: u8) -> Option<egui::PointerButton> {
-    match button {
-        0 => Some(egui::PointerButton::Primary),
-        1 => Some(egui::PointerButton::Middle),
-        2 => Some(egui::PointerButton::Secondary),
-        3 => Some(egui::PointerButton::Extra1),
-        4 => Some(egui::PointerButton::Extra2),
-        _ => None,
-    }
-}
-
-/// Map a DOM `KeyboardEvent.code` string to an `egui::Key`. Partial
-/// mapping mirroring `winit_keycode_from_str` above; egui has fewer
-/// key variants so unmapped codes are dropped silently. Coverage
-/// focuses on what tesseract_demo + future demos plausibly need
-/// inside egui widgets: arrows, text-editing keys, function keys,
-/// alpha + digits.
-fn egui_key_from_code(code: &str) -> Option<egui::Key> {
-    let by_letter = match code {
-        "KeyA" => Some(egui::Key::A), "KeyB" => Some(egui::Key::B),
-        "KeyC" => Some(egui::Key::C), "KeyD" => Some(egui::Key::D),
-        "KeyE" => Some(egui::Key::E), "KeyF" => Some(egui::Key::F),
-        "KeyG" => Some(egui::Key::G), "KeyH" => Some(egui::Key::H),
-        "KeyI" => Some(egui::Key::I), "KeyJ" => Some(egui::Key::J),
-        "KeyK" => Some(egui::Key::K), "KeyL" => Some(egui::Key::L),
-        "KeyM" => Some(egui::Key::M), "KeyN" => Some(egui::Key::N),
-        "KeyO" => Some(egui::Key::O), "KeyP" => Some(egui::Key::P),
-        "KeyQ" => Some(egui::Key::Q), "KeyR" => Some(egui::Key::R),
-        "KeyS" => Some(egui::Key::S), "KeyT" => Some(egui::Key::T),
-        "KeyU" => Some(egui::Key::U), "KeyV" => Some(egui::Key::V),
-        "KeyW" => Some(egui::Key::W), "KeyX" => Some(egui::Key::X),
-        "KeyY" => Some(egui::Key::Y), "KeyZ" => Some(egui::Key::Z),
-        _ => None,
-    };
-    if by_letter.is_some() {
-        return by_letter;
-    }
-    let by_digit = match code {
-        "Digit0" => Some(egui::Key::Num0), "Digit1" => Some(egui::Key::Num1),
-        "Digit2" => Some(egui::Key::Num2), "Digit3" => Some(egui::Key::Num3),
-        "Digit4" => Some(egui::Key::Num4), "Digit5" => Some(egui::Key::Num5),
-        "Digit6" => Some(egui::Key::Num6), "Digit7" => Some(egui::Key::Num7),
-        "Digit8" => Some(egui::Key::Num8), "Digit9" => Some(egui::Key::Num9),
-        _ => None,
-    };
-    if by_digit.is_some() {
-        return by_digit;
-    }
-    let by_fn = match code {
-        "F1" => Some(egui::Key::F1),  "F2" => Some(egui::Key::F2),
-        "F3" => Some(egui::Key::F3),  "F4" => Some(egui::Key::F4),
-        "F5" => Some(egui::Key::F5),  "F6" => Some(egui::Key::F6),
-        "F7" => Some(egui::Key::F7),  "F8" => Some(egui::Key::F8),
-        "F9" => Some(egui::Key::F9),  "F10" => Some(egui::Key::F10),
-        "F11" => Some(egui::Key::F11), "F12" => Some(egui::Key::F12),
-        _ => None,
-    };
-    if by_fn.is_some() {
-        return by_fn;
-    }
-    match code {
-        "Space" => Some(egui::Key::Space),
-        "Enter" => Some(egui::Key::Enter),
-        "Escape" => Some(egui::Key::Escape),
-        "Tab" => Some(egui::Key::Tab),
-        "Backspace" => Some(egui::Key::Backspace),
-        "Delete" => Some(egui::Key::Delete),
-        "ArrowUp" => Some(egui::Key::ArrowUp),
-        "ArrowDown" => Some(egui::Key::ArrowDown),
-        "ArrowLeft" => Some(egui::Key::ArrowLeft),
-        "ArrowRight" => Some(egui::Key::ArrowRight),
-        "Home" => Some(egui::Key::Home),
-        "End" => Some(egui::Key::End),
-        "PageUp" => Some(egui::Key::PageUp),
-        "PageDown" => Some(egui::Key::PageDown),
-        "Backquote" => Some(egui::Key::Backtick),
-        "Minus" => Some(egui::Key::Minus),
-        "Equal" => Some(egui::Key::Equals),
-        _ => None,
-    }
-}
-
-/// Map a DOM `MouseEvent.button` index to a `winit::event::MouseButton`.
-/// The DOM convention is 0=primary, 1=middle, 2=secondary; winit uses
-/// named variants.
-fn mouse_button_from_dom(button: u8) -> MouseButton {
-    match button {
-        0 => MouseButton::Left,
-        1 => MouseButton::Middle,
-        2 => MouseButton::Right,
-        3 => MouseButton::Back,
-        4 => MouseButton::Forward,
-        other => MouseButton::Other(other as u16),
-    }
-}
-
-/// Map a DOM `KeyboardEvent.code` string to a `winit::keyboard::KeyCode`.
-/// Partial mapping focused on the keys rye demos actually use today
-/// (WASD + modifiers + the hotkey set + arrow keys + function keys 1-12
-/// + digits). Returns `None` for unmapped codes; the caller drops the
-/// event silently.
-///
-/// Growing this table: each new code we want to support adds one line.
-/// Stays in worker.rs for now because it's the only consumer; if a
-/// second crate ever needs the same translation, lift into rye-input.
-fn winit_keycode_from_str(code: &str) -> Option<KeyCode> {
-    // Letters A-Z. Done as a single match arm because the cases are
-    // mechanical + writing them out gives the compiler the chance to
-    // jump-table optimize.
-    let by_letter = match code {
-        "KeyA" => Some(KeyCode::KeyA), "KeyB" => Some(KeyCode::KeyB),
-        "KeyC" => Some(KeyCode::KeyC), "KeyD" => Some(KeyCode::KeyD),
-        "KeyE" => Some(KeyCode::KeyE), "KeyF" => Some(KeyCode::KeyF),
-        "KeyG" => Some(KeyCode::KeyG), "KeyH" => Some(KeyCode::KeyH),
-        "KeyI" => Some(KeyCode::KeyI), "KeyJ" => Some(KeyCode::KeyJ),
-        "KeyK" => Some(KeyCode::KeyK), "KeyL" => Some(KeyCode::KeyL),
-        "KeyM" => Some(KeyCode::KeyM), "KeyN" => Some(KeyCode::KeyN),
-        "KeyO" => Some(KeyCode::KeyO), "KeyP" => Some(KeyCode::KeyP),
-        "KeyQ" => Some(KeyCode::KeyQ), "KeyR" => Some(KeyCode::KeyR),
-        "KeyS" => Some(KeyCode::KeyS), "KeyT" => Some(KeyCode::KeyT),
-        "KeyU" => Some(KeyCode::KeyU), "KeyV" => Some(KeyCode::KeyV),
-        "KeyW" => Some(KeyCode::KeyW), "KeyX" => Some(KeyCode::KeyX),
-        "KeyY" => Some(KeyCode::KeyY), "KeyZ" => Some(KeyCode::KeyZ),
-        _ => None,
-    };
-    if by_letter.is_some() {
-        return by_letter;
-    }
-
-    let by_digit = match code {
-        "Digit0" => Some(KeyCode::Digit0), "Digit1" => Some(KeyCode::Digit1),
-        "Digit2" => Some(KeyCode::Digit2), "Digit3" => Some(KeyCode::Digit3),
-        "Digit4" => Some(KeyCode::Digit4), "Digit5" => Some(KeyCode::Digit5),
-        "Digit6" => Some(KeyCode::Digit6), "Digit7" => Some(KeyCode::Digit7),
-        "Digit8" => Some(KeyCode::Digit8), "Digit9" => Some(KeyCode::Digit9),
-        _ => None,
-    };
-    if by_digit.is_some() {
-        return by_digit;
-    }
-
-    let by_fn = match code {
-        "F1" => Some(KeyCode::F1),  "F2" => Some(KeyCode::F2),
-        "F3" => Some(KeyCode::F3),  "F4" => Some(KeyCode::F4),
-        "F5" => Some(KeyCode::F5),  "F6" => Some(KeyCode::F6),
-        "F7" => Some(KeyCode::F7),  "F8" => Some(KeyCode::F8),
-        "F9" => Some(KeyCode::F9),  "F10" => Some(KeyCode::F10),
-        "F11" => Some(KeyCode::F11), "F12" => Some(KeyCode::F12),
-        _ => None,
-    };
-    if by_fn.is_some() {
-        return by_fn;
-    }
-
-    // Everything else: catch-all of the common control + arrow keys.
-    match code {
-        "Space" => Some(KeyCode::Space),
-        "Enter" => Some(KeyCode::Enter),
-        "Escape" => Some(KeyCode::Escape),
-        "Tab" => Some(KeyCode::Tab),
-        "Backspace" => Some(KeyCode::Backspace),
-        "Delete" => Some(KeyCode::Delete),
-        "Backquote" => Some(KeyCode::Backquote),
-        "Minus" => Some(KeyCode::Minus),
-        "Equal" => Some(KeyCode::Equal),
-        "BracketLeft" => Some(KeyCode::BracketLeft),
-        "BracketRight" => Some(KeyCode::BracketRight),
-        "Semicolon" => Some(KeyCode::Semicolon),
-        "Quote" => Some(KeyCode::Quote),
-        "Comma" => Some(KeyCode::Comma),
-        "Period" => Some(KeyCode::Period),
-        "Slash" => Some(KeyCode::Slash),
-        "Backslash" => Some(KeyCode::Backslash),
-        "ShiftLeft" => Some(KeyCode::ShiftLeft),
-        "ShiftRight" => Some(KeyCode::ShiftRight),
-        "ControlLeft" => Some(KeyCode::ControlLeft),
-        "ControlRight" => Some(KeyCode::ControlRight),
-        "AltLeft" => Some(KeyCode::AltLeft),
-        "AltRight" => Some(KeyCode::AltRight),
-        "ArrowUp" => Some(KeyCode::ArrowUp),
-        "ArrowDown" => Some(KeyCode::ArrowDown),
-        "ArrowLeft" => Some(KeyCode::ArrowLeft),
-        "ArrowRight" => Some(KeyCode::ArrowRight),
-        _ => None,
-    }
-}

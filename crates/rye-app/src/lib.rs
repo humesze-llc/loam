@@ -79,6 +79,7 @@ pub mod capture;
 #[path = "capture_stub.rs"]
 pub mod capture;
 pub mod args;
+pub mod keymap;
 pub mod log;
 pub mod trace;
 #[cfg(target_arch = "wasm32")]
