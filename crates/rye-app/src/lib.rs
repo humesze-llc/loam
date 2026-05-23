@@ -79,6 +79,8 @@ pub mod capture;
 #[path = "capture_stub.rs"]
 pub mod capture;
 pub mod args;
+pub mod fps;
+pub mod frame_pacing;
 pub mod keymap;
 pub mod log;
 pub mod trace;
@@ -708,6 +710,11 @@ struct Runner<A: App> {
     last_update_at: Option<Instant>,
 
     tick_index: u64,
+    /// Timestamp of the previous `redraw` entry. Used by the [`frame_pacing`]
+    /// throttle at the top of each `redraw` to decide whether to sleep (native)
+    /// or skip-and-rerequest (wasm) before doing this frame's work. `None`
+    /// disables throttling until the first frame establishes a reference.
+    last_redraw_at: Option<Instant>,
     /// Consecutive `App::render` failures since the last successful frame. Compared
     /// against `RunConfig::render_error_budget`.
     render_error_streak: u32,
@@ -741,6 +748,7 @@ impl<A: App> Runner<A> {
             fps: 0.0,
             last_update_at: None,
             tick_index: 0,
+            last_redraw_at: None,
             render_error_streak: 0,
             deferred_error: None,
 
@@ -1099,6 +1107,32 @@ impl<A: App> Runner<A> {
             return;
         }
         let Some(rd) = self.rd.as_ref() else { return };
+
+        // Frame-rate cap. The `fps` console command pokes
+        // [`frame_pacing::set_target_fps`]; we read it here. Cap is enforced
+        // differently per target — native sleeps the remainder of the period;
+        // wasm skips the RAF callback and re-requests, since we can't block in
+        // the browser. With `target_fps = 0` the load returns `None` and we
+        // fall through to the surface's native cadence (vsync on native, RAF
+        // on wasm).
+        if let (Some(period), Some(last)) =
+            (frame_pacing::target_period(), self.last_redraw_at)
+        {
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed < period {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    win.request_redraw();
+                    return;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    std::thread::sleep(period - elapsed);
+                }
+            }
+        }
+        self.last_redraw_at = Some(Instant::now());
 
         // Mark frame start for `idle` measurement. `end_frame` subtracts this from
         // the previous `end_frame` timestamp to get `idle` (browser/RAF gap, not

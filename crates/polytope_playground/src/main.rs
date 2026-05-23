@@ -1528,6 +1528,7 @@ impl RotatePolytopesApp {
         // which is the data we need to drive M4.5 v2 perf decisions (pipeline
         // warming, wireframe caching).
         rye_app::trace::register_command(&mut c);
+        rye_app::fps::register_command(&mut c);
 
         c
     }
