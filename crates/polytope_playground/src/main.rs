@@ -493,7 +493,7 @@ impl Demo {
         // can serve a stale page+script combination otherwise. F3's perf
         // overlay shows fps + framebuffer size when that data is wanted.
         let build_label = format!(
-            "{}{}",
+            "version: {}{}",
             env!("BUILD_HASH"),
             env!("BUILD_DIRTY"),
         );
