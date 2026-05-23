@@ -11,22 +11,43 @@
 //!
 //! ## One cycle, per slot
 //!
-//! Each frame uses ONE of `FRAMES_IN_FLIGHT` slots in a single query set + resolve
-//! buffer (striped). The flow per frame `f`:
+//! Each frame uses ONE of `FRAMES_IN_FLIGHT` slots in a single query set + two
+//! striped GPU buffers (a resolve buffer the GPU writes into, plus a map buffer
+//! the CPU reads from). The flow per frame `f`:
 //!
 //! 1. **Write start.** Just after `begin_frame`: a tiny `gpu-timer-start` encoder
 //!    writes `timestamp(slot=2f)` and submits.
-//! 2. **Write end + resolve.** Just before `frame.present`: a tiny `gpu-timer-end`
-//!    encoder writes `timestamp(slot=2f+1)`, calls `resolve_query_set` to copy the
-//!    two u64 ticks into the resolve buffer slice for slot f, and submits.
+//! 2. **Write end + resolve + copy.** Just before `frame.present`: a tiny
+//!    `gpu-timer-end` encoder writes `timestamp(slot=2f+1)`, calls
+//!    `resolve_query_set` to copy the two u64 ticks into the resolve buffer slice
+//!    for slot f, then `copy_buffer_to_buffer` into the map buffer's matching
+//!    slice. (See "Why two buffers" below.) Then submits.
 //! 3. **Schedule map.** The runner's `tick()` call (after queue.submit) schedules
-//!    `map_async` on the slot's buffer slice. The callback fires when the GPU has
-//!    actually finished the frame; it reads the two u64s, converts ticks ->
+//!    `map_async` on the map buffer's slot slice. The callback fires when the GPU
+//!    has actually finished the frame; it reads the two u64s, converts ticks ->
 //!    nanoseconds via `Queue::get_timestamp_period`, and sends the delta over an
 //!    `mpsc` channel.
 //! 4. **Drain.** The next frame's `tick()` drains the channel and pushes any
 //!    received durations into `rye_time::frame_trace` as `gpu-total` sections,
 //!    where they appear in `trace summary` alongside the CPU sections.
+//!
+//! ## Why two layers of buffers
+//!
+//! wgpu 27 validates: "MAP usage can only be combined with the opposite COPY."
+//! That is, `MAP_READ` may only pair with `COPY_DST` (and `MAP_WRITE` with
+//! `COPY_SRC`); any other non-MAP usage on the same buffer is rejected at
+//! `create_buffer` time. `QUERY_RESOLVE` is a separate write usage, not a COPY,
+//! so `MAP_READ | QUERY_RESOLVE` panics on device init. The fix is the standard
+//! staging dance: one GPU-only resolve buffer with `QUERY_RESOLVE | COPY_SRC`,
+//! plus CPU-mappable map buffers with `MAP_READ | COPY_DST`, joined by
+//! `copy_buffer_to_buffer` inside the end-of-frame encoder.
+//!
+//! And map buffers are **per-slot**, not a single striped buffer, because wgpu
+//! treats a buffer as "mapped" the instant `map_async` is requested on any
+//! slice — for the whole buffer, until `unmap()`. If we shared one map buffer
+//! across slots, slot N+1's `copy_buffer_to_buffer` would fail at
+//! `Queue::submit` ("buffer is still mapped") while slot N is awaiting its
+//! callback. Three tiny per-slot buffers let independent slots make progress.
 //!
 //! Triple-buffering (3 frame slots) gives enough headroom for the typical 1-2 frame
 //! GPU latency without colliding with the slot being mapped for read.
@@ -43,7 +64,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use wgpu::{
     Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features, MapMode, Queue,
-    QuerySet, QuerySetDescriptor, QueryType,
+    QuerySet, QuerySetDescriptor, QueryType, QUERY_RESOLVE_BUFFER_ALIGNMENT,
 };
 
 /// Three in-flight frames is enough headroom for the typical WebGPU latency profile
@@ -55,22 +76,34 @@ const FRAMES_IN_FLIGHT: usize = 3;
 /// Bytes per resolved slot pair (two `u64` ticks).
 const BYTES_PER_SLOT: u64 = 16;
 
-/// Per-slot state. `in_flight` is set when the slot has been resolved and is awaiting
-/// its `map_async` callback. The callback clears it (via the same `Arc`) after the
-/// timing has been delivered through the channel.
+/// Stride between slot offsets in the resolve buffer. `resolve_query_set`
+/// requires the destination offset to be aligned to
+/// `QUERY_RESOLVE_BUFFER_ALIGNMENT` (256 bytes), so each slot's payload sits at
+/// `slot * SLOT_STRIDE_BYTES` even though it only uses the first 16 bytes of
+/// that window. Map buffers don't need this stride — each is its own buffer.
+const SLOT_STRIDE_BYTES: u64 = QUERY_RESOLVE_BUFFER_ALIGNMENT;
+
+/// Per-slot state. `in_flight` is set when the slot has been resolved and is
+/// awaiting its `map_async` callback. The callback clears it (via the same
+/// `Arc`) after the timing has been delivered through the channel. `map_buffer`
+/// is per-slot so independent slots don't block each other on `Queue::submit`
+/// (wgpu locks a whole buffer the moment any slice is mapped).
 struct SlotState {
     in_flight: Arc<AtomicBool>,
+    map_buffer: Buffer,
 }
 
 /// Triple-buffered timestamp recorder owned by `RenderDevice`.
 pub struct GpuTimer {
     /// One query set with `FRAMES_IN_FLIGHT * 2` slots (start + end per frame).
     query_set: QuerySet,
-    /// Single resolve buffer striped into per-slot 16-byte slices. `QUERY_RESOLVE`
-    /// for `resolve_query_set` writes, `MAP_READ` for the async callback's reads.
+    /// GPU-only resolve buffer striped by `SLOT_STRIDE_BYTES`. `QUERY_RESOLVE`
+    /// for `resolve_query_set` writes, `COPY_SRC` so the end-of-frame encoder
+    /// can stage the slot into its per-slot map buffer. One buffer is enough
+    /// here because there's no CPU mapping on this side.
     resolve_buffer: Buffer,
-    /// Per-slot in-flight flags. Slot at `frame_index % FRAMES_IN_FLIGHT` is the
-    /// current frame's slot.
+    /// Per-slot state. Slot at `frame_index % FRAMES_IN_FLIGHT` is the current
+    /// frame's slot. See [`SlotState`] for why map buffers are per-slot.
     slots: [SlotState; FRAMES_IN_FLIGHT],
     /// Strictly increasing frame counter. Wraps after `u64::MAX`.
     frame_index: u64,
@@ -99,12 +132,18 @@ impl GpuTimer {
         });
         let resolve_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("rye-render::GpuTimer::resolve_buffer"),
-            size: BYTES_PER_SLOT * FRAMES_IN_FLIGHT as u64,
-            usage: BufferUsages::QUERY_RESOLVE | BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            size: SLOT_STRIDE_BYTES * FRAMES_IN_FLIGHT as u64,
+            usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let slots = std::array::from_fn(|_| SlotState {
             in_flight: Arc::new(AtomicBool::new(false)),
+            map_buffer: device.create_buffer(&BufferDescriptor {
+                label: Some("rye-render::GpuTimer::map_buffer"),
+                size: BYTES_PER_SLOT,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
         });
         let (tx, rx) = channel();
         Some(Self {
@@ -128,7 +167,7 @@ impl GpuTimer {
     }
 
     fn slot_byte_range(slot: usize) -> std::ops::Range<u64> {
-        let base = slot as u64 * BYTES_PER_SLOT;
+        let base = slot as u64 * SLOT_STRIDE_BYTES;
         base..(base + BYTES_PER_SLOT)
     }
 
@@ -145,9 +184,10 @@ impl GpuTimer {
         encoder.write_timestamp(&self.query_set, range.start);
     }
 
-    /// Write the end-of-frame timestamp + resolve the slot pair into the resolve
-    /// buffer. Caller submits the encoder before `frame.present`. Marks the slot
-    /// in-flight; the next `tick` schedules its `map_async`.
+    /// Write the end-of-frame timestamp, resolve the slot pair into the resolve
+    /// buffer, then stage that slot into the CPU-mappable map buffer. Caller
+    /// submits the encoder before `frame.present`. Marks the slot in-flight; the
+    /// next `tick` schedules its `map_async` on the map buffer.
     pub fn write_end_and_resolve(&self, encoder: &mut CommandEncoder) {
         let slot = self.current_slot();
         if self.slots[slot].in_flight.load(Ordering::Acquire) {
@@ -161,6 +201,13 @@ impl GpuTimer {
             query_range,
             &self.resolve_buffer,
             byte_range.start,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            byte_range.start,
+            &self.slots[slot].map_buffer,
+            0,
+            BYTES_PER_SLOT,
         );
         self.slots[slot].in_flight.store(true, Ordering::Release);
     }
@@ -216,18 +263,16 @@ impl GpuTimer {
         {
             return;
         }
-        let byte_range = Self::slot_byte_range(just_resolved_slot);
-        let buffer = self.resolve_buffer.clone();
+        let buffer = self.slots[just_resolved_slot].map_buffer.clone();
         let buffer_for_callback = buffer.clone();
         let period_ns = self.timestamp_period_ns;
         let tx = self.tx.clone();
         let flag = self.slots[just_resolved_slot].in_flight.clone();
-        let cb_range = byte_range.clone();
         buffer
-            .slice(byte_range)
+            .slice(..)
             .map_async(MapMode::Read, move |result| {
                 if result.is_ok() {
-                    let view = buffer_for_callback.slice(cb_range).get_mapped_range();
+                    let view = buffer_for_callback.slice(..).get_mapped_range();
                     if view.len() == BYTES_PER_SLOT as usize {
                         let start_ticks = u64::from_le_bytes(
                             view[0..8].try_into().expect("8-byte u64"),
