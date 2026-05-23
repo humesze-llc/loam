@@ -9,8 +9,8 @@
 //! ## Design
 //!
 //! - **One enum, all variants.** A `Shape` carries every shape either role needs. Variants that
-//!   don't apply to a particular role — e.g. [`Shape::Polygon2D`] has no 3D SDF emission,
-//!   [`Shape::Box3`] has no dedicated physics narrowphase today — are simply not implemented by
+//!   don't apply to a particular role; e.g. [`Shape::Polygon2D`] has no 3D SDF emission,
+//!   [`Shape::Box3`] has no dedicated physics narrowphase today; are simply not implemented by
 //!   that role's trait and return `None` / no-op.
 //! - **Pose is extrinsic.** Most shapes (Sphere, Box3, the polytopes) are defined in a local
 //!   "shape frame" and positioned by the caller's transform: the physics body's

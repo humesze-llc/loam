@@ -3,10 +3,10 @@
 //!
 //! ## Subcommands
 //!
-//! - `fps` — print the current target.
-//! - `fps <n>` — set the target to `n` frames per second. Accepts integers and
+//! - `fps`: print the current target.
+//! - `fps <n>`: set the target to `n` frames per second. Accepts integers and
 //!   floats; `n` must be in `(0, 1000]`.
-//! - `fps unlimited` (alias: `off`, `0`) — remove the cap entirely. On native
+//! - `fps unlimited` (alias: `off`, `0`): remove the cap entirely. On native
 //!   the surface's `PresentMode` (vsync) is the upper bound; on wasm the
 //!   browser's `requestAnimationFrame` cadence remains the upper bound.
 //!
@@ -28,7 +28,7 @@ const MAX_ACCEPTED_FPS: f32 = 1000.0;
 fn print_current(out: &mut rye_egui::ConsoleWriter) {
     let f = frame_pacing::target_fps();
     if f <= 0.0 {
-        out.line("fps: unlimited (uncapped — surface/vsync or browser RAF is the upper bound)");
+        out.line("fps: unlimited (uncapped; surface/vsync or browser RAF is the upper bound)");
     } else {
         out.line(format!("fps: target {f:.1}"));
     }

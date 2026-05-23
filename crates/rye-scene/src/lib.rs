@@ -47,7 +47,7 @@ mod tests {
         let e3 = s.to_wgsl(&EuclideanR3, "sdf_0");
         let h3 = s.to_wgsl(&HyperbolicH3, "sdf_0");
         let s3 = s.to_wgsl(&SphericalS3, "sdf_0");
-        // The emitted body must be identical across spaces — only rye_distance differs at
+        // The emitted body must be identical across spaces; only rye_distance differs at
         // prelude link time, not in the emitted text.
         assert_eq!(e3, h3);
         assert_eq!(h3, s3);

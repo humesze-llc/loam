@@ -1795,32 +1795,37 @@ mod drag_tests {
     /// movement. We thread a monotonic clock so each frame's input
     /// has `time = N * 50ms`; well past the default click duration.
     fn pointer_press(time: f64, pos: egui::Pos2) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen());
-        input.time = Some(time);
-        input.events.push(egui::Event::PointerMoved(pos));
-        input.events.push(egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: Default::default(),
-        });
-        input
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(time),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        }
     }
 
     fn pointer_move(time: f64, pos: egui::Pos2) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen());
-        input.time = Some(time);
-        input.events.push(egui::Event::PointerMoved(pos));
-        input
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(time),
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        }
     }
 
     fn warmup_input(time: f64) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen());
-        input.time = Some(time);
-        input
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(time),
+            ..Default::default()
+        }
     }
 
     /// Simulate "click on card, then drag past the drag threshold"
@@ -1920,12 +1925,14 @@ mod drag_tests {
     /// headless `Context::run` (Area-routed input doesn't seem to
     /// reach the interaction step the same way it does in a real
     /// winit-driven loop). Instead we verify that:
-    /// 1. Rendering the same source closure in two `Area`s with
-    ///    different layers does NOT trigger the debug-assert when
-    ///    ids are scoped per-ui (`make_persistent_id`).
-    /// 2. The IDs actually ARE distinct between the two passes.
-    /// The first part; running this test without panic in debug
-    ///; is what catches a regression to globally-stable ids.
+    ///
+    ///   1. Rendering the same source closure in two `Area`s with
+    ///      different layers does NOT trigger the debug-assert when
+    ///      ids are scoped per-ui (`make_persistent_id`).
+    ///   2. The IDs actually ARE distinct between the two passes.
+    ///
+    /// The first part (running this test without panic in debug) is
+    /// what catches a regression to globally-stable ids.
     #[test]
     fn make_persistent_id_per_pass_avoids_layer_collision() {
         let ctx = egui::Context::default();
@@ -2103,18 +2110,20 @@ mod drag_tests {
         let drag_total = total_during_drag;
         let dragged_id = ctx.dragged_id();
         // Release.
-        let mut release_input = egui::RawInput::default();
-        release_input.screen_rect = Some(screen());
-        release_input.time = Some(0.6);
-        release_input
-            .events
-            .push(egui::Event::PointerMoved(target_pos));
-        release_input.events.push(egui::Event::PointerButton {
-            pos: target_pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: Default::default(),
-        });
+        let release_input = egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(0.6),
+            events: vec![
+                egui::Event::PointerMoved(target_pos),
+                egui::Event::PointerButton {
+                    pos: target_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
         let _ = ctx.run(release_input, |c| {
             render_during_drag(c, &mut total_during_drag)
         });

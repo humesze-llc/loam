@@ -506,9 +506,10 @@ impl Bivector4 {
         )
     }
 
-    /// Hodge dual `B* = B · I`. Swaps each plane with its orthogonal complement (with signs from
-    /// reordering basis vectors): `xy ↔ −zw`, `xz ↔ +yw`, `xw ↔ −yz` (and the reverse swaps
-    /// for the other three). Used inside the invariant decomposition.
+    /// Hodge dual `B* = B · I`. Swaps each plane with its orthogonal
+    /// complement (with signs from reordering basis vectors): `xy <-> −zw`,
+    /// `xz <-> +yw`, `xw <-> −yz` (and the reverse swaps for the other
+    /// three). Used inside the invariant decomposition.
     pub fn dual(self) -> Self {
         Self {
             xy: -self.zw,
@@ -808,7 +809,7 @@ impl Rotor4 {
     /// rotor applied to the canonical basis vectors e₁, e₂, e₃, e₄. Output
     /// layout is `[col0, col1, col2, col3]` (column-major), which matches
     /// both glam's `Mat4` storage and WGSL's `mat4x4<f32>` upload convention
-    /// — `bytemuck::cast` directly into a GPU uniform slot without
+    ///; `bytemuck::cast` directly into a GPU uniform slot without
     /// transposition.
     ///
     /// Cost: four [`Rotor::apply`] calls (~120 flops total). Negligible
@@ -1346,17 +1347,17 @@ mod tests {
         let theta = 0.7;
         let v = Vec3::new(1.0, 2.0, 3.0).normalize();
 
-        // xy-plane rotation ↔ rotation about +z axis.
+        // xy-plane rotation <-> rotation about +z axis.
         let rotor = Bivector3::new(theta, 0.0, 0.0).exp();
         let quat = Quat::from_axis_angle(Vec3::Z, theta);
         assert_vec3_close(rotor.apply(v), quat * v);
 
-        // yz-plane rotation ↔ rotation about +x axis.
+        // yz-plane rotation <-> rotation about +x axis.
         let rotor = Bivector3::new(0.0, theta, 0.0).exp();
         let quat = Quat::from_axis_angle(Vec3::X, theta);
         assert_vec3_close(rotor.apply(v), quat * v);
 
-        // zx-plane rotation ↔ rotation about +y axis.
+        // zx-plane rotation <-> rotation about +y axis.
         let rotor = Bivector3::new(0.0, 0.0, theta).exp();
         let quat = Quat::from_axis_angle(Vec3::Y, theta);
         assert_vec3_close(rotor.apply(v), quat * v);
@@ -1708,9 +1709,10 @@ mod tests {
     /// (sum-of-plane-bivectors) and multiplicative (rotor compose) drift specific to compound
     /// bivectors that include w-mixing planes.
     ///
-    /// `omega = e_xy + e_xz + e_xw + e_yz` is the exact bivector the failing-screenshot
-    /// polytope_playground run had active. Regression gate for the issue #37 fix in `Rotor4::mul`
-    /// (the e14·e24 / e24·e14 pair's signs in the e12 output were swapped). Pre-fix drift was
+    /// `omega = e_xy + e_xz + e_xw + e_yz` is the exact bivector the
+    /// failing-screenshot polytope_playground run had active. Regression gate
+    /// for the issue #37 fix in `Rotor4::mul` (the e14·e24 / e24·e14 pair's
+    /// signs in the e12 output were swapped). Pre-fix drift was
     /// ~1.3%; post-fix it sits at f32 noise (~5e-7).
     #[test]
     fn rotor4_compound_xy_xz_xw_yz_integrated_matches_closed_form() {
@@ -1809,9 +1811,11 @@ mod tests {
         }
     }
 
-    /// Same 900-step integration but **with `.normalize()` after each composition**, mirroring
-    /// the actual integrator path in `rye_physics::euclidean_r4::integrate_orientation`. If this
-    /// fails, the polytope-playground "shapes growing" symptom is the visible bug; if this passes,
+    /// Same 900-step integration but **with `.normalize()` after each
+    /// composition**, mirroring the actual integrator path in
+    /// `rye_physics::euclidean_r4::integrate_orientation`. If this fails, the
+    /// polytope-playground "shapes growing" symptom is the visible bug; if
+    /// this passes,
     /// the integrator's existing normalize handles the algebraic drift the previous test catches
     /// and the visual issue is somewhere else (cross-section shape change, dispatcher inverse
     /// rotor, etc.).

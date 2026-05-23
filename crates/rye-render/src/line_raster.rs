@@ -442,7 +442,7 @@ impl LineRasterNode {
 
     /// Record a render pass that draws the uploaded line mesh into `view`, using the
     /// caller-supplied `encoder`. **Does NOT call `encoder.finish()` or
-    /// `queue.submit`** — those are the caller's responsibility, typically the
+    /// `queue.submit`**; those are the caller's responsibility, typically the
     /// runner batching multiple passes into one submit per frame (the
     /// `App::record` path).
     ///
@@ -514,8 +514,8 @@ impl LineRasterNode {
 
     /// Legacy wrapper: builds its own encoder + submits. Kept for backwards
     /// compatibility with demos still on the multi-submit `App::render` path.
-    /// New code should prefer [`Self::record`] called from inside
-    /// [`App::record`](rye_app::App::record), which lets the runner share one
+    /// New code should prefer `Self::record` called from inside
+    /// `App::record`, which lets the runner share one
     /// encoder across the whole frame.
     pub fn execute(
         &self,

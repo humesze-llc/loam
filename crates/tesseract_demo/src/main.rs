@@ -6,8 +6,8 @@
 //!
 //! ## Why this demo (vs. polytope_playground)
 //!
-//! Validates the small-demo hypothesis: ship the focused experience that a
-//! blog post needs, with the minimum pipeline footprint to do it. This demo:
+//! Validates the small-demo hypothesis: ship a focused experience with the
+//! minimum pipeline footprint, then iterate. This demo:
 //!
 //! - Uses exactly ONE render pipeline (the line rasterizer). No SDF raymarch,
 //!   no triangle rasterizer, no point sprite pass, no shared depth buffer.
@@ -66,10 +66,10 @@ const POLYTOPE_SCALE: f32 = 1.5;
 
 /// Per-line tint applied on top of the w-depth color algorithm baked into the
 /// `LineRasterStaticR4Node` shader. Rgb multiplies the depth-cue palette
-/// (cool blue back → warm orange front, lerped by the segment's midpoint w
+/// (cool blue back to warm orange front, lerped by the segment's midpoint w
 /// AFTER the rotor), so a value close to white preserves the depth gradient's
 /// hue identity; alpha controls per-line opacity. The depth cue is what gives
-/// the demo its "easy to read which line is in front of which" property — see
+/// the demo its "easy to read which line is in front of which" property; see
 /// the shader file for the algorithm.
 const EDGE_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.95];
 const EDGE_WIDTH_PX: f32 = 1.6;
@@ -170,7 +170,7 @@ impl TesseractApp {
             dimension: wgpu::TextureDimension::D2,
             // Must match the pipeline's target format. `target_format()`
             // returns the sRGB sibling on the composite path (wasm) and the
-            // direct swapchain format otherwise — same value the pipeline
+            // direct swapchain format otherwise; same value the pipeline
             // was built with at construction time, so the warmup pass is
             // format-compatible.
             format: rd.target_format(),
@@ -193,7 +193,7 @@ impl TesseractApp {
             // `record` is the regular per-frame draw path; running it once
             // with the current state (identity rotor + initial camera) is
             // enough to drive the pipeline through its first compile.
-            // Discard any error — warming isn't critical.
+            // Discard any error; warming isn't critical.
             let _ = self.record(&mut ctx);
         }
         rd.queue.submit(Some(encoder.finish()));
@@ -300,7 +300,7 @@ impl App for TesseractApp {
         // the demo links). (2) Warming + click-to-start interact: when the
         // demo is manually-launched, warmup at App::setup runs after the
         // click, which is precisely the window where a brief loading delay
-        // is acceptable — we don't want to spend that compile budget at
+        // is acceptable; we don't want to spend that compile budget at
         // page-load before the user has expressed interest.
         //
         // Doesn't warm `ui.paint` (egui owns its pipelines, compiles them
@@ -319,7 +319,7 @@ impl App for TesseractApp {
     fn update(&mut self, ctx: &mut FrameCtx<'_>) {
         // Use the runner-supplied wall-clock dt (varies frame-to-frame, captures
         // stutter accurately). A hardcoded `1.0 / 60.0` would have the rotor
-        // advance "60 fps worth" each frame regardless of actual cadence — at the
+        // advance "60 fps worth" each frame regardless of actual cadence; at the
         // observed 50fps that's a ~17% slowdown of the intended SPIN_RATE, and on
         // stutter frames the rotor would visibly lag.
         //
@@ -341,11 +341,11 @@ impl App for TesseractApp {
         match self.mode {
             CameraMode::Orbit => {
                 self.orbit
-                    .advance(ctx.input.clone(), &mut self.camera, &EuclideanR3, dt);
+                    .advance(ctx.input, &mut self.camera, &EuclideanR3, dt);
             }
             CameraMode::FreeRoam => {
                 self.free_roam
-                    .advance(ctx.input.clone(), &mut self.camera, &EuclideanR3, dt);
+                    .advance(ctx.input, &mut self.camera, &EuclideanR3, dt);
                 // `FrameInput` already aggregates WASD + Space/Shift into the
                 // `move_forward`, `move_right`, `move_up` axes (+1 / 0 / -1
                 // each frame). Combine with the camera's local basis to get
@@ -368,7 +368,7 @@ impl App for TesseractApp {
         use winit::keyboard::{KeyCode, PhysicalKey};
         // Gate app-level hotkeys on egui NOT having keyboard focus. Without this,
         // typing `trace` in the console fires our `KeyT` handler and toggles
-        // pause — silently freezing the animation while the user just wanted to
+        // pause; silently freezing the animation while the user just wanted to
         // run a console command. `ui_has_focus` is the runner's flag for "an
         // egui widget (TextEdit, the console, etc.) is consuming keyboard."
         if ctx.ui_has_focus {

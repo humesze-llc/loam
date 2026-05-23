@@ -183,12 +183,12 @@ pub trait App: Sized + 'static {
     /// stale. Rebuild what you care about.
     fn on_shader_reload(&mut self, _ctx: &mut SetupCtx<'_>) {}
 
-    /// **Legacy render path.** Implement either this OR [`App::record`]; the runner
+    /// **Legacy render path.** Implement either this OR `App::record`; the runner
     /// always calls `record`, whose default impl calls this. Each invocation of
     /// `render` typically creates its own command encoder + queue.submit (per pass
     /// or per node), so a demo with three nodes pays at least three submits per
     /// frame. On wasm32, each submit crosses the JS boundary and adds compositor
-    /// latency; the [`App::record`] path lets the runner batch the demo's draws
+    /// latency; the `App::record` path lets the runner batch the demo's draws
     /// with ui-paint + composite into a single per-frame submit.
     ///
     /// New demos should override `record` instead. This method remains for
@@ -282,7 +282,7 @@ pub struct TickCtx {
     pub tick: u64,
 }
 
-/// Render-time context. Handed to [`App::record`] each frame. Owns a shared command
+/// Render-time context. Handed to `App::record` each frame. Owns a shared command
 /// encoder that the demo writes its scene passes into; the runner reuses the same
 /// encoder for ui-paint and the wasm-side composite, then submits it exactly once
 /// at end of frame.
@@ -421,11 +421,11 @@ impl Default for RunConfig {
 ///
 /// On wasm32:
 /// - When invoked inside a `DedicatedWorkerGlobalScope` (worker
-///   context), routes to [`wasm::worker::run`]. Drives the App's
-///   lifecycle on a worker-side RAF loop with the [`wasm::worker_ui::WorkerUi`]
+///   context), routes to `wasm::worker::run`. Drives the App's
+///   lifecycle on a worker-side RAF loop with the `wasm::worker_ui::WorkerUi`
 ///   egui integration.
 /// - When invoked on main thread AND the page's `host_id` element has
-///   `data-mode="manual"`, routes to [`wasm::launch_on_click`]. Wires
+///   `data-mode="manual"`, routes to `wasm::launch_on_click`. Wires
 ///   the launch button to spawn the worker on click.
 /// - When invoked on main thread WITHOUT manual mode, falls back to
 ///   [`run_with_config`] (the legacy windowed-mode wasm path).
@@ -1112,7 +1112,7 @@ impl<A: App> Runner<A> {
         // off-side picks the best non-Fifo mode the adapter advertised:
         // `Mailbox` first (triple-buffered, no tearing), `Immediate` as
         // fallback (single-buffered, tearing allowed). If neither is offered
-        // (typical browser surface), the request silently no-ops — surface
+        // (typical browser surface), the request silently no-ops; surface
         // configuration is the wrong layer to surface an error in that case.
         if let (Some(want_on), Some(rd)) =
             (frame_pacing::take_pending_vsync(), self.rd.as_mut())
@@ -1135,7 +1135,7 @@ impl<A: App> Runner<A> {
 
         // Frame-rate cap. The `fps` console command pokes
         // [`frame_pacing::set_target_fps`]; we read it here. Cap is enforced
-        // differently per target — native does a precise sleep up to the
+        // differently per target; native does a precise sleep up to the
         // deadline; wasm skips the RAF callback and re-requests, since we
         // can't block in the browser. With `target_fps = 0` the load returns
         // `None` and we fall through to the surface's native cadence (vsync
@@ -1168,7 +1168,7 @@ impl<A: App> Runner<A> {
 
         // Mark frame start for `idle` measurement. `end_frame` subtracts this from
         // the previous `end_frame` timestamp to get `idle` (browser/RAF gap, not
-        // our work) — separate from `between-frames` (total cadence, our work +
+        // our work); separate from `between-frames` (total cadence, our work +
         // idle combined).
         rye_time::frame_trace::begin_frame();
 
@@ -1209,7 +1209,7 @@ impl<A: App> Runner<A> {
 
         // Compute dt (wall-clock seconds since previous update). First frame after
         // setup has no prior `last_update_at`, so we seed with the fixed-timestep
-        // interval — better than 0.0, which would zero out any dt-driven animation
+        // interval; better than 0.0, which would zero out any dt-driven animation
         // on its very first integration step.
         let now_inst = Instant::now();
         let dt = match self.last_update_at {

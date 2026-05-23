@@ -2,7 +2,7 @@
 //!
 //! Single API ([`Args`]) backed by `std::env::args` on native and
 //! `window.location.search` on wasm32. Demos use it for things like
-//! `?shape=tesseract`, `?seed=42`, `?fov=60` — anything a user might tweak
+//! `?shape=tesseract`, `?seed=42`, `?fov=60`: anything a user might tweak
 //! without recompiling.
 //!
 //! ## Design notes (why this is a struct, not free functions)
@@ -133,7 +133,7 @@ impl Args {
     }
 
     /// Look up a value and parse it as `T`. Returns `None` if the key was
-    /// missing OR the value failed to parse — distinguish these with `get`
+    /// missing OR the value failed to parse; distinguish these with `get`
     /// if your demo needs a specific error message.
     pub fn parse<T: std::str::FromStr>(&self, key: &str) -> Option<T> {
         self.get(key)?.parse().ok()

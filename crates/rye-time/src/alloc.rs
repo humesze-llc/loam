@@ -19,13 +19,13 @@
 //! `GlobalAlloc` is called from any thread; on wasm32 we're single-threaded so
 //! thread-locals would suffice, but atomics are correct everywhere and the cost
 //! is one `fetch_add` per call. Relaxed ordering is fine because we don't
-//! synchronize OTHER memory through these counters — they're plain counts.
+//! synchronize OTHER memory through these counters; they're plain counts.
 //!
 //! ## Why "installed" is its own bool
 //!
 //! The counters start at zero. If a demo never installs the wrapper, the per-
 //! frame delta is identically zero forever, which would print as "0 allocs"
-//! misleadingly. The wrapper sets [`ALLOC_INSTALLED`] on first call so
+//! misleadingly. The wrapper sets `ALLOC_INSTALLED` on first call so
 //! `frame_trace` can distinguish "no allocator wired" from "no allocations
 //! this frame." The latter is the steady-state goal we're driving toward.
 //!
@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Process-global counter of total bytes allocated since startup. Monotonic
 /// (never decreases); the per-frame delta is computed by sampling at frame
-/// boundaries and subtracting. `Relaxed` ordering everywhere — no other memory
+/// boundaries and subtracting. `Relaxed` ordering everywhere; no other memory
 /// is synchronized through these counters.
 pub(crate) static TOTAL_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Process-global counter of total bytes deallocated since startup. Same shape
@@ -161,7 +161,7 @@ pub struct AllocDelta {
 
 /// Read the current allocation counters. Returns `None` when no
 /// [`CountingAllocator`] has been installed (the sentinel
-/// [`ALLOC_INSTALLED`] was never set), so callers can distinguish "nothing
+/// `ALLOC_INSTALLED` was never set), so callers can distinguish "nothing
 /// allocated" from "no allocator wired."
 pub fn current_snapshot() -> Option<AllocSnapshot> {
     if !ALLOC_INSTALLED.load(Ordering::Relaxed) {

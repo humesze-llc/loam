@@ -37,7 +37,7 @@ pub fn launch_on_click(host_id: &str, button_id: &str, canvas_id: &str) -> Resul
     // worker initializes wgpu + renders a single preview frame, then
     // idles. The launch button is now a full-cover overlay that
     // displays "click anywhere to launch" with a `backdrop-filter:
-    // blur(...)` applied over the canvas underneath — so the viewer
+    // blur(...)` applied over the canvas underneath; so the viewer
     // sees a blurred preview of the demo's first frame, not a dark
     // placeholder. When the user clicks, the click handler posts a
     // `Start` message to the worker (kicks off its RAF loop) AND
@@ -173,7 +173,7 @@ fn spawn_worker_for_preview(
 
     // Wait for the worker to signal it's ready (handler installed) before
     // posting the Init message. Without this handshake, the Init might
-    // arrive before the worker's listener exists — Firefox empirically
+    // arrive before the worker's listener exists; Firefox empirically
     // drops such messages despite the spec implying queue semantics.
     let worker_for_ready = worker.clone();
     let offscreen_for_ready = offscreen.clone();
@@ -247,7 +247,7 @@ fn spawn_worker_for_preview(
     //   repeat clicks; the explicit Cell is easier to reason about.
     // - Post Start FIRST, then disable + hide the overlay. If the post
     //   fails (worker terminated, etc.), the overlay stays visible so
-    //   a retry click can fire again — better than "overlay gone and
+    //   a retry click can fire again; better than "overlay gone and
     //   nothing happens".
     // - Set `pointer-events: none` on the overlay BEFORE removal so
     //   any pending click events queued by the browser don't fire on
@@ -360,7 +360,7 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
     // The fix is debouncing, not just rate-limiting: wait until the user
     // has STOPPED resizing (~100ms of no events) before committing the
     // new size. During the drag the canvas backing-store stays at its
-    // old size — CSS scales it visually so the demo stretches briefly
+    // old size; CSS scales it visually so the demo stretches briefly
     // but no GPU work happens. Once the drag settles, one resize
     // message is sent and the worker reconfigures once.
     //
@@ -401,8 +401,10 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
                     Some((_, _, frames)) => {
                         *frames += 1;
                         if *frames >= RESIZE_DEBOUNCE_FRAMES {
-                            let (w, h, _) = p.take().expect("just matched Some");
-                            Some((w, h))
+                            // We just observed Some via `as_mut()`, so take()
+                            // returns Some here. `.map` keeps this expression-
+                            // shaped (no .expect, no panicking unwrap).
+                            p.take().map(|(w, h, _)| (w, h))
                         } else {
                             None
                         }
@@ -424,10 +426,14 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
         }) as Box<dyn FnMut()>));
         {
             let first_cb = raf_cb.borrow();
-            let first = first_cb.as_ref().expect("RAF cb populated above");
-            window
-                .request_animation_frame(first.as_ref().unchecked_ref())
-                .map_err(|e| anyhow!("resize rAF init: {e:?}"))?;
+            // `raf_cb` was just populated three lines up; the borrow is fresh.
+            // Fall through silently if somehow None (browser would just never
+            // animate; not a panicking condition).
+            if let Some(first) = first_cb.as_ref() {
+                window
+                    .request_animation_frame(first.as_ref().unchecked_ref())
+                    .map_err(|e| anyhow!("resize rAF init: {e:?}"))?;
+            }
         }
         Box::leak(Box::new(raf_cb));
     }
@@ -436,7 +442,7 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
     // hundreds of times per second; forwarding each one is a JS-object
     // allocation per event + a postMessage. At sustained drag speeds
     // that's enough to overwhelm the JS heap and crash the browser tab
-    // (we hit this empirically during Phase B3 testing).
+    // (verified empirically during a sustained-drag stress test).
     //
     // Coalesce: the listener writes the latest mouse position into a
     // shared RefCell. A separate rAF loop checks for a pending mouse-
@@ -479,10 +485,12 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
         }) as Box<dyn FnMut()>));
         {
             let first_cb = raf_cb.borrow();
-            let first = first_cb.as_ref().expect("RAF cb populated above");
-            window
-                .request_animation_frame(first.as_ref().unchecked_ref())
-                .map_err(|e| anyhow!("mousemove rAF init: {e:?}"))?;
+            // `raf_cb` was just populated four lines up; the borrow is fresh.
+            if let Some(first) = first_cb.as_ref() {
+                window
+                    .request_animation_frame(first.as_ref().unchecked_ref())
+                    .map_err(|e| anyhow!("mousemove rAF init: {e:?}"))?;
+            }
         }
         Box::leak(Box::new(raf_cb));
     }

@@ -167,8 +167,9 @@ impl Polytope4 {
     /// inradius (constant across all cells of a regular polytope).
     ///
     /// Returns `(normals, inradius)` matching the shape of the existing
-    /// [`crate::euclidean_r4::cell120_face_planes`] / [`crate::euclidean_r4::cell600_face_planes`]
-    /// helpers. Use with [`crate::euclidean_r4::polytope_sdf_wolfe`] to compute an exact SDF
+    /// `cell120_face_planes` / `cell600_face_planes` helpers in
+    /// [`crate::euclidean_r4`]. Use with
+    /// [`crate::euclidean_r4::polytope_sdf_wolfe`] to compute an exact SDF
     /// for any regular convex 4-polytope.
     ///
     /// **Difference from the existing `cell{120,600}_face_planes` helpers.** Those use the
@@ -527,7 +528,8 @@ pub fn polytope4_section_faces(
 /// frames.
 ///
 /// Algorithm details captured here in one place so the two public consumers
-/// ([`polytope_section_overlay_with_vertices`] for overlays, [`polytope_section_faces_with_vertices`]
+/// ([`polytope_section_overlay_with_vertices`] for overlays,
+/// [`polytope_section_faces_with_vertices`]
 /// for surface replacement) share the geometric logic. Either consumer can change its
 /// output shape (color, width, mesh format) without touching the cross-section math.
 fn for_each_section_cap(
@@ -1654,8 +1656,8 @@ mod tests {
 
     /// The four polytopes without the documented face-plane BUG agree exactly
     /// (within f32 tolerance) with the topology-derived SDF along the section
-    /// perimeter. This is the "no camera tricks" gate the M3 doc framed: section
-    /// algorithm and SDF agree, both compute the *same* surface.
+    /// perimeter. This is the "no camera tricks" gate: section algorithm and
+    /// SDF agree, both compute the *same* surface.
     ///
     /// Uses `Polytope4::face_planes` (topology-derived, exact for every regular
     /// convex 4-polytope) rather than the raymarch kernel's `cell{120,600}_face_planes`
@@ -1829,15 +1831,18 @@ mod tests {
         }
     }
 
-    /// Randomized robustness sweep: across each polytope, sample 16 random Rotor4 orientations
-    /// applied to the canonical vertex set and 16 random slice values, exercising the cross-
-    /// section algorithm under non-axis-aligned inputs. Asserts: every emitted vertex is finite
-    /// (no NaN/Inf), every triangle index references a valid vertex, every line-segment endpoint
-    /// matches an existing triangle vertex up to perturbation tolerance, and the perimeter is
-    /// always non-empty when the slice falls inside the polytope's rotated w-range.
+    /// Randomized robustness sweep: across each polytope, sample 16 random
+    /// Rotor4 orientations applied to the canonical vertex set and 16 random
+    /// slice values, exercising the cross-section algorithm under non-axis-
+    /// aligned inputs. Asserts: every emitted vertex is finite (no NaN/Inf),
+    /// every triangle index references a valid vertex, every line-segment
+    /// endpoint matches an existing triangle vertex up to perturbation
+    /// tolerance, and the perimeter is always non-empty when the slice falls
+    /// inside the polytope's rotated w-range.
     ///
-    /// Catches a different failure class from the fixed-vertex tests: numerical instability that
-    /// only triggers at off-axis orientations (cap-collinearity that survives `fit_plane_basis`,
+    /// Catches a different failure class from the fixed-vertex tests:
+    /// numerical instability that only triggers at off-axis orientations
+    /// (cap-collinearity that survives `fit_plane_basis`,
     /// FMA rounding at edge intersections, perturbation aliasing). Pure deterministic: uses
     /// a xorshift PRNG seeded with a fixed value, so failures reproduce verbatim across runs.
     #[test]

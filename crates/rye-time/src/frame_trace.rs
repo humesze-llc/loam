@@ -62,7 +62,7 @@ pub struct Section {
 /// installs that allocator as its `#[global_allocator]`. The fields cover net
 /// bytes (signed), bytes allocated (unsigned), and the alloc/dealloc call
 /// counts, which together let the PerfOverlay show "we're allocating 1.2 MB
-/// across 3,400 calls per frame" — both numbers matter when chasing the
+/// across 3,400 calls per frame"; both numbers matter when chasing the
 /// per-frame-interop-leak pattern characterized 2026-05-22.
 #[derive(Clone, Debug, Default)]
 pub struct FrameTrace {
@@ -111,7 +111,7 @@ impl Tracer {
 ///
 /// Architectural note: keeping the sampler as a function-pointer slot
 /// registered from outside means `rye-time` doesn't depend on `js-sys` /
-/// `web-sys` for this functionality — the host crate (`rye-app`) owns the
+/// `web-sys` for this functionality; the host crate (`rye-app`) owns the
 /// platform-specific access and registers a callback. Keeps the leaf crate's
 /// dep graph small.
 pub type HeapSampler = fn() -> Option<u64>;
@@ -149,7 +149,7 @@ thread_local! {
     /// window. With a 120-frame window at 50fps (= 2.4s of history), spikes that
     /// happen sparser than ~once-per-second fall out of the window before a
     /// human notices the demo stuttered. `MAX_EVER` is the answer to "what's
-    /// the worst this has ever been?" — independent of when the user opened
+    /// the worst this has ever been?"; independent of when the user opened
     /// the perf overlay. Cleared only by [`clear_max_ever`].
     static MAX_EVER: RefCell<std::collections::HashMap<&'static str, Duration>> =
         RefCell::new(std::collections::HashMap::new());
@@ -199,7 +199,7 @@ impl Drop for Scope {
 }
 
 /// Open a CPU-timing scope. The returned guard records on drop. Bind it with a real
-/// name (`let _s = scope("foo")`) — binding to `_` drops it immediately and records
+/// name (`let _s = scope("foo")`); binding to `_` drops it immediately and records
 /// a zero-duration section, which is not what you want.
 #[cfg(feature = "frame-trace")]
 #[inline]
@@ -256,7 +256,7 @@ pub fn begin_frame() {
 ///   Equal to `1 / fps`. Useful as a sanity check; if the perf overlay says 50fps
 ///   the mean should be ~20ms.
 /// - **`idle`**: time from the last `end_frame` until this frame's `begin_frame`.
-///   That's the gap when our code wasn't running — browser RAF scheduling, vsync
+///   That's the gap when our code wasn't running; browser RAF scheduling, vsync
 ///   alignment, JS GC, tab throttling. This is what dominates `between-frames` on
 ///   wasm (per the 2026-05-22 diagnosis); separating it explicitly means the perf
 ///   overlay can show "where is time going?" without mental subtraction.
@@ -425,7 +425,7 @@ pub fn history() -> Vec<FrameTrace> {
 /// stack without cloning the VecDeque or its `Vec<Section>` payloads.
 ///
 /// `f` must NOT call back into `frame_trace` mutators (`scope`, `end_frame`,
-/// `record_external`) while the borrow is held — that would deadlock the
+/// `record_external`) while the borrow is held; that would deadlock the
 /// `RefCell`. Reading via `last_frame`, `max_ever`, etc. is fine because
 /// those use separate cells / re-entry-safe paths.
 ///
@@ -494,7 +494,7 @@ pub fn set_spike_threshold(threshold: Duration) {
 /// the next `end_frame`. If `end_frame` has already rolled for the frame the
 /// timestamp belongs to (typical: timestamps arrive 1-2 frames late), the section is
 /// attributed to whatever frame is currently in flight. That's good enough for
-/// aggregate stats — the rolling window absorbs the small attribution drift.
+/// aggregate stats; the rolling window absorbs the small attribution drift.
 #[cfg(feature = "frame-trace")]
 pub fn record_external(name: &'static str, elapsed: Duration) {
     TRACER.with(|t| {

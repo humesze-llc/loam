@@ -1,11 +1,11 @@
-//! Process-global frame pacing state — target framerate, vsync toggle, and
-//! the precise sleep utility — read by [`crate::Runner::redraw`] at the top
-//! of every redraw to gate this frame's work.
+//! Process-global frame pacing state (target framerate, vsync toggle, precise
+//! sleep utility), read by `Runner::redraw` at the top of every
+//! redraw to gate this frame's work.
 //!
 //! ## Why a process-global atomic instead of a `Runner` field
 //!
-//! The `fps` / `vsync` console commands live behind the [`Console`] handler,
-//! which gets a `&mut Ctx` (the app's own context) — not the [`Runner`]. The
+//! The `fps` / `vsync` console commands live behind the `Console` handler,
+//! which gets a `&mut Ctx` (the app's own context), not the `Runner`. The
 //! cleanest way to let the handler change a runner setting without threading
 //! state through every demo's `Ctx` is a static the runner reads each frame.
 //! The same pattern is used for [`rye_time::frame_trace::set_capacity`].
@@ -16,7 +16,7 @@
 //!
 //! - **Native**: the runner [`precise_sleep_until`]s the deadline at the start
 //!   of each redraw. With `target_fps = 0` the cap is removed and the
-//!   surface's [`PresentMode`] decides the cadence — `Fifo` (default) blocks
+//!   surface's `PresentMode` decides the cadence; `Fifo` (default) blocks
 //!   at vsync. `vsync off` swaps the surface to `Mailbox` (or `Immediate` as
 //!   fallback) so the cap can drive cadence above the display refresh rate.
 //! - **Wasm**: the browser's `requestAnimationFrame` is the upper bound
@@ -35,18 +35,18 @@ use web_time::Instant;
 
 /// 60 fps in nanoseconds (≈16.667 ms). Initial value the runner uses unless a
 /// console command changes it. Picked because it matches the typical display
-/// refresh rate the browser RAF and most native vsync settings already enforce
-/// — i.e. the cap is mostly a no-op until the user explicitly raises or lowers
-/// it.
+/// refresh rate the browser RAF and most native vsync settings already
+/// enforce. i.e., the cap is mostly a no-op until the user explicitly raises
+/// or lowers it.
 const DEFAULT_PERIOD_NS: u64 = 16_666_667;
 
-/// Target frame period in nanoseconds. `0` means "uncapped" — the runner will
+/// Target frame period in nanoseconds. `0` means "uncapped"; the runner will
 /// not sleep / skip and lets the display refresh rate or browser RAF be the
 /// pacing source.
 static TARGET_PERIOD_NS: AtomicU64 = AtomicU64::new(DEFAULT_PERIOD_NS);
 
 /// Set the target frame period from a desired fps. `fps <= 0.0` removes the cap
-/// (uncapped — frames as fast as the surface and browser allow).
+/// (uncapped: frames as fast as the surface and browser allow).
 pub fn set_target_fps(fps: f32) {
     if fps <= 0.0 {
         TARGET_PERIOD_NS.store(0, Ordering::Release);
@@ -98,7 +98,7 @@ pub fn request_vsync_on() {
 /// Request that the runner switch the surface to vsync-off on its next redraw.
 /// The runner picks the best available off-mode (`Mailbox` if advertised,
 /// otherwise `Immediate`, otherwise leaves the mode alone since the adapter
-/// has nothing better than `Fifo` to offer — this is the typical browser case).
+/// has nothing better than `Fifo` to offer; this is the typical browser case).
 pub fn request_vsync_off() {
     PENDING_VSYNC.store(VSYNC_REQ_OFF, Ordering::Release);
 }
@@ -123,8 +123,8 @@ pub fn take_pending_vsync() -> Option<bool> {
 /// busy-waits the last `SPIN_TAIL` so the wake-up lands inside ~100 µs of the
 /// deadline regardless of the OS timer's nominal precision. Tuned to be wider
 /// than Windows' default 15.625 ms timer tick is *imprecise*, not wider than
-/// the *whole* tick — `std::thread::sleep` rounds DOWN sometimes and UP others;
-/// 2 ms of spin covers the worst-case overshoot we've seen on Win11.
+/// the *whole* tick: `std::thread::sleep` rounds DOWN sometimes and UP others,
+/// and 2 ms of spin covers the worst-case overshoot we've seen on Win11.
 const SPIN_TAIL: Duration = Duration::from_millis(2);
 
 /// Sleep until `deadline`, hybrid coarse-sleep + spin-wait for sub-millisecond
@@ -234,11 +234,7 @@ mod tests {
         }
         let actual = Instant::now() - start;
         let expected = period * 5;
-        let diff = if actual > expected {
-            actual - expected
-        } else {
-            expected - actual
-        };
+        let diff = actual.abs_diff(expected);
         assert!(
             diff < Duration::from_millis(5),
             "cadence drifted: actual={actual:?} expected={expected:?}",

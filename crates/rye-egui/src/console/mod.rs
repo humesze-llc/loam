@@ -7,7 +7,7 @@
 //!
 //! ## What lives here vs what doesn't
 //!
-//! - **Here**: [`Console`] (the main type), [`Command`] trait + [`cmd`] closure shim,
+//! - **Here**: `Console` (the main type), [`Command`] trait + [`cmd`] closure shim,
 //!   [`ConsoleWriter`] (output collector), key handling for the input line, the parser.
 //!   `Console` is generic over a `Ctx` type so consuming crates choose what state
 //!   commands operate on.
@@ -65,7 +65,7 @@ static ECHO_TO_BROWSER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Enable / disable scrollback echo to the browser DevTools console (wasm32
-/// only). See [`ECHO_TO_BROWSER`] for the architectural rationale. On native
+/// only). See `ECHO_TO_BROWSER` for the architectural rationale. On native
 /// this is a no-op so demos can call it unconditionally during command setup.
 pub fn set_console_echo(enabled: bool) {
     #[cfg(target_arch = "wasm32")]
@@ -1126,7 +1126,7 @@ impl<Ctx: 'static> Console<Ctx> {
         // Architectural note: this deliberately bypasses `tracing` and calls
         // `web_sys::console::log_1` directly. `tracing::info!` would conflict
         // with the existing `log on` feature (tracing -> scrollback via
-        // `rye_app::log::ConsoleLayer`) — running both directions through
+        // `rye_app::log::ConsoleLayer`); running both directions through
         // tracing creates a feedback loop where each emitted event lands in
         // the scrollback, gets re-echoed, lands again, ad infinitum. The
         // direct console.log path is feedback-free because no Rust subscriber
@@ -1484,7 +1484,7 @@ impl<Ctx: 'static> Console<Ctx> {
 // Built-in commands
 // ---------------------------------------------------------------------------
 
-/// Framework-owned commands that mutate [`Console`] internal state directly: history,
+/// Framework-owned commands that mutate `Console` internal state directly: history,
 /// detached flag, etc. They can't go through [`Command<Ctx>`] cleanly because that
 /// trait only sees `&mut Ctx` (the user's context), not `&mut Console<Ctx>`. Storing
 /// their name + help in one enum centralizes what was previously duplicated across

@@ -3,9 +3,10 @@
 //!
 //! - [`launch`]: click-to-start container + the original page-startup
 //!   helpers (`is_manual_mode`, `wait_for_launch`).
-//! - [`worker`] (Phase A onward): OffscreenCanvas + Web Worker mode for
-//!   GC-isolated rendering. See `docs/devlog/context/OFFSCREEN_CANVAS_WORKERS.md`
-//!   for the architectural design.
+//! - [`worker`]: OffscreenCanvas + Web Worker mode for GC-isolated rendering.
+//!   The main thread owns the DOM and forwards input via postMessage; the
+//!   worker owns wgpu + egui and drives RAF. Avoids main-thread GC pauses and
+//!   sidesteps winit's incomplete worker-context support.
 //!
 //! Detection helpers ([`is_worker_context`], plus the heap sampler that
 //! `rye-time::frame_trace` registers) live at the module root so the

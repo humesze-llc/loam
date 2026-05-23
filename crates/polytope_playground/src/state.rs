@@ -360,7 +360,7 @@ pub(crate) struct Demo {
     /// this toggle only affects the dim wireframe overlay on top.
     pub(crate) wireframe_projection: WireframeProjection,
     /// Filled-faces rasterizer for the cross-section of every polychoral body. When
-    /// [`Self::surface_raster_enabled`] is `true`, this replaces the SDF raymarch for the
+    /// `Self::surface_raster_enabled` is `true`, this replaces the SDF raymarch for the
     /// six regular convex 4-polytopes: the SDF gets `BodyUniform::default()` for those
     /// slots (which the kernel skips) and the section's filled cell-caps come through
     /// here instead. Per-body solid color + face-normal Lambert in the fragment shader.

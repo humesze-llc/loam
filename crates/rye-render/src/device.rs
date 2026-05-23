@@ -210,7 +210,7 @@ impl RenderDevice {
 
         // Offscreen sRGB scene target + composite. When the swapchain format is
         // already sRGB (native + the rare browser that advertises sRGB), we render
-        // straight into the swapchain and skip the composite — that's the standard
+        // straight into the swapchain and skip the composite; that's the standard
         // path. When the swapchain is linear (Chrome WebGPU canvas on 2026-05), we
         // allocate an sRGB scene texture, redirect rendering into it, and add a
         // final pass that samples + gamma-encodes for write to the linear swapchain.

@@ -1,24 +1,20 @@
 //! Web Worker mode for rye demos. Moves the render loop into a worker so V8's
 //! GC pauses don't block the visible page.
 //!
-//! See `docs/devlog/context/OFFSCREEN_CANVAS_WORKERS.md` for the full
-//! architectural design + phasing plan.
+//! ## What this provides
 //!
-//! ## Status
-//!
-//! **Phase A** (active): bare-minimum POC. Worker receives an OffscreenCanvas
-//! via postMessage, creates a wgpu Surface from it, runs a rolled-own RAF
-//! loop that clears the canvas to a cycling color. No App-trait integration,
-//! no input handling, no egui. Validates that wgpu + OffscreenCanvas + a
-//! worker-side RAF loop actually compose on Chromium with our wgpu/web-sys
-//! versions. If Phase A works, Phase B adds the App + RenderDevice wiring.
+//! Worker receives an OffscreenCanvas via postMessage, creates a wgpu Surface
+//! from it, and drives a rolled-own RAF loop that runs the full App lifecycle
+//! (setup, update, ui, record) plus an egui overlay (via [`WorkerUi`], which
+//! translates [`InputMessage`] directly into `egui::RawInput`, bypassing
+//! egui-winit which doesn't run in worker context).
 //!
 //! ## Why a rolled-own event loop (no winit)
 //!
-//! winit 0.30 doesn't support `WorkerGlobalScope` (issue #1518 since 2020;
+//! winit 0.30 doesn't support `WorkerGlobalScope` (issue #1518 since 2020):
 //! `web_sys::window()` panics in worker context, breaks scale-factor / event
-//! pump). Until upstream lands worker support — Bevy tried and abandoned the
-//! PR — we own this code path ourselves. Trade-off accepted because the
+//! pump. Until upstream lands worker support (Bevy tried and abandoned the
+//! PR), we own this code path ourselves. Trade-off accepted because the
 //! pieces we need (RAF, GPU surface creation, message passing) are all
 //! available without winit.
 //!
@@ -59,8 +55,6 @@ use winit::keyboard::PhysicalKey;
 /// alive as long as the wasm-bindgen heap holds the closures (the
 /// `forget()` calls below ensure that).
 ///
-/// **Phase B1 scope**: tesseract appears in worker. No input events,
-/// no egui UI overlay (Phase B3 + B4 add those).
 pub fn run<A: App + 'static>() -> Result<()>
 where
     A::Space: 'static,
@@ -70,15 +64,14 @@ where
     // worker's context, selectable in DevTools' execution-context picker).
     install_logging_idempotent();
 
-    tracing::info!("rye_app::wasm::worker::run: Phase A entry");
+    tracing::debug!("rye_app::wasm::worker::run: entry");
 
     let scope = worker_scope()?;
     let scope_for_handler = scope.clone();
 
     // The message handler ingests the OffscreenCanvas + size from the
     // first postMessage and kicks off the wgpu init. Subsequent messages
-    // (Phase B's input events) reuse this same handler with a `kind`
-    // dispatch.
+    // (input events) reuse this same handler with a `kind` dispatch.
     //
     // Use `addEventListener("message", ...)` rather than `set_onmessage`
     // because `addEventListener` is reliably retroactive: messages
@@ -88,9 +81,7 @@ where
     // queued messages are flushed; `addEventListener` is the safer
     // contract.
     let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
-        // `info!` (not debug) so the diagnostic is visible at default
-        // tracing levels. Drop to debug once Phase B is stable.
-        tracing::info!("rye_app::wasm::worker: message handler firing");
+        tracing::debug!("rye_app::wasm::worker: message handler firing");
         if let Err(e) = handle_message::<A>(&scope_for_handler, event) {
             tracing::error!("rye_app::wasm::worker: message handler failed: {e:#}");
         }
@@ -141,7 +132,7 @@ where
     // `init` and `start` are both special-cased: `init` needs A (spawns
     // the async wgpu setup with the App type) and `start` needs to fire
     // BEFORE the RAF loop exists (so we can't route it through the
-    // per-frame queue — that queue only drains inside the loop).
+    // per-frame queue; that queue only drains inside the loop).
     let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
         .ok()
         .and_then(|v| v.as_string());
@@ -208,15 +199,14 @@ where
     Ok(())
 }
 
-/// Phase B1: build `RenderDevice` from the worker-owned OffscreenCanvas,
-/// run `App::setup`, and start the RAF loop driving the App's per-frame
-/// lifecycle.
+/// Build `RenderDevice` from the worker-owned OffscreenCanvas, run
+/// `App::setup`, and start the RAF loop driving the App's per-frame lifecycle.
 ///
 /// Uses `RenderDevice::from_surface` so the wgpu setup matches the
 /// windowed-mode path (sRGB composite, MSAA negotiation, GPU timer
-/// detection, etc.). The worker doesn't get MSAA in this phase
-/// because the OffscreenCanvas surface format negotiation matches
-/// the browser-WebGPU non-sRGB swap case (composite + sample_count=1).
+/// detection, etc.). The worker doesn't get MSAA because the OffscreenCanvas
+/// surface format negotiation matches the browser-WebGPU non-sRGB swap case
+/// (composite + sample_count=1).
 async fn init_renderer<A: App + 'static>(
     scope: DedicatedWorkerGlobalScope,
     canvas: OffscreenCanvas,
@@ -249,7 +239,7 @@ where
     // setup. From here the worker path is feature-equivalent to the
     // windowed-mode path: same adapter selection, same MSAA negotiation,
     // same sRGB composite dance. The size passed is the OffscreenCanvas'
-    // pixel dimensions in this phase; Phase B2 will plumb resize events.
+    // pixel dimensions at init; resize events are plumbed via InputMessage.
     let size = winit::dpi::PhysicalSize::new(width, height);
     let rd = RenderDevice::from_surface(
         instance,
@@ -275,8 +265,8 @@ where
     // the init message (already applied to canvas dimensions). Recover
     // it from width / canvas.client_width if needed; for now, derive
     // it as width / css_logical_width assumption (1x equivalent) and
-    // accept that worker mode shows egui at 1pt:1px scale. Phase B+
-    // can plumb DPR explicitly through the init message.
+    // accept that worker mode shows egui at 1pt:1px scale. Plumbing
+    // DPR explicitly through the init message is a future improvement.
     let pixels_per_point = 1.0; // see comment above; minor cosmetic issue.
 
     let mut runner = WorkerRunner::<A>::setup(
@@ -293,7 +283,7 @@ where
     // uses `backdrop-filter: blur(...)` to blur whatever's rendered on
     // the canvas; this single frame becomes the blurred preview the
     // viewer sees BEFORE clicking. After this call, the canvas backing
-    // store holds the demo's initial state — same content the worker
+    // store holds the demo's initial state; same content the worker
     // would render on the very first RAF tick if it had started, just
     // displayed via the placeholder canvas instead of through a live
     // RAF loop.
@@ -329,7 +319,7 @@ where
 
     // Stash the RAF kickoff in the thread_local so the `Start` message
     // handler (in `apply_message`) can invoke it when the user clicks.
-    // We don't kick off RAF here — the launch overlay is still visible
+    // We don't kick off RAF here; the launch overlay is still visible
     // and we want the canvas to keep showing the preview frame until
     // the user opts in.
     let scope_for_kickoff = scope.clone();
@@ -393,8 +383,8 @@ thread_local! {
 /// + the wall-clock / tick bookkeeping the existing main-thread Runner
 /// owns. Sits inside the RAF closure via `Rc<RefCell>`.
 ///
-/// Phase B1 scope: drives `App::update` + `App::record` only. No egui,
-/// no input (Phase B3 + B4 add those).
+/// Drives the full App lifecycle: `App::update` + `App::ui` (through
+/// [`WorkerUi`]) + `App::record`, plus input fan-out via [`InputState`].
 struct WorkerRunner<A: App + 'static>
 where
     A::Space: 'static,
@@ -405,7 +395,7 @@ where
     /// on the OffscreenCanvas, the underlying backing wouldn't track the new
     /// surface configuration and the render would silently stretch/scissor.
     canvas: OffscreenCanvas,
-    #[allow(dead_code)] // held alive for App's runtime; lookups via ShaderDb come in Phase B3+
+    #[allow(dead_code)] // held alive so any cached pipelines/shader handles stay valid
     shader_db: ShaderDb,
     #[allow(dead_code)] // wasm stub today; native parity in case the trait grows
     watcher: Option<AssetWatcher>,
@@ -515,13 +505,12 @@ where
     }
 
     /// Apply one `InputMessage`. Resize updates the surface; the other
-    /// variants route into `InputState` for the App's per-frame
-    /// `FrameInput`. Phase B4 will also fan these out to egui via
-    /// `RawInput` so HUD widgets can respond.
+    /// variants route into `InputState` for the App's per-frame `FrameInput`,
+    /// and fan out to egui via `RawInput` so HUD widgets can respond.
     ///
     /// `App::on_event` (the path that handles winit `WindowEvent`s, e.g.
     /// tesseract_demo's KeyF / KeyT / Space / KeyR hotkeys) is deliberately
-    /// NOT plumbed here — constructing winit's `KeyEvent` requires private
+    /// NOT plumbed here; constructing winit's `KeyEvent` requires private
     /// platform-specific fields. Tesseract_demo's HOTKEYS won't work in
     /// worker mode yet; the camera + WASD axes will because those go
     /// through `FrameInput`.
@@ -537,7 +526,7 @@ where
                 // Render one frame at the new size so the preview
                 // refreshes (no CSS-stretched display). When the RAF
                 // loop is already running this is just one extra frame
-                // before the next RAF tick — harmless. When we're in
+                // before the next RAF tick; harmless. When we're in
                 // pre-Start preview mode, this is the only frame that
                 // happens, and it's what the launch overlay's
                 // backdrop-filter blurs.
@@ -589,7 +578,7 @@ where
             }
             InputMessage::Visibility(_) => {
                 // Visibility isn't load-bearing for tesseract_demo right
-                // now; Phase B+ could pause continuous animation here.
+                // now; future work could pause continuous animation here.
             }
             InputMessage::Start => {
                 // Handled directly by `handle_message` (special-cased
@@ -609,9 +598,9 @@ where
         rye_time::frame_trace::begin_frame();
         let _frame_scope = rye_time::frame_trace::scope("frame");
 
-        // Drain queued input messages. Phase B2 only handles `Resize`;
-        // Phase B3 will add the mouse/keyboard variants here (routed
-        // into `InputState`) and Phase B4 will fan them out to egui too.
+        // Drain queued input messages. Resize updates the surface; mouse
+        // and keyboard variants route into `InputState` and fan out to
+        // egui via `RawInput` so HUD widgets see them too.
         for msg in messages::drain_messages() {
             self.apply_message(msg);
         }
@@ -637,7 +626,7 @@ where
                 rd: &self.rd,
                 input,
                 time: self.start.elapsed().as_secs_f32(),
-                fps: 0.0, // Phase B1: skip FPS bookkeeping; not used by tesseract_demo.
+                fps: 0.0, // worker-side FPS bookkeeping not yet wired; reads as 0.0.
                 n_ticks: 0,
                 tick: self.tick_index,
                 dt,
@@ -646,7 +635,7 @@ where
             };
             self.app.update(&mut fctx);
 
-            // App::ui — egui frame begin, App builds widgets, paint happens
+            // App::ui; egui frame begin, App builds widgets, paint happens
             // after the scene render below. Same lifecycle as the windowed
             // runner: begin_frame -> ctx clone -> App::ui -> paint at end.
             let egui_ctx = self.ui.begin_frame().clone();
@@ -722,7 +711,7 @@ fn worker_scope() -> Result<DedicatedWorkerGlobalScope> {
 
 /// Install console panic hook + tracing-to-DevTools routing exactly once
 /// per JS context (main thread has its own instance, worker has its own
-/// — std::sync::Once is per-process). Both `run` (worker) and
+///; std::sync::Once is per-process). Both `run` (worker) and
 /// `launch_on_click` (main) call this so a demo using worker mode gets
 /// the same observability surface as the legacy `run_with_config` path
 /// did.

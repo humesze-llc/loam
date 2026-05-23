@@ -117,10 +117,10 @@ impl PointRasterNode {
     /// Construct the pipeline.
     ///
     /// - `surface_format` must match the color attachment at draw time.
-    /// - `depth`: see [`crate::DepthMode`]. Determines whether the pipeline reads depth, reads +
-    ///   writes depth, or skips it entirely. `LessEqual` is the compare convention; same
-    ///   reasoning as in `LineRasterNode` (points drawn on top of co-located polygons stay
-    ///   visible).
+    /// - `depth`: see [`crate::DepthMode`]. Determines whether the pipeline
+    ///   reads depth, reads + writes depth, or skips it entirely. `LessEqual`
+    ///   is the compare convention; same reasoning as in `LineRasterNode`
+    ///   (points drawn on top of co-located polygons stay visible).
     /// - `sample_count` must match the attachment's MSAA sample count.
     pub fn new(
         device: &Device,

@@ -4,14 +4,14 @@
 //!
 //! ## Subcommands
 //!
-//! - `trace` / `trace summary` — print the aggregate p50 / p95 / p99 / max for every
+//! - `trace` / `trace summary`: print the aggregate p50 / p95 / p99 / max for every
 //!   section in the rolling window (sorted by p95 descending). Sane default for "what
 //!   is the slowest part of a frame right now."
-//! - `trace last` — print the most recently completed frame's per-section breakdown.
+//! - `trace last`: print the most recently completed frame's per-section breakdown.
 //!   Useful for catching a one-off spike: hit it right after the visible stutter.
-//! - `trace clear` — drop the rolling history. The next `trace summary` reflects only
+//! - `trace clear`: drop the rolling history. The next `trace summary` reflects only
 //!   frames recorded after the clear.
-//! - `trace cap <N>` — set the rolling-window size to N frames. Default is 120
+//! - `trace cap <N>`: set the rolling-window size to N frames. Default is 120
 //!   (~2 seconds at 60fps). Larger windows smooth out short-term variance but
 //!   take longer to react to changes in the hot path.
 //!
@@ -54,18 +54,18 @@ fn print_summary(out: &mut rye_egui::ConsoleWriter) {
         return;
     }
     let history_len = frame_trace::history().len();
-    out.line(&format!(
+    out.line(format!(
         "trace summary ({history_len} frames, sorted by p95 desc):"
     ));
     // Header. Column widths picked to fit common section names + reasonable us/ms
     // values. Names beyond 16 chars get truncated which is fine; if it becomes a
     // problem we can widen the field.
-    out.line(&format!(
+    out.line(format!(
         "  {:<18} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "section", "n", "mean", "p50", "p95", "p99", "max",
     ));
     for s in stats {
-        out.line(&format!(
+        out.line(format!(
             "  {:<18} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8}",
             truncate(s.name, 18),
             s.samples,
@@ -95,7 +95,7 @@ fn print_last(out: &mut rye_egui::ConsoleWriter) {
         return;
     };
     let total = frame.total();
-    out.line(&format!(
+    out.line(format!(
         "trace last-frame ({} sections, sum {}):",
         frame.sections.len(),
         fmt_dur(total),
@@ -106,7 +106,7 @@ fn print_last(out: &mut rye_egui::ConsoleWriter) {
         } else {
             0.0
         };
-        out.line(&format!(
+        out.line(format!(
             "  {:<18} {:>10} ({:>4.1}%)",
             truncate(section.name, 18),
             fmt_dur(section.elapsed),
@@ -263,7 +263,7 @@ impl PerfOverlay {
     }
 
     /// Force the overlay visible regardless of toggle state. For embedded
-    /// demos on blog posts where the perf data should always show.
+    /// demos where the perf data should always show.
     pub fn always_visible(mut self) -> Self {
         self.visible = true;
         self
@@ -388,7 +388,7 @@ impl PerfOverlay {
                         // long run; differences = scope-uncovered work in
                         // redraw (FPS bookkeeping, capture, etc.).
                         //
-                        // The `worst` column is session-lifetime — survives the
+                        // The `worst` column is session-lifetime; survives the
                         // rolling window so multi-second spikes that happened
                         // minutes ago are still visible. Colored red when it's
                         // pathological (>= 100ms = ~6 vsync) so the user's eye
@@ -500,8 +500,7 @@ impl PerfOverlay {
                             };
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "mean  {:>6} allocs/frame",
-                                    mean_count,
+                                    "mean  {mean_count:>6} allocs/frame",
                                 ))
                                 .font(mono.clone())
                                 .color(count_color(mean_count)),
@@ -572,7 +571,7 @@ impl PerfOverlay {
 }
 
 /// Maximum window size the PerfOverlay supports for percentile statistics.
-/// Drives the inline stack array in [`StackBuf`]; oversized windows are
+/// Drives the inline stack array in `StackBuf`; oversized windows are
 /// clamped to this value. 256 × 16 B/Duration = 4 KB on stack per buffer;
 /// three buffers (cadence, frame, idle) = 12 KB. Comfortably inside the
 /// 1 MB main-thread stack on every supported target.

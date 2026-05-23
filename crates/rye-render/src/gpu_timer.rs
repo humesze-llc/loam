@@ -44,7 +44,7 @@
 //!
 //! And map buffers are **per-slot**, not a single striped buffer, because wgpu
 //! treats a buffer as "mapped" the instant `map_async` is requested on any
-//! slice — for the whole buffer, until `unmap()`. If we shared one map buffer
+//! slice; for the whole buffer, until `unmap()`. If we shared one map buffer
 //! across slots, slot N+1's `copy_buffer_to_buffer` would fail at
 //! `Queue::submit` ("buffer is still mapped") while slot N is awaiting its
 //! callback. Three tiny per-slot buffers let independent slots make progress.
@@ -80,7 +80,7 @@ const BYTES_PER_SLOT: u64 = 16;
 /// requires the destination offset to be aligned to
 /// `QUERY_RESOLVE_BUFFER_ALIGNMENT` (256 bytes), so each slot's payload sits at
 /// `slot * SLOT_STRIDE_BYTES` even though it only uses the first 16 bytes of
-/// that window. Map buffers don't need this stride — each is its own buffer.
+/// that window. Map buffers don't need this stride; each is its own buffer.
 const SLOT_STRIDE_BYTES: u64 = QUERY_RESOLVE_BUFFER_ALIGNMENT;
 
 /// Per-slot state. `in_flight` is set when the slot has been resolved and is
@@ -233,7 +233,7 @@ impl GpuTimer {
         //
         //    Note: in_flight stays true between resolve() and the callback's clear.
         //    Scheduling map_async on a slot whose callback already fired (in_flight
-        //    cleared) is harmless — we just won't see it because we skip cleared
+        //    cleared) is harmless; we just won't see it because we skip cleared
         //    slots. The only invariant we rely on is that map_async is called at
         //    most once per resolve, which is true because resolve sets in_flight,
         //    and the callback clears it (re-arming the slot for the next resolve).
@@ -273,13 +273,16 @@ impl GpuTimer {
             .map_async(MapMode::Read, move |result| {
                 if result.is_ok() {
                     let view = buffer_for_callback.slice(..).get_mapped_range();
-                    if view.len() == BYTES_PER_SLOT as usize {
-                        let start_ticks = u64::from_le_bytes(
-                            view[0..8].try_into().expect("8-byte u64"),
-                        );
-                        let end_ticks = u64::from_le_bytes(
-                            view[8..16].try_into().expect("8-byte u64"),
-                        );
+                    // Per-slot map buffer is constructed with `size: BYTES_PER_SLOT`
+                    // (16), so the slice length is guaranteed by wgpu. We still
+                    // pattern-destructure here so a divergence between
+                    // BYTES_PER_SLOT and the literal byte ranges would be caught at
+                    // compile time rather than via a runtime `.expect` panic.
+                    if let (Ok(start_bytes), Ok(end_bytes)) =
+                        (<[u8; 8]>::try_from(&view[0..8]), <[u8; 8]>::try_from(&view[8..16]))
+                    {
+                        let start_ticks = u64::from_le_bytes(start_bytes);
+                        let end_ticks = u64::from_le_bytes(end_bytes);
                         let delta_ticks = end_ticks.saturating_sub(start_ticks);
                         let delta_ns = (delta_ticks as f64 * period_ns as f64) as u64;
                         let _ = tx.send(Duration::from_nanos(delta_ns));

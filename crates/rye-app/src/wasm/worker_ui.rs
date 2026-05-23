@@ -13,8 +13,8 @@
 //!   windowed path; not load-bearing for the demos we ship).
 //! - No `winit_state.take_egui_input` step (we build `RawInput` ourselves
 //!   from accumulated events).
-//! - Bypassed entirely on first paint: no warmup yet (Phase B+ adds
-//!   N3-style worker-side egui pipeline warming).
+//! - No worker-side egui pipeline warmup yet; first egui-touching frame
+//!   pays compile cost (future work to mirror the windowed warmup path).
 
 use rye_egui::egui;
 
@@ -34,7 +34,7 @@ pub struct WorkerUi {
     /// pointer/key events carry the right `Modifiers`.
     modifiers: egui::Modifiers,
     /// Canvas pixel dimensions + DPR. Egui works in "points" (CSS-pixel
-    /// equivalents), wgpu in pixels — `pixels_per_point` is the conversion.
+    /// equivalents), wgpu in pixels; `pixels_per_point` is the conversion.
     width_px: u32,
     height_px: u32,
     pixels_per_point: f32,

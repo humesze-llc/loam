@@ -19,13 +19,13 @@
 //! ## Per-frame flow
 //!
 //! 1. Setup-time: caller builds the canonical R⁴ mesh (e.g. via
-//!    `Polytope4::Tesseract.topology()` + an edge → segment fan-out) and uploads
-//!    it ONCE via [`Self::upload_mesh`].
+//!    `Polytope4::Tesseract.topology()` + an edge-to-segment fan-out) and uploads
+//!    it ONCE via `Self::upload_mesh`.
 //! 2. Per frame: caller integrates a `Rotor4`, converts it via
-//!    [`rye_math::Rotor4::to_mat4`], and calls [`Self::set_transform`] with the
+//!    [`rye_math::Rotor4::to_mat4`], and calls `Self::set_transform` with the
 //!    matrix + view*proj + viewport + focal_distance. That writes a single
 //!    144-byte uniform; no other per-frame GPU work.
-//! 3. Caller records the pass via [`Self::record`] into the shared encoder
+//! 3. Caller records the pass via `Self::record` into the shared encoder
 //!    (same pattern as `LineRasterNode::record`).
 //!
 //! ## Pipeline shape
@@ -118,7 +118,7 @@ impl LineRasterStaticR4Node {
     /// Construct the pipeline.
     ///
     /// `surface_format`, `depth`, and `sample_count` mirror
-    /// [`crate::LineRasterNode::new`] — the pipeline-state knobs that have to
+    /// [`crate::LineRasterNode::new`]; the pipeline-state knobs that have to
     /// match the attachments at draw time. See those docs for the contract.
     pub fn new(
         device: &Device,
@@ -309,9 +309,9 @@ impl LineRasterStaticR4Node {
 
     /// Upload an R⁴ line mesh. Intended to be called ONCE (or only when the
     /// topology changes, e.g. user toggled to a different polytope); per-frame
-    /// rotation is handled by [`Self::set_transform`] without re-uploading.
+    /// rotation is handled by `Self::set_transform` without re-uploading.
     ///
-    /// Allocates a scratch `Vec<LineInstance4D>` once per call — fine for the
+    /// Allocates a scratch `Vec<LineInstance4D>` once per call; fine for the
     /// setup-time use case; if callers ever start calling this every frame,
     /// migrate to the [`crate::LineRasterNode`] dynamic-upload pattern instead
     /// (or extend this node with a scratch-buffer field).
@@ -376,7 +376,7 @@ impl LineRasterStaticR4Node {
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    /// Record the draw pass. Mirrors [`crate::LineRasterNode::record`] — same
+    /// Record the draw pass. Mirrors [`crate::LineRasterNode::record`]; same
     /// `LoadOp::Load` discipline, same depth-attachment contract, same panic
     /// messages for mismatches.
     pub fn record(

@@ -1,4 +1,4 @@
-//! egui ↔ wgpu ↔ winit integration owned by `rye-app::Runner`.
+//! egui + wgpu + winit integration owned by `rye-app::Runner`.
 //!
 //! The lifecycle the framework runs each frame:
 //!

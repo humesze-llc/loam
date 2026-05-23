@@ -108,11 +108,11 @@ pub fn drain_messages() -> Vec<InputMessage> {
 /// Parse a non-init postMessage payload into an `InputMessage`.
 ///
 /// Returns:
-/// - `Ok(Some(msg))` — parsed successfully
-/// - `Ok(None)` — message kind is "init" (caller handles specially) OR
+/// - `Ok(Some(msg))`: parsed successfully
+/// - `Ok(None)`: message kind is "init" (caller handles specially) OR
 ///   the kind is unrecognized (we don't error on unknown kinds; the
 ///   worker just logs and drops them)
-/// - `Err(_)` — the payload itself is malformed (missing `kind` field)
+/// - `Err(_)`: the payload itself is malformed (missing `kind` field)
 ///
 /// The `init` kind is intentionally NOT handled here because parsing it
 /// requires extracting an `OffscreenCanvas` transferable + triggering
