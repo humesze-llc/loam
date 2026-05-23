@@ -55,7 +55,7 @@
 
 use anyhow::{anyhow, Result};
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use rye_app::{egui, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
 use rye_egui::Console;
 use rye_math::WPlane;
 use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
@@ -1592,35 +1592,17 @@ impl App for RotatePolytopesApp {
 }
 
 fn main() -> Result<()> {
-    // On wasm32, the page can opt into click-to-start by setting
-    // `data-mode="manual"` on `#rye-canvas-host`. In that case we install a one-shot
-    // click handler on `#rye-launch` and return; the actual app launch happens when
-    // the user clicks. This solves the "demo eats GPU + RAF while idle" problem and
-    // is the foundation for multi-demo blog embedding.
-    #[cfg(target_arch = "wasm32")]
-    {
-        const HOST_ID: &str = "rye-canvas-host";
-        const BUTTON_ID: &str = "rye-launch";
-        if rye_app::wasm::is_manual_mode(HOST_ID) {
-            rye_app::wasm::wait_for_launch(BUTTON_ID, || {
-                if let Err(e) = launch_app() {
-                    tracing::error!("polytope_playground launch failed: {e:#}");
-                }
-            })?;
-            return Ok(());
-        }
-    }
-    launch_app()
-}
-
-fn launch_app() -> Result<()> {
-    let config = RunConfig {
+    // `rye_app::run` handles native + wasm dispatch (worker context vs
+    // main-thread launch-on-click vs main-thread auto-launch fallback)
+    // based on the page's `data-mode` attribute and the WasmConfig IDs.
+    // Default WasmConfig uses our standard layout (`rye-canvas-host` /
+    // `rye-launch` / `rye-canvas`); the demo's `index.html` matches.
+    rye_app::run::<RotatePolytopesApp>(RunConfig {
         window: WindowAttributes::default()
             .with_title("polytope playground")
             .with_visible(false),
         ..RunConfig::default()
-    };
-    run_with_config::<RotatePolytopesApp>(config)
+    })
 }
 
 // ---------------------------------------------------------------------------

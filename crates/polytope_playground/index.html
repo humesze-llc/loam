@@ -16,6 +16,25 @@
           href="Cargo.toml"
           data-cargo-no-default-features />
 
+    <!-- Worker-mode wasm-URL capture. Trunk injects an inline
+         `<script type="module">` (immediately above this comment in source
+         order) containing the import path to the hashed wasm bundle. This
+         synchronous script regex-extracts the URL into
+         `window.__rye_wasm_url` so the main-thread Rust code can spawn a
+         Worker pointing at the same bundle. Generic across demo names —
+         picks the first `.js` import in any module script. -->
+    <script>
+      (function () {
+        for (const s of document.querySelectorAll('script[type="module"]')) {
+          const m = s.textContent.match(/from\s*['"]([^'"]+\.js)['"]/);
+          if (m) {
+            window.__rye_wasm_url = new URL(m[1], document.baseURI).href;
+            return;
+          }
+        }
+      })();
+    </script>
+
     <style>
         html, body {
             margin: 0;
@@ -31,23 +50,20 @@
         #rye-canvas-host {
             position: absolute;
             inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
         }
-        /* winit creates an HTMLCanvasElement; the cfg-gated `attach_canvas_to_dom`
-           helper in rye-app sets its style to 100% / 100% / display:block, so the
-           selector below is a defensive duplicate for older builds + inspector
-           reproducibility. */
         #rye-canvas-host canvas {
-            width: 100% !important;
-            height: 100% !important;
+            width: 100%;
+            height: 100%;
             display: block;
             background: #0e0e12;
         }
-        /* Click-to-start launch button. Visible until the user opts in; the wasm
-           runtime removes it on click, then the canvas attaches in its place. */
+        /* Click-to-start launch button. Worker mode removes it on click;
+           the canvas underneath is revealed when rendering starts. */
         .rye-demo-launch {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
             font: inherit;
             font-size: 14px;
             letter-spacing: 0.08em;
@@ -70,11 +86,13 @@
     </style>
 </head>
 <body>
-    <!-- `data-mode="manual"` opts into click-to-start. The wasm runtime sees this
-         attribute, installs a one-shot click handler on `#rye-launch`, and only
-         calls `run_with_config` when the button is clicked. Remove the attribute
-         (or set it to anything else) for auto-start on page load. -->
+    <!-- `data-mode="manual"` opts into click-to-start. The wasm runtime
+         sees this attribute, installs a one-shot click handler on
+         `#rye-launch`, transfers the `#rye-canvas` to a fresh Worker on
+         click, and runs the App lifecycle inside the worker. Remove the
+         attribute for auto-start on page load (legacy main-thread mode). -->
     <div id="rye-canvas-host" data-mode="manual">
+        <canvas id="rye-canvas" width="1280" height="800"></canvas>
         <button id="rye-launch" class="rye-demo-launch" type="button">
             Launch polytope playground
         </button>
