@@ -31,6 +31,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::rc::Rc;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -39,19 +40,30 @@ use web_sys::{
     OffscreenCanvas, Worker, WorkerOptions, WorkerType,
 };
 
-/// Phase A worker entry. Installs an `onmessage` handler that waits for the
-/// initial canvas-transfer message, then sets up wgpu + the RAF clear loop.
+use crate::{App, FrameCtx, RenderCtx, SetupCtx};
+use rye_asset::AssetWatcher;
+use rye_input::FrameInput;
+use rye_render::device::RenderDevice;
+use rye_shader::ShaderDb;
+
+/// Worker entry. Generic over the demo's `App` type so the same worker
+/// scaffolding drives whatever lifecycle the demo defines.
 ///
-/// Returns `Ok(())` synchronously after wiring the message handler; the
-/// actual work happens inside the message + RAF callbacks. The worker
-/// stays alive as long as the wasm-bindgen heap holds the closures (which
-/// the `forget()` calls below ensure).
+/// Installs a `message` listener that waits for the canvas-transfer init,
+/// then constructs `RenderDevice` + `WorkerRunner<A>` and starts the RAF
+/// loop that drives `A`'s per-frame lifecycle (update + record).
 ///
-/// **Phase A scope**: clears the canvas to a cycling color. No App trait,
-/// no rendering pipeline. The point is to validate that wgpu surface
-/// creation from OffscreenCanvas + a worker-side `requestAnimationFrame`
-/// loop work together; the demo wiring comes in Phase B.
-pub fn run() -> Result<()> {
+/// Returns `Ok(())` synchronously after wiring the listener; the actual
+/// work happens inside the message + RAF callbacks. The worker stays
+/// alive as long as the wasm-bindgen heap holds the closures (the
+/// `forget()` calls below ensure that).
+///
+/// **Phase B1 scope**: tesseract appears in worker. No input events,
+/// no egui UI overlay (Phase B3 + B4 add those).
+pub fn run<A: App + 'static>() -> Result<()>
+where
+    A::Space: 'static,
+{
     // Worker has its own JS heap + console; install panic hook + tracing
     // so unhandled errors + log lines surface in DevTools (under the
     // worker's context, selectable in DevTools' execution-context picker).
@@ -76,9 +88,9 @@ pub fn run() -> Result<()> {
     // contract.
     let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
         // `info!` (not debug) so the diagnostic is visible at default
-        // tracing levels. Drop to debug once Phase A is verified working.
+        // tracing levels. Drop to debug once Phase B is stable.
         tracing::info!("rye_app::wasm::worker: message handler firing");
-        if let Err(e) = handle_message(&scope_for_handler, event) {
+        if let Err(e) = handle_message::<A>(&scope_for_handler, event) {
             tracing::error!("rye_app::wasm::worker: message handler failed: {e:#}");
         }
     }) as Box<dyn FnMut(MessageEvent)>);
@@ -112,9 +124,15 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Dispatch a single inbound `postMessage`. Phase A only handles the
-/// `init` kind; Phase B will add input-event variants.
-fn handle_message(scope: &DedicatedWorkerGlobalScope, event: MessageEvent) -> Result<()> {
+/// Dispatch a single inbound `postMessage`. Phase B1 only handles the
+/// `init` kind; Phase B3 adds input-event variants.
+fn handle_message<A: App + 'static>(
+    scope: &DedicatedWorkerGlobalScope,
+    event: MessageEvent,
+) -> Result<()>
+where
+    A::Space: 'static,
+{
     let data: JsValue = event.data();
     let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
         .ok()
@@ -137,7 +155,7 @@ fn handle_message(scope: &DedicatedWorkerGlobalScope, event: MessageEvent) -> Re
             // scheduling state, so they survive after this handler returns.
             let scope_for_render = scope.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = init_renderer(scope_for_render, canvas, width, height).await {
+                if let Err(e) = init_renderer::<A>(scope_for_render, canvas, width, height).await {
                     tracing::error!("rye_app::wasm::worker: init_renderer failed: {e:#}");
                 }
             });
@@ -158,22 +176,24 @@ fn read_u32_field(obj: &JsValue, key: &str) -> Option<u32> {
         .map(|f| f as u32)
 }
 
-/// Phase A renderer: minimal wgpu setup + RAF clear loop.
+/// Phase B1: build `RenderDevice` from the worker-owned OffscreenCanvas,
+/// run `App::setup`, and start the RAF loop driving the App's per-frame
+/// lifecycle.
 ///
-/// Creates an Instance with the WebGPU backend, requests an adapter that's
-/// compatible with the OffscreenCanvas surface, picks the first supported
-/// surface format, configures the surface, and starts a RAF loop that
-/// clears to a time-varying color so the viewer can confirm the worker is
-/// producing frames.
-///
-/// **Phase A constraints**: no MSAA, no depth buffer, no sRGB composite
-/// dance, no perf telemetry. Just enough to prove the foundation works.
-async fn init_renderer(
+/// Uses `RenderDevice::from_surface` so the wgpu setup matches the
+/// windowed-mode path (sRGB composite, MSAA negotiation, GPU timer
+/// detection, etc.). The worker doesn't get MSAA in this phase
+/// because the OffscreenCanvas surface format negotiation matches
+/// the browser-WebGPU non-sRGB swap case (composite + sample_count=1).
+async fn init_renderer<A: App + 'static>(
     scope: DedicatedWorkerGlobalScope,
     canvas: OffscreenCanvas,
     width: u32,
     height: u32,
-) -> Result<()> {
+) -> Result<()>
+where
+    A::Space: 'static,
+{
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::BROWSER_WEBGPU,
         ..Default::default()
@@ -186,83 +206,55 @@ async fn init_renderer(
         .create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas))
         .context("create_surface from OffscreenCanvas")?;
 
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: Some(&surface),
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-        })
-        .await
-        .context("request_adapter")?;
-
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: Some("rye_app::wasm::worker::device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                .using_resolution(adapter.limits()),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::default(),
-            experimental_features: wgpu::ExperimentalFeatures::default(),
-        })
-        .await
-        .context("request_device")?;
-
-    let surface_caps = surface.get_capabilities(&adapter);
-    let surface_format = surface_caps
-        .formats
-        .first()
-        .copied()
-        .ok_or_else(|| anyhow!("surface has no supported formats"))?;
-    tracing::info!(
-        "rye_app::wasm::worker: surface format = {:?}, adapter = {:?}",
-        surface_format,
-        adapter.get_info()
-    );
-
-    surface.configure(
-        &device,
-        &wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: surface_caps
-                .alpha_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        },
-    );
-
-    // The RAF loop is a self-referential pattern: the closure schedules
-    // itself for the next frame. Standard wasm-bindgen idiom uses
-    // `Rc<RefCell<Option<Closure>>>` so the closure can reference itself
-    // through the shared cell.
-    let frame_state = Rc::new(RefCell::new(FrameState {
-        device,
-        queue,
+    // Hand the surface off to the shared `RenderDevice::from_surface`
+    // setup. From here the worker path is feature-equivalent to the
+    // windowed-mode path: same adapter selection, same MSAA negotiation,
+    // same sRGB composite dance. The size passed is the OffscreenCanvas'
+    // pixel dimensions in this phase; Phase B2 will plumb resize events.
+    let size = winit::dpi::PhysicalSize::new(width, height);
+    let rd = RenderDevice::from_surface(
+        instance,
         surface,
-        frame_index: 0u64,
-    }));
+        size,
+        // Worker mode: no MSAA for now. The composite pass for the
+        // non-sRGB browser-WebGPU surface forces sample_count=1 anyway
+        // (see RenderDevice::new's `effective_msaa` logic), so this is
+        // a no-op even when set higher.
+        1,
+    )
+    .await
+    .context("RenderDevice::from_surface")?;
+    tracing::info!(
+        "rye_app::wasm::worker: RenderDevice ready (target_format={:?}, sample_count={})",
+        rd.target_format(),
+        rd.sample_count()
+    );
+
+    // Construct the App via the shared `SetupCtx` shape. AssetWatcher on
+    // wasm32 is a no-op stub; ShaderDb is straightforward.
+    let runner = WorkerRunner::<A>::setup(rd)
+        .await
+        .context("WorkerRunner::setup")?;
+    tracing::info!("rye_app::wasm::worker: WorkerRunner setup complete; starting RAF loop");
+
+    // Self-referential RAF closure. Captures the runner via Rc<RefCell>
+    // and re-schedules itself each frame. Standard wasm-bindgen pattern.
+    let runner = Rc::new(RefCell::new(runner));
     let raf_cb = Rc::new(RefCell::new(None::<Closure<dyn FnMut(f64)>>));
     let raf_cb_for_closure = raf_cb.clone();
     let scope_for_closure = scope.clone();
-    let frame_state_for_closure = frame_state.clone();
+    let runner_for_closure = runner.clone();
 
     *raf_cb.borrow_mut() = Some(Closure::wrap(Box::new(move |_timestamp: f64| {
-        if let Err(e) = render_one_frame(&frame_state_for_closure) {
-            tracing::error!("rye_app::wasm::worker: render_one_frame failed: {e:#}");
-            // Don't reschedule on error; let the loop end so the user sees
-            // the error in the console and we don't spam the log.
+        // Borrow the runner mutably for one frame. The closure is the
+        // sole owner of mutable access on this single-threaded worker;
+        // no contention possible.
+        if let Err(e) = runner_for_closure.borrow_mut().frame() {
+            tracing::error!("rye_app::wasm::worker: frame failed: {e:#}");
+            // Stop the loop on error so the developer sees one log line,
+            // not 60 per second.
             return;
         }
-        // Schedule the next RAF. The `as_ref` access through the borrow is
-        // safe because the only mutator (the initial `*raf_cb.borrow_mut() = ...`
-        // above) ran before the first RAF callback fires.
         let cb_ref = raf_cb_for_closure.borrow();
         if let Some(cb) = cb_ref.as_ref() {
             let _ = scope_for_closure
@@ -270,7 +262,7 @@ async fn init_renderer(
         }
     }) as Box<dyn FnMut(f64)>));
 
-    // Kick off the first frame, dropping the borrow before we leak the Rc.
+    // Kick off the first frame (dropping the borrow before we leak the Rc).
     {
         let first_cb = raf_cb.borrow();
         let first = first_cb
@@ -281,73 +273,152 @@ async fn init_renderer(
             .map_err(|e| anyhow!("request_animation_frame: {e:?}"))?;
     }
 
-    // Both `raf_cb` and `frame_state` need to outlive this function so the
-    // closure stays valid for subsequent RAF callbacks. Leaking via
-    // `Box::leak` of a `Box<Rc<...>>` is the standard wasm-bindgen pattern
-    // for "this state must live forever in this worker."
+    // Both `raf_cb` and `runner` need to outlive this function so the
+    // closure stays valid for subsequent RAF callbacks.
     Box::leak(Box::new(raf_cb));
-    Box::leak(Box::new(frame_state));
+    Box::leak(Box::new(runner));
 
     Ok(())
 }
 
-/// Per-frame state owned by the RAF closure.
-struct FrameState {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
-    frame_index: u64,
-}
-
-/// Render one frame: clear to a time-varying color, present.
+/// Per-worker lifecycle state: owns the RenderDevice + the user's App
+/// + the wall-clock / tick bookkeeping the existing main-thread Runner
+/// owns. Sits inside the RAF closure via `Rc<RefCell>`.
 ///
-/// Phase A only. Phase B replaces this with the App::record lifecycle.
-fn render_one_frame(state: &Rc<RefCell<FrameState>>) -> Result<()> {
-    let mut state = state.borrow_mut();
-    state.frame_index = state.frame_index.wrapping_add(1);
+/// Phase B1 scope: drives `App::update` + `App::record` only. No egui,
+/// no input (Phase B3 + B4 add those).
+struct WorkerRunner<A: App + 'static>
+where
+    A::Space: 'static,
+{
+    rd: RenderDevice,
+    #[allow(dead_code)] // held alive for App's runtime; lookups via ShaderDb come in Phase B3+
+    shader_db: ShaderDb,
+    #[allow(dead_code)] // wasm stub today; native parity in case the trait grows
+    watcher: Option<AssetWatcher>,
+    app: A,
+    start: web_time::Instant,
+    last_update_at: Option<web_time::Instant>,
+    tick_index: u64,
+    _marker: PhantomData<A::Space>,
+}
 
-    let frame = state
-        .surface
-        .get_current_texture()
-        .context("get_current_texture")?;
-    let view = frame
-        .texture
-        .create_view(&wgpu::TextureViewDescriptor::default());
-
-    // Cycling clear color so a viewer can confirm the worker is producing
-    // fresh frames. ~5-second period; brightness in a comfortable mid-tone
-    // range so it's pleasant against a typical page background.
-    let t = (state.frame_index as f32) * (1.0 / 60.0);
-    let r = (0.5 + 0.4 * (t * 0.7).sin()) as f64;
-    let g = (0.5 + 0.4 * (t * 0.5 + 1.0).sin()) as f64;
-    let b = (0.5 + 0.4 * (t * 0.3 + 2.0).sin()) as f64;
-
-    let mut encoder = state
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("rye_app::wasm::worker::clear-encoder"),
-        });
-    {
-        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("rye_app::wasm::worker::clear-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a: 1.0 }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
+impl<A: App + 'static> WorkerRunner<A>
+where
+    A::Space: 'static,
+{
+    /// Construct the runner: build ShaderDb + AssetWatcher (wasm stub) +
+    /// invoke `A::setup`. Async because `A::setup` may itself await on
+    /// asset loading or device-feature probes; in practice for the
+    /// existing demos it's synchronous and returns immediately.
+    async fn setup(rd: RenderDevice) -> Result<Self> {
+        let mut shader_db = ShaderDb::new(rd.device.clone());
+        // AssetWatcher init failure isn't fatal: demos work without hot-
+        // reload. On wasm32 the watcher is a no-op stub so Ok(_) always.
+        let mut watcher = match AssetWatcher::new() {
+            Ok(w) => Some(w),
+            Err(e) => {
+                tracing::warn!("AssetWatcher disabled: {e}");
+                None
+            }
+        };
+        let mut ctx = SetupCtx {
+            rd: &rd,
+            shader_db: &mut shader_db,
+            watcher: watcher.as_mut(),
+            time: 0.0,
+        };
+        let app = A::setup(&mut ctx).map_err(|e| e.context("App::setup"))?;
+        Ok(Self {
+            rd,
+            shader_db,
+            watcher,
+            app,
+            start: web_time::Instant::now(),
+            last_update_at: None,
+            tick_index: 0,
+            _marker: PhantomData,
+        })
     }
-    state.queue.submit(Some(encoder.finish()));
-    frame.present();
 
-    Ok(())
+    /// One frame: dt, App::update, begin_frame, App::record, composite,
+    /// submit, present. Wraps `rye_time::frame_trace::scope` so the same
+    /// telemetry the windowed-mode runner emits is available here.
+    fn frame(&mut self) -> Result<()> {
+        rye_time::frame_trace::begin_frame();
+        let _frame_scope = rye_time::frame_trace::scope("frame");
+
+        // dt: wall-clock since previous update. First frame falls back
+        // to 1/60 so the App doesn't see a 0 dt that breaks integrators.
+        let now = web_time::Instant::now();
+        let dt = match self.last_update_at {
+            Some(prev) => now.duration_since(prev).as_secs_f32(),
+            None => 1.0 / 60.0,
+        };
+        self.last_update_at = Some(now);
+        self.tick_index = self.tick_index.wrapping_add(1);
+
+        // App::update with an empty FrameInput (Phase B3 will plumb real
+        // input from main-thread InputMessage events).
+        {
+            let _scope = rye_time::frame_trace::scope("app-update");
+            let mut fctx = FrameCtx {
+                rd: &self.rd,
+                input: FrameInput::default(),
+                time: self.start.elapsed().as_secs_f32(),
+                fps: 0.0, // Phase B1: skip FPS bookkeeping; not used by tesseract_demo.
+                n_ticks: 0,
+                tick: self.tick_index,
+                dt,
+                ui_has_focus: false,
+                _non_exhaustive: PhantomData,
+            };
+            self.app.update(&mut fctx);
+        }
+
+        // begin_frame -> record -> composite -> submit -> present.
+        let (frame, swap_view) = self
+            .rd
+            .begin_frame()
+            .context("RenderDevice::begin_frame")?;
+        let render_view = self
+            .rd
+            .msaa_view()
+            .or(self.rd.scene_view())
+            .unwrap_or(&swap_view);
+
+        let mut encoder = self
+            .rd
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rye_app::wasm::worker::frame"),
+            });
+
+        {
+            let _scope = rye_time::frame_trace::scope("app-record");
+            let mut ctx = RenderCtx {
+                rd: &self.rd,
+                view: render_view,
+                encoder: &mut encoder,
+            };
+            self.app.record(&mut ctx).context("App::record")?;
+        }
+
+        // Composite pass when the swap is non-sRGB (browser-WebGPU).
+        if self.rd.scene_view().is_some() {
+            let _scope = rye_time::frame_trace::scope("composite");
+            self.rd.composite_to_swap(&mut encoder, &swap_view);
+        }
+
+        {
+            let _scope = rye_time::frame_trace::scope("present");
+            self.rd.queue.submit(Some(encoder.finish()));
+            frame.present();
+        }
+
+        rye_time::frame_trace::end_frame();
+        Ok(())
+    }
 }
 
 fn worker_scope() -> Result<DedicatedWorkerGlobalScope> {

@@ -519,13 +519,14 @@ fn main() -> Result<()> {
     #[cfg(target_arch = "wasm32")]
     {
         // Worker side: the wasm binary was instantiated by the Blob-URL
-        // bootstrap inside a fresh Worker. Run the Phase A worker entry
-        // (clear-loop), then exit `main`. The worker stays alive via the
-        // RAF closure leaked inside `worker::run`. Tracing + panic hook
-        // are installed by `worker::run` itself (worker has its own JS
-        // heap so we initialize independently of the main thread).
+        // bootstrap inside a fresh Worker. Run the App lifecycle via
+        // `worker::run::<TesseractApp>()` — this constructs a
+        // `WorkerRunner<TesseractApp>` after the canvas-transfer message
+        // arrives, then drives App::setup + per-frame update/record on
+        // its own RAF loop. Tracing + panic hook are installed inside
+        // `worker::run` itself (worker has its own JS heap).
         if rye_app::wasm::is_worker_context() {
-            return rye_app::wasm::worker::run();
+            return rye_app::wasm::worker::run::<TesseractApp>();
         }
 
         // Main thread: wire the launch button to spawn the worker on

@@ -85,9 +85,30 @@ impl RenderDevice {
     /// supported by the adapter for the chosen surface format.
     pub async fn new(window: Arc<Window>, requested_msaa_samples: u32) -> Result<Self> {
         let instance = Instance::default();
-
         let surface = instance.create_surface(window.clone())?;
+        let size = window.inner_size();
+        Self::from_surface(instance, surface, size, requested_msaa_samples).await
+    }
 
+    /// Variant of [`Self::new`] that takes a wgpu [`Surface`] directly. Used by code
+    /// paths that don't have a winit [`Window`] (Web Worker mode constructs the
+    /// surface from an `OffscreenCanvas` in `rye-app::wasm::worker`, then hands it
+    /// here).
+    ///
+    /// Keeps `rye-render` decoupled from `web-sys` and the worker-mode plumbing:
+    /// the caller owns the surface-creation specifics; this function owns the
+    /// adapter / device / configuration / scene-target / composite / msaa setup
+    /// that's identical regardless of how the surface was obtained.
+    ///
+    /// `size` is the surface's pixel dimensions. The caller decides how to derive
+    /// it (`window.inner_size()` in the windowed path, the OffscreenCanvas
+    /// dimensions in the worker path).
+    pub async fn from_surface(
+        instance: Instance,
+        surface: Surface<'static>,
+        size: winit::dpi::PhysicalSize<u32>,
+        requested_msaa_samples: u32,
+    ) -> Result<Self> {
         let adapter = instance
             .request_adapter(&RequestAdapterOptions {
                 compatible_surface: Some(&surface),
@@ -138,7 +159,6 @@ impl RenderDevice {
             );
         }
 
-        let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
         let format = caps
             .formats
