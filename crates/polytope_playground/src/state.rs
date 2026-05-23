@@ -8,7 +8,8 @@
 //! `pub(crate)` so those sibling impls can access them directly without
 //! per-field accessors.
 
-use rye_app::{Camera, OrbitController};
+use glam::Vec3;
+use rye_app::{Camera, FirstPersonController, OrbitController};
 use rye_math::{Bivector4, EuclideanR3, Plane4, Rotor4};
 use rye_render::raymarch::{BodyUniform, Hyperslice4DNode};
 
@@ -162,6 +163,22 @@ impl WireframeColorMode {
             _ => None,
         }
     }
+}
+
+/// Camera control mode. `Orbit` is the default scroll-zoom/drag-to-rotate camera that
+/// stays focused on the world origin (where the polytope bodies sit). `FreeRoam` lets
+/// the user fly the camera around via WASD + mouse-look; useful for inspecting the
+/// 120-cell / 600-cell from arbitrary angles without orbiting through the floor.
+///
+/// Toggle via the `camera` console command: bare `camera` cycles, `camera orbit` /
+/// `camera freecam` set explicitly. Switching to `Orbit` resets the orbit controller
+/// to its default distance + pitch so the camera returns to a known framing instead
+/// of inheriting wherever FreeRoam ended.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CameraMode {
+    #[default]
+    Orbit,
+    FreeRoam,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +341,19 @@ pub(crate) struct Demo {
     pub(crate) space: EuclideanR3,
     pub(crate) camera: Camera<EuclideanR3>,
     pub(crate) orbit: OrbitController<EuclideanR3>,
+    /// Free-roam controller for the WASD + mouse-look camera mode. Coexists with
+    /// `orbit` so toggling between modes preserves each controller's internal
+    /// state (orbit's distance/pitch, freecam's yaw/pitch). Only the active mode
+    /// advances against input each frame.
+    pub(crate) free_roam: FirstPersonController<EuclideanR3>,
+    /// World-space position the camera holds in `FreeRoam` mode. The controller
+    /// only handles look direction (right/up/forward); position is integrated
+    /// here from `move_forward / move_right / move_up` axes in the per-frame
+    /// update.
+    pub(crate) free_roam_pos: Vec3,
+    /// Active camera control mode. Default `Orbit` matches the long-standing
+    /// behavior; `FreeRoam` is opt-in via the `camera` console command.
+    pub(crate) camera_mode: CameraMode,
     pub(crate) node: Hyperslice4DNode,
     /// Rasterizer node for the cross-section perimeter (bright cyan edges around each
     /// cap polygon). Filled caps are NOT drawn -- the SDF raymarcher already renders the
@@ -457,9 +487,9 @@ pub(crate) struct Demo {
     /// the polytope rotates. Off by default; opened from `View > Example callout`
     /// (and toggleable via the console `callout` command).
     ///
-    /// Hosts the `rye_egui::callout` primitive added in the M4-close mini-sprint;
-    /// future tutorial / explanation overlays in the playground will instantiate
-    /// additional `CalloutState`s the same way.
+    /// Hosts the `rye_egui::callout` primitive; future tutorial / explanation
+    /// overlays in the playground will instantiate additional `CalloutState`s
+    /// the same way.
     pub(crate) example_callout: rye_egui::CalloutState,
 
     /// Cached natural overlay width on first frame. Used as the fixed width of the

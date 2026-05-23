@@ -262,6 +262,13 @@ impl App for TesseractApp {
         rye_app::trace::register_command(&mut console);
         rye_app::fps::register_command(&mut console);
         rye_app::vsync::register_command(&mut console);
+        rye_app::version::register_command(
+            &mut console,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            env!("BUILD_HASH"),
+            env!("BUILD_DIRTY"),
+        );
         rye_app::log::register_command(&mut console);
         let perf = rye_app::trace::PerfOverlay::new();
 

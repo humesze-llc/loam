@@ -84,6 +84,7 @@ pub mod frame_pacing;
 pub mod keymap;
 pub mod log;
 pub mod trace;
+pub mod version;
 pub mod vsync;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;

@@ -55,7 +55,10 @@
 
 use anyhow::{anyhow, Result};
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use rye_app::{egui, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use rye_app::{
+    egui, App, Camera, CameraController, FirstPersonController, FrameCtx, OrbitController,
+    RunConfig, SetupCtx,
+};
 use rye_egui::Console;
 use rye_math::WPlane;
 use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
@@ -115,7 +118,7 @@ use active::combo_name;
 use catalog::{parse_row_from_args, SHAPE_CATALOG};
 use consts::{BODY_SIZE, BODY_Y, T_SCRUB_RATE, T_SLIDER_INITIAL, W_RANGE, W_SCRUB_RATE};
 use state::{
-    body_position, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode,
+    body_position, CameraMode, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode,
     WireframeProjection,
 };
 
@@ -248,6 +251,13 @@ impl Demo {
         // default zoom; user can scroll-zoom in.
         orbit.set_orbit(9.5, -0.25);
 
+        // Free-roam controller is constructed but unused until the user
+        // toggles via `camera freecam`. Initial yaw 0 / pitch 0 matches the
+        // tesseract_demo pattern; the camera's actual orientation seeds
+        // from the orbit's last frame at toggle time.
+        let free_roam = FirstPersonController::<EuclideanR3>::new(0.0, 0.0);
+        let free_roam_pos = camera.position;
+
         // Always start at w=0 regardless of row contents. Auto-shifting
         // to the 120/600-cell's "Platonic-named" cross-section was
         // confusing in mixed rows: the other shapes' slices got pulled
@@ -259,6 +269,9 @@ impl Demo {
             space: EuclideanR3,
             camera,
             orbit,
+            free_roam,
+            free_roam_pos,
+            camera_mode: CameraMode::default(),
             node,
             section_edges,
             parent_wireframe,
@@ -417,10 +430,29 @@ impl Demo {
         // of a row of horizon shots.
         let lift_orbit = self.view_mode == ViewMode::Filmstrip && self.strip_w && self.strip_t;
         self.orbit.target.y = if lift_orbit { BODY_Y } else { 0.0 };
-        use rye_camera::CameraController;
         if !ctx.ui_has_focus {
-            self.orbit
-                .advance(ctx.input, &mut self.camera, &EuclideanR3, 0.0);
+            match self.camera_mode {
+                CameraMode::Orbit => {
+                    self.orbit
+                        .advance(ctx.input, &mut self.camera, &EuclideanR3, dt_secs);
+                }
+                CameraMode::FreeRoam => {
+                    // Mouse-look + WASD translation. Mirror tesseract_demo's
+                    // pattern: controller handles look; we integrate position
+                    // here from the drained input axes.
+                    self.free_roam
+                        .advance(ctx.input, &mut self.camera, &EuclideanR3, dt_secs);
+                    const FREECAM_SPEED: f32 = 4.5; // units/sec
+                    let mut delta = self.camera.forward * ctx.input.move_forward
+                        + self.camera.right * ctx.input.move_right
+                        + Vec3::Y * ctx.input.move_up;
+                    if delta.length_squared() > 1e-6 {
+                        delta = delta.normalize();
+                        self.free_roam_pos += delta * FREECAM_SPEED * dt_secs;
+                        self.camera.position = self.free_roam_pos;
+                    }
+                }
+            }
         }
         let view = self.camera.view();
 
@@ -456,29 +488,23 @@ impl Demo {
         // subsequent positioning calculations).
         self.render_menu_bar(ctx);
 
-        // Top-left: title + fps + framebuffer size. Replaces the old
-        // panel header now that the side panel is gone. Larger
-        // typography so the title reads as the program's nameplate
-        // rather than just another label.
-        let cfg = &frame.rd.surface_bundle.config;
-        let (fb_w, fb_h) = (cfg.width, cfg.height);
-        // y offset clears the menu bar (~24-28px depending on
-        // font) plus a small visual margin. egui::Area's anchor
-        // is screen-relative, not content-rect-relative, so the
-        // offset must include the menu bar height manually.
-        egui::Area::new(egui::Id::new("polytope-playground-title"))
-            .anchor(egui::Align2::LEFT_TOP, [20.0, 50.0])
+        // Top-right: short git hash + dirty marker. Identifies the build at
+        // a glance when a tester reloads the wasm bundle; the browser cache
+        // can serve a stale page+script combination otherwise. F3's perf
+        // overlay shows fps + framebuffer size when that data is wanted.
+        let build_label = format!(
+            "{}{}",
+            env!("BUILD_HASH"),
+            env!("BUILD_DIRTY"),
+        );
+        egui::Area::new(egui::Id::new("polytope-playground-build"))
+            .anchor(egui::Align2::RIGHT_TOP, [-12.0, 50.0])
             .show(ctx, |ui| {
                 ui.add(egui::Label::new(
-                    egui::RichText::new("Polytope Playground")
-                        .size(22.0)
-                        .strong()
-                        .color(egui::Color32::WHITE),
-                ));
-                ui.add(egui::Label::new(
-                    egui::RichText::new(format!("{:.0} fps   {}×{}", frame.fps, fb_w, fb_h))
-                        .size(13.0)
-                        .color(egui::Color32::from_gray(190)),
+                    egui::RichText::new(build_label)
+                        .monospace()
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(140)),
                 ));
             });
 
@@ -1525,11 +1551,77 @@ impl RotatePolytopesApp {
         // Framework-provided frame-timing surface: `trace [summary|last|clear|cap N]`.
         // The runner is already recording per-section scopes on every redraw; this
         // command lets the user read them. Surfaces the slowest hot-path sections,
-        // which is the data we need to drive M4.5 v2 perf decisions (pipeline
-        // warming, wireframe caching).
+        // which is the data the pipeline-warming + wireframe-cache decisions read
+        // from.
         rye_app::trace::register_command(&mut c);
         rye_app::fps::register_command(&mut c);
         rye_app::vsync::register_command(&mut c);
+        rye_app::version::register_command(
+            &mut c,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            env!("BUILD_HASH"),
+            env!("BUILD_DIRTY"),
+        );
+
+        // Demo-side camera mode toggle. Bare `camera` cycles between Orbit
+        // (the default scroll-zoom/drag camera) and FreeRoam (WASD + mouse-
+        // look). Explicit `camera orbit` resets the orbit controller to its
+        // default distance + pitch so the camera returns to a known framing
+        // around the world origin; `camera freecam` seeds the free-roam
+        // position from the camera's current location.
+        c.register(
+            rye_egui::cmd::<Demo, _>(
+                "camera",
+                "camera mode: orbit (default) or freecam (WASD + mouse-look). Bare cycles.",
+                |args, demo, out| {
+                    let next = match args.first().copied() {
+                        None => match demo.camera_mode {
+                            CameraMode::Orbit => CameraMode::FreeRoam,
+                            CameraMode::FreeRoam => CameraMode::Orbit,
+                        },
+                        Some("orbit") => CameraMode::Orbit,
+                        Some("freecam") => CameraMode::FreeRoam,
+                        Some(other) => {
+                            out.line(format!(
+                                "camera: unknown mode `{other}` (try orbit|freecam)"
+                            ));
+                            return Ok(());
+                        }
+                    };
+                    demo.camera_mode = next;
+                    match next {
+                        CameraMode::Orbit => {
+                            // Reset orbit so the camera returns to a known
+                            // framing around (0, 0, 0) regardless of where
+                            // freecam left it.
+                            demo.orbit = OrbitController::default();
+                            demo.orbit.set_orbit(9.5, -0.25);
+                            out.line("camera: orbit (reset to world origin)");
+                        }
+                        CameraMode::FreeRoam => {
+                            // Seed freecam from the camera's current pose so
+                            // the toggle feels continuous instead of
+                            // teleporting.
+                            demo.free_roam_pos = demo.camera.position;
+                            out.line(
+                                "camera: freecam (WASD + Space/Shift; drag to look)",
+                            );
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .with_args(&[&["orbit", "freecam"]]),
+        );
+
+        // The `floor` toggle the user asked for is deferred. The SDF ground
+        // (a y=0 HalfSpace4D in the scene composition) is baked into the
+        // shader module at App::setup time via `Scene4::to_hyperslice_wgsl`,
+        // so toggling visibility at runtime requires either recompiling the
+        // shader (cheap, ~100-300ms wasm) or adding a kernel-uniform flag to
+        // rye-scene (cheaper per-toggle but engine-level work). Tracked as
+        // follow-up; not part of this polish pass.
 
         c
     }
