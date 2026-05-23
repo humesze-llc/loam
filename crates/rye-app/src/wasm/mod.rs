@@ -12,9 +12,15 @@
 //! `rye_app::wasm::*` import path stays flat for the common cases.
 
 pub mod launch;
+pub mod main_launcher;
 pub mod messages;
 pub mod worker;
 pub mod worker_ui;
+
+// Re-export the demo-facing entry so callers can write
+// `rye_app::wasm::launch_on_click(...)` without descending into the
+// submodule. The submodule path is still available for explicit access.
+pub use main_launcher::launch_on_click;
 
 // Re-export the click-to-start surface at the wasm module level so existing
 // `rye_app::wasm::is_manual_mode(...)` and `rye_app::wasm::wait_for_launch(...)`

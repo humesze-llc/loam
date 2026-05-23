@@ -538,7 +538,7 @@ fn main() -> Result<()> {
         const BUTTON_ID: &str = "rye-launch";
         const CANVAS_ID: &str = "rye-canvas";
         if rye_app::wasm::is_manual_mode(HOST_ID) {
-            return rye_app::wasm::worker::launch_on_click(HOST_ID, BUTTON_ID, CANVAS_ID);
+            return rye_app::wasm::launch_on_click(HOST_ID, BUTTON_ID, CANVAS_ID);
         }
         // No `data-mode="manual"` on the host element: fall through to
         // the legacy main-thread auto-launch path. Useful for native or
