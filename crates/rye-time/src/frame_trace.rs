@@ -462,7 +462,7 @@ pub fn all_max_ever() -> Vec<(&'static str, Duration)> {
     MAX_EVER.with(|m| {
         let mut out: Vec<(&'static str, Duration)> =
             m.borrow().iter().map(|(k, v)| (*k, *v)).collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         out
     })
 }
@@ -576,7 +576,7 @@ pub fn aggregate() -> Vec<SectionStats> {
         })
         .collect();
 
-    stats.sort_by(|a, b| b.p95.cmp(&a.p95));
+    stats.sort_by_key(|s| std::cmp::Reverse(s.p95));
     stats
 }
 
