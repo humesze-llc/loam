@@ -84,6 +84,7 @@ pub mod frame_pacing;
 pub mod keymap;
 pub mod log;
 pub mod trace;
+pub mod vsync;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
@@ -1106,21 +1107,51 @@ impl<A: App> Runner<A> {
         if self.minimized {
             return;
         }
+        // Pending vsync transitions from the `vsync` console command. Applied
+        // here so the next `begin_frame` picks up the new present mode. The
+        // off-side picks the best non-Fifo mode the adapter advertised:
+        // `Mailbox` first (triple-buffered, no tearing), `Immediate` as
+        // fallback (single-buffered, tearing allowed). If neither is offered
+        // (typical browser surface), the request silently no-ops — surface
+        // configuration is the wrong layer to surface an error in that case.
+        if let (Some(want_on), Some(rd)) =
+            (frame_pacing::take_pending_vsync(), self.rd.as_mut())
+        {
+            let target = if want_on {
+                wgpu::PresentMode::Fifo
+            } else {
+                let modes = rd.supported_present_modes();
+                if modes.contains(&wgpu::PresentMode::Mailbox) {
+                    wgpu::PresentMode::Mailbox
+                } else if modes.contains(&wgpu::PresentMode::Immediate) {
+                    wgpu::PresentMode::Immediate
+                } else {
+                    rd.present_mode()
+                }
+            };
+            let _ = rd.set_present_mode(target);
+        }
         let Some(rd) = self.rd.as_ref() else { return };
 
         // Frame-rate cap. The `fps` console command pokes
         // [`frame_pacing::set_target_fps`]; we read it here. Cap is enforced
-        // differently per target — native sleeps the remainder of the period;
-        // wasm skips the RAF callback and re-requests, since we can't block in
-        // the browser. With `target_fps = 0` the load returns `None` and we
-        // fall through to the surface's native cadence (vsync on native, RAF
-        // on wasm).
+        // differently per target — native does a precise sleep up to the
+        // deadline; wasm skips the RAF callback and re-requests, since we
+        // can't block in the browser. With `target_fps = 0` the load returns
+        // `None` and we fall through to the surface's native cadence (vsync
+        // on native, RAF on wasm).
+        //
+        // We anchor the deadline on the previous frame's ideal start (not on
+        // the actual wake-up) so the cadence stays locked to the period even
+        // if individual frames overshoot. If we ran long (work + present took
+        // longer than the period), we set `last_redraw_at = now` to "catch
+        // up" instead of falling further behind on every subsequent frame.
+        let mut frame_anchor = Instant::now();
         if let (Some(period), Some(last)) =
             (frame_pacing::target_period(), self.last_redraw_at)
         {
-            let now = Instant::now();
-            let elapsed = now.saturating_duration_since(last);
-            if elapsed < period {
+            let deadline = last + period;
+            if frame_anchor < deadline {
                 #[cfg(target_arch = "wasm32")]
                 {
                     win.request_redraw();
@@ -1128,11 +1159,12 @@ impl<A: App> Runner<A> {
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    std::thread::sleep(period - elapsed);
+                    frame_pacing::precise_sleep_until(deadline);
+                    frame_anchor = deadline;
                 }
             }
         }
-        self.last_redraw_at = Some(Instant::now());
+        self.last_redraw_at = Some(frame_anchor);
 
         // Mark frame start for `idle` measurement. `end_frame` subtracts this from
         // the previous `end_frame` timestamp to get `idle` (browser/RAF gap, not

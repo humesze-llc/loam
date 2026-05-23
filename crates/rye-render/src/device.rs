@@ -74,6 +74,12 @@ pub struct RenderDevice {
     /// resize can recreate the scene target with the same format. `None` when
     /// scene_target is `None`.
     scene_format: Option<TextureFormat>,
+    /// Present modes the adapter advertised for this surface. Cached at
+    /// construction so the runtime `vsync` command can validate without
+    /// re-querying `get_surface_capabilities` (which would force a roundtrip on
+    /// every console command). Wasm browsers typically advertise only
+    /// `PresentMode::Fifo`; native usually has all four.
+    present_modes: Vec<PresentMode>,
 }
 
 impl RenderDevice {
@@ -247,6 +253,9 @@ impl RenderDevice {
 
         let gpu_timer = crate::gpu_timer::GpuTimer::new(&device, &queue);
 
+        let present_modes = caps.present_modes.clone();
+        tracing::info!("surface present modes advertised: {present_modes:?}");
+
         Ok(Self {
             instance,
             adapter,
@@ -263,6 +272,7 @@ impl RenderDevice {
             scene_target,
             composite,
             scene_format,
+            present_modes,
         })
     }
 
@@ -318,6 +328,49 @@ impl RenderDevice {
     /// requested count for the chosen surface format.
     pub fn sample_count(&self) -> u32 {
         self.sample_count
+    }
+
+    /// Currently configured present mode. `PresentMode::Fifo` (vsync) is the
+    /// default the surface is constructed with.
+    pub fn present_mode(&self) -> PresentMode {
+        self.surface_bundle.config.present_mode
+    }
+
+    /// Present modes the adapter advertised for this surface. Use to validate
+    /// before calling [`Self::set_present_mode`]; modes outside this list
+    /// trigger a wgpu validation error at `surface.configure`.
+    pub fn supported_present_modes(&self) -> &[PresentMode] {
+        &self.present_modes
+    }
+
+    /// Switch the surface to a new present mode at runtime. Returns `Ok(())` if
+    /// the mode was applied, `Err(mode)` if the adapter does not advertise it
+    /// (no surface change occurs). Reconfigures the surface in place; the next
+    /// `begin_frame` will use the new mode.
+    ///
+    /// Common modes:
+    /// - `Fifo`: vsync; blocks at `present` until the next display refresh.
+    ///   Lowest power, no tearing, max framerate = display refresh rate. The
+    ///   default and the only mode advertised by browser WebGPU surfaces.
+    /// - `Mailbox`: triple-buffered; latest frame replaces the queued one. No
+    ///   tearing AND no `present` block, so framerate is uncapped by vsync.
+    ///   Preferred for "vsync off" when supported.
+    /// - `Immediate`: single-buffered; `present` returns immediately, tearing
+    ///   visible. Use only if `Mailbox` isn't available.
+    /// - `FifoRelaxed`: adaptive vsync; tears under the rate, vsyncs above.
+    pub fn set_present_mode(&mut self, mode: PresentMode) -> std::result::Result<(), PresentMode> {
+        if !self.present_modes.contains(&mode) {
+            return Err(mode);
+        }
+        if self.surface_bundle.config.present_mode == mode {
+            return Ok(());
+        }
+        self.surface_bundle.config.present_mode = mode;
+        self.surface_bundle
+            .surface
+            .configure(&self.device, &self.surface_bundle.config);
+        tracing::info!("surface present_mode -> {mode:?}");
+        Ok(())
     }
 
     /// View into the multisampled color attachment, when MSAA is enabled. `None` when

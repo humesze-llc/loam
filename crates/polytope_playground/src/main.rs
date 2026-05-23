@@ -1529,6 +1529,7 @@ impl RotatePolytopesApp {
         // warming, wireframe caching).
         rye_app::trace::register_command(&mut c);
         rye_app::fps::register_command(&mut c);
+        rye_app::vsync::register_command(&mut c);
 
         c
     }

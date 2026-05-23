@@ -261,6 +261,7 @@ impl App for TesseractApp {
         let mut console = Console::<()>::new();
         rye_app::trace::register_command(&mut console);
         rye_app::fps::register_command(&mut console);
+        rye_app::vsync::register_command(&mut console);
         rye_app::log::register_command(&mut console);
         let perf = rye_app::trace::PerfOverlay::new();
 
