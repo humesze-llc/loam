@@ -30,9 +30,13 @@
          minimum-friction Phase A solution; revisit if multi-demo demos
          start to share a real initializer anyway. -->
     <script>
+      // Generic match: trunk emits one `<script type="module">` with an
+      // `import init from '/...js'` line. Pick the first `.js` URL in
+      // any module-script textContent and expose it for the worker to
+      // reuse. Works for any demo without hardcoding the demo name.
       (function () {
         for (const s of document.querySelectorAll('script[type="module"]')) {
-          const m = s.textContent.match(/from\s*['"]([^'"]*tesseract_demo[-_][^'"]*\.js)['"]/);
+          const m = s.textContent.match(/from\s*['"]([^'"]+\.js)['"]/);
           if (m) {
             window.__rye_wasm_url = new URL(m[1], document.baseURI).href;
             return;

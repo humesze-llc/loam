@@ -355,6 +355,37 @@ pub struct RunConfig {
     /// requested count isn't supported on the chosen surface format, [`RenderDevice`]
     /// falls back to the highest supported lower count and logs a warning.
     pub msaa_samples: u32,
+    /// Wasm-specific knobs (DOM IDs the page exposes). Ignored on native. The
+    /// defaults match the standard layout rye demos use (`rye-canvas-host`
+    /// container, `rye-launch` button, `rye-canvas` canvas); demos that ship
+    /// a different HTML layout override here.
+    pub wasm: WasmConfig,
+}
+
+/// Wasm-only configuration knobs: the DOM element IDs the page uses to host
+/// the demo. Defaults match the standard layout in the engine's example
+/// `index.html` templates. Demos that need custom IDs override the fields
+/// they care about and `..WasmConfig::default()` the rest.
+#[derive(Clone)]
+pub struct WasmConfig {
+    /// Container element with `data-mode="manual"`. Determines whether the
+    /// demo enters click-to-start mode (vs auto-launch on page load).
+    pub host_id: String,
+    /// Launch button. Click handler transfers the canvas to a worker.
+    pub button_id: String,
+    /// Canvas the worker renders into. The element is
+    /// `transferControlToOffscreen()`-ed to the worker on click.
+    pub canvas_id: String,
+}
+
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            host_id: "rye-canvas-host".into(),
+            button_id: "rye-launch".into(),
+            canvas_id: "rye-canvas".into(),
+        }
+    }
 }
 
 impl Default for RunConfig {
@@ -369,6 +400,7 @@ impl Default for RunConfig {
             esc_exits: true,
             render_error_budget: 8,
             msaa_samples: 1,
+            wasm: WasmConfig::default(),
         }
     }
 }
@@ -377,9 +409,47 @@ impl Default for RunConfig {
 // Public entry points
 // ---------------------------------------------------------------------------
 
-/// Run an app with default config.
-pub fn run<A: App>() -> anyhow::Result<()> {
-    run_with_config::<A>(RunConfig::default())
+/// Run a demo. The unified entry point that handles native + wasm
+/// (both main-thread fallback and worker mode) in one call.
+///
+/// On native, this is equivalent to [`run_with_config`]: the function
+/// blocks until the event loop exits and returns the deferred error
+/// (or `Ok(())`).
+///
+/// On wasm32:
+/// - When invoked inside a `DedicatedWorkerGlobalScope` (worker
+///   context), routes to [`wasm::worker::run`]. Drives the App's
+///   lifecycle on a worker-side RAF loop with the [`wasm::worker_ui::WorkerUi`]
+///   egui integration.
+/// - When invoked on main thread AND the page's `host_id` element has
+///   `data-mode="manual"`, routes to [`wasm::launch_on_click`]. Wires
+///   the launch button to spawn the worker on click.
+/// - When invoked on main thread WITHOUT manual mode, falls back to
+///   [`run_with_config`] (the legacy windowed-mode wasm path).
+///
+/// The single function call replaces ~8 lines of dispatch boilerplate
+/// in each demo's `main()`. Demos that need finer control over the
+/// dispatch (e.g. inspecting `wasm::is_worker_context()` for setup-time
+/// side effects) can still call the lower-level entry points directly.
+pub fn run<A: App + 'static>(config: RunConfig) -> anyhow::Result<()>
+where
+    A::Space: 'static,
+{
+    #[cfg(target_arch = "wasm32")]
+    {
+        if wasm::is_worker_context() {
+            return wasm::worker::run::<A>();
+        }
+        if wasm::launch::is_manual_mode(&config.wasm.host_id) {
+            return wasm::launch_on_click(
+                &config.wasm.host_id,
+                &config.wasm.button_id,
+                &config.wasm.canvas_id,
+            );
+        }
+        // Fall through to main-thread auto-launch (legacy wasm path).
+    }
+    run_with_config::<A>(config)
 }
 
 /// Run an app with custom config.

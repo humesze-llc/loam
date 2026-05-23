@@ -22,8 +22,8 @@
 use anyhow::Result;
 use glam::{Mat4, Vec2, Vec3};
 use rye_app::{
-    egui, run_with_config, App, Camera, CameraController, FirstPersonController, FrameCtx,
-    OrbitController, RenderCtx, RunConfig, SetupCtx,
+    egui, App, Camera, CameraController, FirstPersonController, FrameCtx, OrbitController,
+    RenderCtx, RunConfig, SetupCtx,
 };
 
 // Per-frame allocation telemetry. Wraps the system allocator with a counter
@@ -516,43 +516,16 @@ impl App for TesseractApp {
 }
 
 fn main() -> Result<()> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        // Worker side: the wasm binary was instantiated by the Blob-URL
-        // bootstrap inside a fresh Worker. Run the App lifecycle via
-        // `worker::run::<TesseractApp>()` — this constructs a
-        // `WorkerRunner<TesseractApp>` after the canvas-transfer message
-        // arrives, then drives App::setup + per-frame update/record on
-        // its own RAF loop. Tracing + panic hook are installed inside
-        // `worker::run` itself (worker has its own JS heap).
-        if rye_app::wasm::is_worker_context() {
-            return rye_app::wasm::worker::run::<TesseractApp>();
-        }
-
-        // Main thread: wire the launch button to spawn the worker on
-        // click. The button + canvas + host element come from the demo's
-        // index.html. The actual App lifecycle (Phase B onward) will run
-        // inside the worker; for Phase A the worker only renders a
-        // cycling clear-color.
-        const HOST_ID: &str = "rye-canvas-host";
-        const BUTTON_ID: &str = "rye-launch";
-        const CANVAS_ID: &str = "rye-canvas";
-        if rye_app::wasm::is_manual_mode(HOST_ID) {
-            return rye_app::wasm::launch_on_click(HOST_ID, BUTTON_ID, CANVAS_ID);
-        }
-        // No `data-mode="manual"` on the host element: fall through to
-        // the legacy main-thread auto-launch path. Useful for native or
-        // for wasm demos that haven't migrated to worker mode yet.
-    }
-    launch_app()
-}
-
-fn launch_app() -> Result<()> {
-    let config = RunConfig {
+    // `rye_app::run` handles native + wasm dispatch (worker context vs
+    // main-thread launch-on-click vs main-thread auto-launch fallback)
+    // based on the page's `data-mode` attribute and the WasmConfig IDs.
+    // The default `WasmConfig` matches our standard `index.html` layout
+    // (canvas / button / host element IDs); override if you ship a
+    // different page structure.
+    rye_app::run::<TesseractApp>(RunConfig {
         window: WindowAttributes::default()
             .with_title("tesseract demo")
             .with_visible(false),
         ..RunConfig::default()
-    };
-    run_with_config::<TesseractApp>(config)
+    })
 }
