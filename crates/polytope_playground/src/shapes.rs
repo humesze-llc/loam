@@ -12,7 +12,8 @@ use rye_egui::{
     },
     media::add_button,
 };
-use rye_render::raymarch::{SHAPE_120CELL, SHAPE_600CELL};
+use rye_physics::polytope::Polytope4;
+use rye_render::raymarch::RaymarchShape;
 
 use crate::catalog::{render_shape_catalog_menu, ShapeEntry};
 use crate::consts::{CARD_ITEM_SPACING_X, CONTROL_H, CONTROL_W, MAX_ROW_LEN, SHAPE_CARD_WIDTH};
@@ -25,14 +26,21 @@ impl Demo {
     /// Apply/Clear in `Composer`).
     pub(crate) fn render_shapes_section(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        let has_heavy = self
-            .row
-            .iter()
-            .any(|e| e.shape == SHAPE_120CELL || e.shape == SHAPE_600CELL);
-        if has_heavy {
+        // Only the SDF raymarch path is heavy on the 120/600-cell (~24 KB of const face-
+        // normal data + per-pixel Wolfe-greedy projection); the rasterized path keeps both
+        // polychora at vsync regardless of how many are in the row, and Off doesn't render
+        // their surface at all, so the warning only fires when `surface sdf` is active.
+        let has_heavy_sdf = self.surface_mode.uses_sdf_for_polychora()
+            && self.row.iter().any(|e| {
+                matches!(
+                    e.shape,
+                    RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
+                )
+            });
+        if has_heavy_sdf {
             ui.colored_label(
                 egui::Color32::from_rgb(242, 130, 70),
-                "120/600-cell SDFs are heavy; expect <60 fps.",
+                "120/600-cell SDFs are heavy; expect <60 fps. Try `surface raster`.",
             );
         }
         let mut row_changed = false;
@@ -50,7 +58,7 @@ impl Demo {
             last_row_rect.and_then(|rect| drop_target_idx(ui.ctx(), dragging_shape, rect, row_len));
         let row_rect = egui::ScrollArea::horizontal()
             .auto_shrink([false, true])
-            .id_salt("rotate-polytopes-shapes-scroll")
+            .id_salt("polytope-playground-shapes-scroll")
             .show(ui, |ui| {
                 let row_response =
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {

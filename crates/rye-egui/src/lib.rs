@@ -65,6 +65,7 @@
 mod bivector_matrix;
 pub mod console;
 pub mod dnd;
+mod floating;
 mod integration;
 mod linear_indicator;
 pub mod media;
@@ -73,7 +74,14 @@ mod slider_edit;
 mod world;
 
 pub use bivector_matrix::{bivector_matrix, cell_text as bivector_matrix_cell_text};
-pub use console::{cmd, Command, Console, ConsoleWriter, HistoryLine, LineKind};
+pub use console::{
+    cmd, console_echo_enabled, set_console_echo, subcommands, Command, Console, ConsoleWriter,
+    HistoryLine, LineKind, SubcommandSet,
+};
+pub use floating::{
+    callout, floating_panel, floating_panel_builder, sticky_menu, CalloutState,
+    FloatingPanelBuilder,
+};
 pub use integration::UiIntegration;
 pub use linear_indicator::LinearIndicator;
 pub use overlay::BottomOverlay;

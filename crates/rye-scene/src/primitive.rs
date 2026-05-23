@@ -1,7 +1,7 @@
 //! WGSL emission for [`rye_shape::Shape`].
 //!
 //! The shape data model lives in `rye-shape`, that's where `Sphere`, `HalfSpace`, `Box3`, and
-//! the polytope variants are defined so that `rye-physics` and `rye-sdf` share one canonical
+//! the polytope variants are defined so that `rye-physics` and `rye-scene` share one canonical
 //! type. This module is the rendering half: it implements the [`Primitive`] extension trait on
 //! [`Shape`], dispatching per-variant to the WGSL formula appropriate to each.
 //!

@@ -1,3 +1,9 @@
 [toolchain]
-channel = "stable"
+# Pinned to match CI (`.github/workflows/ci.yml` uses
+# `dtolnay/rust-toolchain@stable`, which honors this file). Bump in lockstep
+# with CI by editing `channel` and running `rustup update <new-version>`
+# locally. Pinning prevents the drift that produced an audit-passes-locally-
+# but-fails-on-CI loop in May 2026 (local clippy 1.88 didn't surface lints
+# that CI's 1.95 enforced under `-D warnings`).
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]

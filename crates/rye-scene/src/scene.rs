@@ -13,7 +13,7 @@
 //!
 //! ```rust
 //! use glam::Vec3;
-//! use rye_sdf::scene::{Scene, SceneNode};
+//! use rye_scene::scene::{Scene, SceneNode};
 //! use rye_math::EuclideanR3;
 //!
 //! let scene = Scene::new(
@@ -131,7 +131,7 @@ impl Scene {
         let result_var = emit_node(&self.root, space, &mut counter, &mut helpers, &mut body);
 
         format!(
-            "// ---- rye-sdf scene (typed) ----\n\
+            "// ---- rye-scene scene (typed) ----\n\
              {helpers}\
              fn rye_scene_sdf(p: vec3<f32>) -> f32 {{\n\
              {body}\

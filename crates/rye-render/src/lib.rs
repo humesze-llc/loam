@@ -12,10 +12,67 @@
 //! The crate stays deliberately small: it hands wgpu primitives to callers rather than
 //! abstracting them behind a higher-level engine API.
 
+pub mod composite;
+pub mod depth;
 pub mod device;
+pub mod gpu_timer;
 pub mod graph;
 pub mod lattice;
+pub mod line_raster;
+pub mod line_raster_static_r4;
+pub mod point_raster;
 pub mod raymarch;
+pub mod triangle_raster;
 
+pub use depth::DepthBuffer;
 pub use lattice::Viewport;
+pub use line_raster::{LineRasterNode, LineRasterUniforms};
+pub use line_raster_static_r4::{LineRasterStaticR4Node, LineRasterStaticR4Uniforms};
+pub use point_raster::{PointRasterNode, PointRasterUniforms};
 pub use raymarch::{GeodesicRayMarchNode, RayMarchNode, RayMarchUniforms};
+pub use triangle_raster::{
+    FragmentShading, TriangleRasterNode, TriangleRasterUniforms, TriangleVertex,
+};
+
+/// How a rasterizer pipeline interacts with depth. Three states only -- avoids the
+/// invalid-combination problem an `Option<TextureFormat> + bool depth_write` API would
+/// have. Shared by [`LineRasterNode`] and [`TriangleRasterNode`].
+///
+/// - [`DepthMode::Off`]: no depth attachment; passes draw on top in submission order.
+///   Useful for HUD-style overlays where occlusion doesn't matter.
+/// - [`DepthMode::ReadWrite`]: standard scene-geometry mode. Per-fragment `depth_compare:
+///   Less` + depth-write enabled; this is how lines and filled triangles behave in
+///   normal 3D rendering.
+/// - [`DepthMode::ReadOnly`]: depth-test against the existing buffer but don't write to
+///   it. Used for alpha-blended overlays that should be occluded by scene geometry
+///   in front of them without burying subsequent draws behind them in depth.
+#[derive(Copy, Clone, Debug)]
+pub enum DepthMode {
+    Off,
+    ReadWrite { format: wgpu::TextureFormat },
+    ReadOnly { format: wgpu::TextureFormat },
+}
+
+impl DepthMode {
+    /// Format of the depth attachment, if any. Used by the pipeline-builder helpers to
+    /// configure the [`wgpu::DepthStencilState`] uniformly.
+    pub fn format(&self) -> Option<wgpu::TextureFormat> {
+        match self {
+            DepthMode::Off => None,
+            DepthMode::ReadWrite { format } | DepthMode::ReadOnly { format } => Some(*format),
+        }
+    }
+
+    /// `true` for any depth-aware mode (read-only or read-write). The pipeline needs a
+    /// depth attachment when this is `true`; execute() validates this against the
+    /// caller's `Option<&TextureView>`.
+    pub fn is_active(&self) -> bool {
+        !matches!(self, DepthMode::Off)
+    }
+
+    /// Whether the pipeline should write depth. `false` for `Off` and `ReadOnly`;
+    /// `true` for `ReadWrite`.
+    pub fn writes(&self) -> bool {
+        matches!(self, DepthMode::ReadWrite { .. })
+    }
+}

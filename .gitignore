@@ -29,8 +29,14 @@ desktop.ini
 # Personal devlog — backed up separately (Obsidian)
 docs/devlog/
 
+# Personal audit / dev scripts (not shipped; rerun locally)
+scripts/
+
 # Demo capture artifacts (rye-app capture module + legacy --capture-{apng,gif} flags)
 /captures/
 *.apng
 *.gif
 /out.*
+
+# Trunk wasm build output (per-demo bundles emit into ./dist; rebuild any time)
+/dist/

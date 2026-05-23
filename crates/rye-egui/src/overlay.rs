@@ -336,14 +336,14 @@ mod tests {
     fn animate_value_progresses_across_frames() {
         let ctx = egui::Context::default();
         let mut last = 0.0;
-        // Phase 1: target = 80, 30 frames. Should converge to 80.
+        // Stage 1: target = 80, 30 frames. Should converge to 80.
         for _ in 0..30 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 last = ctx.animate_value_with_time(egui::Id::new("v"), 80.0, 0.18);
             });
         }
         let phase1 = last;
-        // Phase 2: target = 220, 30 frames. Should converge to ~220.
+        // Stage 2: target = 220, 30 frames. Should converge to ~220.
         for _ in 0..30 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 last = ctx.animate_value_with_time(egui::Id::new("v"), 220.0, 0.18);
@@ -370,7 +370,7 @@ mod tests {
     fn expand_toggle_makes_body_visible() {
         let ctx = egui::Context::default();
 
-        // Phase 1: 30 frames in collapsed state.
+        // Stage 1: 30 frames in collapsed state.
         let mut collapsed_overlay = egui::Rect::NOTHING;
         let mut collapsed_body_rendered = false;
         for _ in 0..30 {
@@ -392,7 +392,7 @@ mod tests {
             });
         }
 
-        // Phase 2: 30 frames in expanded state.
+        // Stage 2: 30 frames in expanded state.
         let mut expanded_overlay = egui::Rect::NOTHING;
         let mut expanded_body_rect = egui::Rect::NOTHING;
         let mut expanded_body_rendered = false;
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn footer_stays_visible_on_first_growth_frame() {
         let ctx = egui::Context::default();
-        // Phase 1: settle in collapsed state (footer only).
+        // Stage 1: settle in collapsed state (footer only).
         for _ in 0..30 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 BottomOverlay::new("growth-test")
@@ -530,7 +530,7 @@ mod tests {
                     });
             });
         }
-        // Phase 2: ONE frame with sudden growth; body added on top.
+        // Stage 2: ONE frame with sudden growth; body added on top.
         let mut footer_rect = egui::Rect::NOTHING;
         let mut overlay_rect = egui::Rect::NOTHING;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -555,7 +555,7 @@ mod tests {
         );
     }
 
-    /// Mimics rotate_polytopes's pattern: an outer `BottomOverlay` containing a body section
+    /// Mimics polytope_playground's pattern: an outer `BottomOverlay` containing a body section
     /// (with its own inner horizontal `ScrollArea`), then sliders, then a footer. Verifies
     /// that when the overlay is at a `target_h` smaller than the natural content height, the
     /// FOOTER widgets (rendered last) stay inside the overlay rect; which is what the

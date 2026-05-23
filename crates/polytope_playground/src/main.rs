@@ -54,18 +54,52 @@
 //!   `octahedron`, `cuboctahedron`, `dodecahedron`, `icosahedron`).
 
 use anyhow::{anyhow, Result};
-use glam::{Vec3, Vec4};
-use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use glam::{Mat4, Vec2, Vec3, Vec4};
+use rye_app::{egui, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
 use rye_egui::Console;
+use rye_math::WPlane;
 use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
+use rye_physics::polytope::{
+    polytope_section_faces_append, polytope_section_overlay_with_vertices, vertex_color_by_position,
+};
 use rye_render::{
     device::RenderDevice,
     raymarch::{
         polytope_extended_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL,
     },
-    Viewport,
+    DepthBuffer, DepthMode, LineRasterNode, PointRasterNode, TriangleRasterNode, Viewport,
 };
-use rye_sdf::{Scene4, SceneNode4};
+
+/// Depth-attachment format for the rasterized section-faces pass. 32-bit float gives
+/// enough precision to depth-sort cell caps from the 600-cell (which can have ~24
+/// active caps within tenths of a unit of camera-z) without artifacting.
+const SECTION_FACES_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Uniform R³ scale factor that `projection` applies to a 4D point with `w = w_slice`.
+/// For `Projection::Identity` (drop-w) the result is `1.0`; for `Projection::Perspective4D`
+/// it's `focal_distance / (focal_distance - w_slice)`, clamped against the same epsilon
+/// the impl uses internally. Used by the wireframe overlay to translate section caps (whose
+/// vertices all share `w = w_slice`) into the perspective-scaled R³ frame without re-running
+/// the cap algorithm in 4D.
+fn perspective_scale_at_w(w_slice: f32, projection: &rye_math::Projection<4>) -> f32 {
+    match *projection {
+        rye_math::Projection::Identity | rye_math::Projection::Orthographic { .. } => 1.0,
+        rye_math::Projection::Perspective4D { focal_distance } => {
+            focal_distance / (focal_distance - w_slice).max(1e-4)
+        }
+    }
+}
+
+/// Map a body-local R³ point to world R³: scale by `section_scale` (the perspective scale at
+/// the cap's w-coordinate) then translate by the body's R³ position. Cap rendering uses this
+/// because the cross-section algorithm internally drops w and emits body-local R³; the world
+/// transform happens here.
+fn local_r3_to_world(p: [f32; 3], section_scale: f32, body_pos_r3: Vec3) -> [f32; 3] {
+    let scaled = Vec3::from_array(p) * section_scale;
+    (scaled + body_pos_r3).to_array()
+}
+use rye_scene::{Scene4, SceneNode4};
+use rye_shape::LineMesh;
 use winit::window::WindowAttributes;
 
 mod active;
@@ -80,7 +114,10 @@ mod ui;
 use active::combo_name;
 use catalog::{parse_row_from_args, SHAPE_CATALOG};
 use consts::{BODY_SIZE, BODY_Y, T_SCRUB_RATE, T_SLIDER_INITIAL, W_RANGE, W_SCRUB_RATE};
-use state::{body_position, Demo, RotationMode, ViewMode};
+use state::{
+    body_position, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode,
+    WireframeProjection,
+};
 
 #[cfg(test)]
 use catalog::{parse_shape_name, ShapeEntry, DEFAULT_ROW};
@@ -113,31 +150,96 @@ impl Demo {
             .rd
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("rotate_polytopes shader"),
+                label: Some("polytope_playground shader"),
                 source: wgpu::ShaderSource::Wgsl(shader_source.into()),
             });
         let mut node = Hyperslice4DNode::new(
             &ctx.rd.device,
-            ctx.rd.surface_bundle.config.format,
+            ctx.rd.target_format(),
             &module,
             ctx.rd.sample_count(),
         );
 
+        // Initial body uniforms for the SDF kernel. With the surface default flipped to
+        // raster, polychoral entries are emitted as `BodyUniform::default()` (kind =
+        // Invalid) so the kernel skips them; the section-faces rasterizer draws them
+        // instead. Mirrors `Demo::sdf_body_for_slot` for the initial upload; subsequent
+        // re-uploads go through that helper directly.
         let n = row.len();
         let bodies: Vec<BodyUniform> = row
             .iter()
             .enumerate()
             .map(|(slot, entry)| {
-                BodyUniform::polytope_with_rotor(
-                    body_position(slot, n),
-                    entry.shape,
-                    BODY_SIZE,
-                    Rotor4::IDENTITY,
-                    entry.body_color,
-                )
+                if entry.shape.polytope4().is_some() {
+                    BodyUniform::default()
+                } else {
+                    BodyUniform::polytope_with_rotor(
+                        body_position(slot, n),
+                        entry.shape.shape_id(),
+                        BODY_SIZE,
+                        Rotor4::IDENTITY,
+                        entry.body_color,
+                    )
+                }
             })
             .collect();
         node.set_bodies(&bodies);
+
+        // Section perimeter (cyan outlines): depth-test ReadOnly against the shared
+        // section-faces depth attachment. With multiple polychora in a row, polytope A's
+        // perimeter must be occluded by polytope B's filled caps when A sits behind B.
+        // `LineRasterNode` uses `CompareFunction::LessEqual`, so a perimeter line sitting
+        // at exactly its own cap's depth still passes the test and draws on top, keeping
+        // the intended "outline of this cap" visual.
+        let section_edges = LineRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.target_format(),
+            DepthMode::ReadOnly {
+                format: SECTION_FACES_DEPTH_FORMAT,
+            },
+            ctx.rd.sample_count(),
+        );
+        // Parent wireframe: depth-test ReadOnly against the shared section-faces depth
+        // attachment. Lines whose projected R³ position sits behind a section cap get
+        // occluded by it; lines in front draw over. No depth-write so the wireframe
+        // doesn't muddy the depth buffer for any downstream pass. In SDF mode the
+        // depth buffer is cleared per frame but no pass writes to it, so the test
+        // trivially passes everywhere -- the SDF visual stays unchanged.
+        let parent_wireframe = LineRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.target_format(),
+            DepthMode::ReadOnly {
+                format: SECTION_FACES_DEPTH_FORMAT,
+            },
+            ctx.rd.sample_count(),
+        );
+
+        // Point-disc rasterizer for the optional vertex + cell-center sprites overlay.
+        // Same depth-attachment setup as the other rasterizer nodes so points respect the
+        // shared section-faces depth buffer (sprites that sit behind a cap get occluded).
+        let points_node = PointRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.target_format(),
+            DepthMode::ReadOnly {
+                format: SECTION_FACES_DEPTH_FORMAT,
+            },
+            ctx.rd.sample_count(),
+        );
+
+        // Rasterized cross-section faces: filled cell-caps with face-normal Lambert
+        // shading. Uses a depth attachment so caps from different cells of the same
+        // polychoron occlude each other correctly when projected to camera space. The
+        // depth buffer is sized + cleared per-frame inside the render path (only when
+        // surface mode is `Raster`); see `Demo::render_section_faces` in this file.
+        let section_faces = TriangleRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.target_format(),
+            DepthMode::ReadWrite {
+                format: SECTION_FACES_DEPTH_FORMAT,
+            },
+            rye_render::FragmentShading::FaceNormalLambert,
+            ctx.rd.sample_count(),
+        );
 
         let mut camera = Camera::<EuclideanR3>::at_origin();
         camera.position = Vec3::new(0.0, 3.0, 9.0);
@@ -158,6 +260,24 @@ impl Demo {
             camera,
             orbit,
             node,
+            section_edges,
+            parent_wireframe,
+            wireframe_enabled: false,
+            wireframe_nearest_active: true,
+            wireframe_perimeter: true,
+            wireframe_color_mode: WireframeColorMode::default(),
+            wireframe_projection: WireframeProjection::default(),
+            section_faces,
+            points_node,
+            points_enabled: false,
+            points_show_vertices: true,
+            points_show_cell_centers: true,
+            points_size_px: 4.0,
+            points_mesh_scratch: rye_shape::PointMesh::<3>::default(),
+            section_faces_depth: None,
+            section_world_vertices_scratch: Vec::new(),
+            section_faces_mesh_scratch: rye_shape::TriangleMesh::<3>::default(),
+            surface_mode: SurfaceMode::default(),
             row,
             w_slice: initial_w,
             slider_up_held: false,
@@ -177,6 +297,11 @@ impl Demo {
             t_slider_max: T_SLIDER_INITIAL,
             expanded: false,
             show_help: false,
+            show_render_panel: false,
+            example_callout: rye_egui::CalloutState {
+                window_pos: egui::Pos2::new(220.0, 120.0),
+                open: false,
+            },
             overlay_pinned_width: None,
             show_formula: false,
             show_controls: true,
@@ -341,11 +466,11 @@ impl Demo {
         // font) plus a small visual margin. egui::Area's anchor
         // is screen-relative, not content-rect-relative, so the
         // offset must include the menu bar height manually.
-        egui::Area::new(egui::Id::new("rotate-polytopes-title"))
+        egui::Area::new(egui::Id::new("polytope-playground-title"))
             .anchor(egui::Align2::LEFT_TOP, [20.0, 50.0])
             .show(ctx, |ui| {
                 ui.add(egui::Label::new(
-                    egui::RichText::new("4D Polytope Rotation")
+                    egui::RichText::new("Polytope Playground")
                         .size(22.0)
                         .strong()
                         .color(egui::Color32::WHITE),
@@ -378,7 +503,7 @@ impl Demo {
             // formula and combo-name labels wrap inside.
             const FORMULA_POPUP_W: f32 = 320.0;
             egui::Window::new("formula")
-                .id(egui::Id::new("rotate-polytopes-formula"))
+                .id(egui::Id::new("polytope-playground-formula"))
                 .title_bar(false)
                 .resizable(false)
                 .collapsible(false)
@@ -418,6 +543,89 @@ impl Demo {
 
         // Modal help window (opened by the `?` button).
         self.render_help_window(ctx);
+        // Floating render-settings modal (opened by the gear button in the bottom
+        // overlay; off by default so the scene fills the window for first-launch
+        // viewing).
+        self.render_render_panel(ctx);
+        // Example annotation callout (off by default; toggle via View > Example
+        // callout). Demonstrates the rye_egui::callout primitive against the first
+        // polychoron in the row.
+        self.render_example_callout(ctx, frame);
+    }
+
+    /// Demonstrate the `rye_egui::callout` primitive against the first polychoron in
+    /// the row. The anchor follows vertex 0 of that polytope's canonical topology
+    /// through the current rotor + body position + wireframe projection chain,
+    /// reprojected per frame so the line tracks live as the polytope rotates. No-op
+    /// when the row is empty or contains no polychora.
+    fn render_example_callout(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
+        if !self.example_callout.open {
+            return;
+        }
+        // Find the first polychoron in the row; its vertex 0 is the anchor target.
+        let Some((slot, entry)) = self
+            .row
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.shape.polytope4().is_some())
+        else {
+            return;
+        };
+        let polytope = entry.shape.polytope4().expect("filter guarantees Some");
+        let topo = polytope.topology();
+        let canonical_v0 = topo.vertices[0];
+        let v_local_4d = BODY_SIZE * self.rot_state.apply(canonical_v0);
+        let v_local_r3 = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+            v_local_4d,
+            &self.wireframe_projection.to_projection(),
+        );
+        let n = self.row.len();
+        let body_pos = body_position(slot, n);
+        let world_pos = v_local_r3 + Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+
+        // Reproject world R³ -> screen pixels via the same camera the rasterizer
+        // chain uses. `world_to_screen` does the perspective + NDC + viewport-flip
+        // math; it returns `None` when the anchor is offscreen (behind the camera or
+        // outside the viewing frustum), in which case the callout draws nothing.
+        let view_dir = self.camera.view();
+        let cfg = &frame.rd.surface_bundle.config;
+        let ppp = ctx.pixels_per_point();
+        let vp_w = (cfg.width as f32 / ppp).round() as u32;
+        let vp_h = (cfg.height as f32 / ppp).round() as u32;
+        let Some(screen_pos) = rye_egui::world_to_screen(
+            world_pos,
+            &view_dir,
+            60.0_f32.to_radians(),
+            (vp_w, vp_h),
+            0.1,
+            100.0,
+        ) else {
+            return;
+        };
+
+        let title = format!("{} vertex 0", entry.label);
+        rye_egui::callout(
+            ctx,
+            "polytope-playground-example-callout",
+            screen_pos,
+            &mut self.example_callout,
+            &title,
+            |ui| {
+                ui.label(
+                    "Example callout: this leader line tracks vertex 0 of the first \
+                     polychoron in the row as it rotates through 4D. Drag the panel \
+                     anywhere; the line keeps the anchor live. Same primitive \
+                     (rye_egui::callout) is the foundation for future tutorial \
+                     overlays in Polytope Playground.",
+                );
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Anchor coordinates").strong());
+                ui.label(format!(
+                    "world R³: ({:.2}, {:.2}, {:.2})",
+                    world_pos.x, world_pos.y, world_pos.z
+                ));
+            },
+        );
     }
 
     pub(crate) fn on_event(&mut self, ev: &winit::event::WindowEvent, _ctx: &mut FrameCtx<'_>) {
@@ -460,10 +668,9 @@ impl Demo {
     }
 
     pub(crate) fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
-        // Scene renders to the full window. The bottom controls
-        // overlay floats on top; `BottomOverlay` is an Area, not
-        // a docked panel, so the scene viewport doesn't need to
-        // skip a bottom strip.
+        // Scene renders to the full window. The bottom controls overlay floats on top
+        // (Area, not a docked panel; doesn't reserve pixels); the Render settings modal
+        // is also free-floating, so the scene viewport is always the framebuffer.
         let cfg = &rd.surface_bundle.config;
         let viewport = Viewport::full([cfg.width, cfg.height]);
         if self.view_mode == ViewMode::Filmstrip {
@@ -540,7 +747,7 @@ impl Demo {
                     };
                     let body = BodyUniform::polytope_with_rotor(
                         [0.0, BODY_Y, 0.0, 0.0],
-                        entry.shape,
+                        entry.shape.shape_id(),
                         BODY_SIZE,
                         cell_rotor,
                         entry.body_color,
@@ -555,20 +762,535 @@ impl Demo {
             result
         } else {
             {
-                let u = self.node.uniforms_mut();
-                u.resolution = viewport.resolution_f32();
-                u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+                let _scope = rye_time::frame_trace::scope("pp-sdf");
+                {
+                    let u = self.node.uniforms_mut();
+                    u.resolution = viewport.resolution_f32();
+                    u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+                }
+                self.node.flush_uniforms(&rd.queue);
+                self.node.execute_in_viewport(rd, view, viewport)?;
             }
-            self.node.flush_uniforms(&rd.queue);
-            self.node.execute_in_viewport(rd, view, viewport)
+            // Shared depth attachment for the rasterized section pass + the parent
+            // wireframe's depth-test. Ensured + cleared once per Shapes-view frame so
+            // the order is: SDF (color only) -> section_faces (writes depth + color
+            // when raster mode is on) -> wireframe (tests depth, no write). In SDF
+            // mode no pass writes depth, so the cleared `1.0` buffer makes every
+            // wireframe fragment pass the depth-test trivially -- visual unchanged.
+            self.ensure_and_clear_shared_depth(rd)?;
+            if matches!(self.surface_mode, SurfaceMode::Raster) {
+                let _scope = rye_time::frame_trace::scope("pp-section-faces");
+                self.render_section_faces(rd, view)?;
+            }
+            // Cross-section + parent-wireframe overlay (when toggled). Only in Shapes
+            // view since Filmstrip's per-cell viewport composition would require
+            // per-cell depth-clear + per-cell uploads that aren't worth the v1 plumbing.
+            if self.wireframe_enabled {
+                // pp-wireframe is the project-memory-flagged hot path
+                // (`project_polychoral_raster_perf`). Want a per-frame number here so
+                // we can confirm (or refute) that hypothesis with browser data.
+                let _scope = rye_time::frame_trace::scope("pp-wireframe");
+                self.render_wireframe_overlay(rd, view)?;
+            }
+            // Points overlay (vertex markers + cell-center sprites). Drawn last so the
+            // discs sit on top of wireframe edges and section caps at the same depth.
+            if self.points_enabled {
+                let _scope = rye_time::frame_trace::scope("pp-points");
+                self.render_points(rd, view)?;
+            }
+            Ok(())
         }
+    }
+
+    /// Ensure the shared section-faces depth attachment exists at the current
+    /// swapchain size + sample count, then clear it to `1.0`. Called once per
+    /// Shapes-view frame at the top of the rasterizer chain.
+    ///
+    /// The buffer is shared between `section_faces` (which writes depth when raster
+    /// mode is on) and `parent_wireframe` (which depth-tests against it without
+    /// writing). Sharing means we pay one ensure + one clear per frame regardless of
+    /// surface mode.
+    fn ensure_and_clear_shared_depth(&mut self, rd: &RenderDevice) -> Result<()> {
+        let cfg = &rd.surface_bundle.config;
+        DepthBuffer::ensure(
+            &mut self.section_faces_depth,
+            &rd.device,
+            SECTION_FACES_DEPTH_FORMAT,
+            (cfg.width, cfg.height),
+            rd.sample_count(),
+        );
+        let depth = self
+            .section_faces_depth
+            .as_ref()
+            .expect("ensure() guarantees Some");
+        let mut encoder = rd
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("shared depth clear"),
+            });
+        let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shared depth clear pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rd.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    /// Build a combined section-faces mesh across every polychoral body in `self.row`,
+    /// upload it, clear the section-faces depth attachment, and execute the triangle
+    /// raster pass. No-op when no polychoral body is present in the row.
+    ///
+    /// Per-body world transform mirrors `render_wireframe_overlay`: canonical vertices
+    /// `v` become `body_position + BODY_SIZE * rot_state.apply(v)`. The section
+    /// algorithm then runs on these world vertices against the demo's `w_slice`,
+    /// producing R³ geometry that composes with the camera the SDF raymarcher uses.
+    ///
+    /// Depth: within a single cap, the fan triangles are coplanar (the cap is a 2D
+    /// polygon in R³) and don't occlude one another. Different caps within one
+    /// polytope, and caps across different polychoral bodies, all project to
+    /// different camera depths after the view-projection step, so they DO require a
+    /// depth attachment to resolve front-to-back occlusion correctly. The shared
+    /// depth buffer is ensured + cleared at the top of the Shapes-view render path
+    /// (see `Demo::ensure_and_clear_shared_depth`); this pass writes into it.
+    /// Build the combined point sprites mesh (vertex markers + cell-center sprites) across
+    /// every polychoral body in the row, upload it, and execute the point-disc raster pass.
+    ///
+    /// Same body-local + perspective + world-translate pattern as the wireframe and section-
+    /// faces paths: each body's vertices and cell centers are computed in body-local 4D,
+    /// projected through `wireframe_projection`, and translated by the body's R³ position so
+    /// the perspective scale doesn't smear the body across its row x-offset.
+    ///
+    /// Coloring: vertex sprites use the same per-vertex position-derived RGB scheme as the
+    /// "unique" wireframe color mode (`vertex_color_by_position`), so vertex sprites visually
+    /// belong with the colored wireframe. Cell-center sprites use a uniform white with
+    /// reduced alpha to read as a secondary structural marker rather than competing with the
+    /// vertex sprites.
+    fn render_points(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
+        let cfg = &rd.surface_bundle.config;
+        let n = self.row.len();
+        let wireframe_projection = self.wireframe_projection.to_projection();
+        // Cell-center sprite color: a dim warm white. Pre-multiplied alpha makes the sprite
+        // read as a "second-tier" marker behind the brighter vertex discs.
+        const CELL_CENTER_COLOR: [f32; 4] = [0.92, 0.88, 0.78, 0.65];
+
+        let mesh = &mut self.points_mesh_scratch;
+        mesh.positions.clear();
+        mesh.colors.clear();
+        mesh.sizes.clear();
+
+        for (slot, entry) in self.row.iter().enumerate() {
+            let Some(polytope) = entry.shape.polytope4() else {
+                continue;
+            };
+            let topo = polytope.topology();
+            let body_pos = body_position(slot, n);
+            let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+
+            if self.points_show_vertices {
+                for v in topo.vertices {
+                    let v_local = BODY_SIZE * self.rot_state.apply(*v);
+                    let v3_local =
+                        <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                            v_local,
+                            &wireframe_projection,
+                        );
+                    let v_world = v3_local + body_pos_r3;
+                    mesh.positions.push(v_world.to_array());
+                    // Color by the canonical (unrotated) vertex position so the sprite hue
+                    // matches its corresponding wireframe edge in `WireframeColorMode::Unique`.
+                    mesh.colors.push(vertex_color_by_position(*v));
+                    mesh.sizes.push(self.points_size_px);
+                }
+            }
+            if self.points_show_cell_centers {
+                for c in polytope.cell_centers() {
+                    let c_local = BODY_SIZE * self.rot_state.apply(c);
+                    let c3_local =
+                        <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                            c_local,
+                            &wireframe_projection,
+                        );
+                    let c_world = c3_local + body_pos_r3;
+                    mesh.positions.push(c_world.to_array());
+                    mesh.colors.push(CELL_CENTER_COLOR);
+                    // Cell-center sprites half-sized so they don't compete visually with the
+                    // brighter vertex discs.
+                    mesh.sizes.push(self.points_size_px * 0.5);
+                }
+            }
+        }
+
+        // Camera matches the wireframe overlay / section faces (same view-projection).
+        let view_dir = self.camera.view();
+        let aspect = cfg.width as f32 / cfg.height as f32;
+        let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
+        let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
+        let view_proj = proj_mat * view_mat;
+        let vp_size = Vec2::new(cfg.width as f32, cfg.height as f32);
+        self.points_node.set_camera(&rd.queue, view_proj, vp_size);
+        self.points_node.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            mesh,
+            &rye_math::Projection::Identity,
+        );
+        let depth_view = self
+            .section_faces_depth
+            .as_ref()
+            .map(|b| &b.view)
+            .expect("shared depth buffer must be ensured before points overlay");
+        self.points_node.execute(rd, view, Some(depth_view), None)?;
+        Ok(())
+    }
+
+    fn render_section_faces(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
+        let cfg = &rd.surface_bundle.config;
+        let n = self.row.len();
+
+        // Reuse the per-Demo scratch mesh; capacity grows once to fit the largest
+        // polychoron and stays there. Each frame's `clear()` keeps the underlying
+        // allocations.
+        let combined = &mut self.section_faces_mesh_scratch;
+        combined.vertices.clear();
+        combined.colors.clear();
+        combined.indices.clear();
+
+        // Same perspective scaling logic the wireframe path uses (see render_wireframe_overlay):
+        // section the body in body-local 4D, then translate the produced R³ caps by the body's
+        // R³ position with the active perspective scale at the slice's w. With drop-w this
+        // collapses to identity scaling; with Perspective4D the cap scales by
+        // `focal / (focal - w_slice)`.
+        let wireframe_projection = self.wireframe_projection.to_projection();
+        let section_scale = perspective_scale_at_w(self.w_slice, &wireframe_projection);
+
+        for (slot, entry) in self.row.iter().enumerate() {
+            let Some(polytope) = entry.shape.polytope4() else {
+                continue;
+            };
+            let topo = polytope.topology();
+            let body_pos = body_position(slot, n);
+            let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+
+            // Body-local 4D scratch (rotor-rotated, scaled, NO world translate). Same
+            // rationale as the wireframe path: keep the body's R³ position out of the 4D
+            // perspective math so it doesn't get scaled by `focal / (focal - w)`.
+            self.section_world_vertices_scratch.clear();
+            self.section_world_vertices_scratch.extend(
+                topo.vertices
+                    .iter()
+                    .map(|v| BODY_SIZE * self.rot_state.apply(*v)),
+            );
+
+            // Match the SDF's per-body solid coloring: every cap of this polychoron uses
+            // the body's identity color from the catalog. Per-face Lambert in the fragment
+            // shader adds the geometric depth; the underlying color is flat.
+            let [r, g, b] = entry.body_color;
+            let start = combined.vertices.len();
+            polytope_section_faces_append(
+                topo.edges,
+                topo.cells,
+                &self.section_world_vertices_scratch,
+                WPlane::new(self.w_slice),
+                [r, g, b, 1.0],
+                combined,
+            );
+            // Translate this body's body-local cap vertices into world R³. Indices were
+            // emitted with the correct vertex offset already (the `_append` API handles
+            // that internally); only the vertex positions need rebasing.
+            for v in &mut combined.vertices[start..] {
+                *v = local_r3_to_world(*v, section_scale, body_pos_r3);
+            }
+        }
+
+        // Empty mesh handling lives in `TriangleRasterNode::execute` (it short-circuits
+        // when `index_count == 0`); no need for a redundant early-return here.
+
+        // Camera matches the SDF raymarcher's effective view-projection (same as the
+        // wireframe overlay uses), so pixel-aligned composition over the SDF pass.
+        let view_dir = self.camera.view();
+        let aspect = cfg.width as f32 / cfg.height as f32;
+        let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
+        let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
+        let view_proj = proj_mat * view_mat;
+
+        // The shared depth attachment is ensured + cleared once per frame by
+        // `ensure_and_clear_shared_depth` at the top of the Shapes-view render path;
+        // here we just consume the view for the triangle pass's depth-write.
+        let depth = self
+            .section_faces_depth
+            .as_ref()
+            .expect("shared depth buffer must be ensured before section_faces");
+
+        self.section_faces.set_camera(&rd.queue, view_proj);
+        self.section_faces.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            combined,
+            &rye_math::Projection::Identity,
+        );
+        self.section_faces
+            .execute(rd, view, Some(&depth.view), None)?;
+        Ok(())
+    }
+
+    /// Build the three overlay meshes (section triangles, section perimeter edges, parent
+    /// wireframe) from the current row + rotor + w_slice, upload them, clear the overlay
+    /// depth buffer, and execute the three raster passes on top of the existing SDF render.
+    ///
+    /// Per-body transform: each canonical Polytope4 vertex `v` becomes the world Vec4
+    /// `body.position + BODY_SIZE * rot_state.apply(v)`. The section algorithm then runs
+    /// on these world vertices against the demo's `w_slice`, producing geometry in world
+    /// R³ that composes cleanly with the SDF camera frame.
+    ///
+    /// Non-polychoral shapes (Clifford torus, duocylinder, etc.) in the row are skipped:
+    /// they have no [`rye_physics::polytope::Polytope4`] mapping and the cross-section
+    /// algorithm doesn't apply to smooth surfaces.
+    fn render_wireframe_overlay(
+        &mut self,
+        rd: &RenderDevice,
+        view: &wgpu::TextureView,
+    ) -> Result<()> {
+        let cfg = &rd.surface_bundle.config;
+        let n = self.row.len();
+
+        // Build combined meshes across the entire row.
+        let mut section_edges = LineMesh::<3>::default();
+        let mut parent_lines = LineMesh::<3>::default();
+        // Uniform-alpha endpoints when `nearest-active` is off; the active-mode mapping
+        // interpolates between DIM (cells the slice misses entirely) and BRIGHT (cells
+        // the slice is at the midpoint of).
+        const PARENT_ALPHA_UNIFORM: f32 = 0.55;
+        const PARENT_ALPHA_DIM: f32 = 0.10;
+        const PARENT_ALPHA_BRIGHT: f32 = 0.85;
+        const PARENT_WIDTH: f32 = 1.2;
+        // Active-mode palette. Green for edges in any currently-intersected cell;
+        // neutral gray for the rest. Chosen for clear binary contrast against the
+        // grayish-blue scene backdrop and the dim ground checkerboard.
+        const ACTIVE_GREEN: [f32; 4] = [0.40, 1.00, 0.55, 1.0];
+        const INACTIVE_GRAY: [f32; 4] = [0.55, 0.55, 0.58, 1.0];
+        let nearest_active = self.wireframe_nearest_active;
+        let color_mode = self.wireframe_color_mode;
+        // Resolve once per frame; same projection applied to every body's wireframe so all
+        // bodies share a consistent R³ embedding.
+        let wireframe_projection = self.wireframe_projection.to_projection();
+
+        for (slot, entry) in self.row.iter().enumerate() {
+            let Some(polytope) = entry.shape.polytope4() else {
+                continue;
+            };
+            let topo = polytope.topology();
+            let body_pos = body_position(slot, n);
+            // Body's R³ position. The body sits at body_pos.w = 0 in 4D, so the perspective
+            // projection at this body's location collapses to a pure R³ translation; doing
+            // the projection in body-local 4D and translating in R³ AFTER is the only way
+            // to keep the body's apparent x-position stable when Perspective4D scales the
+            // (x, y, z) channel by `focal / (focal - w)`.
+            let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+            // Body-local 4D vertices: rotor-rotated, scaled, NO world translate yet. The
+            // translate happens after the chosen `wireframe_projection` maps each vertex
+            // from R⁴ to R³.
+            let local_vertices: Vec<Vec4> = topo
+                .vertices
+                .iter()
+                .map(|v| BODY_SIZE * self.rot_state.apply(*v))
+                .collect();
+
+            // Cross-section perimeter edges. The cyan outlines bound each cell cap on the
+            // slice; gated by `wireframe_perimeter` so users can show the parent edge graph
+            // on its own. `polytope_section_overlay_with_vertices` uses drop-w internally,
+            // so its R³ output is in body-local frame; we apply the perspective scale at
+            // w_slice (uniform across the cap because every cap point shares the slice's w)
+            // and translate to world R³.
+            if self.wireframe_perimeter {
+                let section_scale = perspective_scale_at_w(self.w_slice, &wireframe_projection);
+                let (_tri, mut perim) = polytope_section_overlay_with_vertices(
+                    topo.edges,
+                    topo.cells,
+                    &local_vertices,
+                    WPlane::new(self.w_slice),
+                );
+                for (a, b) in &mut perim.segments {
+                    *a = local_r3_to_world(*a, section_scale, body_pos_r3);
+                    *b = local_r3_to_world(*b, section_scale, body_pos_r3);
+                }
+                section_edges.segments.append(&mut perim.segments);
+                section_edges.colors.append(&mut perim.colors);
+                section_edges.widths.append(&mut perim.widths);
+            }
+
+            // Per-cell "crossing strength" in [0, 1]: 1 when `w_slice` is at the cell's
+            // w-midpoint (cap face is widest), 0 when the slice is at the cell's w-boundary
+            // or outside it entirely. A linear w-midpoint proxy avoids computing actual
+            // cap areas while giving the same visual gradient: cells the slice is *deep
+            // in* peak in brightness, cells the slice barely touches taper to dim.
+            let cell_strengths: Vec<f32> = topo
+                .cells
+                .iter()
+                .map(|cell| {
+                    let (w_min, w_max) = cell
+                        .iter()
+                        .map(|&i| local_vertices[i as usize].w)
+                        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), w| {
+                            (lo.min(w), hi.max(w))
+                        });
+                    let half_extent = (w_max - w_min) * 0.5;
+                    if half_extent <= 0.0 {
+                        return 0.0;
+                    }
+                    let mid = (w_min + w_max) * 0.5;
+                    let dist = (self.w_slice - mid).abs();
+                    (1.0 - dist / half_extent).clamp(0.0, 1.0)
+                })
+                .collect();
+
+            // Per-edge brightness: max strength across cells the edge belongs to. An edge
+            // belongs to a cell when both endpoints sit in that cell's vertex list. This
+            // lets a single edge "light up" as soon as ANY containing cell is being
+            // crossed deep; doesn't require the slice to specifically hit the cell whose
+            // boundary the edge sits on.
+            let edge_strength = |i: u32, j: u32| -> f32 {
+                let mut best = 0.0_f32;
+                for (cell, strength) in topo.cells.iter().zip(cell_strengths.iter()) {
+                    if cell.contains(&i) && cell.contains(&j) && *strength > best {
+                        best = *strength;
+                    }
+                }
+                best
+            };
+
+            // Active-mode binary classification: an edge is "active" if at least one of
+            // its containing cells has the slice strictly between its w-range endpoints
+            // (i.e., the slice is currently producing a cap from that cell). Uses the
+            // same `edges-in-cell` membership rule as `edge_strength`; threshold is
+            // `cell_strength > 0.0`, which corresponds exactly to `w_min < w_slice <
+            // w_max` after the `(1 - dist / half_extent)` clamp.
+            let edge_is_active = |i: u32, j: u32| -> bool {
+                topo.cells
+                    .iter()
+                    .zip(cell_strengths.iter())
+                    .any(|(cell, &s)| s > 0.0 && cell.contains(&i) && cell.contains(&j))
+            };
+
+            // Parent wireframe: every polytope edge as a world-R³ line. Base RGB is
+            // picked by `wireframe_color_mode`:
+            // - `Unique`: per-vertex position-derived RGB from the canonical vertex
+            //   set so each vertex gets a distinct hue from its 4D coordinates and
+            //   the polytope's symmetry shows as smooth gradients (same scheme as
+            //   `Polytope4::lines_colored_by_position`).
+            // - `Active`: binary green/gray by cell-activity (see `edge_is_active`).
+            // Alpha is then modulated per-edge by the `nearest-active` strength (when
+            // that toggle is on) or held uniform.
+            for &[i, j] in topo.edges {
+                let ia = i as usize;
+                let ja = j as usize;
+                let a = local_vertices[ia];
+                let b = local_vertices[ja];
+                let (mut color_a, mut color_b) = match color_mode {
+                    WireframeColorMode::Unique => (
+                        vertex_color_by_position(topo.vertices[ia]),
+                        vertex_color_by_position(topo.vertices[ja]),
+                    ),
+                    WireframeColorMode::Active => {
+                        let c = if edge_is_active(i, j) {
+                            ACTIVE_GREEN
+                        } else {
+                            INACTIVE_GRAY
+                        };
+                        (c, c)
+                    }
+                };
+                let alpha = if nearest_active {
+                    let s = edge_strength(i, j);
+                    PARENT_ALPHA_DIM + (PARENT_ALPHA_BRIGHT - PARENT_ALPHA_DIM) * s
+                } else {
+                    PARENT_ALPHA_UNIFORM
+                };
+                color_a[3] = alpha;
+                color_b[3] = alpha;
+                // Project 4D endpoints to R³ through the active wireframe projection (in
+                // body-local frame), then translate by `body_pos_r3` to land in world R³.
+                // For DropW the projection is identity-on-(x, y, z); for Perspective4D each
+                // component scales by `focal / (focal - w)`.
+                let a3_local =
+                    <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                        a,
+                        &wireframe_projection,
+                    );
+                let b3_local =
+                    <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                        b,
+                        &wireframe_projection,
+                    );
+                let a3 = a3_local + body_pos_r3;
+                let b3 = b3_local + body_pos_r3;
+                parent_lines.segments.push((a3.to_array(), b3.to_array()));
+                parent_lines.colors.push((color_a, color_b));
+                parent_lines.widths.push(PARENT_WIDTH);
+            }
+        }
+
+        // Upload (each call is a no-op when its mesh is empty).
+        self.section_edges.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &section_edges,
+            &rye_math::Projection::Identity,
+            1,
+        );
+        self.parent_wireframe.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &parent_lines,
+            &rye_math::Projection::Identity,
+            1,
+        );
+
+        // Camera. Build the same view+projection matrix the SDF raymarcher uses
+        // implicitly via its ray basis, so the rasterized overlay aligns pixel-for-pixel
+        // with the raymarched scene.
+        let view_dir = self.camera.view();
+        let aspect = cfg.width as f32 / cfg.height as f32;
+        let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
+        let proj_mat = Mat4::perspective_rh(60.0_f32.to_radians(), aspect, 0.1, 100.0);
+        let view_proj = proj_mat * view_mat;
+        let vp_size = Vec2::new(cfg.width as f32, cfg.height as f32);
+        self.section_edges.set_camera(&rd.queue, view_proj, vp_size);
+        self.parent_wireframe
+            .set_camera(&rd.queue, view_proj, vp_size);
+
+        // Section perimeter edges then dim parent wireframe. Both depth-test (no write)
+        // against the shared section-faces depth attachment so lines behind a cap get
+        // correctly occluded across polytopes in a row. The shared buffer is ensured +
+        // cleared earlier in the frame; here we just borrow the view. In SDF mode no
+        // pass writes depth, so the cleared `1.0` buffer makes every fragment pass the
+        // test, preserving the historical visual.
+        let depth_view = self
+            .section_faces_depth
+            .as_ref()
+            .map(|b| &b.view)
+            .expect("shared depth buffer must be ensured before wireframe overlay");
+        self.section_edges
+            .execute(rd, view, Some(depth_view), None)?;
+        self.parent_wireframe
+            .execute(rd, view, Some(depth_view), None)?;
+        Ok(())
     }
 
     pub(crate) fn title(&self, _fps: f32) -> std::borrow::Cow<'static, str> {
         // Window title is now decorative, all live state is in the
         // overlay. Keep the title static so OS task switchers show
         // a stable label.
-        std::borrow::Cow::Borrowed("rotate polytopes")
+        std::borrow::Cow::Borrowed("polytope playground")
     }
 }
 
@@ -637,6 +1359,157 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
+        // Cross-section + parent-wireframe overlay. Tab-completion is context-aware
+        // via [`SubcommandSet`]: each subcommand's value slot lists only that
+        // subcommand's choices. Bare invocations flip:
+        //   `wireframe`                 -> flips main on/off
+        //   `wireframe nearest-active`  -> flips the alpha gradient toggle
+        //   `wireframe color <mode>`    -> sets the color mode
+        c.register(
+            rye_egui::subcommands::<Demo>("wireframe", "wireframe + cross-section overlay")
+                .on_bare(|d| {
+                    d.wireframe_enabled = !d.wireframe_enabled;
+                    Ok(())
+                })
+                .toggle(
+                    "nearest-active",
+                    "per-edge alpha gradient by cell-crossing strength (bare flips)",
+                    |d, v| {
+                        d.wireframe_nearest_active = v.unwrap_or(!d.wireframe_nearest_active);
+                        Ok(())
+                    },
+                )
+                .toggle(
+                    "perimeter",
+                    "cyan cross-section perimeter outlines (bare flips)",
+                    |d, v| {
+                        d.wireframe_perimeter = v.unwrap_or(!d.wireframe_perimeter);
+                        Ok(())
+                    },
+                )
+                .choice(
+                    "color",
+                    "base RGB for parent edges (bare cycles): unique (default) or active",
+                    &["unique", "active"],
+                    |d, name| {
+                        d.wireframe_color_mode = match name {
+                            Some(n) => WireframeColorMode::from_token(n).ok_or_else(|| {
+                                anyhow!("unknown color mode `{n}` (try unique|active)")
+                            })?,
+                            None => match d.wireframe_color_mode {
+                                WireframeColorMode::Unique => WireframeColorMode::Active,
+                                WireframeColorMode::Active => WireframeColorMode::Unique,
+                            },
+                        };
+                        Ok(())
+                    },
+                )
+                .choice(
+                    "perspective",
+                    "wireframe 4D->R³ projection (bare cycles): drop-w (default) or w-depth",
+                    &["drop-w", "w-depth"],
+                    |d, name| {
+                        d.wireframe_projection = match name {
+                            Some(n) => WireframeProjection::from_token(n).ok_or_else(|| {
+                                anyhow!("unknown projection `{n}` (try drop-w|w-depth)")
+                            })?,
+                            None => match d.wireframe_projection {
+                                WireframeProjection::DropW => WireframeProjection::WDepth,
+                                WireframeProjection::WDepth => WireframeProjection::DropW,
+                            },
+                        };
+                        Ok(())
+                    },
+                ),
+        );
+
+        // Points overlay: vertex markers + cell-center sprites. Same SubcommandSet shape as
+        // `wireframe`: bare flips main on/off, subcommands gate per-category visibility, and
+        // a size knob for the disc radius. Off by default so first-launch readers see the
+        // demo's identity (SDF / raster + wireframe) rather than a vertex cloud.
+        c.register(
+            rye_egui::subcommands::<Demo>("points", "vertex + cell-center sprite overlay")
+                .on_bare(|d| {
+                    d.points_enabled = !d.points_enabled;
+                    Ok(())
+                })
+                .toggle(
+                    "vertices",
+                    "render a disc at each polytope vertex (bare flips)",
+                    |d, v| {
+                        d.points_show_vertices = v.unwrap_or(!d.points_show_vertices);
+                        Ok(())
+                    },
+                )
+                .toggle(
+                    "cell-centers",
+                    "render a dim disc at each cell's centroid (bare flips)",
+                    |d, v| {
+                        d.points_show_cell_centers = v.unwrap_or(!d.points_show_cell_centers);
+                        Ok(())
+                    },
+                )
+                .custom(
+                    "size",
+                    "set the disc radius in pixels (e.g. `points size 8`)",
+                    &[],
+                    &[],
+                    |d, rest, _out| {
+                        let Some(token) = rest.first() else {
+                            return Err(anyhow!("usage: points size <pixels>"));
+                        };
+                        let px: f32 = token
+                            .parse()
+                            .map_err(|e| anyhow!("invalid pixel value `{token}`: {e}"))?;
+                        if !(1.0..=64.0).contains(&px) {
+                            return Err(anyhow!("points size {px} out of range; expected 1..=64"));
+                        }
+                        d.points_size_px = px;
+                        Ok(())
+                    },
+                ),
+        );
+
+        // Polychoral surface renderer: raster (default) / SDF / off. Bare `surface` is
+        // shorthand for "off" so the user can hide cap fills quickly when inspecting the
+        // wireframe and cross-section perimeter on their own. Explicit `surface raster`
+        // and `surface sdf` set those modes; `surface off` is the same as bare.
+        c.register(
+            rye_egui::cmd(
+                "surface",
+                "polychoral surface mode: raster | sdf | off (bare = off)",
+                |args, demo: &mut Demo, _out| {
+                    let next = match args.first().copied() {
+                        Some(token) => SurfaceMode::from_token(token).ok_or_else(|| {
+                            anyhow!("unknown arg `{token}` (try raster|sdf|off)")
+                        })?,
+                        None => SurfaceMode::Off,
+                    };
+                    if next != demo.surface_mode {
+                        demo.surface_mode = next;
+                        // Re-emit the SDF body list: switching INTO Sdf mode makes the
+                        // polychora live in the kernel, switching OUT marks them inert.
+                        demo.rebuild_bodies();
+                    }
+                    Ok(())
+                },
+            )
+            .with_args(&[&["raster", "sdf", "off"]])
+            .with_long_help(
+                "Selects how the six regular convex 4-polytopes (5-cell, tesseract, 16-cell,\n\
+                 24-cell, 120-cell, 600-cell) are rendered.\n\
+                 \n\
+                 subcommands:\n  \
+                 raster  Rasterized cross-section cell-caps (the default). Face-normal Lambert\n                         lit, per-body solid color. Much faster for the 120-cell + 600-cell\n                         and exact (no SDF approximation).\n  \
+                 sdf     SDF raymarch. The historical pre-rasterizer path; smoother shading\n                         but the 120-cell and 600-cell carry a face-plane approximation BUG.\n                         Kept for visual comparison.\n  \
+                 off     No surface rendered. Wireframe overlay + cross-section perimeter\n                         stay visible if enabled; the cap interiors are blank. Useful for\n                         inspecting the wireframe on its own.\n\
+                 \n\
+                 Bare `surface` (no argument) is shorthand for `surface off`.\n\
+                 \n\
+                 Smooth-surface shapes (Clifford torus, duocylinder, spherinder, 3-sphere)\n\
+                 ignore this and always render via the SDF; they have no rasterizer path.",
+            ),
+        );
 
         // Framework-provided capture: `capture png [pre|post|both] [dir]`,
         // `capture frames [pre|post|both] [dir]`, `capture stop`. Bound to F12 (one-shot)
@@ -648,6 +1521,15 @@ impl RotatePolytopesApp {
         // Framework-provided log mirror: `log on|off|toggle` toggles whether
         // `tracing::*` events show up in the console scrollback.
         rye_app::log::register_command(&mut c);
+
+        // Framework-provided frame-timing surface: `trace [summary|last|clear|cap N]`.
+        // The runner is already recording per-section scopes on every redraw; this
+        // command lets the user read them. Surfaces the slowest hot-path sections,
+        // which is the data we need to drive M4.5 v2 perf decisions (pipeline
+        // warming, wireframe caching).
+        rye_app::trace::register_command(&mut c);
+        rye_app::fps::register_command(&mut c);
+        rye_app::vsync::register_command(&mut c);
 
         c
     }
@@ -712,20 +1594,24 @@ impl App for RotatePolytopesApp {
 }
 
 fn main() -> Result<()> {
-    let config = RunConfig {
+    // `rye_app::run` handles native + wasm dispatch (worker context vs
+    // main-thread launch-on-click vs main-thread auto-launch fallback)
+    // based on the page's `data-mode` attribute and the WasmConfig IDs.
+    // Default WasmConfig uses our standard layout (`rye-canvas-host` /
+    // `rye-launch` / `rye-canvas`); the demo's `index.html` matches.
+    rye_app::run::<RotatePolytopesApp>(RunConfig {
         window: WindowAttributes::default()
-            .with_title("rotate polytopes")
+            .with_title("polytope playground")
             .with_visible(false),
         ..RunConfig::default()
-    };
-    run_with_config::<RotatePolytopesApp>(config)
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Layout regression tests
 // ---------------------------------------------------------------------------
 //
-// `cargo test --example rotate_polytopes` to run.
+// `cargo test --example polytope_playground` to run.
 //
 // These tests headless-render the shape row through `egui::Context::run`
 // and inspect the actual placed-rect positions of every card and the
@@ -909,32 +1795,37 @@ mod drag_tests {
     /// movement. We thread a monotonic clock so each frame's input
     /// has `time = N * 50ms`; well past the default click duration.
     fn pointer_press(time: f64, pos: egui::Pos2) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen());
-        input.time = Some(time);
-        input.events.push(egui::Event::PointerMoved(pos));
-        input.events.push(egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: Default::default(),
-        });
-        input
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(time),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        }
     }
 
     fn pointer_move(time: f64, pos: egui::Pos2) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen());
-        input.time = Some(time);
-        input.events.push(egui::Event::PointerMoved(pos));
-        input
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(time),
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        }
     }
 
     fn warmup_input(time: f64) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(screen());
-        input.time = Some(time);
-        input
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(time),
+            ..Default::default()
+        }
     }
 
     /// Simulate "click on card, then drag past the drag threshold"
@@ -1008,7 +1899,7 @@ mod drag_tests {
     /// `Id::new` for stable per-row-index keys.
     #[test]
     fn id_new_starts_drag() {
-        let id = egui::Id::new(("rotate-polytopes-shape-card-test", 0_usize));
+        let id = egui::Id::new(("polytope-playground-shape-card-test", 0_usize));
         let ctx = drive_drag(id);
         assert!(
             ctx.is_being_dragged(id),
@@ -1034,12 +1925,14 @@ mod drag_tests {
     /// headless `Context::run` (Area-routed input doesn't seem to
     /// reach the interaction step the same way it does in a real
     /// winit-driven loop). Instead we verify that:
-    /// 1. Rendering the same source closure in two `Area`s with
-    ///    different layers does NOT trigger the debug-assert when
-    ///    ids are scoped per-ui (`make_persistent_id`).
-    /// 2. The IDs actually ARE distinct between the two passes.
-    /// The first part; running this test without panic in debug
-    ///; is what catches a regression to globally-stable ids.
+    ///
+    ///   1. Rendering the same source closure in two `Area`s with
+    ///      different layers does NOT trigger the debug-assert when
+    ///      ids are scoped per-ui (`make_persistent_id`).
+    ///   2. The IDs actually ARE distinct between the two passes.
+    ///
+    /// The first part (running this test without panic in debug) is
+    /// what catches a regression to globally-stable ids.
     #[test]
     fn make_persistent_id_per_pass_avoids_layer_collision() {
         let ctx = egui::Context::default();
@@ -1217,18 +2110,20 @@ mod drag_tests {
         let drag_total = total_during_drag;
         let dragged_id = ctx.dragged_id();
         // Release.
-        let mut release_input = egui::RawInput::default();
-        release_input.screen_rect = Some(screen());
-        release_input.time = Some(0.6);
-        release_input
-            .events
-            .push(egui::Event::PointerMoved(target_pos));
-        release_input.events.push(egui::Event::PointerButton {
-            pos: target_pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: Default::default(),
-        });
+        let release_input = egui::RawInput {
+            screen_rect: Some(screen()),
+            time: Some(0.6),
+            events: vec![
+                egui::Event::PointerMoved(target_pos),
+                egui::Event::PointerButton {
+                    pos: target_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
         let _ = ctx.run(release_input, |c| {
             render_during_drag(c, &mut total_during_drag)
         });

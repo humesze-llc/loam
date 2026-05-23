@@ -1,10 +1,10 @@
 //! Periodic geodesic lattice demo scene. Self-contained; depends only
-//! on the typed [`rye_sdf::Scene`] / [`rye_sdf::SceneNode`] layer and
+//! on the typed [`rye_scene::Scene`] / [`rye_scene::SceneNode`] layer and
 //! emits WGSL against any [`rye_math::WgslSpace`].
 
 use glam::Vec3;
 use rye_math::{Space, WgslSpace};
-use rye_sdf::{Scene, SceneNode};
+use rye_scene::{Scene, SceneNode};
 
 /// Periodic geodesic lattice scene.
 ///

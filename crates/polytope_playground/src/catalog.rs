@@ -9,21 +9,20 @@
 
 use anyhow::{anyhow, Result};
 use rye_app::egui;
-use rye_render::raymarch::{
-    SHAPE_120CELL, SHAPE_16CELL, SHAPE_24CELL, SHAPE_3SPHERE, SHAPE_600CELL, SHAPE_CLIFFORD_TORUS,
-    SHAPE_DUOCYLINDER, SHAPE_PENTATOPE, SHAPE_SPHERINDER, SHAPE_TESSERACT,
-};
+use rye_physics::polytope::Polytope4;
+use rye_render::raymarch::RaymarchShape;
 
-/// One polytope's metadata: shape index in the kernel's table, per-body fragment color
-/// (driven into `BodyUniform.color` on the GPU side, NOT the panel's card color; those
-/// are uniformly grey in the redesigned UI), short display label, and long mathematical
-/// name shown in card tooltips. The long name uses the `pentachoron` / `tesseract` /
+/// One polytope's metadata: typed shape identifier ([`RaymarchShape`], unifying the GPU
+/// SDF shape ID with the optional polytope topology), per-body fragment color (driven
+/// into `BodyUniform.color` on the GPU side, NOT the panel's card color; those are
+/// uniformly grey in the redesigned UI), short display label, and long mathematical name
+/// shown in card tooltips. The long name uses the `pentachoron` / `tesseract` /
 /// `hexadecachoron` family; the `*-plex` aliases (pentaplex, dodecaplex, ...) are
 /// deliberately avoided since "plex" is dimension-generalized rather than being the
 /// actual 4D name.
 #[derive(Copy, Clone, PartialEq)]
 pub(crate) struct ShapeEntry {
-    pub(crate) shape: u32,
+    pub(crate) shape: RaymarchShape,
     pub(crate) body_color: [f32; 3],
     pub(crate) label: &'static str,
     pub(crate) long_name: &'static str,
@@ -34,25 +33,25 @@ pub(crate) struct ShapeEntry {
 /// triple; visually contrasting shapes left-to-right.
 pub(crate) const DEFAULT_ROW: &[ShapeEntry] = &[
     ShapeEntry {
-        shape: SHAPE_24CELL,
+        shape: RaymarchShape::Polytope(Polytope4::Cell24),
         body_color: [0.95, 0.45, 0.85],
         label: "24-cell",
         long_name: "icositetrachoron",
     },
     ShapeEntry {
-        shape: SHAPE_PENTATOPE,
+        shape: RaymarchShape::Polytope(Polytope4::Pentatope),
         body_color: [0.95, 0.55, 0.30],
         label: "5-cell",
         long_name: "pentachoron",
     },
     ShapeEntry {
-        shape: SHAPE_16CELL,
+        shape: RaymarchShape::Polytope(Polytope4::Cell16),
         body_color: [0.55, 0.95, 0.40],
         label: "16-cell",
         long_name: "hexadecachoron",
     },
     ShapeEntry {
-        shape: SHAPE_TESSERACT,
+        shape: RaymarchShape::Polytope(Polytope4::Tesseract),
         body_color: [0.30, 0.55, 0.95],
         label: "8-cell",
         long_name: "tesseract",
@@ -66,61 +65,61 @@ pub(crate) const DEFAULT_ROW: &[ShapeEntry] = &[
 /// space).
 pub(crate) const SHAPE_CATALOG: &[ShapeEntry] = &[
     ShapeEntry {
-        shape: SHAPE_PENTATOPE,
+        shape: RaymarchShape::Polytope(Polytope4::Pentatope),
         body_color: [0.95, 0.55, 0.30],
         label: "5-cell",
         long_name: "pentachoron",
     },
     ShapeEntry {
-        shape: SHAPE_TESSERACT,
+        shape: RaymarchShape::Polytope(Polytope4::Tesseract),
         body_color: [0.30, 0.55, 0.95],
         label: "8-cell",
         long_name: "tesseract",
     },
     ShapeEntry {
-        shape: SHAPE_16CELL,
+        shape: RaymarchShape::Polytope(Polytope4::Cell16),
         body_color: [0.55, 0.95, 0.40],
         label: "16-cell",
         long_name: "hexadecachoron",
     },
     ShapeEntry {
-        shape: SHAPE_24CELL,
+        shape: RaymarchShape::Polytope(Polytope4::Cell24),
         body_color: [0.95, 0.45, 0.85],
         label: "24-cell",
         long_name: "icositetrachoron",
     },
     ShapeEntry {
-        shape: SHAPE_120CELL,
+        shape: RaymarchShape::Polytope(Polytope4::Cell120),
         body_color: [0.40, 0.85, 0.85],
         label: "120-cell",
         long_name: "hecatonicosachoron",
     },
     ShapeEntry {
-        shape: SHAPE_600CELL,
+        shape: RaymarchShape::Polytope(Polytope4::Cell600),
         body_color: [0.95, 0.85, 0.40],
         label: "600-cell",
         long_name: "hexacosichoron",
     },
     ShapeEntry {
-        shape: SHAPE_3SPHERE,
+        shape: RaymarchShape::ThreeSphere,
         body_color: [0.85, 0.40, 0.40],
         label: "3-sphere",
         long_name: "hypersphere (4-ball)",
     },
     ShapeEntry {
-        shape: SHAPE_DUOCYLINDER,
+        shape: RaymarchShape::Duocylinder,
         body_color: [0.60, 0.45, 0.90],
         label: "duocyl",
         long_name: "duocylinder (D² × D²)",
     },
     ShapeEntry {
-        shape: SHAPE_CLIFFORD_TORUS,
+        shape: RaymarchShape::CliffordTorus,
         body_color: [0.70, 0.85, 0.35],
         label: "clifford",
         long_name: "Clifford torus tube",
     },
     ShapeEntry {
-        shape: SHAPE_SPHERINDER,
+        shape: RaymarchShape::Spherinder,
         body_color: [0.85, 0.55, 0.75],
         label: "spherinder",
         long_name: "spherinder (B³ × interval)",

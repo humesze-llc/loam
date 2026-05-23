@@ -56,7 +56,7 @@ use rye_render::{
         polytope_stub_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL, MAX_BODIES,
     },
 };
-use rye_sdf::{Scene4, SceneNode4};
+use rye_scene::{Scene4, SceneNode4};
 use winit::window::WindowAttributes;
 
 const RADIUS_4D: f32 = 1.0;

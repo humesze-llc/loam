@@ -480,8 +480,8 @@ pub fn polytope_body_r4(
 
 // ---------------------------------------------------------------------------
 // 4D regular polytopes. Six exist in 4D (five analogues of the Platonic solids plus the 24-cell
-// which has no 3D counterpart). The four most physically useful for games — 5-cell, tesseract,
-// 16-cell, 24-cell — are generated here. The 120-cell (600 vertices) and 600-cell (120 vertices)
+// which has no 3D counterpart). The four most physically useful for games; 5-cell, tesseract,
+// 16-cell, 24-cell; are generated here. The 120-cell (600 vertices) and 600-cell (120 vertices)
 // land when a demo actually needs them.
 //
 // Every generator returns vertices centered at the origin and scaled so the circumradius
@@ -794,6 +794,13 @@ pub fn icosian_inradius_unit() -> f32 {
 /// - `offset`: the inradius (uniform across all face planes for a regular polytope).
 ///
 /// A point `p` is inside the 120-cell iff `dot(n_i, p) <= offset` for all 120 normals.
+// BUG: the dual-vertex normals are exact for the 24 axial + 16 tesseract-corner orbits but only
+// approximate for the 96 golden-ratio orbits, so the SDF surface here is a slightly-truncated
+// 120-cell. The mismatch is visible when the section-perimeter wireframe is overlaid on the SDF.
+// A previous attempt to substitute topology-derived face normals triggered a wgpu/naga device
+// error in the raymarch pipeline and was reverted. Forward path: render filled cross-section
+// triangles via the rasterizer and stop relying on the SDF for surface visualization of this
+// polytope.
 pub fn cell120_face_planes() -> (Vec<Vec4>, f32) {
     (cell600_vertices(1.0), icosian_inradius_unit())
 }
@@ -802,6 +809,10 @@ pub fn cell120_face_planes() -> (Vec<Vec4>, f32) {
 ///
 /// Returns `(normals, offset)` where `normals` are the 600 unit-length face-direction vectors.
 /// These are the 120-cell's vertices, already unit-length when generated at circumradius 1.
+// BUG: same approximation as `cell120_face_planes`. The 600-cell's true face normals are the
+// 600 cell centroids of its tetrahedral cells, not the 120-cell's vertex set; the two coincide
+// on the axial/tesseract orbits and diverge on the 96 golden-ratio orbits. Same forward path:
+// rasterized section faces will replace the SDF surface for this polytope.
 pub fn cell600_face_planes() -> (Vec<Vec4>, f32) {
     (cell120_vertices(1.0), icosian_inradius_unit())
 }
@@ -820,7 +831,7 @@ pub fn cell600_face_planes() -> (Vec<Vec4>, f32) {
 /// `|p - q|` subject to the active plane constraints, so the chained projections find the global
 /// Voronoi-region closest point.
 pub fn polytope_sdf_wolfe(p: Vec4, face_normals: &[Vec4], inradius: f32) -> f32 {
-    // Phase 1: max plane distance.
+    // Stage 1: max plane distance.
     let mut max_d = f32::NEG_INFINITY;
     let mut active_idx = [0usize; 4];
     for (i, n) in face_normals.iter().enumerate() {

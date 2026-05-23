@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <title>Polytope Playground &middot; Rye</title>
+
+    <!-- `polytope_playground` is a workspace member crate (promoted from the
+         `examples/` tree because Trunk's wasm pipeline can only target `[[bin]]`,
+         not `[[example]]`). The local `Cargo.toml` declares an implicit binary
+         from `src/main.rs`; Trunk picks it up automatically. The
+         `data-cargo-no-default-features` flag drops the `capture` feature on wasm
+         so the native-only encoder crates (image, gif, color_quant, png) stay out
+         of the wasm dep tree. -->
+    <link data-trunk rel="rust"
+          href="Cargo.toml"
+          data-cargo-no-default-features />
+
+    <!-- Worker-mode wasm-URL capture. Trunk injects an inline
+         `<script type="module">` (immediately above this comment in source
+         order) containing the import path to the hashed wasm bundle. This
+         synchronous script regex-extracts the URL into
+         `window.__rye_wasm_url` so the main-thread Rust code can spawn a
+         Worker pointing at the same bundle. Generic across demo names --
+         picks the first `.js` import in any module script. -->
+    <script>
+      (function () {
+        for (const s of document.querySelectorAll('script[type="module"]')) {
+          const m = s.textContent.match(/from\s*['"]([^'"]+\.js)['"]/);
+          if (m) {
+            window.__rye_wasm_url = new URL(m[1], document.baseURI).href;
+            return;
+          }
+        }
+      })();
+    </script>
+
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: #0e0e12;
+            color: #d8d8df;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                         "Helvetica Neue", Arial, sans-serif;
+            overflow: hidden;
+        }
+        #rye-canvas-host {
+            position: absolute;
+            inset: 0;
+        }
+        #rye-canvas-host canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            background: #0e0e12;
+        }
+        /* Launch overlay: covers the host; clicking anywhere fires
+           the worker's Start signal. The worker has already rendered
+           ONE preview frame into the canvas underneath;
+           `backdrop-filter: blur(...)` blurs that frame so the viewer
+           sees a softened preview of the demo's initial state. */
+        .rye-demo-launch {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font: inherit;
+            font-size: 14px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #d8d8df;
+            background: rgba(14, 14, 18, 0.35);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            border: none;
+            cursor: pointer;
+            transition: background 200ms ease, opacity 200ms ease;
+        }
+        .rye-demo-launch::after {
+            content: 'Click anywhere to launch';
+            display: inline-block;
+            padding: 14px 28px;
+            border: 1px solid rgba(200, 200, 220, 0.5);
+            border-radius: 6px;
+            background: rgba(20, 20, 28, 0.55);
+        }
+        .rye-demo-launch:hover {
+            background: rgba(14, 14, 18, 0.25);
+        }
+        .rye-demo-launch:hover::after {
+            background: rgba(28, 28, 38, 0.65);
+            border-color: rgba(220, 220, 240, 0.7);
+        }
+        .rye-demo-launch:active {
+            background: rgba(14, 14, 18, 0.4);
+        }
+    </style>
+</head>
+<body>
+    <!-- `data-mode="manual"` opts into click-to-start. The wasm runtime
+         sees this attribute, installs a one-shot click handler on
+         `#rye-launch`, transfers the `#rye-canvas` to a fresh Worker on
+         click, and runs the App lifecycle inside the worker. Remove the
+         attribute for auto-start on page load (legacy main-thread mode). -->
+    <div id="rye-canvas-host" data-mode="manual">
+        <canvas id="rye-canvas" width="1280" height="800"></canvas>
+        <button id="rye-launch" class="rye-demo-launch" type="button"
+                aria-label="Launch demo"></button>
+    </div>
+</body>
+</html>

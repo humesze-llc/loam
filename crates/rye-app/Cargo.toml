@@ -17,12 +17,21 @@ capture = ["dep:image", "dep:gif", "dep:color_quant", "dep:png"]
 [dependencies]
 anyhow.workspace = true
 glam.workspace = true
-pollster = "0.3"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+# Wall-clock primitives that work on both native (re-exports `std::time::Instant`) and
+# wasm32 (backed by `performance.now()`). Used for the event-loop FPS counter, frame
+# timestamps, and capture timing.
+web-time = { workspace = true }
 
+# Encoder crates are optional + only meaningful on native (the wasm build routes
+# capture through `capture_stub.rs`, which doesn't reference any of these). They stay
+# under `[dependencies]` so the `capture = ["dep:image", ...]` feature definition
+# resolves cleanly; the actual code that uses them sits behind
+# `cfg(all(feature = "capture", not(target_arch = "wasm32")))` in `capture.rs`. Wasm
+# builds opt out via `--no-default-features` (which trunk does for us via Trunk.toml).
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 gif = { version = "0.13", optional = true }
 color_quant = { version = "1.1", optional = true }
@@ -36,3 +45,71 @@ rye-render = { path = "../rye-render" }
 rye-shader = { path = "../rye-shader" }
 rye-time   = { path = "../rye-time" }
 rye-egui   = { path = "../rye-egui" }
+
+# Direct dep so the worker-mode `WorkerUi` (N5 Phase B4) can use
+# `egui_wgpu::Renderer` without going through rye-egui's `UiIntegration`
+# (which is winit-coupled). Same version rye-egui pulls in to keep the
+# egui type universe consistent across the workspace.
+egui-wgpu  = { version = "0.33", default-features = false }
+
+# Native-only async bridge: `pollster::block_on` synchronously awaits the
+# `wgpu::Instance::request_adapter` future for `RenderDevice::new`. On wasm there's no
+# blocking primitive; `run_with_config` uses `wasm_bindgen_futures::spawn_local`
+# instead, declared in the wasm target-specific block below.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.3"
+
+# Wasm-only deps. `wasm-bindgen-futures` bridges `Future` -> JS microtask queue for the
+# device-acquisition path. `console_error_panic_hook` surfaces Rust panics in the
+# browser dev console with a useful trace instead of `unreachable executed`.
+# `tracing-wasm` routes `tracing::*` events to the right console severity levels.
+# `web-sys` provides the typed JS bindings for `window.location` (URL params via the
+# Args trait), `Performance.now()` (high-res timing in the absence of `Instant`), and
+# the canvas attachment for `winit`'s web event loop.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+tracing-wasm = "0.2"
+# `js-sys` provides `Reflect` so the heap sampler can read the non-standard
+# `performance.memory.usedJSHeapSize` property without a typed binding (web-sys
+# does not surface it because it's Chrome/Edge-only). Used by
+# `wasm::js_heap_sampler` and registered into `rye-time::frame_trace` at startup.
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlButtonElement",
+    "Location",
+    "UrlSearchParams",
+    "Performance",
+    "Event",
+    "EventTarget",
+    # Worker-mode (Phase A onward). See OFFSCREEN_CANVAS_WORKERS.md.
+    # - DedicatedWorkerGlobalScope: type to detect "am I in a worker?"
+    #   and to call requestAnimationFrame inside the worker.
+    # - Worker: main-thread handle for spawning + posting messages.
+    # - OffscreenCanvas: the transferable rendering target.
+    # - MessageEvent / MessagePort: postMessage wiring.
+    "DedicatedWorkerGlobalScope",
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "OffscreenCanvas",
+    "MessageEvent",
+    # Blob + Url: used to construct an inline ESM bootstrap for the worker
+    # (so we don't have to ship a separate worker_bootstrap.js file per
+    # demo + the bootstrap can reference the trunk-hashed wasm URL at
+    # spawn time).
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    # DOM event types we forward to the worker from main thread (Phase B3).
+    "MouseEvent",
+    "KeyboardEvent",
+    "WheelEvent",
+    "FocusEvent",
+    "VisibilityState",
+] }
