@@ -154,17 +154,21 @@ thread_local! {
     static MAX_EVER: RefCell<std::collections::HashMap<&'static str, Duration>> =
         RefCell::new(std::collections::HashMap::new());
     /// Threshold above which `end_frame` emits a `tracing::warn!` naming the
-    /// offending section + its elapsed time + the frame index. Default chosen
-    /// to catch user-visible stalls (>= 50ms ≈ 3 vsync intervals at 60Hz)
-    /// without flooding on common 25ms variance.
+    /// offending section + its elapsed time + the frame index. Default of
+    /// 250ms is "user-perceptible freeze": at 4fps the demo is clearly
+    /// stuck on something. Below that, routine wasm GC stalls and 120/600-
+    /// cell wireframe rebuilds (50-150ms) drown the log. Perf work that
+    /// wants to characterize the 50-100ms range lowers the threshold via
+    /// [`set_spike_threshold`] at startup.
     ///
     /// Architectural note: tracing::warn! goes to console.warn on wasm
-    /// (selectable + copyable in DevTools) and to stderr on native; both are
-    /// the right surfaces for "something just went pathological for one
-    /// frame." If this becomes too chatty under load, raise the threshold or
-    /// add a "first N per session" gate rather than turning it off.
+    /// (selectable + copyable in DevTools) and to stderr on native; both
+    /// are the right surfaces for "something just went pathological for
+    /// one frame." If this is still too chatty under load, raise further;
+    /// the prior 50ms default produced per-frame log spam on polytope
+    /// playground in browser.
     static SPIKE_THRESHOLD: std::cell::Cell<Duration> =
-        const { std::cell::Cell::new(Duration::from_millis(50)) };
+        const { std::cell::Cell::new(Duration::from_millis(250)) };
     /// Strictly-increasing frame counter for the spike log message, so a
     /// human reading three "spike at frame 1247" messages can tell they're
     /// genuinely separate events vs. one redraw firing the warn multiple
