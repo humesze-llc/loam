@@ -150,6 +150,12 @@ impl InputState {
     /// accumulators run in parallel and the consumer picks one. Right for
     /// FPS-style mouse-look that wants infinite-yaw delta past the screen
     /// edge.
+    ///
+    /// Internal: only the runner's `device_event` handler is expected to
+    /// call this. Exposed `pub` because the runner lives in a separate
+    /// crate (`rye-app`) and Rust's visibility doesn't have a workspace-
+    /// internal mode. `#[doc(hidden)]` to keep it out of demo-facing docs.
+    #[doc(hidden)]
     pub fn accumulate_raw_motion(&mut self, dx: f64, dy: f64) {
         self.frame.mouse_raw_delta += Vec2::new(dx as f32, dy as f32);
     }

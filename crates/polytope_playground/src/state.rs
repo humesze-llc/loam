@@ -8,8 +8,7 @@
 //! `pub(crate)` so those sibling impls can access them directly without
 //! per-field accessors.
 
-use glam::Vec3;
-use rye_app::{Camera, FirstPersonController, OrbitController};
+use rye_app::{freecam::Freecam, Camera, OrbitController};
 use rye_math::{Bivector4, EuclideanR3, Plane4, Rotor4};
 use rye_render::raymarch::{BodyUniform, Hyperslice4DNode};
 
@@ -341,27 +340,17 @@ pub(crate) struct Demo {
     pub(crate) space: EuclideanR3,
     pub(crate) camera: Camera<EuclideanR3>,
     pub(crate) orbit: OrbitController<EuclideanR3>,
-    /// Free-roam controller for the WASD + mouse-look camera mode. Coexists with
-    /// `orbit` so toggling between modes preserves each controller's internal
-    /// state (orbit's distance/pitch, freecam's yaw/pitch). Only the active mode
-    /// advances against input each frame.
-    pub(crate) free_roam: FirstPersonController<EuclideanR3>,
-    /// World-space position the camera holds in `FreeRoam` mode. The controller
-    /// only handles look direction (right/up/forward); position is integrated
-    /// here from `move_forward / move_right / move_up` axes in the per-frame
-    /// update.
-    pub(crate) free_roam_pos: Vec3,
-    /// Active camera control mode. Default `Orbit` matches the long-standing
-    /// behavior; `FreeRoam` is opt-in via the `camera` console command.
+    /// Freecam preset (mouse-look + WASD + cursor grab). Drives the
+    /// camera in `CameraMode::FreeRoam`; the orbit controller drives it
+    /// in `CameraMode::Orbit`. The preset owns its own yaw, pitch,
+    /// position, and cursor-grab state internally; the demo reads
+    /// `freecam.active()` / `freecam.cursor_grabbed()` rather than
+    /// mirroring those flags.
+    pub(crate) freecam: Freecam,
+    /// Active camera control mode. Default `Orbit` matches the long-
+    /// standing behavior; `FreeRoam` is opt-in via the `camera` console
+    /// command.
     pub(crate) camera_mode: CameraMode,
-    /// Whether the cursor is currently grabbed (hidden + confined to the
-    /// window). Set to `true` when entering FreeRoam; toggleable within
-    /// FreeRoam via Alt for UI access. Reset to `false` when leaving
-    /// FreeRoam. Drives both the runtime cursor visibility (via
-    /// `rye_app::cursor::request_*`) and the `FirstPersonController`'s
-    /// `use_raw_delta` flag (raw motion past the screen edge keeps panning
-    /// alive when the cursor is grabbed).
-    pub(crate) cursor_grabbed: bool,
     pub(crate) node: Hyperslice4DNode,
     /// Rasterizer node for the cross-section perimeter (bright cyan edges around each
     /// cap polygon). Filled caps are NOT drawn -- the SDF raymarcher already renders the

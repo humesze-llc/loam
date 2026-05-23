@@ -81,6 +81,7 @@ pub mod args;
 pub mod capture;
 pub mod cursor;
 pub mod fps;
+pub mod freecam;
 pub mod frame_pacing;
 pub mod keymap;
 pub mod log;
@@ -1186,27 +1187,48 @@ impl<A: App> Runner<A> {
             let _ = rd.set_present_mode(target);
         }
 
-        // Pending cursor grab requests from `rye_app::cursor`. Native only;
-        // browser Pointer Lock requires a recent user gesture that console
-        // commands don't satisfy, so wasm freecam currently has the
-        // cursor-escape limitation documented in the cursor module. Confined
-        // mode (not Locked) keeps the cursor pinned inside the window while
-        // letting the OS report raw motion via DeviceEvent::MouseMotion.
+        // Pending cursor grab + visibility transitions from
+        // `rye_app::cursor`. Native only; browser Pointer Lock requires a
+        // recent user gesture that console commands don't satisfy (the
+        // cursor module emits a one-time tracing::warn on wasm).
+        //
+        // Grab + visibility are independent. The runner translates the
+        // engine-level `GrabMode` to winit's `CursorGrabMode` and falls
+        // back from `Locked` to `Confined` (or vice versa) if the platform
+        // doesn't support the requested mode (macOS + Linux/X11 vary on
+        // which they prefer; Windows accepts both). The fallback chain
+        // preserves the user's intent (some form of grab) rather than
+        // silently dropping to `None`.
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(grab) = cursor::take_pending() {
+        {
             use winit::window::CursorGrabMode;
-            let grab_mode = if grab {
-                CursorGrabMode::Confined
-            } else {
-                CursorGrabMode::None
-            };
-            // Confined mode is widely supported on Windows + macOS + Linux/X11.
-            // Fall back to Locked if Confined isn't accepted; either gives us
-            // the raw-delta behavior we need.
-            if win.set_cursor_grab(grab_mode).is_err() && grab {
-                let _ = win.set_cursor_grab(CursorGrabMode::Locked);
+            let (pending_grab, pending_vis) = cursor::take_pending();
+            let mut applied = cursor::current_state();
+            if let Some(mode) = pending_grab {
+                let primary = match mode {
+                    cursor::GrabMode::None => CursorGrabMode::None,
+                    cursor::GrabMode::Confined => CursorGrabMode::Confined,
+                    cursor::GrabMode::Locked => CursorGrabMode::Locked,
+                };
+                if win.set_cursor_grab(primary).is_err()
+                    && mode != cursor::GrabMode::None
+                {
+                    let fallback = match mode {
+                        cursor::GrabMode::Locked => CursorGrabMode::Confined,
+                        cursor::GrabMode::Confined => CursorGrabMode::Locked,
+                        cursor::GrabMode::None => CursorGrabMode::None,
+                    };
+                    let _ = win.set_cursor_grab(fallback);
+                }
+                applied.grab = mode;
             }
-            win.set_cursor_visible(!grab);
+            if let Some(visible) = pending_vis {
+                win.set_cursor_visible(visible);
+                applied.visible = visible;
+            }
+            if pending_grab.is_some() || pending_vis.is_some() {
+                cursor::mark_applied(applied.grab, applied.visible);
+            }
         }
 
         let Some(rd) = self.rd.as_ref() else { return };
