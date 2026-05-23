@@ -12,6 +12,7 @@
 //! `rye_app::wasm::*` import path stays flat for the common cases.
 
 pub mod launch;
+pub mod messages;
 pub mod worker;
 
 // Re-export the click-to-start surface at the wasm module level so existing

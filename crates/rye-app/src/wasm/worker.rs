@@ -31,7 +31,6 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use wasm_bindgen::prelude::Closure;
@@ -41,6 +40,7 @@ use web_sys::{
     OffscreenCanvas, Worker, WorkerOptions, WorkerType,
 };
 
+use super::messages::{self, InputMessage};
 use crate::{App, FrameCtx, RenderCtx, SetupCtx};
 use rye_asset::AssetWatcher;
 use rye_egui::egui;
@@ -49,85 +49,6 @@ use rye_render::device::RenderDevice;
 use rye_shader::ShaderDb;
 use winit::event::{ElementState, MouseScrollDelta};
 use winit::keyboard::PhysicalKey;
-
-// ---------------------------------------------------------------------------
-// InputMessage: typed protocol between main thread and worker
-// ---------------------------------------------------------------------------
-
-/// Per-frame inputs the main thread forwards to the worker. Each variant
-/// corresponds to a `kind` string in the postMessage JS object payload.
-/// The worker-side `handle_message` parses these and pushes them onto
-/// a thread_local queue; `WorkerRunner::frame` drains the queue at the
-/// top of each frame and applies the events.
-///
-/// Why an enum (vs raw JS objects passed through to the App): keeps the
-/// worker-side App code allocation-free for high-frequency events
-/// (mouse-move at 60Hz; if we serialized/deserialized JSON per event,
-/// every mouse motion would allocate strings).
-#[derive(Debug)]
-pub enum InputMessage {
-    /// New canvas pixel dimensions. Sent by main thread on window resize
-    /// (DPR-multiplied to physical pixels). Triggers a wgpu surface
-    /// reconfigure on the next frame.
-    Resize { width: u32, height: u32 },
-
-    /// Pointer moved to (x, y) in canvas-local CSS pixels (the worker
-    /// applies DPR if needed). `buttons` is the standard `MouseEvent.buttons`
-    /// bitmask (1=primary, 2=secondary, 4=middle).
-    MouseMove { x: f32, y: f32, buttons: u8 },
-
-    /// Pointer button transitioned. `button` is the standard
-    /// `MouseEvent.button` (0=primary, 1=middle, 2=secondary).
-    MouseButton {
-        x: f32,
-        y: f32,
-        button: u8,
-        pressed: bool,
-    },
-
-    /// Wheel delta in lines (after the browser's pixel/line normalization).
-    /// `dx`/`dy` follow DOM convention: positive = right/down.
-    MouseWheel { dx: f32, dy: f32 },
-
-    /// Keyboard key transitioned. `code` is the physical-key code (e.g.
-    /// "KeyT", "Space"); `key` is the logical key (e.g. "t", " ").
-    /// Phase B3 uses `code` for gameplay hotkeys + `key` for text input.
-    Key {
-        code: String,
-        key: String,
-        pressed: bool,
-        repeat: bool,
-        ctrl: bool,
-        shift: bool,
-        alt: bool,
-        meta: bool,
-    },
-
-    /// Window focus state changed.
-    Focus(bool),
-
-    /// Page visibility (tab-in-foreground) state changed.
-    Visibility(bool),
-}
-
-thread_local! {
-    /// Per-worker queue of inbound input messages, drained at the top of
-    /// every frame by `WorkerRunner::frame`. Using a thread_local because
-    /// the message handler closure doesn't have direct access to the
-    /// runner (the runner is constructed asynchronously, after the first
-    /// init message arrives).
-    static MESSAGE_QUEUE: RefCell<VecDeque<InputMessage>> = RefCell::new(VecDeque::new());
-}
-
-fn enqueue(msg: InputMessage) {
-    MESSAGE_QUEUE.with(|q| q.borrow_mut().push_back(msg));
-}
-
-/// Drain all queued messages. Returns them in arrival order so the
-/// runner can apply them sequentially. Called once per frame.
-fn drain_messages() -> Vec<InputMessage> {
-    MESSAGE_QUEUE.with(|q| q.borrow_mut().drain(..).collect())
-}
 
 /// Worker entry. Generic over the demo's `App` type so the same worker
 /// scaffolding drives whatever lifecycle the demo defines.
@@ -207,8 +128,10 @@ where
     Ok(())
 }
 
-/// Dispatch a single inbound `postMessage`. Phase B1 only handles the
-/// `init` kind; Phase B3 adds input-event variants.
+/// Dispatch a single inbound `postMessage`. The `init` kind is special-
+/// cased here (extracts the OffscreenCanvas + spawns the async wgpu
+/// setup); all other kinds go through [`messages::parse_non_init`] and
+/// get pushed onto the per-worker queue for the frame-loop to drain.
 fn handle_message<A: App + 'static>(
     scope: &DedicatedWorkerGlobalScope,
     event: MessageEvent,
@@ -217,128 +140,52 @@ where
     A::Space: 'static,
 {
     let data: JsValue = event.data();
+
+    // `init` is the only kind that touches A. Everything else lives in
+    // the non-generic messages module.
     let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
         .ok()
         .and_then(|v| v.as_string());
+    if kind.as_deref() == Some("init") {
+        let canvas = js_sys::Reflect::get(&data, &JsValue::from_str("canvas"))
+            .map_err(|e| anyhow!("init missing 'canvas' field: {e:?}"))?
+            .dyn_into::<OffscreenCanvas>()
+            .map_err(|e| anyhow!("init 'canvas' is not an OffscreenCanvas: {e:?}"))?;
+        let width = js_sys::Reflect::get(&data, &JsValue::from_str("width"))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .map(|f| f as u32)
+            .unwrap_or(800);
+        let height = js_sys::Reflect::get(&data, &JsValue::from_str("height"))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .map(|f| f as u32)
+            .unwrap_or(600);
 
-    match kind.as_deref() {
-        Some("init") => {
-            let canvas = js_sys::Reflect::get(&data, &JsValue::from_str("canvas"))
-                .map_err(|e| anyhow!("init missing 'canvas' field: {e:?}"))?
-                .dyn_into::<OffscreenCanvas>()
-                .map_err(|e| anyhow!("init 'canvas' is not an OffscreenCanvas: {e:?}"))?;
-            let width = read_u32_field(&data, "width").unwrap_or(800);
-            let height = read_u32_field(&data, "height").unwrap_or(600);
-
-            tracing::info!(
-                "rye_app::wasm::worker: received init ({width}x{height}); spawning wgpu setup"
-            );
-            // wgpu setup is async; spawn it on the worker's task queue.
-            // The closures inside take ownership of the canvas + RAF
-            // scheduling state, so they survive after this handler returns.
-            let scope_for_render = scope.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = init_renderer::<A>(scope_for_render, canvas, width, height).await {
-                    tracing::error!("rye_app::wasm::worker: init_renderer failed: {e:#}");
-                }
-            });
-            Ok(())
-        }
-        Some("resize") => {
-            let width = read_u32_field(&data, "width").unwrap_or(0);
-            let height = read_u32_field(&data, "height").unwrap_or(0);
-            enqueue(InputMessage::Resize { width, height });
-            Ok(())
-        }
-        Some("mouse_move") => {
-            let x = read_f32_field(&data, "x").unwrap_or(0.0);
-            let y = read_f32_field(&data, "y").unwrap_or(0.0);
-            let buttons = read_u32_field(&data, "buttons").unwrap_or(0) as u8;
-            enqueue(InputMessage::MouseMove { x, y, buttons });
-            Ok(())
-        }
-        Some("mouse_button") => {
-            let x = read_f32_field(&data, "x").unwrap_or(0.0);
-            let y = read_f32_field(&data, "y").unwrap_or(0.0);
-            let button = read_u32_field(&data, "button").unwrap_or(0) as u8;
-            let pressed = read_bool_field(&data, "pressed").unwrap_or(false);
-            enqueue(InputMessage::MouseButton {
-                x,
-                y,
-                button,
-                pressed,
-            });
-            Ok(())
-        }
-        Some("mouse_wheel") => {
-            let dx = read_f32_field(&data, "dx").unwrap_or(0.0);
-            let dy = read_f32_field(&data, "dy").unwrap_or(0.0);
-            enqueue(InputMessage::MouseWheel { dx, dy });
-            Ok(())
-        }
-        Some("key") => {
-            let code = read_string_field(&data, "code").unwrap_or_default();
-            let key = read_string_field(&data, "key").unwrap_or_default();
-            let pressed = read_bool_field(&data, "pressed").unwrap_or(false);
-            let repeat = read_bool_field(&data, "repeat").unwrap_or(false);
-            let ctrl = read_bool_field(&data, "ctrl").unwrap_or(false);
-            let shift = read_bool_field(&data, "shift").unwrap_or(false);
-            let alt = read_bool_field(&data, "alt").unwrap_or(false);
-            let meta = read_bool_field(&data, "meta").unwrap_or(false);
-            enqueue(InputMessage::Key {
-                code,
-                key,
-                pressed,
-                repeat,
-                ctrl,
-                shift,
-                alt,
-                meta,
-            });
-            Ok(())
-        }
-        Some("focus") => {
-            let focused = read_bool_field(&data, "focused").unwrap_or(false);
-            enqueue(InputMessage::Focus(focused));
-            Ok(())
-        }
-        Some("visibility") => {
-            let visible = read_bool_field(&data, "visible").unwrap_or(false);
-            enqueue(InputMessage::Visibility(visible));
-            Ok(())
-        }
-        Some(other) => {
-            tracing::warn!("rye_app::wasm::worker: unknown message kind '{other}'");
-            Ok(())
-        }
-        None => Err(anyhow!("postMessage missing 'kind' field")),
+        tracing::info!(
+            "rye_app::wasm::worker: received init ({width}x{height}); spawning wgpu setup"
+        );
+        let scope_for_render = scope.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = init_renderer::<A>(scope_for_render, canvas, width, height).await {
+                tracing::error!("rye_app::wasm::worker: init_renderer failed: {e:#}");
+            }
+        });
+        return Ok(());
     }
-}
 
-fn read_u32_field(obj: &JsValue, key: &str) -> Option<u32> {
-    js_sys::Reflect::get(obj, &JsValue::from_str(key))
-        .ok()
-        .and_then(|v| v.as_f64())
-        .map(|f| f as u32)
-}
-
-fn read_f32_field(obj: &JsValue, key: &str) -> Option<f32> {
-    js_sys::Reflect::get(obj, &JsValue::from_str(key))
-        .ok()
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32)
-}
-
-fn read_bool_field(obj: &JsValue, key: &str) -> Option<bool> {
-    js_sys::Reflect::get(obj, &JsValue::from_str(key))
-        .ok()
-        .and_then(|v| v.as_bool())
-}
-
-fn read_string_field(obj: &JsValue, key: &str) -> Option<String> {
-    js_sys::Reflect::get(obj, &JsValue::from_str(key))
-        .ok()
-        .and_then(|v| v.as_string())
+    // Non-init kinds: parse + queue.
+    match messages::parse_non_init(&data)? {
+        Some(msg) => messages::enqueue(msg),
+        None => {
+            // Unknown kind. Don't error (defensive against future
+            // additions on main side); the warn surfaces it for debugging.
+            if let Some(k) = kind {
+                tracing::warn!("rye_app::wasm::worker: unknown message kind '{k}'");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Phase B1: build `RenderDevice` from the worker-owned OffscreenCanvas,
@@ -914,7 +761,7 @@ where
         // Drain queued input messages. Phase B2 only handles `Resize`;
         // Phase B3 will add the mouse/keyboard variants here (routed
         // into `InputState`) and Phase B4 will fan them out to egui too.
-        for msg in drain_messages() {
+        for msg in messages::drain_messages() {
             self.apply_message(msg);
         }
 
