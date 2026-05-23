@@ -14,6 +14,7 @@
 pub mod launch;
 pub mod messages;
 pub mod worker;
+pub mod worker_ui;
 
 // Re-export the click-to-start surface at the wasm module level so existing
 // `rye_app::wasm::is_manual_mode(...)` and `rye_app::wasm::wait_for_launch(...)`
