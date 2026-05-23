@@ -61,8 +61,7 @@ pub const PANEL_HEIGHT_FRACTION: f32 = 0.5;
 /// console subcommand registered by `rye_app::log`. Process-global because the
 /// typical demo has one Console; multi-Console demos would share the toggle.
 #[cfg(target_arch = "wasm32")]
-static ECHO_TO_BROWSER: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ECHO_TO_BROWSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Enable / disable scrollback echo to the browser DevTools console (wasm32
 /// only). See `ECHO_TO_BROWSER` for the architectural rationale. On native

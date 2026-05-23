@@ -550,7 +550,10 @@ pub fn aggregate() -> Vec<SectionStats> {
     let mut buckets: HashMap<&'static str, Vec<Duration>> = HashMap::new();
     for frame in &frames {
         for section in &frame.sections {
-            buckets.entry(section.name).or_default().push(section.elapsed);
+            buckets
+                .entry(section.name)
+                .or_default()
+                .push(section.elapsed);
         }
     }
 

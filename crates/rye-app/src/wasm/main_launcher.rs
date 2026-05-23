@@ -10,7 +10,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{HtmlButtonElement, HtmlCanvasElement, MessageEvent, Worker, WorkerOptions, WorkerType};
+use web_sys::{
+    HtmlButtonElement, HtmlCanvasElement, MessageEvent, Worker, WorkerOptions, WorkerType,
+};
 
 /// Main-thread entry point for worker mode. Wires the launch button so a
 /// click transfers the page's canvas to a freshly-spawned worker, which
@@ -72,11 +74,7 @@ fn read_wasm_bundle_url() -> Result<String> {
 /// wire the launch-overlay click handler that posts the `Start`
 /// message + removes the overlay on click. Called once at page load
 /// from `launch_on_click`.
-fn spawn_worker_for_preview(
-    canvas_id: &str,
-    _host_id: &str,
-    button_id: &str,
-) -> Result<()> {
+fn spawn_worker_for_preview(canvas_id: &str, _host_id: &str, button_id: &str) -> Result<()> {
     let document = web_sys::window()
         .and_then(|w| w.document())
         .ok_or_else(|| anyhow!("no document on global window"))?;
@@ -139,9 +137,8 @@ fn spawn_worker_for_preview(
     // the same. Instead of shipping a separate `worker_bootstrap.js` per
     // demo, build the bootstrap inline as a Blob URL pointing at the same
     // wasm bundle.
-    let bootstrap_js = format!(
-        "import init from '{js_url}';\nawait init({{ module_or_path: '{wasm_url}' }});\n"
-    );
+    let bootstrap_js =
+        format!("import init from '{js_url}';\nawait init({{ module_or_path: '{wasm_url}' }});\n");
     let blob_parts = js_sys::Array::new();
     blob_parts.push(&JsValue::from_str(&bootstrap_js));
     let blob_options = web_sys::BlobPropertyBag::new();
@@ -153,8 +150,8 @@ fn spawn_worker_for_preview(
 
     let opts = WorkerOptions::new();
     opts.set_type(WorkerType::Module);
-    let worker = Worker::new_with_options(&blob_url, &opts)
-        .map_err(|e| anyhow!("Worker::new: {e:?}"))?;
+    let worker =
+        Worker::new_with_options(&blob_url, &opts).map_err(|e| anyhow!("Worker::new: {e:?}"))?;
 
     // Shared state for the ready handshake + the click-before-ready race:
     // - `worker_ready`: set to true once the worker has posted `ready`
@@ -221,9 +218,7 @@ fn spawn_worker_for_preview(
             );
             let start_msg = build_msg("start");
             if let Err(e) = worker_for_ready.post_message(&start_msg) {
-                tracing::error!(
-                    "rye_app::wasm::worker: postMessage queued Start failed: {e:?}"
-                );
+                tracing::error!("rye_app::wasm::worker: postMessage queued Start failed: {e:?}");
             }
         }
     }) as Box<dyn FnMut(MessageEvent)>);
@@ -236,8 +231,7 @@ fn spawn_worker_for_preview(
     // from the page to the worker. Installed BEFORE the worker is fully
     // ready so events during the setup window get queued by the browser
     // (or via the worker's handle_message queue) and applied on first frame.
-    install_dom_input_forwarders(&worker, &canvas)
-        .context("install_dom_input_forwarders")?;
+    install_dom_input_forwarders(&worker, &canvas).context("install_dom_input_forwarders")?;
 
     // Launch-overlay click handler. Spam-click defensive:
     // - FnMut closure (not `Closure::once`) so repeat invocations are
@@ -260,9 +254,7 @@ fn spawn_worker_for_preview(
         let fired: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
         let on_click = Closure::wrap(Box::new(move || {
             if fired.get() {
-                tracing::debug!(
-                    "rye_app::wasm::worker: launch click ignored (already fired)"
-                );
+                tracing::debug!("rye_app::wasm::worker: launch click ignored (already fired)");
                 return;
             }
             fired.set(true);
@@ -420,8 +412,7 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
             }
             let cb_ref = raf_cb_for_closure.borrow();
             if let Some(cb) = cb_ref.as_ref() {
-                let _ = window_for_raf
-                    .request_animation_frame(cb.as_ref().unchecked_ref());
+                let _ = window_for_raf.request_animation_frame(cb.as_ref().unchecked_ref());
             }
         }) as Box<dyn FnMut()>));
         {
@@ -479,8 +470,7 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
             }
             let cb_ref = raf_cb_for_closure.borrow();
             if let Some(cb) = cb_ref.as_ref() {
-                let _ = window_for_raf
-                    .request_animation_frame(cb.as_ref().unchecked_ref());
+                let _ = window_for_raf.request_animation_frame(cb.as_ref().unchecked_ref());
             }
         }) as Box<dyn FnMut()>));
         {
@@ -576,8 +566,7 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
         let worker = worker.clone();
         let document_for_query = document.clone();
         let cb = Closure::wrap(Box::new(move || {
-            let visible =
-                document_for_query.visibility_state() != web_sys::VisibilityState::Hidden;
+            let visible = document_for_query.visibility_state() != web_sys::VisibilityState::Hidden;
             let msg = build_msg("visibility");
             set_msg_bool(&msg, "visible", visible);
             let _ = worker.post_message(&msg);

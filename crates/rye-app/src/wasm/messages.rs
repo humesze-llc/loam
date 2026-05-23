@@ -157,9 +157,7 @@ pub fn parse_non_init(data: &JsValue) -> Result<Option<InputMessage>> {
             meta: read_bool_field(data, "meta").unwrap_or(false),
         },
         "focus" => InputMessage::Focus(read_bool_field(data, "focused").unwrap_or(false)),
-        "visibility" => {
-            InputMessage::Visibility(read_bool_field(data, "visible").unwrap_or(false))
-        }
+        "visibility" => InputMessage::Visibility(read_bool_field(data, "visible").unwrap_or(false)),
         "start" => InputMessage::Start,
         _ => return Ok(None), // unknown kind; caller decides to warn or ignore
     };

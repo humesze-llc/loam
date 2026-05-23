@@ -151,9 +151,7 @@ where
             // harmless (init_renderer doesn't re-read the flag after
             // first consume).
             START_REQUESTED.with(|s| s.set(true));
-            tracing::info!(
-                "rye_app::wasm::worker: Start received before kickoff ready; queued"
-            );
+            tracing::info!("rye_app::wasm::worker: Start received before kickoff ready; queued");
         }
         return Ok(());
     }
@@ -242,9 +240,7 @@ where
     // pixel dimensions at init; resize events are plumbed via InputMessage.
     let size = winit::dpi::PhysicalSize::new(width, height);
     let rd = RenderDevice::from_surface(
-        instance,
-        surface,
-        size,
+        instance, surface, size,
         // Worker mode: no MSAA for now. The composite pass for the
         // non-sRGB browser-WebGPU surface forces sample_count=1 anyway
         // (see RenderDevice::new's `effective_msaa` logic), so this is
@@ -269,15 +265,10 @@ where
     // DPR explicitly through the init message is a future improvement.
     let pixels_per_point = 1.0; // see comment above; minor cosmetic issue.
 
-    let mut runner = WorkerRunner::<A>::setup(
-        rd,
-        canvas_for_runner,
-        width,
-        height,
-        pixels_per_point,
-    )
-    .await
-    .context("WorkerRunner::setup")?;
+    let mut runner =
+        WorkerRunner::<A>::setup(rd, canvas_for_runner, width, height, pixels_per_point)
+            .await
+            .context("WorkerRunner::setup")?;
 
     // Render exactly ONE preview frame. The launch overlay on main side
     // uses `backdrop-filter: blur(...)` to blur whatever's rendered on
@@ -312,8 +303,7 @@ where
         }
         let cb_ref = raf_cb_for_closure.borrow();
         if let Some(cb) = cb_ref.as_ref() {
-            let _ = scope_for_closure
-                .request_animation_frame(cb.as_ref().unchecked_ref());
+            let _ = scope_for_closure.request_animation_frame(cb.as_ref().unchecked_ref());
         }
     }) as Box<dyn FnMut(f64)>));
 
@@ -327,9 +317,7 @@ where
     let kickoff: Box<dyn FnOnce()> = Box::new(move || {
         let cb_ref = raf_cb_for_kickoff.borrow();
         if let Some(cb) = cb_ref.as_ref() {
-            if let Err(e) =
-                scope_for_kickoff.request_animation_frame(cb.as_ref().unchecked_ref())
-            {
+            if let Err(e) = scope_for_kickoff.request_animation_frame(cb.as_ref().unchecked_ref()) {
                 tracing::error!("rye_app::wasm::worker: RAF kickoff failed: {e:?}");
             }
         }
@@ -496,8 +484,7 @@ where
         }
         self.canvas.set_width(width);
         self.canvas.set_height(height);
-        self.rd
-            .resize(winit::dpi::PhysicalSize::new(width, height));
+        self.rd.resize(winit::dpi::PhysicalSize::new(width, height));
         self.width_px = width;
         self.height_px = height;
         self.ui.resize(width, height, self.pixels_per_point);
@@ -531,9 +518,7 @@ where
                 // happens, and it's what the launch overlay's
                 // backdrop-filter blurs.
                 if let Err(e) = self.frame() {
-                    tracing::error!(
-                        "rye_app::wasm::worker: post-resize frame failed: {e:#}"
-                    );
+                    tracing::error!("rye_app::wasm::worker: post-resize frame failed: {e:#}");
                 }
             }
             InputMessage::MouseMove { x, y, .. } => {
@@ -551,8 +536,7 @@ where
                 self.input.mouse_input(button, state);
             }
             InputMessage::MouseWheel { dx, dy } => {
-                self.input
-                    .mouse_wheel(MouseScrollDelta::LineDelta(dx, dy));
+                self.input.mouse_wheel(MouseScrollDelta::LineDelta(dx, dy));
             }
             InputMessage::Key {
                 ref code, pressed, ..
@@ -644,10 +628,7 @@ where
         }
 
         // begin_frame -> record -> composite -> submit -> present.
-        let (frame, swap_view) = self
-            .rd
-            .begin_frame()
-            .context("RenderDevice::begin_frame")?;
+        let (frame, swap_view) = self.rd.begin_frame().context("RenderDevice::begin_frame")?;
         let render_view = self
             .rd
             .msaa_view()

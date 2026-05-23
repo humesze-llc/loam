@@ -369,10 +369,7 @@ impl PerfOverlay {
             .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(60, 60, 75),
-                    ))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 75)))
                     .show(ui, |ui| {
                         ui.set_min_width(260.0);
                         let mono = egui::FontId::monospace(11.0);
@@ -499,11 +496,9 @@ impl PerfOverlay {
                                 }
                             };
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "mean  {mean_count:>6} allocs/frame",
-                                ))
-                                .font(mono.clone())
-                                .color(count_color(mean_count)),
+                                egui::RichText::new(format!("mean  {mean_count:>6} allocs/frame",))
+                                    .font(mono.clone())
+                                    .color(count_color(mean_count)),
                             );
                             ui.label(
                                 egui::RichText::new(format!(
@@ -658,11 +653,17 @@ fn draw_sparkline(ui: &mut rye_egui::egui::Ui, gaps: &[Duration]) {
     let ref_60 = y_for_ms(16.67);
     let ref_30 = y_for_ms(33.33);
     painter.line_segment(
-        [egui::pos2(rect.left(), ref_60), egui::pos2(rect.right(), ref_60)],
+        [
+            egui::pos2(rect.left(), ref_60),
+            egui::pos2(rect.right(), ref_60),
+        ],
         egui::Stroke::new(0.5, egui::Color32::from_rgb(60, 100, 70)),
     );
     painter.line_segment(
-        [egui::pos2(rect.left(), ref_30), egui::pos2(rect.right(), ref_30)],
+        [
+            egui::pos2(rect.left(), ref_30),
+            egui::pos2(rect.right(), ref_30),
+        ],
         egui::Stroke::new(0.5, egui::Color32::from_rgb(120, 90, 60)),
     );
 

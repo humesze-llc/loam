@@ -35,11 +35,11 @@ use rye_app::{
 #[global_allocator]
 static GLOBAL: rye_time::alloc::CountingAllocator<std::alloc::System> =
     rye_time::alloc::CountingAllocator::new(std::alloc::System);
-use rye_render::device::RenderDevice;
 use rye_egui::Console;
 use rye_math::{Bivector, Bivector4, EuclideanR3, Rotor4};
 use rye_physics::polytope::Polytope4;
-use rye_render::{LineRasterStaticR4Node, DepthMode, Viewport};
+use rye_render::device::RenderDevice;
+use rye_render::{DepthMode, LineRasterStaticR4Node, Viewport};
 use rye_shape::LineMesh;
 use winit::window::WindowAttributes;
 
@@ -397,8 +397,7 @@ impl App for TesseractApp {
                 KeyCode::KeyT | KeyCode::Space => {
                     // T toggles pause; Space is the common gamer pause key.
                     // Both go through the same flag.
-                    if !matches!(code, KeyCode::Space)
-                        || !matches!(self.mode, CameraMode::FreeRoam)
+                    if !matches!(code, KeyCode::Space) || !matches!(self.mode, CameraMode::FreeRoam)
                     {
                         self.paused = !self.paused;
                     }
@@ -499,11 +498,7 @@ impl App for TesseractApp {
             .show(ctx, |ui| {
                 ui.colored_label(
                     egui::Color32::from_rgb(120, 120, 130),
-                    format!(
-                        "build {}{}",
-                        env!("BUILD_HASH"),
-                        env!("BUILD_DIRTY"),
-                    ),
+                    format!("build {}{}", env!("BUILD_HASH"), env!("BUILD_DIRTY"),),
                 );
             });
         // Perf overlay: F3-toggle, draws on top of the HUD. Reads

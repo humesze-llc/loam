@@ -75,10 +75,10 @@ use web_time::Instant;
 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
 pub mod capture;
 
+pub mod args;
 #[cfg(any(not(feature = "capture"), target_arch = "wasm32"))]
 #[path = "capture_stub.rs"]
 pub mod capture;
-pub mod args;
 pub mod fps;
 pub mod frame_pacing;
 pub mod keymap;
@@ -578,12 +578,7 @@ fn setup_after_device<A: App>(
     // scene attachment, since both passes write into the same color attachment and the
     // deferred MSAA resolve happens at the end of the egui paint pass. See
     // [`UiIntegration::paint`]'s `resolve_target` parameter.
-    let mut ui = UiIntegration::new(
-        &rd.device,
-        win,
-        rd.target_format(),
-        rd.sample_count(),
-    );
+    let mut ui = UiIntegration::new(&rd.device, win, rd.target_format(), rd.sample_count());
 
     // Runner-side pipeline warming (N3). Forces lazy pipeline compilation for
     // egui-wgpu's shape variants and the browser-WebGPU composite pass during
@@ -625,9 +620,7 @@ fn setup_after_device<A: App>(
 /// move the result in; the runner borrows it on each callback to try to take the
 /// result out).
 #[cfg(target_arch = "wasm32")]
-type PendingInit<A> = std::rc::Rc<
-    std::cell::RefCell<Option<anyhow::Result<InitArtifacts<A>>>>,
->;
+type PendingInit<A> = std::rc::Rc<std::cell::RefCell<Option<anyhow::Result<InitArtifacts<A>>>>>;
 
 /// Attach the canvas backing the winit window to the page's DOM. Without this the
 /// canvas exists only as a JS object the surface can target but nothing the user can
@@ -656,12 +649,9 @@ fn attach_canvas_to_dom(win: &winit::window::Window) -> anyhow::Result<()> {
 
     let host: web_sys::Element = match document.get_element_by_id("rye-canvas-host") {
         Some(el) => el,
-        None => document
-            .body()
-            .map(Into::into)
-            .ok_or_else(|| anyhow::anyhow!(
-                "no canvas host: page is missing both `#rye-canvas-host` and `<body>`"
-            ))?,
+        None => document.body().map(Into::into).ok_or_else(|| {
+            anyhow::anyhow!("no canvas host: page is missing both `#rye-canvas-host` and `<body>`")
+        })?,
     };
 
     // Fill the host. Without these the canvas keeps winit's default intrinsic size
@@ -1114,9 +1104,7 @@ impl<A: App> Runner<A> {
         // fallback (single-buffered, tearing allowed). If neither is offered
         // (typical browser surface), the request silently no-ops; surface
         // configuration is the wrong layer to surface an error in that case.
-        if let (Some(want_on), Some(rd)) =
-            (frame_pacing::take_pending_vsync(), self.rd.as_mut())
-        {
+        if let (Some(want_on), Some(rd)) = (frame_pacing::take_pending_vsync(), self.rd.as_mut()) {
             let target = if want_on {
                 wgpu::PresentMode::Fifo
             } else {
@@ -1147,9 +1135,7 @@ impl<A: App> Runner<A> {
         // longer than the period), we set `last_redraw_at = now` to "catch
         // up" instead of falling further behind on every subsequent frame.
         let mut frame_anchor = Instant::now();
-        if let (Some(period), Some(last)) =
-            (frame_pacing::target_period(), self.last_redraw_at)
-        {
+        if let (Some(period), Some(last)) = (frame_pacing::target_period(), self.last_redraw_at) {
             let deadline = last + period;
             if frame_anchor < deadline {
                 #[cfg(target_arch = "wasm32")]
@@ -1333,10 +1319,7 @@ impl<A: App> Runner<A> {
                 //      an offscreen sRGB texture; a composite pass at end-of-frame
                 //      samples it and gamma-encodes for write to swap_view.
                 //   3. Swap view directly (native, MSAA off).
-                let render_view = rd
-                    .msaa_view()
-                    .or(rd.scene_view())
-                    .unwrap_or(&swap_view);
+                let render_view = rd.msaa_view().or(rd.scene_view()).unwrap_or(&swap_view);
 
                 // GPU timer start. Tiny dedicated encoder so the timestamp lands in
                 // the queue before any of the frame's submitted work. Stays separate
@@ -1392,11 +1375,11 @@ impl<A: App> Runner<A> {
                         );
                     } else {
                         rd.queue.submit(Some(encoder.finish()));
-                        encoder = rd.device.create_command_encoder(
-                            &wgpu::CommandEncoderDescriptor {
-                                label: Some("rye-app::frame-post-pre-capture"),
-                            },
-                        );
+                        encoder =
+                            rd.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("rye-app::frame-post-pre-capture"),
+                                });
                         capture_consume(&mut self.capture, rd, &frame.texture, true, capture_now);
                     }
                 }
@@ -1422,11 +1405,11 @@ impl<A: App> Runner<A> {
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 if do_capture && self.capture.wants_post() {
                     rd.queue.submit(Some(encoder.finish()));
-                    encoder = rd.device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
+                    encoder = rd
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("rye-app::frame-post-post-capture"),
-                        },
-                    );
+                        });
                     capture_consume(&mut self.capture, rd, &frame.texture, false, capture_now);
                 }
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]

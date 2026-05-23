@@ -30,9 +30,9 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use rye_egui::{cmd, Console, HistoryLine};
 #[cfg(not(target_arch = "wasm32"))]
 use rye_egui::LineKind;
+use rye_egui::{cmd, Console, HistoryLine};
 #[cfg(not(target_arch = "wasm32"))]
 use tracing::field::{Field, Visit};
 #[cfg(not(target_arch = "wasm32"))]

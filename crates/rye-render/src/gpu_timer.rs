@@ -63,8 +63,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 use wgpu::{
-    Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features, MapMode, Queue,
-    QuerySet, QuerySetDescriptor, QueryType, QUERY_RESOLVE_BUFFER_ALIGNMENT,
+    Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features, MapMode, QuerySet,
+    QuerySetDescriptor, QueryType, Queue, QUERY_RESOLVE_BUFFER_ALIGNMENT,
 };
 
 /// Three in-flight frames is enough headroom for the typical WebGPU latency profile
@@ -255,8 +255,7 @@ impl GpuTimer {
         //    resolved on this tick's previous frame. That's `(frame_index - 1) %
         //    FRAMES_IN_FLIGHT`. The other slots are either free or already
         //    callback-pending; we don't re-schedule.
-        let just_resolved_slot =
-            (self.frame_index.wrapping_sub(1) as usize) % FRAMES_IN_FLIGHT;
+        let just_resolved_slot = (self.frame_index.wrapping_sub(1) as usize) % FRAMES_IN_FLIGHT;
         if !self.slots[just_resolved_slot]
             .in_flight
             .load(Ordering::Acquire)
@@ -268,32 +267,31 @@ impl GpuTimer {
         let period_ns = self.timestamp_period_ns;
         let tx = self.tx.clone();
         let flag = self.slots[just_resolved_slot].in_flight.clone();
-        buffer
-            .slice(..)
-            .map_async(MapMode::Read, move |result| {
-                if result.is_ok() {
-                    let view = buffer_for_callback.slice(..).get_mapped_range();
-                    // Per-slot map buffer is constructed with `size: BYTES_PER_SLOT`
-                    // (16), so the slice length is guaranteed by wgpu. We still
-                    // pattern-destructure here so a divergence between
-                    // BYTES_PER_SLOT and the literal byte ranges would be caught at
-                    // compile time rather than via a runtime `.expect` panic.
-                    if let (Ok(start_bytes), Ok(end_bytes)) =
-                        (<[u8; 8]>::try_from(&view[0..8]), <[u8; 8]>::try_from(&view[8..16]))
-                    {
-                        let start_ticks = u64::from_le_bytes(start_bytes);
-                        let end_ticks = u64::from_le_bytes(end_bytes);
-                        let delta_ticks = end_ticks.saturating_sub(start_ticks);
-                        let delta_ns = (delta_ticks as f64 * period_ns as f64) as u64;
-                        let _ = tx.send(Duration::from_nanos(delta_ns));
-                    }
-                    drop(view);
-                    buffer_for_callback.unmap();
+        buffer.slice(..).map_async(MapMode::Read, move |result| {
+            if result.is_ok() {
+                let view = buffer_for_callback.slice(..).get_mapped_range();
+                // Per-slot map buffer is constructed with `size: BYTES_PER_SLOT`
+                // (16), so the slice length is guaranteed by wgpu. We still
+                // pattern-destructure here so a divergence between
+                // BYTES_PER_SLOT and the literal byte ranges would be caught at
+                // compile time rather than via a runtime `.expect` panic.
+                if let (Ok(start_bytes), Ok(end_bytes)) = (
+                    <[u8; 8]>::try_from(&view[0..8]),
+                    <[u8; 8]>::try_from(&view[8..16]),
+                ) {
+                    let start_ticks = u64::from_le_bytes(start_bytes);
+                    let end_ticks = u64::from_le_bytes(end_bytes);
+                    let delta_ticks = end_ticks.saturating_sub(start_ticks);
+                    let delta_ns = (delta_ticks as f64 * period_ns as f64) as u64;
+                    let _ = tx.send(Duration::from_nanos(delta_ns));
                 }
-                // Clear the flag whether the read succeeded or not; otherwise a
-                // single failed map_async would permanently stall the slot.
-                flag.store(false, Ordering::Release);
-            });
+                drop(view);
+                buffer_for_callback.unmap();
+            }
+            // Clear the flag whether the read succeeded or not; otherwise a
+            // single failed map_async would permanently stall the slot.
+            flag.store(false, Ordering::Release);
+        });
     }
 }
 

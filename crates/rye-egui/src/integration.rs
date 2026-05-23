@@ -171,15 +171,14 @@ impl UiIntegration {
         // need" vs the warm-up time.
         let ctx = self.begin_frame(window);
         let ctx = ctx.clone();
-        egui::Area::new(egui::Id::new("rye-egui::warm"))
-            .show(&ctx, |ui| {
-                ui.label("warm");
-                ui.separator();
-                ui.painter().line_segment(
-                    [egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)],
-                    egui::Stroke::new(1.0, egui::Color32::WHITE),
-                );
-            });
+        egui::Area::new(egui::Id::new("rye-egui::warm")).show(&ctx, |ui| {
+            ui.label("warm");
+            ui.separator();
+            ui.painter().line_segment(
+                [egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)],
+                egui::Stroke::new(1.0, egui::Color32::WHITE),
+            );
+        });
         self.paint(
             device,
             queue,

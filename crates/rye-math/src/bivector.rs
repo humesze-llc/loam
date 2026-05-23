@@ -1195,9 +1195,7 @@ mod tests {
         // Random-ish vector: matrix-vector product should equal R-apply.
         let v = Vec4::new(0.6, -0.4, 0.2, 0.9);
         // Column-major mat4: result = sum_i col_i * v[i].
-        let row = |k: usize| {
-            m[0][k] * v.x + m[1][k] * v.y + m[2][k] * v.z + m[3][k] * v.w
-        };
+        let row = |k: usize| m[0][k] * v.x + m[1][k] * v.y + m[2][k] * v.z + m[3][k] * v.w;
         let by_matrix = Vec4::new(row(0), row(1), row(2), row(3));
         let by_rotor = <Rotor4 as Rotor>::apply(&r, v);
         assert!(

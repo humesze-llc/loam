@@ -45,9 +45,7 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
                         // typed it, they know what they asked for. A future
                         // refactor that plumbs rd through Ctx could read the
                         // applied mode here instead.
-                        out.line(
-                            "vsync: use 'vsync on' (Fifo) or 'vsync off' (Mailbox/Immediate)",
-                        );
+                        out.line("vsync: use 'vsync on' (Fifo) or 'vsync off' (Mailbox/Immediate)");
                     }
                     Some("on") => {
                         frame_pacing::request_vsync_on();

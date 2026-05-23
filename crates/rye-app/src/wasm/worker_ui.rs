@@ -161,9 +161,7 @@ impl WorkerUi {
             // Non-egui-relevant variants: Resize is handled by the
             // runner; Visibility hasn't been wired up; Start fires
             // outside the frame loop entirely (handled in handle_message).
-            InputMessage::Resize { .. }
-            | InputMessage::Visibility(_)
-            | InputMessage::Start => {}
+            InputMessage::Resize { .. } | InputMessage::Visibility(_) | InputMessage::Start => {}
         }
     }
 
@@ -209,8 +207,7 @@ impl WorkerUi {
         resolve_target: Option<&wgpu::TextureView>,
     ) {
         let full_output = self.ctx.end_pass();
-        self.wants_input =
-            self.ctx.wants_pointer_input() || self.ctx.wants_keyboard_input();
+        self.wants_input = self.ctx.wants_pointer_input() || self.ctx.wants_keyboard_input();
 
         let primitives = self
             .ctx

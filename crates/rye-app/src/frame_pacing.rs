@@ -265,6 +265,9 @@ mod tests {
         let deadline = start - Duration::from_millis(10);
         precise_sleep_until(deadline);
         let actual = Instant::now() - start;
-        assert!(actual < Duration::from_millis(2), "took too long: {actual:?}");
+        assert!(
+            actual < Duration::from_millis(2),
+            "took too long: {actual:?}"
+        );
     }
 }

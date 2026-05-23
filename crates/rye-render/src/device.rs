@@ -300,7 +300,8 @@ impl RenderDevice {
             ));
         }
         if let (Some(scene_fmt), Some(composite)) = (self.scene_format, self.composite.as_mut()) {
-            let scene = create_scene_target(&self.device, scene_fmt, new_size.width, new_size.height);
+            let scene =
+                create_scene_target(&self.device, scene_fmt, new_size.width, new_size.height);
             composite.set_scene_view(&self.device, &scene.view);
             self.scene_target = Some(scene);
         }
@@ -408,11 +409,7 @@ impl RenderDevice {
     /// Run the final composite pass: sample the scene texture, gamma-encode in the
     /// fragment shader, and write to `swap_view`. Caller submits the encoder.
     /// No-op when `scene_view()` is `None` (native fast path).
-    pub fn composite_to_swap(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        swap_view: &TextureView,
-    ) {
+    pub fn composite_to_swap(&self, encoder: &mut wgpu::CommandEncoder, swap_view: &TextureView) {
         if let Some(composite) = self.composite.as_ref() {
             composite.run(encoder, swap_view);
         }
