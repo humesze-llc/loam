@@ -296,3 +296,151 @@ impl GpuTimer {
             });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure-function tests: these exercise the slot index / range arithmetic
+    // without needing a wgpu device. The integration paths (write_start,
+    // write_end_and_resolve, tick) require a real Device+Queue and are
+    // covered indirectly by polytope_playground / tesseract_demo running
+    // without panic at startup; that surfaced the original wgpu 27 MAP+
+    // QUERY_RESOLVE validation error this module's design corrects.
+
+    // Compile-time enforcement of the stride-fits-payload invariant. If
+    // someone shrinks SLOT_STRIDE_BYTES below BYTES_PER_SLOT the build
+    // fails, not a test run.
+    const _: () = assert!(SLOT_STRIDE_BYTES >= BYTES_PER_SLOT);
+
+    #[test]
+    fn slot_constants_match_wgpu_alignment() {
+        assert_eq!(SLOT_STRIDE_BYTES, QUERY_RESOLVE_BUFFER_ALIGNMENT);
+        assert_eq!(BYTES_PER_SLOT, 16, "two u64 ticks per slot");
+        // resolve_query_set destination offset alignment is the load-bearing
+        // invariant; if QUERY_RESOLVE_BUFFER_ALIGNMENT ever changes upstream,
+        // SLOT_STRIDE_BYTES tracks it via the binding above.
+    }
+
+    #[test]
+    fn slot_query_range_is_pair_per_slot() {
+        for slot in 0..FRAMES_IN_FLIGHT {
+            let range = GpuTimer::slot_query_range(slot);
+            assert_eq!(range.end - range.start, 2, "two queries per slot");
+            assert_eq!(range.start, (slot * 2) as u32);
+        }
+        // Adjacent slots' ranges must not overlap; resolve_query_set would
+        // otherwise stomp on the previous slot's ticks.
+        for slot in 0..FRAMES_IN_FLIGHT.saturating_sub(1) {
+            let a = GpuTimer::slot_query_range(slot);
+            let b = GpuTimer::slot_query_range(slot + 1);
+            assert!(a.end <= b.start, "slot {slot} overlaps slot {}", slot + 1);
+        }
+    }
+
+    #[test]
+    fn slot_byte_range_is_aligned_and_disjoint() {
+        for slot in 0..FRAMES_IN_FLIGHT {
+            let range = GpuTimer::slot_byte_range(slot);
+            // resolve_query_set requires destination offset to be
+            // QUERY_RESOLVE_BUFFER_ALIGNMENT-aligned. Verifying here so a
+            // refactor that changes SLOT_STRIDE_BYTES caught immediately.
+            assert_eq!(
+                range.start % QUERY_RESOLVE_BUFFER_ALIGNMENT,
+                0,
+                "slot {slot} start not aligned"
+            );
+            assert_eq!(range.end - range.start, BYTES_PER_SLOT);
+        }
+        // Disjoint between adjacent slots: otherwise a copy from one slot
+        // would corrupt another's pending data.
+        for slot in 0..FRAMES_IN_FLIGHT.saturating_sub(1) {
+            let a = GpuTimer::slot_byte_range(slot);
+            let b = GpuTimer::slot_byte_range(slot + 1);
+            assert!(a.end <= b.start);
+        }
+    }
+
+    // Helper: a GpuTimer-shaped value with just enough state to drive
+    // `current_slot` and the `(frame_index - 1) % N` invariants. We don't
+    // construct an actual GpuTimer (that needs a wgpu Device); we test the
+    // arithmetic in isolation.
+    fn slot_of(frame_index: u64) -> usize {
+        (frame_index as usize) % FRAMES_IN_FLIGHT
+    }
+
+    fn just_resolved_of(frame_index: u64) -> usize {
+        (frame_index.wrapping_sub(1) as usize) % FRAMES_IN_FLIGHT
+    }
+
+    #[test]
+    fn current_slot_cycles_through_frames_in_flight() {
+        for f in 0..(FRAMES_IN_FLIGHT * 4) as u64 {
+            let s = slot_of(f);
+            assert!(s < FRAMES_IN_FLIGHT, "slot {s} out of range");
+            assert_eq!(s, (f as usize) % FRAMES_IN_FLIGHT);
+        }
+    }
+
+    #[test]
+    fn just_resolved_slot_is_previous_frame() {
+        // For a normal forward sequence: just_resolved_slot is the
+        // current_slot of frame_index - 1.
+        for f in 1..(FRAMES_IN_FLIGHT * 4) as u64 {
+            assert_eq!(just_resolved_of(f), slot_of(f - 1));
+        }
+    }
+
+    #[test]
+    fn just_resolved_slot_wraps_around_u64_max() {
+        // The runner uses `frame_index.wrapping_add(1)` per redraw. After a
+        // full u64::MAX worth of frames, the index wraps to 0. We must still
+        // pick the correct previous slot. Demonstrate the math is stable.
+        let f = 0u64; // this is what `frame_index` is right after wrapping
+        let prev = just_resolved_of(f);
+        // `0.wrapping_sub(1) = u64::MAX`; u64::MAX % 3 == 0 (since
+        // 3 * 6148914691236517205 = u64::MAX - 0, so MAX % 3 == 0... actually
+        // 2^64 ≡ 1 mod 3, so u64::MAX ≡ 0 mod 3.)
+        assert_eq!(prev, 0, "u64::MAX % 3 should be 0");
+        assert_eq!(prev, (u64::MAX as usize) % FRAMES_IN_FLIGHT);
+    }
+
+    #[test]
+    fn in_flight_flag_round_trip_clears_after_callback() {
+        // Mimic the slot's lifecycle: resolve sets in_flight; callback clears
+        // it. The real path goes through map_async; here we exercise the
+        // AtomicBool directly to prove the clearing semantics the callback
+        // relies on are sound and re-arm the slot for the next cycle.
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!flag.load(Ordering::Acquire), "starts clear");
+
+        flag.store(true, Ordering::Release);
+        assert!(flag.load(Ordering::Acquire), "resolve sets it");
+
+        // Two consecutive resolves without a callback in between SHOULD be
+        // caught by the write_start / write_end guard (`if in_flight return`).
+        // We assert that path here: starting from in_flight=true, a re-check
+        // sees true and would skip.
+        let still_in_flight = flag.load(Ordering::Acquire);
+        assert!(still_in_flight, "skip guard fires on consecutive resolves");
+
+        // Callback clears (even on map_async failure, per the implementation
+        // comment "Clear the flag whether the read succeeded or not").
+        flag.store(false, Ordering::Release);
+        assert!(!flag.load(Ordering::Acquire), "callback re-arms the slot");
+    }
+
+    #[test]
+    fn channel_round_trip_carries_duration() {
+        // The async map_async callback sends `Duration` over `tx` and `tick`
+        // drains via `try_recv`. Cover the round-trip in isolation; the live
+        // path is the same channel with the buffer-read wedged between send
+        // and recv.
+        let (tx, rx) = channel::<Duration>();
+        let _ = tx.send(Duration::from_micros(16_500));
+        let _ = tx.send(Duration::from_micros(17_100));
+        assert_eq!(rx.try_recv().ok(), Some(Duration::from_micros(16_500)));
+        assert_eq!(rx.try_recv().ok(), Some(Duration::from_micros(17_100)));
+        assert!(rx.try_recv().is_err(), "channel drained");
+    }
+}

@@ -65,3 +65,79 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
         .with_args(&[&["unlimited", "off", "30", "60", "120", "144", "240"]]),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame_pacing;
+    // Tests touch the process-global `frame_pacing` atomic. Default cargo
+    // test parallelism would race the writes against each others' reads;
+    // every test in this crate that touches the pacing atomics shares
+    // `frame_pacing::TEST_LOCK`.
+    use crate::frame_pacing::TEST_LOCK;
+
+    fn build_console() -> rye_egui::Console<()> {
+        let mut c = rye_egui::Console::<()>::new();
+        register_command(&mut c);
+        c
+    }
+
+    #[test]
+    fn fps_numeric_arg_updates_target() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = build_console();
+        let mut ctx = ();
+        c.execute("fps 30", &mut ctx);
+        let target = frame_pacing::target_fps();
+        assert!(
+            (target - 30.0).abs() < 0.1,
+            "fps 30 should set target near 30, got {target}"
+        );
+        frame_pacing::set_target_fps(60.0);
+    }
+
+    #[test]
+    fn fps_unlimited_removes_cap() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = build_console();
+        let mut ctx = ();
+        c.execute("fps unlimited", &mut ctx);
+        assert_eq!(frame_pacing::target_fps(), 0.0);
+        assert!(frame_pacing::target_period().is_none());
+        frame_pacing::set_target_fps(60.0);
+    }
+
+    #[test]
+    fn fps_off_alias_matches_unlimited() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = build_console();
+        let mut ctx = ();
+        c.execute("fps off", &mut ctx);
+        assert_eq!(frame_pacing::target_fps(), 0.0);
+        frame_pacing::set_target_fps(60.0);
+    }
+
+    #[test]
+    fn fps_zero_alias_matches_unlimited() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = build_console();
+        let mut ctx = ();
+        c.execute("fps 0", &mut ctx);
+        assert_eq!(frame_pacing::target_fps(), 0.0);
+        frame_pacing::set_target_fps(60.0);
+    }
+
+    #[test]
+    fn fps_out_of_range_does_not_change_target() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = build_console();
+        let mut ctx = ();
+        let before = frame_pacing::target_fps();
+        // Past the MAX_ACCEPTED_FPS guard; the handler prints a usage line
+        // but does not poke the atomic.
+        c.execute("fps 100000", &mut ctx);
+        let after = frame_pacing::target_fps();
+        assert_eq!(before, after, "out-of-range input should be a no-op");
+        frame_pacing::set_target_fps(60.0);
+    }
+}

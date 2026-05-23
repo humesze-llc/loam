@@ -72,3 +72,75 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
         .with_args(&[&["on", "off"]]),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::frame_pacing;
+    use crate::frame_pacing::TEST_LOCK;
+
+    fn build_console() -> rye_egui::Console<()> {
+        let mut c = rye_egui::Console::<()>::new();
+        super::register_command(&mut c);
+        c
+    }
+
+    fn clear_pending() {
+        let _ = frame_pacing::take_pending_vsync();
+    }
+
+    #[test]
+    fn vsync_on_records_pending_request() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pending();
+        let mut c = build_console();
+        let mut ctx = ();
+        c.execute("vsync on", &mut ctx);
+        assert_eq!(
+            frame_pacing::take_pending_vsync(),
+            Some(true),
+            "vsync on should queue a vsync-on request"
+        );
+    }
+
+    #[test]
+    fn vsync_off_records_pending_request() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pending();
+        let mut c = build_console();
+        let mut ctx = ();
+        c.execute("vsync off", &mut ctx);
+        assert_eq!(
+            frame_pacing::take_pending_vsync(),
+            Some(false),
+            "vsync off should queue a vsync-off request"
+        );
+    }
+
+    #[test]
+    fn vsync_bare_invocation_does_not_change_pending() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pending();
+        let mut c = build_console();
+        let mut ctx = ();
+        c.execute("vsync", &mut ctx);
+        assert_eq!(
+            frame_pacing::take_pending_vsync(),
+            None,
+            "bare `vsync` should print help, not request a transition"
+        );
+    }
+
+    #[test]
+    fn vsync_unknown_subcommand_does_not_change_pending() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pending();
+        let mut c = build_console();
+        let mut ctx = ();
+        c.execute("vsync foo", &mut ctx);
+        assert_eq!(
+            frame_pacing::take_pending_vsync(),
+            None,
+            "unknown subcommand should print error, not queue a transition"
+        );
+    }
+}

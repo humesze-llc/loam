@@ -1851,12 +1851,26 @@ mod tests {
         let mut ctx: Ctx = 0;
         c.execute("echo hello world", &mut ctx);
 
+        // Invariants asserted (not the exact text formatting):
+        // - one Input line + one Output line, in that order
+        // - the Input line includes the user's typed text (echo + args)
+        // - the Output line contains the echo's joined args
+        // Pinning the precise prompt prefix ("> ") would break on any future
+        // prompt-style change; the invariant is what we care about.
         let lines: Vec<&HistoryLine> = c.history.iter().collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].kind, LineKind::Input);
-        assert_eq!(lines[0].text, "> echo hello world");
+        assert!(
+            lines[0].text.contains("echo hello world"),
+            "Input line should include the user's typed text, got: {:?}",
+            lines[0].text
+        );
         assert_eq!(lines[1].kind, LineKind::Output);
-        assert_eq!(lines[1].text, "hello world");
+        assert!(
+            lines[1].text.contains("hello world"),
+            "Output line should contain echo's joined args, got: {:?}",
+            lines[1].text
+        );
     }
 
     #[test]

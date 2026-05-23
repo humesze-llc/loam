@@ -686,3 +686,125 @@ fn draw_sparkline(ui: &mut rye_egui::egui::Ui, gaps: &[Duration]) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `fmt_dur` is the primary string emitter the trace command uses;
+    // verifying the unit boundary picks (ns / us / ms / s) catches drift
+    // if anyone changes the thresholds. Lower bound at each boundary is
+    // the "just-crossed" sample.
+
+    #[test]
+    fn fmt_dur_emits_ns_under_microsecond() {
+        assert!(fmt_dur(Duration::from_nanos(0)).ends_with("ns"));
+        assert!(fmt_dur(Duration::from_nanos(999)).ends_with("ns"));
+    }
+
+    #[test]
+    fn fmt_dur_emits_us_under_millisecond() {
+        assert!(fmt_dur(Duration::from_nanos(1_000)).ends_with("us"));
+        assert!(fmt_dur(Duration::from_nanos(999_999)).ends_with("us"));
+    }
+
+    #[test]
+    fn fmt_dur_emits_ms_under_second() {
+        assert!(fmt_dur(Duration::from_nanos(1_000_000)).ends_with("ms"));
+        assert!(fmt_dur(Duration::from_nanos(999_999_999)).ends_with("ms"));
+    }
+
+    #[test]
+    fn fmt_dur_emits_seconds_above() {
+        assert!(fmt_dur(Duration::from_secs(1)).ends_with('s'));
+        assert!(!fmt_dur(Duration::from_secs(1)).ends_with("ms"));
+        assert!(!fmt_dur(Duration::from_secs(1)).ends_with("us"));
+    }
+
+    #[test]
+    fn truncate_preserves_short_names_and_marks_long_ones() {
+        assert_eq!(truncate("frame", 18), "frame");
+        // A name at the cap fits verbatim.
+        assert_eq!(truncate("abcdefghijklmnopqr", 18).len(), 18);
+        // A name PAST the cap collapses to `cap-1` chars plus a `~` mark.
+        let long = "supercalifragilisticexpialidocious";
+        let t = truncate(long, 18);
+        assert_eq!(t.len(), 18);
+        assert!(t.ends_with('~'), "truncate should mark with `~`");
+    }
+
+    #[test]
+    fn stackbuf_starts_empty() {
+        let buf = StackBuf::new();
+        assert_eq!(buf.as_slice().len(), 0);
+        assert_eq!(buf.mean(), Duration::ZERO);
+        assert_eq!(buf.percentile(0.5), Duration::ZERO);
+        assert_eq!(buf.percentile(0.99), Duration::ZERO);
+    }
+
+    #[test]
+    fn stackbuf_push_appends_in_order() {
+        let mut buf = StackBuf::new();
+        for ms in [10u64, 20, 30] {
+            buf.push(Duration::from_millis(ms));
+        }
+        let slice = buf.as_slice();
+        assert_eq!(slice.len(), 3);
+        assert_eq!(slice[0], Duration::from_millis(10));
+        assert_eq!(slice[1], Duration::from_millis(20));
+        assert_eq!(slice[2], Duration::from_millis(30));
+    }
+
+    #[test]
+    fn stackbuf_push_silently_drops_past_max_window() {
+        let mut buf = StackBuf::new();
+        for i in 0..(MAX_WINDOW + 10) {
+            buf.push(Duration::from_nanos(i as u64));
+        }
+        assert_eq!(
+            buf.as_slice().len(),
+            MAX_WINDOW,
+            "push beyond cap must not allocate; samples drop"
+        );
+    }
+
+    #[test]
+    fn stackbuf_mean_handles_uniform_input() {
+        let mut buf = StackBuf::new();
+        for _ in 0..10 {
+            buf.push(Duration::from_millis(16));
+        }
+        assert_eq!(buf.mean(), Duration::from_millis(16));
+    }
+
+    #[test]
+    fn stackbuf_percentile_picks_nearest_rank() {
+        // 10 samples: 1ms, 2ms, ..., 10ms.
+        let mut buf = StackBuf::new();
+        for ms in 1..=10u64 {
+            buf.push(Duration::from_millis(ms));
+        }
+        // p50 with nearest-rank: floor(10 * 0.5) = 5 -> samples[5] = 6ms.
+        assert_eq!(buf.percentile(0.5), Duration::from_millis(6));
+        // p95: floor(10 * 0.95) = 9 -> samples[9] = 10ms (the max).
+        assert_eq!(buf.percentile(0.95), Duration::from_millis(10));
+        // p99 same range: clamped to len-1 = 9 -> 10ms.
+        assert_eq!(buf.percentile(0.99), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn stackbuf_percentile_is_order_preserving_on_self() {
+        // The implementation sorts into a stack-local copy and leaves `self`
+        // untouched. The sparkline downstream relies on insertion order; if
+        // a refactor moved the sort onto `self.samples`, the sparkline would
+        // show sorted bars instead of time-ordered ones.
+        let mut buf = StackBuf::new();
+        for ms in [30u64, 5, 25, 10, 20] {
+            buf.push(Duration::from_millis(ms));
+        }
+        let before: Vec<Duration> = buf.as_slice().to_vec();
+        let _ = buf.percentile(0.5);
+        let after: Vec<Duration> = buf.as_slice().to_vec();
+        assert_eq!(before, after, "percentile must not reorder self");
+    }
+}

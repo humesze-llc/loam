@@ -160,27 +160,44 @@ pub fn precise_sleep_until(deadline: Instant) {
 #[cfg(target_arch = "wasm32")]
 pub fn precise_sleep_until(_deadline: Instant) {}
 
+// Test-only shared lock. Every test in this crate that touches the
+// process-global pacing atomics (`TARGET_PERIOD_NS`, `PENDING_VSYNC`) must
+// hold this lock for the duration of its observations. Without it, cargo's
+// default parallel test runner interleaves writes and reads across modules
+// (`fps::tests`, `vsync::tests`, this module) and produces flaky assertions.
+//
+// `unwrap_or_else(|e| e.into_inner())` keeps the suite robust against a
+// poisoned lock from a panicking sibling test; the data inside is just unit,
+// so there's nothing to recover from.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn default_is_60fps() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Reset to the canonical default in case a sibling test (or a
+        // previous run) left the atomic in another state.
+        set_target_fps(60.0);
         assert!((target_fps() - 60.0).abs() < 0.01);
         assert!(target_period().is_some());
     }
 
     #[test]
     fn unlimited_round_trip() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_target_fps(0.0);
         assert_eq!(target_fps(), 0.0);
         assert_eq!(target_period(), None);
-        // Restore default for other tests sharing this process.
         set_target_fps(60.0);
     }
 
     #[test]
     fn set_then_read() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_target_fps(144.0);
         let f = target_fps();
         assert!((f - 144.0).abs() < 0.5);
@@ -189,8 +206,7 @@ mod tests {
 
     #[test]
     fn vsync_request_round_trip() {
-        // Read clears any prior pending state so the assertions below aren't
-        // racing other tests' leftover requests.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = take_pending_vsync();
         request_vsync_on();
         assert_eq!(take_pending_vsync(), Some(true));
