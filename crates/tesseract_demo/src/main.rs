@@ -64,9 +64,14 @@ const SPIN_RATE: f32 = 0.4;
 /// without the viewer needing to walk halfway across the page.
 const POLYTOPE_SCALE: f32 = 1.5;
 
-/// Wireframe line color: warm white, slightly translucent so overlap brightens
-/// naturally. Matches polytope_playground's default style.
-const EDGE_COLOR: [f32; 4] = [0.95, 0.94, 0.92, 0.9];
+/// Per-line tint applied on top of the w-depth color algorithm baked into the
+/// `LineRasterStaticR4Node` shader. Rgb multiplies the depth-cue palette
+/// (cool blue back → warm orange front, lerped by the segment's midpoint w
+/// AFTER the rotor), so a value close to white preserves the depth gradient's
+/// hue identity; alpha controls per-line opacity. The depth cue is what gives
+/// the demo its "easy to read which line is in front of which" property — see
+/// the shader file for the algorithm.
+const EDGE_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.95];
 const EDGE_WIDTH_PX: f32 = 1.6;
 
 /// Camera modes the demo supports. Orbit is the default (predictable for a

@@ -9,6 +9,23 @@
 // chain in vs_main. Keeping the two shaders separate (vs trying to share via
 // WGSL "imports") avoids the naga-side composer dependency the project has
 // otherwise avoided so far.
+//
+// ## Depth-cue coloring
+//
+// Unlike the R³ variant — which interpolates a per-endpoint gradient between
+// `start_color` and `end_color` — this shader paints every line with ONE
+// color computed from the segment's midpoint w-coordinate AFTER the rotor.
+// Within a line the color is uniform; across lines the color tracks 4D depth.
+// This is the depth cue that lets a viewer read "which line is in front of
+// which" in a rotating tesseract: the cube-within-cube structure of a
+// Perspective4D-projected tesseract corresponds to a clean +w / -w split, and
+// the color encodes that split directly. As the rotor spins, edges migrate
+// between the +w and −w camps and the colors animate with the geometry.
+//
+// `start_color` is reused as a per-line tint/opacity modulator: rgb multiplies
+// the depth gradient (uniform white = pure depth-cue palette), alpha passes
+// through to the AA blend. `end_color` is ignored on this path; callers
+// usually upload the same value for both endpoints anyway.
 
 struct TransformUniform {
     // 4×4 rotation matrix derived from the host-side `Rotor4` once per frame
@@ -72,7 +89,25 @@ fn vs_main(
     let pick_start = (corner == 0u || corner == 2u);
     let base_ndc   = select(e_ndc, s_ndc, pick_start);
     let base_w     = select(e_clip.w, s_clip.w, pick_start);
-    let color      = select(end_color, start_color, pick_start);
+
+    // Depth-cue color: average the segment's rotated w-coordinates, normalize,
+    // and lerp between a cool "back" tint and a warm "front" tint. Identical
+    // value at both endpoints → no within-line gradient. `start_color` is
+    // applied as a tint multiplier so callers can dim individual edges (or
+    // pass white for the pure depth palette).
+    //
+    // The [-0.5, +0.5] band picked here matches a unit-circumradius tesseract:
+    // every vertex sits on the unit 3-sphere, so w spans exactly that range.
+    // A rotor leaves magnitudes invariant, so the rotated w stays in band.
+    // Different polytopes (24-cell, 600-cell) with their own circumradius will
+    // still produce a usable gradient — the `clamp` keeps the lerp valid; only
+    // the visible contrast shrinks slightly.
+    let mid_w  = (s_4d.w + e_4d.w) * 0.5;
+    let w_norm = clamp(mid_w + 0.5, 0.0, 1.0);
+    let back_tint  = vec3<f32>(0.30, 0.42, 0.58);
+    let front_tint = vec3<f32>(1.00, 0.78, 0.45);
+    let depth_rgb  = mix(back_tint, front_tint, w_norm);
+    let color      = vec4<f32>(depth_rgb * start_color.rgb, start_color.a);
 
     let half_vp     = transform.viewport_size * 0.5;
     let dir_pixels  = (e_ndc.xy - s_ndc.xy) * half_vp;
