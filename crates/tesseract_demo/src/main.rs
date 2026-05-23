@@ -394,13 +394,14 @@ impl App for TesseractApp {
                     };
                     self.free_roam_pos = self.camera.position;
                 }
-                KeyCode::KeyT | KeyCode::Space => {
-                    // T toggles pause; Space is the common gamer pause key.
-                    // Both go through the same flag.
-                    if !matches!(code, KeyCode::Space) || !matches!(self.mode, CameraMode::FreeRoam)
-                    {
-                        self.paused = !self.paused;
-                    }
+                // T always toggles pause; Space ALSO toggles pause, but only
+                // outside FreeRoam (where Space is the jump-up axis and would
+                // be a double-bind).
+                KeyCode::KeyT => {
+                    self.paused = !self.paused;
+                }
+                KeyCode::Space if !matches!(self.mode, CameraMode::FreeRoam) => {
+                    self.paused = !self.paused;
                 }
                 KeyCode::KeyR => {
                     // Reset orientation to identity. omega is preserved so
