@@ -230,11 +230,7 @@ fn unique_edge_palette(edges: &[[u32; 2]]) -> Vec<[f32; 4]> {
 /// by the cell's half-extent, a cheap proxy for the actual cap area that
 /// gives the same visual gradient. Shared by `render_wireframe_overlay` and
 /// `render_points` so both honor the same cell-activity definition.
-fn compute_cell_strengths(
-    cells: &[&[u32]],
-    local_vertices: &[Vec4],
-    w_slice: f32,
-) -> Vec<f32> {
+fn compute_cell_strengths(cells: &[&[u32]], local_vertices: &[Vec4], w_slice: f32) -> Vec<f32> {
     cells
         .iter()
         .map(|cell| {
@@ -547,8 +543,7 @@ impl Demo {
         let dir = (self.slider_up_held as i32 - self.slider_down_held as i32) as f32;
         if dir != 0.0 {
             let w_range = self.effective_w_range();
-            self.w_slice =
-                (self.w_slice + dir * W_SCRUB_RATE * dt_secs).clamp(-w_range, w_range);
+            self.w_slice = (self.w_slice + dir * W_SCRUB_RATE * dt_secs).clamp(-w_range, w_range);
         }
 
         // Time scrub (t axis, left/right arrow keys). Mirrors the
@@ -1538,14 +1533,14 @@ impl Demo {
             // graph). Memoize by `Polytope4` variant so the 600-cell's ~520k pair-checks
             // run once per launch instead of once per frame. Cache lives on Demo; an
             // empty cache simply triggers first-use population for the visited variants.
-            let edge_palette: &[[f32; 4]] =
-                if matches!(color_mode, WireframeColorMode::UniqueEdge) {
-                    self.unique_edge_palette_cache
-                        .entry(polytope)
-                        .or_insert_with(|| unique_edge_palette(topo.edges))
-                } else {
-                    &[]
-                };
+            let edge_palette: &[[f32; 4]] = if matches!(color_mode, WireframeColorMode::UniqueEdge)
+            {
+                self.unique_edge_palette_cache
+                    .entry(polytope)
+                    .or_insert_with(|| unique_edge_palette(topo.edges))
+            } else {
+                &[]
+            };
             // For `WDepth` we normalize against this polytope's CANONICAL max
             // |w| (NOT the per-frame rotated max). The rotor preserves
             // magnitudes, so the maximum |w| any rotated vertex can reach is
@@ -2224,16 +2219,11 @@ impl RotatePolytopesApp {
                         Some("on") => true,
                         Some("off") => false,
                         Some(other) => {
-                            return Err(anyhow!(
-                                "floor: unknown arg `{other}` (try on|off)"
-                            ));
+                            return Err(anyhow!("floor: unknown arg `{other}` (try on|off)"));
                         }
                     };
                     demo.floor_enabled = next;
-                    out.line(format!(
-                        "floor: {}",
-                        if next { "on" } else { "off" }
-                    ));
+                    out.line(format!("floor: {}", if next { "on" } else { "off" }));
                     Ok(())
                 },
             )
@@ -2486,7 +2476,10 @@ mod color_tests {
 
         let c_back = w_depth_color(-5.0, 1.0);
         let c_at_neg_extent = w_depth_color(-1.0, 1.0);
-        assert_eq!(c_back, c_at_neg_extent, "-w past extent should clamp to back");
+        assert_eq!(
+            c_back, c_at_neg_extent,
+            "-w past extent should clamp to back"
+        );
     }
 
     // ---- compute_cell_strengths -----------------------------------------
