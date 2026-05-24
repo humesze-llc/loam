@@ -22,8 +22,8 @@
 use anyhow::Result;
 use glam::{Mat4, Vec2, Vec3};
 use rye_app::{
-    egui, App, Camera, CameraController, FirstPersonController, FrameCtx, OrbitController,
-    RenderCtx, RunConfig, SetupCtx,
+    egui, freecam::Freecam, App, Camera, CameraController, FrameCtx, OrbitController, RenderCtx,
+    RunConfig, SetupCtx,
 };
 
 // Per-frame allocation telemetry. Wraps the system allocator with a counter
@@ -102,16 +102,12 @@ struct TesseractApp {
     camera: Camera<EuclideanR3>,
     /// Orbit controller for the default mode. Reused across toggles.
     orbit: OrbitController<EuclideanR3>,
-    /// Free-roam controller. Constructed lazily on the first toggle so it
-    /// inherits the orbit camera's pose as its starting point.
-    free_roam: FirstPersonController<EuclideanR3>,
+    /// Freecam preset (mouse-look + WASD + cursor grab). Owns its own
+    /// yaw / pitch / position / grab state; the demo only toggles
+    /// `set_active` on mode change and calls `advance` per frame.
+    freecam: Freecam,
     /// Active controller selection.
     mode: CameraMode,
-    /// World-space position of the camera in free-roam mode. The translation
-    /// piece is owned by the demo rather than the controller because the
-    /// `FirstPersonController` advance only sets `right/up/forward`; we
-    /// integrate position from input on top of it.
-    free_roam_pos: Vec3,
     /// Accumulated 4D rotor describing the polytope's current orientation.
     rotor: Rotor4,
     /// Continuous-spin angular velocity. Multiplied by `dt` each tick and
@@ -255,13 +251,22 @@ impl App for TesseractApp {
         let mut orbit: OrbitController<EuclideanR3> = OrbitController::default();
         orbit.set_orbit(5.0, -0.15);
 
-        let free_roam = FirstPersonController::<EuclideanR3>::new(0.0, 0.0);
-        let free_roam_pos = camera.position;
+        // Freecam preset; inactive at startup. `F` toggles it on (mouse-
+        // look + WASD); the preset grabs the cursor + seeds its position
+        // from the camera's current pose at activation time.
+        let freecam = Freecam::new().with_speed(2.5);
 
         let mut console = Console::<()>::new();
         rye_app::trace::register_command(&mut console);
         rye_app::fps::register_command(&mut console);
         rye_app::vsync::register_command(&mut console);
+        rye_app::version::register_command(
+            &mut console,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            env!("BUILD_HASH"),
+            env!("BUILD_DIRTY"),
+        );
         rye_app::log::register_command(&mut console);
         let perf = rye_app::trace::PerfOverlay::new();
 
@@ -269,9 +274,8 @@ impl App for TesseractApp {
             lines,
             camera,
             orbit,
-            free_roam,
+            freecam,
             mode: CameraMode::Orbit,
-            free_roam_pos,
             rotor: Rotor4::IDENTITY,
             // `Bivector4::basis(2)` is the xw plane in `Plane4`'s ordering
             // (0=xy, 1=xz, 2=xw, 3=yz, 4=yw, 5=zw). Times the args-or-default
@@ -337,28 +341,16 @@ impl App for TesseractApp {
         }
 
         // Camera advance. Mode-aware; both controllers consume the drained
-        // input but only one shapes the resulting frame.
+        // input but only one shapes the resulting frame. Freecam preset
+        // handles its own cursor-grab gating (no-ops when released via
+        // Alt) and look + WASD position integration in one call.
         match self.mode {
             CameraMode::Orbit => {
                 self.orbit
                     .advance(ctx.input, &mut self.camera, &EuclideanR3, dt);
             }
             CameraMode::FreeRoam => {
-                self.free_roam
-                    .advance(ctx.input, &mut self.camera, &EuclideanR3, dt);
-                // `FrameInput` already aggregates WASD + Space/Shift into the
-                // `move_forward`, `move_right`, `move_up` axes (+1 / 0 / -1
-                // each frame). Combine with the camera's local basis to get
-                // a world-space velocity vector.
-                let speed = 2.5; // units/sec
-                let mut delta = self.camera.forward * ctx.input.move_forward
-                    + self.camera.right * ctx.input.move_right
-                    + Vec3::Y * ctx.input.move_up;
-                if delta.length_squared() > 1e-6 {
-                    delta = delta.normalize();
-                    self.free_roam_pos += delta * speed * dt;
-                    self.camera.position = self.free_roam_pos;
-                }
+                self.freecam.advance(ctx.input, &mut self.camera, dt);
             }
         }
     }
@@ -377,22 +369,43 @@ impl App for TesseractApp {
         if let WindowEvent::KeyboardInput {
             event:
                 KeyEvent {
-                    state: ElementState::Pressed,
+                    state,
                     physical_key: PhysicalKey::Code(code),
                     ..
                 },
             ..
         } = ev
         {
+            // Alt is the only key that needs BOTH edges: the freecam
+            // preset's `on_alt(pressed)` interprets press + release
+            // according to its `cursor_mode` (Hold by default, MMO-style:
+            // cursor released while held, re-grabbed on release). Toggle
+            // mode ignores release internally.
+            if matches!(code, KeyCode::AltLeft | KeyCode::AltRight)
+                && matches!(self.mode, CameraMode::FreeRoam)
+            {
+                self.freecam.on_alt(matches!(state, ElementState::Pressed));
+                return;
+            }
+            if !matches!(state, ElementState::Pressed) {
+                return;
+            }
             match code {
                 KeyCode::KeyF => {
-                    // Toggle camera mode. Free-roam picks up where orbit left
-                    // off so the view doesn't snap.
+                    // Toggle camera mode. Freecam preset grabs the cursor +
+                    // seeds its position from the current camera pose on
+                    // activation, releases on deactivation; the toggle
+                    // feels continuous rather than teleporting.
                     self.mode = match self.mode {
-                        CameraMode::Orbit => CameraMode::FreeRoam,
-                        CameraMode::FreeRoam => CameraMode::Orbit,
+                        CameraMode::Orbit => {
+                            self.freecam.set_active(true, self.camera.position);
+                            CameraMode::FreeRoam
+                        }
+                        CameraMode::FreeRoam => {
+                            self.freecam.set_active(false, self.camera.position);
+                            CameraMode::Orbit
+                        }
                     };
-                    self.free_roam_pos = self.camera.position;
                 }
                 // T always toggles pause; Space ALSO toggles pause, but only
                 // outside FreeRoam (where Space is the jump-up axis and would

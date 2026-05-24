@@ -1185,6 +1185,32 @@ fn rye_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {
             .expect("hyperslice4d kernel + Scene4 emit should validate");
     }
 
+    /// Same scene + kernel composition as `kernel_validates_with_real_scene_union`, but
+    /// against the gated emit form (`to_hyperslice_wgsl_gated`). Catches WGSL drift when
+    /// the runtime halfspace toggle is wired into the kernel via `u.params.x`. The kernel
+    /// already declares `params: vec4<f32>` in its uniform struct, so the gate expression
+    /// resolves at parse time.
+    #[test]
+    fn kernel_validates_with_gated_scene() {
+        use glam::Vec4;
+        use rye_scene::{Scene4, SceneNode4};
+
+        let scene = Scene4::new(
+            SceneNode4::hypersphere(Vec4::new(0.0, 1.0, 0.0, 0.0), 0.5)
+                .union(SceneNode4::halfspace(Vec4::Y, 0.0)),
+        );
+        let scene_wgsl = scene.to_hyperslice_wgsl_gated("u.w_slice", "u.params.x");
+        let polytope = super::super::polytope_data::polytope_extended_sdfs_wgsl();
+        let source = format!("{HYPERSLICE_KERNEL_WGSL}\n{polytope}\n{scene_wgsl}");
+        let module = naga::front::wgsl::parse_str(&source)
+            .expect("gated Scene4 emit should parse against the kernel");
+        let flags = naga::valid::ValidationFlags::all();
+        let caps = naga::valid::Capabilities::empty();
+        naga::valid::Validator::new(flags, caps)
+            .validate(&module)
+            .expect("gated Scene4 emit should validate against the kernel");
+    }
+
     /// `BODY_KIND_INVALID` must not appear in either dispatch chain. The whole point of the
     /// sentinel is that no branch matches it, so the SDF accumulator passes through unchanged. If
     /// a future edit adds a comparison against `BODY_KIND_INVALID` (in either operand order),

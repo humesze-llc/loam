@@ -365,8 +365,18 @@ impl PerfOverlay {
             0.0
         };
 
+        // Position: top-right by default, but `.movable(true)` lets the user
+        // drag it anywhere. egui persists the resulting offset by `Id` so the
+        // overlay re-opens where the user last left it (within the session).
+        // `Area::default_pos` is honored once; subsequent frames read the
+        // persisted position from `ctx.memory`. Use `default_pos` instead of
+        // `anchor` because anchored areas ignore drag.
+        let screen = ctx.content_rect();
+        let default_x = (screen.right() - 12.0 - 260.0).max(0.0);
         egui::Area::new(egui::Id::new("rye-perf-overlay"))
-            .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
+            .default_pos(egui::pos2(default_x, 12.0))
+            .movable(true)
+            .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 75)))

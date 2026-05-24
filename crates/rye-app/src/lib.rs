@@ -79,11 +79,14 @@ pub mod args;
 #[cfg(any(not(feature = "capture"), target_arch = "wasm32"))]
 #[path = "capture_stub.rs"]
 pub mod capture;
+pub mod cursor;
 pub mod fps;
 pub mod frame_pacing;
+pub mod freecam;
 pub mod keymap;
 pub mod log;
 pub mod trace;
+pub mod version;
 pub mod vsync;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
@@ -1137,6 +1140,23 @@ impl<A: App> ApplicationHandler for Runner<A> {
             }
         }
     }
+
+    /// Device-level events (mouse motion independent of cursor position,
+    /// raw scroll wheel, etc.). The only one we currently consume is
+    /// `MouseMotion`, which gives uncapped deltas that don't stop when the
+    /// cursor hits the screen edge. Routed into `InputState::accumulate_raw_motion`
+    /// so consumers (camera controllers, primarily) that grab the cursor can
+    /// read it via `FrameInput::mouse_raw_delta`.
+    fn device_event(
+        &mut self,
+        _elwt: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        ev: winit::event::DeviceEvent,
+    ) {
+        if let winit::event::DeviceEvent::MouseMotion { delta } = ev {
+            self.input.accumulate_raw_motion(delta.0, delta.1);
+        }
+    }
 }
 
 impl<A: App> Runner<A> {
@@ -1166,6 +1186,62 @@ impl<A: App> Runner<A> {
             };
             let _ = rd.set_present_mode(target);
         }
+
+        // Pending cursor grab + visibility transitions from
+        // `rye_app::cursor`. Native only; browser Pointer Lock requires a
+        // recent user gesture that console commands don't satisfy (the
+        // cursor module emits a one-time tracing::warn on wasm).
+        //
+        // Grab + visibility are independent. The runner translates the
+        // engine-level `GrabMode` to winit's `CursorGrabMode` and falls
+        // back from `Locked` to `Confined` (or vice versa) if the platform
+        // doesn't support the requested mode (macOS + Linux/X11 vary on
+        // which they prefer; Windows accepts both). The fallback chain
+        // preserves the user's intent (some form of grab) rather than
+        // silently dropping to `None`.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use winit::window::CursorGrabMode;
+            let (pending_grab, pending_vis) = cursor::take_pending();
+            let mut applied = cursor::current_state();
+            if let Some(mode) = pending_grab {
+                let primary = match mode {
+                    cursor::GrabMode::None => CursorGrabMode::None,
+                    cursor::GrabMode::Confined => CursorGrabMode::Confined,
+                    cursor::GrabMode::Locked => CursorGrabMode::Locked,
+                };
+                if win.set_cursor_grab(primary).is_err() && mode != cursor::GrabMode::None {
+                    let fallback = match mode {
+                        cursor::GrabMode::Locked => CursorGrabMode::Confined,
+                        cursor::GrabMode::Confined => CursorGrabMode::Locked,
+                        cursor::GrabMode::None => CursorGrabMode::None,
+                    };
+                    let _ = win.set_cursor_grab(fallback);
+                }
+                applied.grab = mode;
+            }
+            if let Some(visible) = pending_vis {
+                win.set_cursor_visible(visible);
+                applied.visible = visible;
+            }
+            if pending_grab.is_some() || pending_vis.is_some() {
+                cursor::mark_applied(applied.grab, applied.visible);
+            }
+            // Warp-to-center request. Applied AFTER the grab/visibility
+            // transition so the new cursor state is in effect first; warping
+            // a still-Locked cursor would be a no-op (winit pins it to the
+            // center already), but pairing the warp with a release lands the
+            // pointer where the user was aiming when they Alt-tabbed out.
+            if cursor::take_pending_warp_center() {
+                let size = win.inner_size();
+                let center = winit::dpi::PhysicalPosition::new(
+                    size.width as f64 / 2.0,
+                    size.height as f64 / 2.0,
+                );
+                let _ = win.set_cursor_position(center);
+            }
+        }
+
         let Some(rd) = self.rd.as_ref() else { return };
 
         // Frame-rate cap. The `fps` console command pokes

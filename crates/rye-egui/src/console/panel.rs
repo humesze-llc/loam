@@ -28,6 +28,7 @@
 //! frame), so the user can click outside the window to give keyboard back to the app.
 
 use egui::{
+    text::{LayoutJob, TextFormat},
     Color32, FontId, Frame, Label, Layout, Margin, Order, RichText, ScrollArea, Sense, Stroke,
     TextEdit, TextWrapMode,
 };
@@ -269,28 +270,68 @@ fn draw_scrollback<Ctx>(ui: &mut egui::Ui, console: &Console<Ctx>, height: f32, 
                             bottom: 4,
                         })
                         .show(ui, |ui| {
-                            // Tight per-line vertical spacing keeps the scrollback
-                            // dense without crowding wrapped continuation rows.
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            for line in &console.history {
-                                ui.add(Label::new(line_text(line)).wrap_mode(TextWrapMode::Wrap));
-                            }
+                            // Single selectable Label backed by a multi-color
+                            // LayoutJob. Lets the user drag-select across line
+                            // boundaries and Ctrl-C / context-menu copy to the
+                            // platform clipboard. The previous per-line Label
+                            // setup rendered the same text but at the canvas
+                            // level: glyphs got rasterized into the wgpu
+                            // surface with no DOM text behind them, so the
+                            // browser's selection rectangle highlighted pixels
+                            // but Ctrl-C copied an empty string. Building one
+                            // LayoutJob preserves per-line color styling
+                            // (Input vs Output vs Error vs System) while
+                            // giving egui's selection a single span to track.
+                            ui.add(
+                                Label::new(scrollback_layout_job(&console.history))
+                                    .wrap_mode(TextWrapMode::Wrap)
+                                    .selectable(true),
+                            );
                         });
                 });
         },
     );
 }
 
-fn line_text(line: &HistoryLine) -> RichText {
-    let color = match line.kind {
+/// Color for a given line kind. Pulled out so the LayoutJob builder + any
+/// future per-line widget can agree.
+fn line_color(kind: LineKind) -> Color32 {
+    match kind {
         LineKind::Input => COLOR_INPUT_ECHO,
         LineKind::Output => COLOR_OUTPUT,
         LineKind::Error => COLOR_ERROR,
         LineKind::System => COLOR_SYSTEM,
-    };
-    RichText::new(&line.text)
-        .color(color)
-        .font(FontId::monospace(FONT_SIZE))
+    }
+}
+
+/// Build a single `LayoutJob` for the scrollback history. Each line gets
+/// its kind-appropriate color via per-section `TextFormat`s; `\n`
+/// separators between lines are appended in the default (`Output`) color
+/// because egui doesn't render the newline glyph itself, only positions
+/// the next section below.
+///
+/// One Label wrapping this job is selectable across line boundaries and
+/// copyable to the platform clipboard via Ctrl-C / right-click menu;
+/// see the call site in `draw_scrollback` for why one job beats N labels.
+fn scrollback_layout_job(history: &std::collections::VecDeque<HistoryLine>) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let font = FontId::monospace(FONT_SIZE);
+    let last = history.len().saturating_sub(1);
+    for (i, line) in history.iter().enumerate() {
+        let fmt = TextFormat {
+            font_id: font.clone(),
+            color: line_color(line.kind),
+            ..Default::default()
+        };
+        job.append(&line.text, 0.0, fmt);
+        if i < last {
+            // Newline carries no visible glyph but determines layout
+            // wrap position; use a minimal default format so it never
+            // contributes color.
+            job.append("\n", 0.0, TextFormat::default());
+        }
+    }
+    job
 }
 
 fn draw_input_row<Ctx: 'static>(
@@ -388,4 +429,105 @@ fn draw_input_row<Ctx: 'static>(
             }
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for `scrollback_layout_job`, the LayoutJob builder backing the
+    //! single-Label scrollback (so Ctrl-C cross-line copy works in browser +
+    //! native). These verify the structural invariants the UI path relies on:
+    //! one section per line, per-kind coloring, newline separators between
+    //! lines. UI rendering itself is not exercised; we read the LayoutJob
+    //! `sections` vector directly.
+    use super::*;
+    use std::collections::VecDeque;
+
+    fn history(lines: &[(LineKind, &str)]) -> VecDeque<HistoryLine> {
+        lines
+            .iter()
+            .map(|(kind, text)| HistoryLine {
+                kind: *kind,
+                text: (*text).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_history_yields_empty_job() {
+        let job = scrollback_layout_job(&VecDeque::new());
+        assert!(job.text.is_empty());
+        assert!(job.sections.is_empty());
+    }
+
+    /// One line in -> one colored section (no trailing newline; the trailing
+    /// `\n` is only inserted BETWEEN lines so the last line stays single-section).
+    #[test]
+    fn single_line_emits_one_colored_section() {
+        let h = history(&[(LineKind::Output, "hello")]);
+        let job = scrollback_layout_job(&h);
+        assert_eq!(job.text, "hello");
+        assert_eq!(job.sections.len(), 1);
+        assert_eq!(job.sections[0].format.color, COLOR_OUTPUT);
+    }
+
+    /// N lines -> 2N-1 sections (N line sections + N-1 newline separators).
+    /// The newline sections carry the default format so they don't accidentally
+    /// recolor empty regions.
+    #[test]
+    fn multiple_lines_alternate_with_newline_separators() {
+        let h = history(&[
+            (LineKind::Input, "> reset"),
+            (LineKind::Output, "ok"),
+            (LineKind::Error, "boom"),
+        ]);
+        let job = scrollback_layout_job(&h);
+        assert_eq!(job.text, "> reset\nok\nboom");
+        // 3 line sections + 2 newline separators = 5 total.
+        assert_eq!(job.sections.len(), 5);
+    }
+
+    /// Each LineKind gets its kind-appropriate color in the LayoutJob section.
+    /// If a future edit changes the per-kind palette without updating
+    /// `line_color`, this test catches the drift.
+    #[test]
+    fn per_line_color_matches_line_kind() {
+        let h = history(&[
+            (LineKind::Input, "in"),
+            (LineKind::Output, "out"),
+            (LineKind::Error, "err"),
+            (LineKind::System, "sys"),
+        ]);
+        let job = scrollback_layout_job(&h);
+        // Sections in order: input, "\n", output, "\n", error, "\n", system.
+        let input_section = &job.sections[0];
+        let output_section = &job.sections[2];
+        let error_section = &job.sections[4];
+        let system_section = &job.sections[6];
+        assert_eq!(input_section.format.color, COLOR_INPUT_ECHO);
+        assert_eq!(output_section.format.color, COLOR_OUTPUT);
+        assert_eq!(error_section.format.color, COLOR_ERROR);
+        assert_eq!(system_section.format.color, COLOR_SYSTEM);
+    }
+
+    /// All line sections use the monospace font at FONT_SIZE. The Ctrl-C copy
+    /// behavior relies on text inside one Label (one font config) so cross-line
+    /// drag-select works without breaks; if a future edit mixes fonts within
+    /// the job, selection would visually split.
+    #[test]
+    fn all_line_sections_share_monospace_font() {
+        let h = history(&[
+            (LineKind::Input, "a"),
+            (LineKind::Output, "b"),
+            (LineKind::Error, "c"),
+        ]);
+        let job = scrollback_layout_job(&h);
+        let expected_font = FontId::monospace(FONT_SIZE);
+        // Sections 0, 2, 4 are line content; 1, 3 are newlines.
+        for idx in [0, 2, 4] {
+            assert_eq!(
+                job.sections[idx].format.font_id, expected_font,
+                "section {idx} (line content) should be monospace",
+            );
+        }
+    }
 }

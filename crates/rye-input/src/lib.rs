@@ -29,12 +29,23 @@ pub const SCROLL_PIXELS_PER_LINE: f32 = 50.0;
 
 /// Accumulated input for one simulation tick, consumed by [`InputState::take_frame`].
 ///
-/// `mouse_delta` and `scroll_lines` reset to zero each frame. `left_mouse_down` persists
-/// until the button is released. `move_*` axes are recomputed from held keys each frame:
-/// +1 / 0 / -1, not accumulated.
+/// `mouse_delta` / `mouse_raw_delta` / `scroll_lines` reset to zero each frame.
+/// `left_mouse_down` persists until the button is released. `move_*` axes are
+/// recomputed from held keys each frame: +1 / 0 / -1, not accumulated.
+///
+/// `mouse_delta` is the OS-clamped cursor delta (`WindowEvent::CursorMoved`).
+/// It stops accumulating when the cursor hits the screen edge or leaves the
+/// window. Right for orbit controllers and any UI-facing handler that wants
+/// the cursor's actual position to mean something.
+///
+/// `mouse_raw_delta` is the raw device delta (`DeviceEvent::MouseMotion`).
+/// It accumulates regardless of cursor position; the OS reports the
+/// underlying mouse motion before clamping. Right for FPS-style mouse-look
+/// where you grab the cursor and want infinite-yaw / infinite-pitch.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FrameInput {
     pub mouse_delta: Vec2,
+    pub mouse_raw_delta: Vec2,
     pub scroll_lines: f32,
     pub left_mouse_down: bool,
     /// WASD forward/back: W = +1, S = −1.
@@ -129,8 +140,24 @@ impl InputState {
 
         let frame = self.frame;
         self.frame.mouse_delta = Vec2::ZERO;
+        self.frame.mouse_raw_delta = Vec2::ZERO;
         self.frame.scroll_lines = 0.0;
         frame
+    }
+
+    /// Accumulate raw device motion (`DeviceEvent::MouseMotion`) into
+    /// `FrameInput::mouse_raw_delta`. Independent of `cursor_moved`; both
+    /// accumulators run in parallel and the consumer picks one. Right for
+    /// FPS-style mouse-look that wants infinite-yaw delta past the screen
+    /// edge.
+    ///
+    /// Internal: only the runner's `device_event` handler is expected to
+    /// call this. Exposed `pub` because the runner lives in a separate
+    /// crate (`rye-app`) and Rust's visibility doesn't have a workspace-
+    /// internal mode. `#[doc(hidden)]` to keep it out of demo-facing docs.
+    #[doc(hidden)]
+    pub fn accumulate_raw_motion(&mut self, dx: f64, dy: f64) {
+        self.frame.mouse_raw_delta += Vec2::new(dx as f32, dy as f32);
     }
 }
 
