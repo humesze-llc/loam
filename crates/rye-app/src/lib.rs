@@ -81,8 +81,8 @@ pub mod args;
 pub mod capture;
 pub mod cursor;
 pub mod fps;
-pub mod freecam;
 pub mod frame_pacing;
+pub mod freecam;
 pub mod keymap;
 pub mod log;
 pub mod trace;
@@ -1210,9 +1210,7 @@ impl<A: App> Runner<A> {
                     cursor::GrabMode::Confined => CursorGrabMode::Confined,
                     cursor::GrabMode::Locked => CursorGrabMode::Locked,
                 };
-                if win.set_cursor_grab(primary).is_err()
-                    && mode != cursor::GrabMode::None
-                {
+                if win.set_cursor_grab(primary).is_err() && mode != cursor::GrabMode::None {
                     let fallback = match mode {
                         cursor::GrabMode::Locked => CursorGrabMode::Confined,
                         cursor::GrabMode::Confined => CursorGrabMode::Locked,
@@ -1228,6 +1226,19 @@ impl<A: App> Runner<A> {
             }
             if pending_grab.is_some() || pending_vis.is_some() {
                 cursor::mark_applied(applied.grab, applied.visible);
+            }
+            // Warp-to-center request. Applied AFTER the grab/visibility
+            // transition so the new cursor state is in effect first; warping
+            // a still-Locked cursor would be a no-op (winit pins it to the
+            // center already), but pairing the warp with a release lands the
+            // pointer where the user was aiming when they Alt-tabbed out.
+            if cursor::take_pending_warp_center() {
+                let size = win.inner_size();
+                let center = winit::dpi::PhysicalPosition::new(
+                    size.width as f64 / 2.0,
+                    size.height as f64 / 2.0,
+                );
+                let _ = win.set_cursor_position(center);
             }
         }
 

@@ -34,6 +34,12 @@
 //! `use_raw_delta` flag) without changing `active`. Bind this to a key
 //! (Alt is the convention) for in-freecam UI interaction.
 //!
+//! Prefer [`Freecam::on_alt`] for the standard FPS/MMO modifier-key contract:
+//! demos forward Alt press AND release into `on_alt(pressed)` and the
+//! cursor-mode field decides whether to toggle (default, FPS sticky) or
+//! hold-to-release (MMO). The mode is runtime-configurable via
+//! [`Freecam::set_cursor_mode`].
+//!
 //! ## Wasm caveat
 //!
 //! `rye_app::cursor::request_grab` is a documented no-op on wasm
@@ -51,6 +57,43 @@ use crate::Camera;
 
 /// Default WASD translation speed for new Freecam instances.
 const DEFAULT_SPEED: f32 = 4.5;
+
+/// How the Alt modifier influences the cursor grab in [`Freecam`].
+///
+/// Both modes still flip the controller's `use_raw_delta` flag so a
+/// released cursor never accumulates yaw/pitch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CursorMode {
+    /// MMO-style: cursor released while Alt is held, re-grabbed when Alt
+    /// is released. Best when the cursor-release windows are short
+    /// (click a button, then resume).
+    Hold,
+    /// FPS sticky-modifier: press Alt to flip the grab, press again to
+    /// flip back. Release does nothing. Default. Best when the
+    /// cursor-release windows are long (read a panel, type into a text
+    /// field).
+    #[default]
+    Toggle,
+}
+
+impl CursorMode {
+    /// Parse a console token (e.g. from `camera freecam cursor_mode hold`).
+    pub fn from_token(s: &str) -> Option<Self> {
+        match s {
+            "hold" => Some(Self::Hold),
+            "toggle" => Some(Self::Toggle),
+            _ => None,
+        }
+    }
+
+    /// Lowercase token mirroring [`Self::from_token`].
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Toggle => "toggle",
+        }
+    }
+}
 
 /// FPS-style camera preset: mouse-look + WASD/Space/Shift translation +
 /// cursor grab management.
@@ -75,6 +118,7 @@ pub struct Freecam {
     pub speed: f32,
     active: bool,
     cursor_grabbed: bool,
+    cursor_mode: CursorMode,
 }
 
 impl Default for Freecam {
@@ -94,6 +138,7 @@ impl Freecam {
             speed: DEFAULT_SPEED,
             active: false,
             cursor_grabbed: false,
+            cursor_mode: CursorMode::default(),
         }
     }
 
@@ -101,6 +146,26 @@ impl Freecam {
     pub fn with_speed(mut self, speed: f32) -> Self {
         self.speed = speed;
         self
+    }
+
+    /// Builder: override the Alt-cursor mode. Default
+    /// [`CursorMode::Toggle`].
+    pub fn with_cursor_mode(mut self, mode: CursorMode) -> Self {
+        self.cursor_mode = mode;
+        self
+    }
+
+    /// Current Alt-cursor mode.
+    pub fn cursor_mode(&self) -> CursorMode {
+        self.cursor_mode
+    }
+
+    /// Switch between [`CursorMode::Hold`] and [`CursorMode::Toggle`] at
+    /// runtime. Does NOT change the current grab state; only how future
+    /// Alt events are interpreted by [`on_alt`](Self::on_alt). Call after
+    /// any user-facing setting flips, e.g. a console command.
+    pub fn set_cursor_mode(&mut self, mode: CursorMode) {
+        self.cursor_mode = mode;
     }
 
     /// Is freecam currently the active camera mode for the demo?
@@ -144,10 +209,53 @@ impl Freecam {
         }
     }
 
+    /// Apply an Alt key event according to the current [`cursor_mode`](Self::cursor_mode).
+    ///
+    /// - [`CursorMode::Hold`]: cursor released while `pressed=true`;
+    ///   re-grabbed when `pressed=false`. Demos must forward BOTH press
+    ///   and release events.
+    /// - [`CursorMode::Toggle`]: `pressed=true` flips the grab once;
+    ///   `pressed=false` is ignored. Demos can forward release safely.
+    ///
+    /// No-op when freecam isn't active.
+    pub fn on_alt(&mut self, pressed: bool) {
+        if !self.active {
+            return;
+        }
+        let target_grabbed = match self.cursor_mode {
+            CursorMode::Hold => !pressed,
+            CursorMode::Toggle => {
+                if !pressed {
+                    return;
+                }
+                !self.cursor_grabbed
+            }
+        };
+        if target_grabbed == self.cursor_grabbed {
+            return;
+        }
+        self.cursor_grabbed = target_grabbed;
+        self.controller.use_raw_delta = target_grabbed;
+        if target_grabbed {
+            crate::cursor::request_grab();
+        } else {
+            // Warp to window center on release so the cursor reappears in a
+            // predictable spot (rather than wherever the OS cached it before
+            // the grab); the user was aiming at the screen center the whole
+            // time freecam was engaged.
+            crate::cursor::request_release();
+            crate::cursor::request_warp_to_center();
+        }
+    }
+
     /// Flip the cursor grab without changing the active state. Bind to
     /// Alt (or similar) in the demo for "release the cursor so I can
     /// click a UI widget, then re-grab to resume mouse-look." No-op if
     /// the freecam isn't active.
+    ///
+    /// Prefer [`on_alt`](Self::on_alt) for the standard modifier-key
+    /// contract; this method ignores [`cursor_mode`](Self::cursor_mode)
+    /// and always toggles.
     pub fn toggle_cursor_grab(&mut self) {
         if !self.active {
             return;
@@ -158,6 +266,7 @@ impl Freecam {
             crate::cursor::request_grab();
         } else {
             crate::cursor::request_release();
+            crate::cursor::request_warp_to_center();
         }
     }
 
@@ -168,19 +277,13 @@ impl Freecam {
     ///
     /// Caller still owns the higher-level mode switch (orbit vs freecam);
     /// this method assumes `Freecam` IS the active controller this frame.
-    pub fn advance(
-        &mut self,
-        input: FrameInput,
-        camera: &mut Camera<EuclideanR3>,
-        dt: f32,
-    ) {
+    pub fn advance(&mut self, input: FrameInput, camera: &mut Camera<EuclideanR3>, dt: f32) {
         if !self.active || !self.cursor_grabbed {
             return;
         }
         // Look direction: controller reads raw delta, updates yaw + pitch,
         // writes the camera's right/up/forward.
-        self.controller
-            .advance(input, camera, &EuclideanR3, dt);
+        self.controller.advance(input, camera, &EuclideanR3, dt);
         // Position: integrate the WASD + Space/Shift axes in the camera's
         // local frame.
         let mut delta = camera.forward * input.move_forward
@@ -331,6 +434,94 @@ mod tests {
         };
         f.advance(input, &mut cam, 0.016);
         assert_eq!(cam.forward, cam_before.forward, "look frozen when released");
+    }
+
+    #[test]
+    fn default_cursor_mode_is_toggle() {
+        let f = Freecam::new();
+        assert_eq!(f.cursor_mode(), CursorMode::Toggle);
+    }
+
+    #[test]
+    fn cursor_mode_from_token_roundtrip() {
+        for m in [CursorMode::Hold, CursorMode::Toggle] {
+            assert_eq!(CursorMode::from_token(m.token()), Some(m));
+        }
+        assert_eq!(CursorMode::from_token("nope"), None);
+    }
+
+    #[test]
+    fn on_alt_hold_releases_and_regrabs() {
+        let _ = cursor::take_pending();
+        let mut f = Freecam::new().with_cursor_mode(CursorMode::Hold);
+        f.set_active(true, Vec3::ZERO);
+        let _ = cursor::take_pending();
+
+        f.on_alt(true);
+        assert!(f.active());
+        assert!(!f.cursor_grabbed());
+        let (grab, _vis) = cursor::take_pending();
+        assert_eq!(grab, Some(cursor::GrabMode::None));
+
+        f.on_alt(false);
+        assert!(f.cursor_grabbed());
+        let (grab, _vis) = cursor::take_pending();
+        assert_eq!(grab, Some(cursor::GrabMode::Locked));
+    }
+
+    #[test]
+    fn on_alt_toggle_ignores_release() {
+        let _ = cursor::take_pending();
+        let mut f = Freecam::new().with_cursor_mode(CursorMode::Toggle);
+        f.set_active(true, Vec3::ZERO);
+        let _ = cursor::take_pending();
+
+        // First press: flip to released.
+        f.on_alt(true);
+        assert!(!f.cursor_grabbed());
+        let _ = cursor::take_pending();
+
+        // Release: ignored.
+        f.on_alt(false);
+        assert!(!f.cursor_grabbed());
+        let (grab, vis) = cursor::take_pending();
+        assert_eq!(grab, None);
+        assert_eq!(vis, None);
+
+        // Second press: flip back to grabbed.
+        f.on_alt(true);
+        assert!(f.cursor_grabbed());
+    }
+
+    #[test]
+    fn on_alt_noop_when_inactive() {
+        let _ = cursor::take_pending();
+        let mut f = Freecam::new();
+        f.on_alt(true);
+        assert!(!f.active());
+        let (grab, vis) = cursor::take_pending();
+        assert_eq!(grab, None);
+        assert_eq!(vis, None);
+    }
+
+    #[test]
+    fn set_cursor_mode_preserves_grab_state() {
+        let _ = cursor::take_pending();
+        let mut f = Freecam::new();
+        f.set_active(true, Vec3::ZERO);
+        let _ = cursor::take_pending();
+        let grabbed_before = f.cursor_grabbed();
+
+        f.set_cursor_mode(CursorMode::Toggle);
+        assert_eq!(f.cursor_mode(), CursorMode::Toggle);
+        assert_eq!(
+            f.cursor_grabbed(),
+            grabbed_before,
+            "mode flip leaves grab alone"
+        );
+        let (grab, vis) = cursor::take_pending();
+        assert_eq!(grab, None);
+        assert_eq!(vis, None);
     }
 
     #[test]

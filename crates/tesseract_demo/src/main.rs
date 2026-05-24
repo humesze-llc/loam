@@ -369,13 +369,27 @@ impl App for TesseractApp {
         if let WindowEvent::KeyboardInput {
             event:
                 KeyEvent {
-                    state: ElementState::Pressed,
+                    state,
                     physical_key: PhysicalKey::Code(code),
                     ..
                 },
             ..
         } = ev
         {
+            // Alt is the only key that needs BOTH edges: the freecam
+            // preset's `on_alt(pressed)` interprets press + release
+            // according to its `cursor_mode` (Hold by default, MMO-style:
+            // cursor released while held, re-grabbed on release). Toggle
+            // mode ignores release internally.
+            if matches!(code, KeyCode::AltLeft | KeyCode::AltRight)
+                && matches!(self.mode, CameraMode::FreeRoam)
+            {
+                self.freecam.on_alt(matches!(state, ElementState::Pressed));
+                return;
+            }
+            if !matches!(state, ElementState::Pressed) {
+                return;
+            }
             match code {
                 KeyCode::KeyF => {
                     // Toggle camera mode. Freecam preset grabs the cursor +
@@ -392,14 +406,6 @@ impl App for TesseractApp {
                             CameraMode::Orbit
                         }
                     };
-                }
-                // Alt toggles the cursor grab while in freecam, releasing
-                // the mouse for UI interaction (e.g., dragging the console
-                // panel). Mode stays FreeRoam; only the grab flips.
-                KeyCode::AltLeft | KeyCode::AltRight
-                    if matches!(self.mode, CameraMode::FreeRoam) =>
-                {
-                    self.freecam.toggle_cursor_grab();
                 }
                 // T always toggles pause; Space ALSO toggles pause, but only
                 // outside FreeRoam (where Space is the jump-up axis and would

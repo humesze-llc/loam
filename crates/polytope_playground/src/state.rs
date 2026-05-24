@@ -8,8 +8,11 @@
 //! `pub(crate)` so those sibling impls can access them directly without
 //! per-field accessors.
 
+use std::collections::HashMap;
+
 use rye_app::{freecam::Freecam, Camera, OrbitController};
 use rye_math::{Bivector4, EuclideanR3, Plane4, Rotor4};
+use rye_physics::polytope::Polytope4;
 use rye_render::raymarch::{BodyUniform, Hyperslice4DNode};
 
 use crate::catalog::ShapeEntry;
@@ -137,13 +140,29 @@ impl WireframeProjection {
 /// nearest-active toggle then modulates alpha on top.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum WireframeColorMode {
-    /// Per-vertex RGB from [`rye_physics::polytope::vertex_color_by_position`]: a
-    /// continuous color field over the polytope's vertex set that flows smoothly
-    /// across the edge graph and reveals symmetry as color gradients. Every vertex
-    /// picks up a distinct hue from its 4D coordinates, so the polytope reads as a
-    /// stylized colorful identity rather than a uniform mass of edges.
+    /// Per-vertex RGB from [`rye_physics::polytope::vertex_color_by_position`]:
+    /// each edge is shaded as a smooth gradient between its two endpoint vertex
+    /// colors, and the canonical vertex hue is derived from the vertex's 4D
+    /// coordinate. The polytope's symmetry shows up as continuous color flow
+    /// across the edge graph (same scheme as `Polytope4::lines_colored_by_position`).
     #[default]
-    Unique,
+    VertexGradient,
+    /// Each edge gets a distinct solid RGB color via greedy graph-coloring on
+    /// the polytope's line graph: edges sharing a vertex always end up with
+    /// different palette indices, so the local edge structure stays visually
+    /// separable at any zoom level. Palette is deterministic (golden-ratio
+    /// hue spacing) so the same shape always paints the same edges the same way.
+    UniqueEdge,
+    /// Per-vertex color by SIGNED `w` in the body-local frame: cool blue
+    /// at extreme `-w`, warm orange at extreme `+w`, near-neutral at the
+    /// slice plane. Normalized against the polytope's canonical max `|w|`
+    /// (a fixed band per shape, NOT a per-frame rotated extent), so the
+    /// gradient stays temporally stable as the rotor spins. Mirrors the
+    /// `LineRasterStaticR4` shader's depth cue in `tesseract_demo`: a
+    /// tesseract under xy/zw rotation paints inner cube blue + outer
+    /// cube orange + connecting edges as smooth blue-to-orange gradients,
+    /// making the w-depth migration visible regardless of camera angle.
+    WDepth,
     /// Binary green/gray by cell activity: edges that belong to at least one cell
     /// the slice is *currently* intersecting are bright green; all other edges are
     /// dim neutral gray. Reads as "which cells of the polytope am I looking at right
@@ -153,13 +172,33 @@ pub(crate) enum WireframeColorMode {
 }
 
 impl WireframeColorMode {
-    /// Parse a console-arg spelling (`unique` or `active`). Returns `None` for any
-    /// other input; the caller surfaces a usage error.
+    /// All four modes in console-cycle order.
+    pub(crate) const ALL: [Self; 4] = [
+        Self::VertexGradient,
+        Self::UniqueEdge,
+        Self::WDepth,
+        Self::Active,
+    ];
+
+    /// Parse a console-arg spelling. Returns `None` for any unknown input;
+    /// the caller surfaces a usage error.
     pub(crate) fn from_token(token: &str) -> Option<Self> {
         match token {
-            "unique" => Some(WireframeColorMode::Unique),
-            "active" => Some(WireframeColorMode::Active),
+            "vertex-gradient" => Some(Self::VertexGradient),
+            "unique-edge" => Some(Self::UniqueEdge),
+            "w-depth" => Some(Self::WDepth),
+            "active" => Some(Self::Active),
             _ => None,
+        }
+    }
+
+    /// Display label for the egui radio buttons.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::VertexGradient => "Vertex gradient",
+            Self::UniqueEdge => "Unique edge",
+            Self::WDepth => "W-depth",
+            Self::Active => "Active",
         }
     }
 }
@@ -386,12 +425,60 @@ pub(crate) struct Demo {
     /// always uses drop-w (mathematically the inhabitant's view of the slice 3-flat);
     /// this toggle only affects the dim wireframe overlay on top.
     pub(crate) wireframe_projection: WireframeProjection,
+    /// Pixel width of parent-wireframe edges. Tuneable via `wireframe width <N>`
+    /// for thicker lines on screenshots. Default bumped from 1.2 px to 1.8 px
+    /// after side-by-side comparison: 1.2 px was too fine to read clearly
+    /// against the SDF backdrop on hi-DPI displays.
+    pub(crate) wireframe_width_px: f32,
+    /// Uniform alpha applied to every parent-wireframe edge when
+    /// [`Self::wireframe_nearest_active`] is OFF. Default 1.0 (fully
+    /// opaque). Tuneable via `wireframe alpha <N>` for a low-key
+    /// "wireframe as background layer" look. Ignored when
+    /// `nearest_active` is ON; in that mode the alpha is driven by the
+    /// per-cell crossing strength (DIM 0.10 to BRIGHT 0.85) regardless
+    /// of this field.
+    pub(crate) wireframe_alpha: f32,
+    /// Memoized per-edge palette for the `unique-edge` wireframe color
+    /// mode, keyed by [`Polytope4`] variant. The palette is a function of
+    /// topology alone (greedy graph-coloring on the line graph), so once
+    /// computed it stays valid for the process lifetime regardless of
+    /// rotor / w_slice / surface scale. Computed on first use; an empty
+    /// cache means the demo has never visited `unique-edge` mode for the
+    /// row's current shapes.
+    pub(crate) unique_edge_palette_cache: HashMap<Polytope4, Vec<[f32; 4]>>,
+    /// Runtime multiplier on [`BODY_SIZE`] for all polychora in the row.
+    /// Set via `surface scale <N>` (default 1.0). Multiplies wireframe, SDF,
+    /// section perimeter, and cross-section cap-fill geometry uniformly so
+    /// the slice-of-the-same-shape stays consistent at any scale. Values in
+    /// (0, 10] are accepted; the upper bound exists to keep the SDF
+    /// marcher's bounded-w-slice assumption intact.
+    pub(crate) surface_scale: f32,
+    /// Per-fragment alpha for the rasterized section-faces (filled cross-
+    /// section cell-caps). Default 1.0 (fully opaque); `surface alpha <N>`
+    /// lowers it so the parent wireframe shows through. Independent of
+    /// `wireframe_nearest_active` (which only modulates wireframe-edge
+    /// alpha, not the surface). Accepted range `(0, 1]`; the lower bound
+    /// is open since 0.0 would just hide the surface entirely (use
+    /// `surface off` for that).
+    pub(crate) surface_alpha: f32,
+    /// `y = 0` hyperplane floor visibility (the gridded ground). On by
+    /// default; toggled via the `floor` console command. Gated at the
+    /// kernel via `u.params[0]` so the toggle is zero-cost: when off, the
+    /// scene's halfspace SDF returns a huge distance and the marcher
+    /// never converges on the floor, so the checkerboard never paints.
+    pub(crate) floor_enabled: bool,
     /// Filled-faces rasterizer for the cross-section of every polychoral body. When
     /// `Self::surface_raster_enabled` is `true`, this replaces the SDF raymarch for the
     /// six regular convex 4-polytopes: the SDF gets `BodyUniform::default()` for those
     /// slots (which the kernel skips) and the section's filled cell-caps come through
     /// here instead. Per-body solid color + face-normal Lambert in the fragment shader.
     pub(crate) section_faces: rye_render::TriangleRasterNode,
+    /// Translucent variant of [`Self::section_faces`] with depth-write
+    /// disabled. Used in place of `section_faces` when `surface_alpha`
+    /// drops below 1.0 so the parent wireframe can show through caps.
+    /// Same vertex/fragment shaders + blend state; the only delta is the
+    /// `DepthMode::ReadOnly` pipeline-bake.
+    pub(crate) section_faces_translucent: rye_render::TriangleRasterNode,
     /// Antialiased point-disc rasterizer for vertex markers and cell-center sprites.
     /// Constructed once during demo setup; uploaded with the combined point mesh each
     /// frame the points overlay is enabled.
@@ -610,10 +697,29 @@ impl Demo {
         BodyUniform::polytope_with_rotor(
             body_position(slot, n),
             entry.shape.shape_id(),
-            BODY_SIZE,
+            self.effective_body_size(),
             rotor,
             entry.body_color,
         )
+    }
+
+    /// Effective body radius after the runtime [`Self::surface_scale`]
+    /// multiplier. All consumers that previously read `BODY_SIZE` directly
+    /// should route through here so the `surface scale` command takes
+    /// effect uniformly across SDF, wireframe, section perimeter, and
+    /// cross-section caps.
+    pub(crate) fn effective_body_size(&self) -> f32 {
+        BODY_SIZE * self.surface_scale
+    }
+
+    /// Effective `w` slider half-range after [`Self::surface_scale`]. The
+    /// canonical [`crate::consts::W_RANGE`] covers a unit-circumradius
+    /// polytope's full w-extent with a small margin; scaling the polytope up
+    /// requires the same scaling on the slider so the slice plane still leaves
+    /// the body at the extremes (otherwise `surface scale 4.0` would cap the
+    /// slider before w reaches the body's hull).
+    pub(crate) fn effective_w_range(&self) -> f32 {
+        crate::consts::W_RANGE * self.surface_scale
     }
 
     /// Drive every body in the row with the same rotor, lets the user directly compare

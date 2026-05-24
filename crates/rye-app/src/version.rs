@@ -39,21 +39,17 @@ pub fn register_command<Ctx: 'static>(
     build_hash: &'static str,
     build_dirty: &'static str,
 ) {
-    console.register(
-        cmd(
-            "version",
-            "show the demo's crate version + git build hash",
-            move |_args, _ctx: &mut Ctx, out| {
-                let line = if build_hash.is_empty() {
-                    format!("{crate_name} v{crate_version}")
-                } else {
-                    format!(
-                        "{crate_name} v{crate_version} ({build_hash}{build_dirty})"
-                    )
-                };
-                out.line(line);
-                Ok(())
-            },
-        ),
-    );
+    console.register(cmd(
+        "version",
+        "show the demo's crate version + git build hash",
+        move |_args, _ctx: &mut Ctx, out| {
+            let line = if build_hash.is_empty() {
+                format!("{crate_name} v{crate_version}")
+            } else {
+                format!("{crate_name} v{crate_version} ({build_hash}{build_dirty})")
+            };
+            out.line(line);
+            Ok(())
+        },
+    ));
 }

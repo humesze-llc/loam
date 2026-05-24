@@ -15,7 +15,7 @@ use rye_egui::{
 };
 use rye_math::{Bivector, Rotor4};
 
-use crate::consts::{CONTROL_H, CONTROL_W, PLAY_PAUSE_W, W_RANGE};
+use crate::consts::{CONTROL_H, CONTROL_W, PLAY_PAUSE_W};
 use crate::state::{
     DeferredAction, Demo, RotationMode, RotorTerm, SurfaceMode, ViewMode, WireframeColorMode,
     WireframeProjection,
@@ -133,9 +133,9 @@ impl Demo {
     }
 
     /// Floating `Render` settings modal. Surfaces the same toggles the console exposes
-    /// (`surface`, `wireframe`, `points`) so new readers can discover the rendering modes
-    /// without typing commands. Each control writes through the same Demo fields the
-    /// console handlers do; the two interfaces stay in lockstep automatically.
+    /// (`surface`, `wireframe`, `wireframe points`) so new readers can discover the
+    /// rendering modes without typing commands. Each control writes through the same Demo
+    /// fields the console handlers do; the two interfaces stay in lockstep automatically.
     ///
     /// Off by default; opened via the gear button in the bottom overlay. Hosted in
     /// [`rye_egui::floating_panel`] for consistency with the engine's other floating
@@ -182,8 +182,9 @@ impl Demo {
                     ui.checkbox(wireframe_nearest_active, "Nearest-active gradient");
                     ui.horizontal(|ui| {
                         ui.label("Color");
-                        ui.radio_value(wireframe_color_mode, WireframeColorMode::Unique, "Unique");
-                        ui.radio_value(wireframe_color_mode, WireframeColorMode::Active, "Active");
+                        for mode in WireframeColorMode::ALL {
+                            ui.radio_value(wireframe_color_mode, mode, mode.label());
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Projection");
@@ -410,12 +411,15 @@ impl Demo {
 
         let row_size = egui::vec2(avail, CONTROL_H);
         let row_layout = egui::Layout::left_to_right(egui::Align::Center);
+        // Surface-scaled W range so a `surface scale 4.0` body has a slider
+        // wide enough for the slice plane to leave it.
+        let w_range = self.effective_w_range();
         ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
             let formatted = format!("w {:>+.3}", self.w_slice);
             slider_with_edit(
                 ui,
                 &mut self.w_slice,
-                -W_RANGE..=W_RANGE,
+                -w_range..=w_range,
                 &formatted,
                 "",
                 3,

@@ -95,6 +95,11 @@ const VIS_SHOW: u8 = 1;
 const VIS_HIDE: u8 = 2;
 static PENDING_VISIBLE: AtomicU8 = AtomicU8::new(VIS_NONE);
 
+// "Warp cursor to window center" pending flag. Demos pair this with a grab
+// release so the OS-cached cursor position doesn't pop up at a stale spot
+// when the user temporarily un-grabs (e.g., Alt in MMO-style cursor mode).
+static PENDING_WARP_CENTER: AtomicBool = AtomicBool::new(false);
+
 // Last-applied state. Updated by the runner once it commits a transition
 // to the window. Read by [`current_state`].
 static APPLIED_GRAB: AtomicU8 = AtomicU8::new(GRAB_NONE);
@@ -130,10 +135,17 @@ pub fn request_grab_mode(mode: GrabMode) {
 
 /// Request the runner show or hide the cursor on its next redraw.
 pub fn request_cursor_visible(visible: bool) {
-    PENDING_VISIBLE.store(
-        if visible { VIS_SHOW } else { VIS_HIDE },
-        Ordering::Release,
-    );
+    PENDING_VISIBLE.store(if visible { VIS_SHOW } else { VIS_HIDE }, Ordering::Release);
+}
+
+/// Request the runner warp the OS cursor to the window's center on its
+/// next redraw. Use this when releasing the grab so the cursor reappears
+/// in a predictable spot (typically the same screen position the user
+/// was aiming at) instead of the OS-cached random position. No-op on wasm
+/// (the browser owns cursor positioning; the warn from `request_grab` covers
+/// this).
+pub fn request_warp_to_center() {
+    PENDING_WARP_CENTER.store(true, Ordering::Release);
 }
 
 /// Convenience: request the FPS-mouse-look pair (Locked + hidden). Common
@@ -166,6 +178,12 @@ pub fn take_pending() -> (Option<GrabMode>, Option<bool>) {
         _ => None,
     };
     (grab, visible)
+}
+
+/// Read + clear the pending warp-to-center flag. Runner-internal.
+#[doc(hidden)]
+pub fn take_pending_warp_center() -> bool {
+    PENDING_WARP_CENTER.swap(false, Ordering::AcqRel)
 }
 
 /// Record what the runner just applied, so [`current_state`] reads it.
@@ -248,5 +266,32 @@ mod tests {
         assert!(!s.visible);
         // Restore default so sibling tests aren't surprised.
         mark_applied(GrabMode::None, true);
+    }
+
+    /// Warp-to-center is a one-shot flag: `request_warp_to_center` sets it,
+    /// `take_pending_warp_center` returns true once and then false until the next
+    /// request. Mirrors the grab/visibility channel's "swap-on-read" semantic so the
+    /// runner doesn't re-warp every frame if no one re-requests.
+    #[test]
+    fn warp_to_center_is_one_shot() {
+        // Drain anything left over from a sibling test.
+        let _ = take_pending_warp_center();
+
+        // No request yet -> false.
+        assert!(!take_pending_warp_center());
+
+        // After requesting -> true once, then false on the second read.
+        request_warp_to_center();
+        assert!(take_pending_warp_center(), "first read after request");
+        assert!(
+            !take_pending_warp_center(),
+            "second read should clear the flag"
+        );
+
+        // Two requests before a read coalesce: still one consumed event.
+        request_warp_to_center();
+        request_warp_to_center();
+        assert!(take_pending_warp_center());
+        assert!(!take_pending_warp_center());
     }
 }

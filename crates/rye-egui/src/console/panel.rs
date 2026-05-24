@@ -430,3 +430,104 @@ fn draw_input_row<Ctx: 'static>(
         },
     );
 }
+
+#[cfg(test)]
+mod tests {
+    //! Tests for `scrollback_layout_job`, the LayoutJob builder backing the
+    //! single-Label scrollback (so Ctrl-C cross-line copy works in browser +
+    //! native). These verify the structural invariants the UI path relies on:
+    //! one section per line, per-kind coloring, newline separators between
+    //! lines. UI rendering itself is not exercised; we read the LayoutJob
+    //! `sections` vector directly.
+    use super::*;
+    use std::collections::VecDeque;
+
+    fn history(lines: &[(LineKind, &str)]) -> VecDeque<HistoryLine> {
+        lines
+            .iter()
+            .map(|(kind, text)| HistoryLine {
+                kind: *kind,
+                text: (*text).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_history_yields_empty_job() {
+        let job = scrollback_layout_job(&VecDeque::new());
+        assert!(job.text.is_empty());
+        assert!(job.sections.is_empty());
+    }
+
+    /// One line in -> one colored section (no trailing newline; the trailing
+    /// `\n` is only inserted BETWEEN lines so the last line stays single-section).
+    #[test]
+    fn single_line_emits_one_colored_section() {
+        let h = history(&[(LineKind::Output, "hello")]);
+        let job = scrollback_layout_job(&h);
+        assert_eq!(job.text, "hello");
+        assert_eq!(job.sections.len(), 1);
+        assert_eq!(job.sections[0].format.color, COLOR_OUTPUT);
+    }
+
+    /// N lines -> 2N-1 sections (N line sections + N-1 newline separators).
+    /// The newline sections carry the default format so they don't accidentally
+    /// recolor empty regions.
+    #[test]
+    fn multiple_lines_alternate_with_newline_separators() {
+        let h = history(&[
+            (LineKind::Input, "> reset"),
+            (LineKind::Output, "ok"),
+            (LineKind::Error, "boom"),
+        ]);
+        let job = scrollback_layout_job(&h);
+        assert_eq!(job.text, "> reset\nok\nboom");
+        // 3 line sections + 2 newline separators = 5 total.
+        assert_eq!(job.sections.len(), 5);
+    }
+
+    /// Each LineKind gets its kind-appropriate color in the LayoutJob section.
+    /// If a future edit changes the per-kind palette without updating
+    /// `line_color`, this test catches the drift.
+    #[test]
+    fn per_line_color_matches_line_kind() {
+        let h = history(&[
+            (LineKind::Input, "in"),
+            (LineKind::Output, "out"),
+            (LineKind::Error, "err"),
+            (LineKind::System, "sys"),
+        ]);
+        let job = scrollback_layout_job(&h);
+        // Sections in order: input, "\n", output, "\n", error, "\n", system.
+        let input_section = &job.sections[0];
+        let output_section = &job.sections[2];
+        let error_section = &job.sections[4];
+        let system_section = &job.sections[6];
+        assert_eq!(input_section.format.color, COLOR_INPUT_ECHO);
+        assert_eq!(output_section.format.color, COLOR_OUTPUT);
+        assert_eq!(error_section.format.color, COLOR_ERROR);
+        assert_eq!(system_section.format.color, COLOR_SYSTEM);
+    }
+
+    /// All line sections use the monospace font at FONT_SIZE. The Ctrl-C copy
+    /// behavior relies on text inside one Label (one font config) so cross-line
+    /// drag-select works without breaks; if a future edit mixes fonts within
+    /// the job, selection would visually split.
+    #[test]
+    fn all_line_sections_share_monospace_font() {
+        let h = history(&[
+            (LineKind::Input, "a"),
+            (LineKind::Output, "b"),
+            (LineKind::Error, "c"),
+        ]);
+        let job = scrollback_layout_job(&h);
+        let expected_font = FontId::monospace(FONT_SIZE);
+        // Sections 0, 2, 4 are line content; 1, 3 are newlines.
+        for idx in [0, 2, 4] {
+            assert_eq!(
+                job.sections[idx].format.font_id, expected_font,
+                "section {idx} (line content) should be monospace",
+            );
+        }
+    }
+}

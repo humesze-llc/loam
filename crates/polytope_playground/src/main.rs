@@ -56,8 +56,9 @@
 use anyhow::{anyhow, Result};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use rye_app::{
-    egui, freecam::Freecam, App, Camera, CameraController, FrameCtx, OrbitController, RunConfig,
-    SetupCtx,
+    egui,
+    freecam::{CursorMode, Freecam},
+    App, Camera, CameraController, FrameCtx, OrbitController, RunConfig, SetupCtx,
 };
 use rye_egui::Console;
 use rye_math::WPlane;
@@ -116,11 +117,165 @@ mod ui;
 
 use active::combo_name;
 use catalog::{parse_row_from_args, SHAPE_CATALOG};
-use consts::{BODY_SIZE, BODY_Y, T_SCRUB_RATE, T_SLIDER_INITIAL, W_RANGE, W_SCRUB_RATE};
+use consts::{BODY_SIZE, BODY_Y, T_SCRUB_RATE, T_SLIDER_INITIAL, W_SCRUB_RATE};
 use state::{
     body_position, CameraMode, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode,
     WireframeProjection,
 };
+
+// Cool-to-warm diverging palette for the `w-depth` wireframe color mode.
+// Tracks SIGNED w in the body-local frame: cool blue at extreme -w (the
+// vertex sits "behind" the slice plane in 4D), warm orange at extreme +w
+// (vertex sits "in front"), and a near-neutral midpoint at w = 0 (vertex
+// sits on the slice plane). This is the same palette + scheme the
+// `LineRasterStaticR4` shader uses in `tesseract_demo`, where it reads as
+// "which edge is in front of which in the rotating tesseract." Picking up
+// the same colors here lets the playground demonstrate the same w-depth
+// cue across every polytope.
+//
+// Signed (not `|w|`) is the key: a tesseract vertex at +0.5 and one at
+// -0.5 are visually distinguishable, so the viewer can track a vertex
+// migrating between "near" and "far" camps as the rotor swings. The
+// previous |w|-based scheme collapsed both into the same color and made
+// 4D rotation visually indistinguishable from a 3D twist at certain
+// angles.
+const W_DEPTH_BACK: [f32; 3] = [0.30, 0.42, 0.58];
+const W_DEPTH_FRONT: [f32; 3] = [1.00, 0.78, 0.45];
+
+/// Convert HSV to RGB. h, s, v in [0, 1]; output channels in [0, 1].
+/// See e.g. Foley, van Dam et al., *Computer Graphics: Principles and
+/// Practice*, 2nd ed., section 13.3.4.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let h6 = h.fract() * 6.0;
+    let c = v * s;
+    let x = c * (1.0 - (h6 % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h6.floor() as i32 % 6 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [r + m, g + m, b + m]
+}
+
+/// Deterministic palette: golden-ratio hue spacing + saturation/value
+/// modulation so consecutive palette indices land far apart in HSV. The
+/// greedy graph-coloring in [`unique_edge_palette`] only ever needs the
+/// first few indices for any of the regular 4-polytopes, so the first ~12
+/// entries are the perceptually-important ones.
+fn unique_edge_palette_color(idx: usize) -> [f32; 4] {
+    // Golden-ratio conjugate: maximally irrational, spreads hues evenly
+    // even for small N. See Knuth, TAOCP vol. 3, section 6.4.
+    const PHI_INV: f32 = 0.618_034;
+    let h = ((idx as f32) * PHI_INV).fract();
+    // 3-cycle on saturation and 2-cycle on value so adjacent indices (which
+    // already differ in hue by ~137 degrees) also differ in S/V.
+    let s = 0.78 + 0.18 * ((idx % 3) as f32 / 2.0);
+    let v = 0.92 - 0.18 * (((idx / 3) % 2) as f32);
+    let [r, g, b] = hsv_to_rgb(h, s, v);
+    [r, g, b, 1.0]
+}
+
+/// Per-edge RGBA palette via greedy graph-coloring on the line graph of
+/// `topo.edges`: two edges sharing a vertex are forbidden the same palette
+/// index, so locally-adjacent edges always read as different colors. The
+/// coloring is deterministic in the input edge order (which is itself
+/// deterministic per [`rye_physics::polytope::Polytope4Topology::edges`]),
+/// so the same polytope paints identically across runs.
+///
+/// Greedy first-fit coloring matches the line graph's chromatic number to
+/// within a factor that depends on vertex ordering; for the six regular
+/// convex 4-polytopes' edge graphs the result is within 1-2 colors of
+/// optimal in practice, which is fine for visual identification.
+fn unique_edge_palette(edges: &[[u32; 2]]) -> Vec<[f32; 4]> {
+    let n = edges.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let [a0, a1] = edges[i];
+            let [b0, b1] = edges[j];
+            if a0 == b0 || a0 == b1 || a1 == b0 || a1 == b1 {
+                adj[i].push(j);
+                adj[j].push(i);
+            }
+        }
+    }
+    let mut color_idx = vec![usize::MAX; n];
+    let mut used = std::collections::HashSet::<usize>::new();
+    for i in 0..n {
+        used.clear();
+        for &nbr in &adj[i] {
+            if color_idx[nbr] != usize::MAX {
+                used.insert(color_idx[nbr]);
+            }
+        }
+        let mut c = 0;
+        while used.contains(&c) {
+            c += 1;
+        }
+        color_idx[i] = c;
+    }
+    color_idx
+        .into_iter()
+        .map(unique_edge_palette_color)
+        .collect()
+}
+
+/// Per-cell "crossing strength" in `[0, 1]`: 1 when `w_slice` sits at the
+/// cell's w-midpoint (the cap face is widest); 0 when the slice is outside
+/// the cell's w-range entirely. Linear in `|w_slice - midpoint|` normalized
+/// by the cell's half-extent, a cheap proxy for the actual cap area that
+/// gives the same visual gradient. Shared by `render_wireframe_overlay` and
+/// `render_points` so both honor the same cell-activity definition.
+fn compute_cell_strengths(
+    cells: &[&[u32]],
+    local_vertices: &[Vec4],
+    w_slice: f32,
+) -> Vec<f32> {
+    cells
+        .iter()
+        .map(|cell| {
+            let (w_min, w_max) = cell
+                .iter()
+                .map(|&i| local_vertices[i as usize].w)
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), w| {
+                    (lo.min(w), hi.max(w))
+                });
+            let half_extent = (w_max - w_min) * 0.5;
+            if half_extent <= 0.0 {
+                return 0.0;
+            }
+            let mid = (w_min + w_max) * 0.5;
+            let dist = (w_slice - mid).abs();
+            (1.0 - dist / half_extent).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// Per-vertex `w-depth` color: cool blue at -w extreme, warm orange at
+/// +w extreme, near-neutral on the slice plane. `w_extent_local` is the
+/// FIXED post-scale bound on `|w|` for this polytope's canonical vertex
+/// set (`canonical_max_w * body_size`), so the gradient stays stable as
+/// the rotor spins: a vertex that lands at `w = +0.4 * body_size` paints
+/// the same color regardless of orientation. Per-vertex (not per-edge)
+/// so edges that span the slice plane visibly fade cool to warm along their
+/// length, surfacing the w-depth migration directly.
+fn w_depth_color(w: f32, w_extent_local: f32) -> [f32; 4] {
+    let denom = w_extent_local.max(1e-6);
+    // Shift signed w from [-extent, +extent] into [0, 1]; clamp guards
+    // against any vertex slightly past the canonical extent (numeric drift
+    // or non-unit-circumradius polytopes).
+    let t = ((w / denom) * 0.5 + 0.5).clamp(0.0, 1.0);
+    [
+        W_DEPTH_BACK[0] + (W_DEPTH_FRONT[0] - W_DEPTH_BACK[0]) * t,
+        W_DEPTH_BACK[1] + (W_DEPTH_FRONT[1] - W_DEPTH_BACK[1]) * t,
+        W_DEPTH_BACK[2] + (W_DEPTH_FRONT[2] - W_DEPTH_BACK[2]) * t,
+        1.0,
+    ]
+}
 
 #[cfg(test)]
 use catalog::{parse_shape_name, ShapeEntry, DEFAULT_ROW};
@@ -143,11 +298,19 @@ impl Demo {
         // shapes can be added to the row at runtime via the panel.
         // The ~24 KB const-array cost is fixed per app and acceptable
         // for a viz/demo target.
+        //
+        // Floor visibility is gated at runtime via `u.params.x` (set by
+        // [`Demo::floor_enabled`] each frame in `update`): when 0.0 the
+        // halfspace SDF returns 1e9 + the ray-plane bound is skipped, so
+        // the marcher never converges on the floor and the checkerboard
+        // never paints. Engine-level support: see
+        // [`Scene4::to_hyperslice_wgsl_gated`]. Zero per-frame cost; one
+        // shader build per launch.
         let shader_source = format!(
             "{kernel}\n{polytope}\n{scene}\n",
             kernel = HYPERSLICE_KERNEL_WGSL,
             polytope = polytope_extended_sdfs_wgsl(),
-            scene = scene.to_hyperslice_wgsl("u.w_slice"),
+            scene = scene.to_hyperslice_wgsl_gated("u.w_slice", "u.params.x"),
         );
         let module = ctx
             .rd
@@ -218,14 +381,16 @@ impl Demo {
         );
 
         // Point-disc rasterizer for the optional vertex + cell-center sprites overlay.
-        // Same depth-attachment setup as the other rasterizer nodes so points respect the
-        // shared section-faces depth buffer (sprites that sit behind a cap get occluded).
+        // No depth attachment: points are debug markers that must read as an overlay
+        // regardless of where the section caps sit. With the previous ReadOnly setup,
+        // a vertex at non-zero w would project (via drop-w) to the SAME (x, y, z) as
+        // its enclosing cap's slice intersection but with a slightly farther camera
+        // depth, so `LessEqual` failed and the sprite vanished behind the cap. The
+        // overlay semantic ("show me where the vertices are") wants always-visible.
         let points_node = PointRasterNode::new(
             &ctx.rd.device,
             ctx.rd.target_format(),
-            DepthMode::ReadOnly {
-                format: SECTION_FACES_DEPTH_FORMAT,
-            },
+            DepthMode::Off,
             ctx.rd.sample_count(),
         );
 
@@ -238,6 +403,30 @@ impl Demo {
             &ctx.rd.device,
             ctx.rd.target_format(),
             DepthMode::ReadWrite {
+                format: SECTION_FACES_DEPTH_FORMAT,
+            },
+            rye_render::FragmentShading::FaceNormalLambert,
+            ctx.rd.sample_count(),
+        );
+        // Translucent variant: identical pipeline modulo depth-write. When
+        // `surface_alpha < 1.0` we render through this one so the parent
+        // wireframe (drawn AFTER section faces with `LessEqual` depth-test)
+        // can show through the cap. The ReadWrite variant above writes
+        // depth, which would otherwise hide wireframe edges sitting behind
+        // a cap regardless of the cap's alpha.
+        //
+        // Tradeoff: with ReadOnly depth, caps within a single polytope can
+        // overpaint each other in submission order when their R³
+        // projections overlap. In practice the section-cap of one cell is
+        // disjoint from the section-cap of another cell at the same
+        // w_slice (each cell hosts at most one cap and they tile the
+        // section), so overdraw is rare. If it surfaces on the 24-cell or
+        // 600-cell at oblique angles, the fix is a depth-only prepass +
+        // ReadOnly color pass; punted until we observe the artifact.
+        let section_faces_translucent = TriangleRasterNode::new(
+            &ctx.rd.device,
+            ctx.rd.target_format(),
+            DepthMode::ReadOnly {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
             rye_render::FragmentShading::FaceNormalLambert,
@@ -277,7 +466,14 @@ impl Demo {
             wireframe_perimeter: true,
             wireframe_color_mode: WireframeColorMode::default(),
             wireframe_projection: WireframeProjection::default(),
+            wireframe_width_px: 1.8,
+            wireframe_alpha: 1.0,
+            unique_edge_palette_cache: std::collections::HashMap::new(),
+            surface_scale: 1.0,
+            surface_alpha: 1.0,
+            floor_enabled: true,
             section_faces,
+            section_faces_translucent,
             points_node,
             points_enabled: false,
             points_show_vertices: true,
@@ -345,10 +541,14 @@ impl Demo {
     pub(crate) fn update(&mut self, ctx: &mut FrameCtx<'_>) {
         let dt_secs = ctx.n_ticks as f32 / 60.0;
 
-        // Slice scrub (w axis, up/down arrow keys).
+        // Slice scrub (w axis, up/down arrow keys). Clamps against the
+        // surface-scaled range so the keyboard scrub matches the slider
+        // bounds after `surface scale`.
         let dir = (self.slider_up_held as i32 - self.slider_down_held as i32) as f32;
         if dir != 0.0 {
-            self.w_slice = (self.w_slice + dir * W_SCRUB_RATE * dt_secs).clamp(-W_RANGE, W_RANGE);
+            let w_range = self.effective_w_range();
+            self.w_slice =
+                (self.w_slice + dir * W_SCRUB_RATE * dt_secs).clamp(-w_range, w_range);
         }
 
         // Time scrub (t axis, left/right arrow keys). Mirrors the
@@ -457,6 +657,12 @@ impl Demo {
             u.time = ctx.time;
             u.tick = ctx.tick as f32;
             u.w_slice = self.w_slice;
+            // Floor-toggle gate read by the wrapper around `rye_scene_sdf`
+            // we injected at App::setup time. `u.params[0]` is 1.0 = floor
+            // on (the canonical halfspace SDF runs), 0.0 = floor off (the
+            // wrapper short-circuits to 1e9 so the marcher never converges
+            // on the floor and the checkerboard never paints).
+            u.params[0] = if self.floor_enabled { 1.0 } else { 0.0 };
         }
         self.node.flush_uniforms(&ctx.rd.queue);
     }
@@ -480,13 +686,19 @@ impl Demo {
         // a glance when a tester reloads the wasm bundle; the browser cache
         // can serve a stale page+script combination otherwise. F3's perf
         // overlay shows fps + framebuffer size when that data is wanted.
-        let build_label = format!(
-            "version: {}{}",
-            env!("BUILD_HASH"),
-            env!("BUILD_DIRTY"),
-        );
+        // Build label: short git hash + dirty marker, rendered top-right with
+        // visually symmetric padding (same gap from menu-bar bottom as from
+        // window's right edge). `MENU_BAR_PAD + LABEL_INSET` lands the label
+        // 14 px below the menu bar; `-LABEL_INSET` puts it 14 px in from the
+        // right edge. Matching values keep the two whitespaces equal.
+        const MENU_BAR_PAD: f32 = 24.0;
+        const LABEL_INSET: f32 = 14.0;
+        let build_label = format!("build: {}{}", env!("BUILD_HASH"), env!("BUILD_DIRTY"),);
         egui::Area::new(egui::Id::new("polytope-playground-build"))
-            .anchor(egui::Align2::RIGHT_TOP, [-12.0, 50.0])
+            .anchor(
+                egui::Align2::RIGHT_TOP,
+                [-LABEL_INSET, MENU_BAR_PAD + LABEL_INSET],
+            )
             .show(ctx, |ui| {
                 ui.add(egui::Label::new(
                     egui::RichText::new(build_label)
@@ -588,7 +800,7 @@ impl Demo {
         let polytope = entry.shape.polytope4().expect("filter guarantees Some");
         let topo = polytope.topology();
         let canonical_v0 = topo.vertices[0];
-        let v_local_4d = BODY_SIZE * self.rot_state.apply(canonical_v0);
+        let v_local_4d = self.effective_body_size() * self.rot_state.apply(canonical_v0);
         let v_local_r3 = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
             v_local_4d,
             &self.wireframe_projection.to_projection(),
@@ -670,20 +882,20 @@ impl Demo {
             // on `FrameInput::move_up`); rotating-on-Space would conflict.
             // T remains the always-available rotation toggle for freecam
             // users.
-            KeyCode::Space
-                if pressed && !matches!(self.camera_mode, CameraMode::FreeRoam) =>
-            {
+            KeyCode::Space if pressed && !matches!(self.camera_mode, CameraMode::FreeRoam) => {
                 self.rotate = !self.rotate;
             }
-            // Alt toggles the cursor grab while in freecam: hidden +
-            // confined for mouse-look, visible + free for UI interaction.
-            // The preset's `toggle_cursor_grab` handles the grab request
-            // and the controller's raw-delta flag together; demo just
-            // calls it. No-op outside freecam (the preset is inactive).
+            // Alt modulates the cursor grab while in freecam. Toggle mode
+            // (default, FPS sticky): press flips the grab, release is
+            // ignored. Hold mode (MMO-style): cursor released while Alt is
+            // held, re-grabbed when Alt is released. Both are routed
+            // through `Freecam::on_alt`, which inspects its `cursor_mode`
+            // field. We forward press AND release so Hold mode sees both
+            // edges; outside freecam the preset short-circuits to no-op.
             KeyCode::AltLeft | KeyCode::AltRight
-                if pressed && matches!(self.camera_mode, CameraMode::FreeRoam) =>
+                if matches!(self.camera_mode, CameraMode::FreeRoam) =>
             {
-                self.freecam.toggle_cursor_grab();
+                self.freecam.on_alt(pressed);
             }
             // Plane toggles. Sum-of-bivectors composition is
             // commutative, so the order in which planes are toggled
@@ -725,7 +937,7 @@ impl Demo {
             // rotor: `exp(omega_animation * t_offset) * rot_state`.
             // For the w-only and t-only 1D cases, the second
             // axis collapses to a single cell with offset=0.
-            let strip_w_extent = BODY_SIZE;
+            let strip_w_extent = self.effective_body_size();
             let (cols, rows, w_on_cols) = match (self.strip_w, self.strip_t) {
                 (true, true) => {
                     if self.strip_swap_axes {
@@ -780,7 +992,7 @@ impl Demo {
                     let body = BodyUniform::polytope_with_rotor(
                         [0.0, BODY_Y, 0.0, 0.0],
                         entry.shape.shape_id(),
-                        BODY_SIZE,
+                        self.effective_body_size(),
                         cell_rotor,
                         entry.body_color,
                     );
@@ -883,7 +1095,7 @@ impl Demo {
     /// raster pass. No-op when no polychoral body is present in the row.
     ///
     /// Per-body world transform mirrors `render_wireframe_overlay`: canonical vertices
-    /// `v` become `body_position + BODY_SIZE * rot_state.apply(v)`. The section
+    /// `v` become `body_position + effective_body_size() * rot_state.apply(v)`. The section
     /// algorithm then runs on these world vertices against the demo's `w_slice`,
     /// producing R³ geometry that composes with the camera the SDF raymarcher uses.
     ///
@@ -902,19 +1114,27 @@ impl Demo {
     /// projected through `wireframe_projection`, and translated by the body's R³ position so
     /// the perspective scale doesn't smear the body across its row x-offset.
     ///
-    /// Coloring: vertex sprites use the same per-vertex position-derived RGB scheme as the
-    /// "unique" wireframe color mode (`vertex_color_by_position`), so vertex sprites visually
-    /// belong with the colored wireframe. Cell-center sprites use a uniform white with
-    /// reduced alpha to read as a secondary structural marker rather than competing with the
-    /// vertex sprites.
+    /// Coloring: sprites honor the active [`WireframeColorMode`] so the
+    /// points overlay reads as part of the same wireframe rendering pass.
+    /// Per-vertex sprites get the same color the matching wireframe vertex
+    /// would carry; per-cell-center sprites get the dominant-cell color
+    /// (cell strength for `Active`, cell-center w for `WDepth`, position-
+    /// derived gradient otherwise). For `UniqueEdge` mode the points fall
+    /// back to the position-gradient because the unique-edge palette is
+    /// edge-indexed and has no canonical vertex assignment.
     fn render_points(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
         let cfg = &rd.surface_bundle.config;
         let n = self.row.len();
         let wireframe_projection = self.wireframe_projection.to_projection();
-        // Cell-center sprite color: a dim warm white. Pre-multiplied alpha makes the sprite
-        // read as a "second-tier" marker behind the brighter vertex discs.
-        const CELL_CENTER_COLOR: [f32; 4] = [0.92, 0.88, 0.78, 0.65];
+        // Active-mode palette: bright green for vertices that belong to a
+        // currently-intersected cell, dim gray otherwise. Same hues the
+        // wireframe overlay uses so the visual identity stays consistent.
+        const ACTIVE_GREEN: [f32; 4] = [0.40, 1.00, 0.55, 1.0];
+        const INACTIVE_GRAY: [f32; 4] = [0.55, 0.55, 0.58, 0.85];
+        let color_mode = self.wireframe_color_mode;
 
+        let body_size = self.effective_body_size();
+        let w_slice = self.w_slice;
         let mesh = &mut self.points_mesh_scratch;
         mesh.positions.clear();
         mesh.colors.clear();
@@ -928,33 +1148,112 @@ impl Demo {
             let body_pos = body_position(slot, n);
             let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
 
+            // Per-frame, per-polytope body-local 4D vertices (rotated + scaled).
+            // Shared by the vertex AND cell-center loops: for WDepth we need
+            // the maximum |w| across them to normalize the gradient, and for
+            // Active we need them to derive cell strengths.
+            let local_vertices: Vec<Vec4> = topo
+                .vertices
+                .iter()
+                .map(|v| body_size * self.rot_state.apply(*v))
+                .collect();
+            // Same canonical-max-w normalization the wireframe overlay uses
+            // (see render_wireframe_overlay), keeping the points' color in
+            // step with the edges across the same w-depth scheme.
+            let w_extent_local: f32 = if matches!(color_mode, WireframeColorMode::WDepth) {
+                let canonical_max_w = topo
+                    .vertices
+                    .iter()
+                    .map(|v| v.w.abs())
+                    .fold(0.0_f32, f32::max)
+                    .max(1e-6);
+                canonical_max_w * body_size
+            } else {
+                1.0
+            };
+            // Cell strengths only computed for the Active mode; saves work in
+            // the common case. Same definition the wireframe overlay uses
+            // (`compute_cell_strengths`) so "vertex in an active cell" reads
+            // consistently across edges + dots.
+            let cell_strengths: Vec<f32> = if matches!(color_mode, WireframeColorMode::Active) {
+                compute_cell_strengths(topo.cells, &local_vertices, w_slice)
+            } else {
+                Vec::new()
+            };
+            let vertex_is_active = |vi: usize| -> bool {
+                topo.cells
+                    .iter()
+                    .zip(cell_strengths.iter())
+                    .any(|(cell, &s)| s > 0.0 && cell.contains(&(vi as u32)))
+            };
+
             if self.points_show_vertices {
-                for v in topo.vertices {
-                    let v_local = BODY_SIZE * self.rot_state.apply(*v);
+                for (vi, v) in topo.vertices.iter().enumerate() {
+                    let v_local = local_vertices[vi];
                     let v3_local =
                         <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
                             v_local,
                             &wireframe_projection,
                         );
                     let v_world = v3_local + body_pos_r3;
+                    let color = match color_mode {
+                        // Position-gradient also covers UniqueEdge, since the
+                        // unique-edge palette is edge-indexed (no canonical
+                        // assignment for a vertex shared by several edges).
+                        WireframeColorMode::VertexGradient | WireframeColorMode::UniqueEdge => {
+                            vertex_color_by_position(*v)
+                        }
+                        WireframeColorMode::WDepth => w_depth_color(v_local.w, w_extent_local),
+                        WireframeColorMode::Active => {
+                            if vertex_is_active(vi) {
+                                ACTIVE_GREEN
+                            } else {
+                                INACTIVE_GRAY
+                            }
+                        }
+                    };
                     mesh.positions.push(v_world.to_array());
-                    // Color by the canonical (unrotated) vertex position so the sprite hue
-                    // matches its corresponding wireframe edge in `WireframeColorMode::Unique`.
-                    mesh.colors.push(vertex_color_by_position(*v));
+                    mesh.colors.push(color);
                     mesh.sizes.push(self.points_size_px);
                 }
             }
             if self.points_show_cell_centers {
-                for c in polytope.cell_centers() {
-                    let c_local = BODY_SIZE * self.rot_state.apply(c);
+                // Pull cell centroids radially inward by `CELL_CENTER_INSET` so
+                // they read as "interior markers" instead of coinciding with the
+                // DUAL polytope's vertices. Mathematically `polytope.cell_centers()`
+                // returns each cell's centroid at the inradius, which IS the
+                // dual's vertex set (16-cell's cell-centroids form a tesseract,
+                // tesseract's form a 16-cell, etc). At full inradius the sprites
+                // look like a smaller dual polytope sitting at the inradius; the
+                // inset puts them visibly INSIDE the body's cap so a viewer reads
+                // "one dot per cell, in the cell's direction" rather than
+                // "vertices of the wrong polytope."
+                const CELL_CENTER_INSET: f32 = 0.5;
+                let centers = polytope.cell_centers();
+                for (ci, c) in centers.iter().enumerate() {
+                    let c_local = body_size * CELL_CENTER_INSET * self.rot_state.apply(*c);
                     let c3_local =
                         <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
                             c_local,
                             &wireframe_projection,
                         );
                     let c_world = c3_local + body_pos_r3;
+                    let color = match color_mode {
+                        WireframeColorMode::VertexGradient | WireframeColorMode::UniqueEdge => {
+                            vertex_color_by_position(*c)
+                        }
+                        WireframeColorMode::WDepth => w_depth_color(c_local.w, w_extent_local),
+                        WireframeColorMode::Active => {
+                            let s = cell_strengths.get(ci).copied().unwrap_or(0.0);
+                            if s > 0.0 {
+                                ACTIVE_GREEN
+                            } else {
+                                INACTIVE_GRAY
+                            }
+                        }
+                    };
                     mesh.positions.push(c_world.to_array());
-                    mesh.colors.push(CELL_CENTER_COLOR);
+                    mesh.colors.push(color);
                     // Cell-center sprites half-sized so they don't compete visually with the
                     // brighter vertex discs.
                     mesh.sizes.push(self.points_size_px * 0.5);
@@ -976,12 +1275,10 @@ impl Demo {
             mesh,
             &rye_math::Projection::Identity,
         );
-        let depth_view = self
-            .section_faces_depth
-            .as_ref()
-            .map(|b| &b.view)
-            .expect("shared depth buffer must be ensured before points overlay");
-        self.points_node.execute(rd, view, Some(depth_view), None)?;
+        // No depth attachment: see `PointRasterNode::new` site for the rationale
+        // (drop-w + ReadOnly LessEqual was occluding non-w=0 vertices behind their
+        // own caps).
+        self.points_node.execute(rd, view, None, None)?;
         Ok(())
     }
 
@@ -992,6 +1289,7 @@ impl Demo {
         // Reuse the per-Demo scratch mesh; capacity grows once to fit the largest
         // polychoron and stays there. Each frame's `clear()` keeps the underlying
         // allocations.
+        let body_size = self.effective_body_size();
         let combined = &mut self.section_faces_mesh_scratch;
         combined.vertices.clear();
         combined.colors.clear();
@@ -1020,12 +1318,14 @@ impl Demo {
             self.section_world_vertices_scratch.extend(
                 topo.vertices
                     .iter()
-                    .map(|v| BODY_SIZE * self.rot_state.apply(*v)),
+                    .map(|v| body_size * self.rot_state.apply(*v)),
             );
 
             // Match the SDF's per-body solid coloring: every cap of this polychoron uses
             // the body's identity color from the catalog. Per-face Lambert in the fragment
-            // shader adds the geometric depth; the underlying color is flat.
+            // shader adds the geometric depth; the underlying color is flat. Alpha is
+            // the user-tuneable `surface_alpha` (default 1.0); below 1.0 the wireframe
+            // overlay behind composites through via `SrcAlpha/OneMinusSrcAlpha` blending.
             let [r, g, b] = entry.body_color;
             let start = combined.vertices.len();
             polytope_section_faces_append(
@@ -1033,7 +1333,7 @@ impl Demo {
                 topo.cells,
                 &self.section_world_vertices_scratch,
                 WPlane::new(self.w_slice),
-                [r, g, b, 1.0],
+                [r, g, b, self.surface_alpha],
                 combined,
             );
             // Translate this body's body-local cap vertices into world R³. Indices were
@@ -1063,15 +1363,34 @@ impl Demo {
             .as_ref()
             .expect("shared depth buffer must be ensured before section_faces");
 
-        self.section_faces.set_camera(&rd.queue, view_proj);
-        self.section_faces.upload::<EuclideanR3, 3>(
-            &rd.device,
-            &rd.queue,
-            combined,
-            &rye_math::Projection::Identity,
-        );
-        self.section_faces
-            .execute(rd, view, Some(&depth.view), None)?;
+        // Pick the depth-write variant based on `surface_alpha`: opaque
+        // (1.0) writes depth so caps occlude one another correctly within
+        // a polytope; translucent (< 1.0) skips depth-write so the parent
+        // wireframe drawn after sees through. The two nodes carry their
+        // own GPU buffers, so we upload the mesh into whichever path
+        // we're about to execute.
+        if self.surface_alpha >= 1.0 {
+            self.section_faces.set_camera(&rd.queue, view_proj);
+            self.section_faces.upload::<EuclideanR3, 3>(
+                &rd.device,
+                &rd.queue,
+                combined,
+                &rye_math::Projection::Identity,
+            );
+            self.section_faces
+                .execute(rd, view, Some(&depth.view), None)?;
+        } else {
+            self.section_faces_translucent
+                .set_camera(&rd.queue, view_proj);
+            self.section_faces_translucent.upload::<EuclideanR3, 3>(
+                &rd.device,
+                &rd.queue,
+                combined,
+                &rye_math::Projection::Identity,
+            );
+            self.section_faces_translucent
+                .execute(rd, view, Some(&depth.view), None)?;
+        }
         Ok(())
     }
 
@@ -1080,9 +1399,9 @@ impl Demo {
     /// depth buffer, and execute the three raster passes on top of the existing SDF render.
     ///
     /// Per-body transform: each canonical Polytope4 vertex `v` becomes the world Vec4
-    /// `body.position + BODY_SIZE * rot_state.apply(v)`. The section algorithm then runs
-    /// on these world vertices against the demo's `w_slice`, producing geometry in world
-    /// R³ that composes cleanly with the SDF camera frame.
+    /// `body.position + effective_body_size() * rot_state.apply(v)`. The section algorithm
+    /// then runs on these world vertices against the demo's `w_slice`, producing geometry
+    /// in world R³ that composes cleanly with the SDF camera frame.
     ///
     /// Non-polychoral shapes (Clifford torus, duocylinder, etc.) in the row are skipped:
     /// they have no [`rye_physics::polytope::Polytope4`] mapping and the cross-section
@@ -1101,10 +1420,16 @@ impl Demo {
         // Uniform-alpha endpoints when `nearest-active` is off; the active-mode mapping
         // interpolates between DIM (cells the slice misses entirely) and BRIGHT (cells
         // the slice is at the midpoint of).
-        const PARENT_ALPHA_UNIFORM: f32 = 0.55;
+        // When `wireframe nearest-active` is OFF, every edge gets the user-
+        // tuneable uniform alpha (`wireframe_alpha`, default 1.0). When ON,
+        // edges interpolate between DIM (cells the slice misses entirely)
+        // and BRIGHT (cells the slice is at the midpoint of). DIM/BRIGHT
+        // stay hardcoded because they encode "very off" / "very on" peaks
+        // of the activity gradient, not a global opacity setting.
         const PARENT_ALPHA_DIM: f32 = 0.10;
         const PARENT_ALPHA_BRIGHT: f32 = 0.85;
-        const PARENT_WIDTH: f32 = 1.2;
+        let parent_alpha_uniform = self.wireframe_alpha;
+        let parent_width = self.wireframe_width_px;
         // Active-mode palette. Green for edges in any currently-intersected cell;
         // neutral gray for the rest. Chosen for clear binary contrast against the
         // grayish-blue scene backdrop and the dim ground checkerboard.
@@ -1131,10 +1456,11 @@ impl Demo {
             // Body-local 4D vertices: rotor-rotated, scaled, NO world translate yet. The
             // translate happens after the chosen `wireframe_projection` maps each vertex
             // from R⁴ to R³.
+            let body_size = self.effective_body_size();
             let local_vertices: Vec<Vec4> = topo
                 .vertices
                 .iter()
-                .map(|v| BODY_SIZE * self.rot_state.apply(*v))
+                .map(|v| body_size * self.rot_state.apply(*v))
                 .collect();
 
             // Cross-section perimeter edges. The cyan outlines bound each cell cap on the
@@ -1160,30 +1486,10 @@ impl Demo {
                 section_edges.widths.append(&mut perim.widths);
             }
 
-            // Per-cell "crossing strength" in [0, 1]: 1 when `w_slice` is at the cell's
-            // w-midpoint (cap face is widest), 0 when the slice is at the cell's w-boundary
-            // or outside it entirely. A linear w-midpoint proxy avoids computing actual
-            // cap areas while giving the same visual gradient: cells the slice is *deep
-            // in* peak in brightness, cells the slice barely touches taper to dim.
-            let cell_strengths: Vec<f32> = topo
-                .cells
-                .iter()
-                .map(|cell| {
-                    let (w_min, w_max) = cell
-                        .iter()
-                        .map(|&i| local_vertices[i as usize].w)
-                        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), w| {
-                            (lo.min(w), hi.max(w))
-                        });
-                    let half_extent = (w_max - w_min) * 0.5;
-                    if half_extent <= 0.0 {
-                        return 0.0;
-                    }
-                    let mid = (w_min + w_max) * 0.5;
-                    let dist = (self.w_slice - mid).abs();
-                    (1.0 - dist / half_extent).clamp(0.0, 1.0)
-                })
-                .collect();
+            // Per-cell "crossing strength" in [0, 1] - shared with render_points
+            // via `compute_cell_strengths` so both passes agree on what "active"
+            // means for a given w_slice + rotated polytope.
+            let cell_strengths = compute_cell_strengths(topo.cells, &local_vertices, self.w_slice);
 
             // Per-edge brightness: max strength across cells the edge belongs to. An edge
             // belongs to a cell when both endpoints sit in that cell's vertex list. This
@@ -1215,22 +1521,70 @@ impl Demo {
 
             // Parent wireframe: every polytope edge as a world-R³ line. Base RGB is
             // picked by `wireframe_color_mode`:
-            // - `Unique`: per-vertex position-derived RGB from the canonical vertex
-            //   set so each vertex gets a distinct hue from its 4D coordinates and
-            //   the polytope's symmetry shows as smooth gradients (same scheme as
+            // - `VertexGradient`: per-vertex position-derived RGB from the canonical
+            //   vertex set so each vertex gets a distinct hue from its 4D coordinates
+            //   and the polytope's symmetry shows as smooth gradients (same scheme as
             //   `Polytope4::lines_colored_by_position`).
+            // - `UniqueEdge`: each edge gets a distinct palette color via greedy
+            //   graph-coloring on the line graph (see `unique_edge_palette`).
+            // - `WDepth`: per-endpoint cool-blue-to-warm-orange by SIGNED w
+            //   in body-local frame, normalized against the polytope's canonical
+            //   max |w| (fixed-band, not per-frame), so a vertex paints the same
+            //   color at the same w regardless of rotor orientation.
             // - `Active`: binary green/gray by cell-activity (see `edge_is_active`).
             // Alpha is then modulated per-edge by the `nearest-active` strength (when
             // that toggle is on) or held uniform.
-            for &[i, j] in topo.edges {
+            // UniqueEdge palette is topology-only (greedy graph-coloring on the line
+            // graph). Memoize by `Polytope4` variant so the 600-cell's ~520k pair-checks
+            // run once per launch instead of once per frame. Cache lives on Demo; an
+            // empty cache simply triggers first-use population for the visited variants.
+            let edge_palette: &[[f32; 4]] =
+                if matches!(color_mode, WireframeColorMode::UniqueEdge) {
+                    self.unique_edge_palette_cache
+                        .entry(polytope)
+                        .or_insert_with(|| unique_edge_palette(topo.edges))
+                } else {
+                    &[]
+                };
+            // For `WDepth` we normalize against this polytope's CANONICAL max
+            // |w| (NOT the per-frame rotated max). The rotor preserves
+            // magnitudes, so the maximum |w| any rotated vertex can reach is
+            // bounded by the canonical max times `body_size`. Holding the
+            // gradient endpoints fixed across frames is what makes the color
+            // cue temporally stable: a vertex migrating from -w to +w as
+            // the rotor swings paints a continuous cool-to-warm shift rather
+            // than a per-frame normalized re-saturation. Mirrors the
+            // `LineRasterStaticR4` shader's hardcoded `[-0.5, +0.5]` band
+            // (which is correct for the tesseract); here it's per-polytope
+            // because the 16-cell, 5-cell, etc. don't share that band.
+            let w_extent_local: f32 = if matches!(color_mode, WireframeColorMode::WDepth) {
+                let canonical_max_w = topo
+                    .vertices
+                    .iter()
+                    .map(|v| v.w.abs())
+                    .fold(0.0_f32, f32::max)
+                    .max(1e-6);
+                canonical_max_w * body_size
+            } else {
+                1.0
+            };
+            for (edge_idx, &[i, j]) in topo.edges.iter().enumerate() {
                 let ia = i as usize;
                 let ja = j as usize;
                 let a = local_vertices[ia];
                 let b = local_vertices[ja];
                 let (mut color_a, mut color_b) = match color_mode {
-                    WireframeColorMode::Unique => (
+                    WireframeColorMode::VertexGradient => (
                         vertex_color_by_position(topo.vertices[ia]),
                         vertex_color_by_position(topo.vertices[ja]),
+                    ),
+                    WireframeColorMode::UniqueEdge => {
+                        let c = edge_palette[edge_idx];
+                        (c, c)
+                    }
+                    WireframeColorMode::WDepth => (
+                        w_depth_color(a.w, w_extent_local),
+                        w_depth_color(b.w, w_extent_local),
                     ),
                     WireframeColorMode::Active => {
                         let c = if edge_is_active(i, j) {
@@ -1245,7 +1599,7 @@ impl Demo {
                     let s = edge_strength(i, j);
                     PARENT_ALPHA_DIM + (PARENT_ALPHA_BRIGHT - PARENT_ALPHA_DIM) * s
                 } else {
-                    PARENT_ALPHA_UNIFORM
+                    parent_alpha_uniform
                 };
                 color_a[3] = alpha;
                 color_b[3] = alpha;
@@ -1267,7 +1621,7 @@ impl Demo {
                 let b3 = b3_local + body_pos_r3;
                 parent_lines.segments.push((a3.to_array(), b3.to_array()));
                 parent_lines.colors.push((color_a, color_b));
-                parent_lines.widths.push(PARENT_WIDTH);
+                parent_lines.widths.push(parent_width);
             }
         }
 
@@ -1354,6 +1708,10 @@ struct RotatePolytopesApp {
     /// Capture parameters panel (output dir, format, fps, scale, start/stop).
     /// Toggled via the `capture panel` console command or the F11 default bind.
     capture_panel: rye_app::capture::CapturePanel,
+    /// F3-toggle live perf overlay: FPS, frame-time, sparkline. Reads from
+    /// `rye_time::frame_trace`, so it surfaces the same numbers `trace summary`
+    /// dumps but continuously. Cheap when hidden (just a key-press check).
+    perf: rye_app::trace::PerfOverlay,
 }
 
 impl RotatePolytopesApp {
@@ -1419,19 +1777,92 @@ impl RotatePolytopesApp {
                         Ok(())
                     },
                 )
+                .custom(
+                    "width",
+                    "parent-wireframe edge thickness in pixels (default 1.8)",
+                    &[&[]],
+                    &[],
+                    |d, args, out| {
+                        match args.first().copied() {
+                            None => {
+                                out.line(format!(
+                                    "wireframe width: {:.2} px",
+                                    d.wireframe_width_px
+                                ));
+                            }
+                            Some(s) => match s.parse::<f32>() {
+                                Ok(w) if w > 0.0 && w <= 16.0 => {
+                                    d.wireframe_width_px = w;
+                                    out.line(format!(
+                                        "wireframe width: set to {w:.2} px"
+                                    ));
+                                }
+                                _ => {
+                                    out.line(format!(
+                                        "wireframe width: invalid `{s}` (need a float in (0, 16])"
+                                    ));
+                                }
+                            },
+                        }
+                        Ok(())
+                    },
+                )
+                .custom(
+                    "alpha",
+                    "uniform edge alpha when nearest-active is off (default 1.0)",
+                    &[&[]],
+                    &[],
+                    |d, args, out| {
+                        match args.first().copied() {
+                            None => {
+                                out.line(format!(
+                                    "wireframe alpha: {:.3} ({})",
+                                    d.wireframe_alpha,
+                                    if d.wireframe_nearest_active {
+                                        "overridden by nearest-active gradient; toggle off to apply"
+                                    } else {
+                                        "active"
+                                    }
+                                ));
+                            }
+                            Some(s) => match s.parse::<f32>() {
+                                Ok(a) if a > 0.0 && a <= 1.0 => {
+                                    d.wireframe_alpha = a;
+                                    out.line(format!(
+                                        "wireframe alpha: set to {a:.3}"
+                                    ));
+                                }
+                                _ => {
+                                    out.line(format!(
+                                        "wireframe alpha: invalid `{s}` (need a float in (0, 1])"
+                                    ));
+                                }
+                            },
+                        }
+                        Ok(())
+                    },
+                )
                 .choice(
                     "color",
-                    "base RGB for parent edges (bare cycles): unique (default) or active",
-                    &["unique", "active"],
+                    "parent-edge color mode (bare cycles): vertex-gradient|unique-edge|w-depth|active",
+                    &["vertex-gradient", "unique-edge", "w-depth", "active"],
                     |d, name| {
                         d.wireframe_color_mode = match name {
                             Some(n) => WireframeColorMode::from_token(n).ok_or_else(|| {
-                                anyhow!("unknown color mode `{n}` (try unique|active)")
+                                anyhow!(
+                                    "unknown color mode `{n}` (try vertex-gradient|unique-edge|w-depth|active)"
+                                )
                             })?,
-                            None => match d.wireframe_color_mode {
-                                WireframeColorMode::Unique => WireframeColorMode::Active,
-                                WireframeColorMode::Active => WireframeColorMode::Unique,
-                            },
+                            None => {
+                                // Cycle through the canonical order so bare
+                                // `wireframe color` visits every mode in turn.
+                                let all = WireframeColorMode::ALL;
+                                let i = all
+                                    .iter()
+                                    .position(|m| *m == d.wireframe_color_mode)
+                                    .unwrap_or(0);
+                                all[(i + 1) % all.len()]
+                            }
                         };
                         Ok(())
                     },
@@ -1452,51 +1883,59 @@ impl RotatePolytopesApp {
                         };
                         Ok(())
                     },
-                ),
-        );
-
-        // Points overlay: vertex markers + cell-center sprites. Same SubcommandSet shape as
-        // `wireframe`: bare flips main on/off, subcommands gate per-category visibility, and
-        // a size knob for the disc radius. Off by default so first-launch readers see the
-        // demo's identity (SDF / raster + wireframe) rather than a vertex cloud.
-        c.register(
-            rye_egui::subcommands::<Demo>("points", "vertex + cell-center sprite overlay")
-                .on_bare(|d| {
-                    d.points_enabled = !d.points_enabled;
-                    Ok(())
-                })
-                .toggle(
-                    "vertices",
-                    "render a disc at each polytope vertex (bare flips)",
-                    |d, v| {
-                        d.points_show_vertices = v.unwrap_or(!d.points_show_vertices);
-                        Ok(())
-                    },
-                )
-                .toggle(
-                    "cell-centers",
-                    "render a dim disc at each cell's centroid (bare flips)",
-                    |d, v| {
-                        d.points_show_cell_centers = v.unwrap_or(!d.points_show_cell_centers);
-                        Ok(())
-                    },
                 )
                 .custom(
-                    "size",
-                    "set the disc radius in pixels (e.g. `points size 8`)",
+                    "points",
+                    "vertex + cell-center sprite overlay (bare flips; sub: vertices|cell-centers|size <N>)",
+                    &[&["vertices", "cell-centers", "size"]],
                     &[],
-                    &[],
-                    |d, rest, _out| {
-                        let Some(token) = rest.first() else {
-                            return Err(anyhow!("usage: points size <pixels>"));
-                        };
-                        let px: f32 = token
-                            .parse()
-                            .map_err(|e| anyhow!("invalid pixel value `{token}`: {e}"))?;
-                        if !(1.0..=64.0).contains(&px) {
-                            return Err(anyhow!("points size {px} out of range; expected 1..=64"));
+                    |d, args, out| {
+                        match args.first().copied() {
+                            None => {
+                                d.points_enabled = !d.points_enabled;
+                                out.line(format!(
+                                    "points: {}",
+                                    if d.points_enabled { "on" } else { "off" }
+                                ));
+                            }
+                            Some("vertices") => {
+                                d.points_show_vertices = !d.points_show_vertices;
+                                out.line(format!(
+                                    "points vertices: {}",
+                                    if d.points_show_vertices { "on" } else { "off" }
+                                ));
+                            }
+                            Some("cell-centers") => {
+                                d.points_show_cell_centers = !d.points_show_cell_centers;
+                                out.line(format!(
+                                    "points cell-centers: {}",
+                                    if d.points_show_cell_centers { "on" } else { "off" }
+                                ));
+                            }
+                            Some("size") => match args.get(1) {
+                                None => out.line(format!(
+                                    "points size: {:.1} px",
+                                    d.points_size_px
+                                )),
+                                Some(token) => {
+                                    let px: f32 = token.parse().map_err(|e| {
+                                        anyhow!("invalid pixel value `{token}`: {e}")
+                                    })?;
+                                    if !(1.0..=64.0).contains(&px) {
+                                        return Err(anyhow!(
+                                            "points size {px} out of range; expected 1..=64"
+                                        ));
+                                    }
+                                    d.points_size_px = px;
+                                    out.line(format!("points size: set to {px:.1} px"));
+                                }
+                            },
+                            Some(other) => {
+                                return Err(anyhow!(
+                                    "unknown points subcommand `{other}` (try vertices|cell-centers|size)"
+                                ));
+                            }
                         }
-                        d.points_size_px = px;
                         Ok(())
                     },
                 ),
@@ -1506,14 +1945,77 @@ impl RotatePolytopesApp {
         // shorthand for "off" so the user can hide cap fills quickly when inspecting the
         // wireframe and cross-section perimeter on their own. Explicit `surface raster`
         // and `surface sdf` set those modes; `surface off` is the same as bare.
+        // `surface scale <N>` rescales every polychoron in the row by multiplying the
+        // canonical `BODY_SIZE` (see [`Demo::effective_body_size`]); default 1.0.
         c.register(
             rye_egui::cmd(
                 "surface",
-                "polychoral surface mode: raster | sdf | off (bare = off)",
-                |args, demo: &mut Demo, _out| {
+                "polychoral surface mode: raster | sdf | off (bare = off); `scale <N>` to resize",
+                |args, demo: &mut Demo, out| {
+                    if matches!(args.first().copied(), Some("scale")) {
+                        match args.get(1).copied() {
+                            None => {
+                                out.line(format!(
+                                    "surface scale: {:.3} (multiplies BODY_SIZE)",
+                                    demo.surface_scale
+                                ));
+                            }
+                            Some(token) => {
+                                let parsed: f32 = token.parse().map_err(|e| {
+                                    anyhow!("invalid scale `{token}`: {e}")
+                                })?;
+                                if !(0.05..=10.0).contains(&parsed) {
+                                    return Err(anyhow!(
+                                        "surface scale {parsed} out of range; expected 0.05..=10.0"
+                                    ));
+                                }
+                                demo.surface_scale = parsed;
+                                // Rebuild SDF body uniforms so the kernel sees the new
+                                // radius immediately; raster paths read effective_body_size()
+                                // every frame and don't need a rebuild.
+                                demo.rebuild_bodies();
+                                // Clamp the current w-slice into the new scaled range so
+                                // a shrink doesn't leave the slider off the visible body.
+                                let w_range = demo.effective_w_range();
+                                demo.w_slice = demo.w_slice.clamp(-w_range, w_range);
+                                out.line(format!(
+                                    "surface scale: set to {parsed:.3}"
+                                ));
+                            }
+                        }
+                        return Ok(());
+                    }
+                    if matches!(args.first().copied(), Some("alpha")) {
+                        match args.get(1).copied() {
+                            None => {
+                                out.line(format!(
+                                    "surface alpha: {:.3} ({} pipeline)",
+                                    demo.surface_alpha,
+                                    if demo.surface_alpha >= 1.0 {
+                                        "opaque"
+                                    } else {
+                                        "translucent"
+                                    }
+                                ));
+                            }
+                            Some(token) => {
+                                let parsed: f32 = token.parse().map_err(|e| {
+                                    anyhow!("invalid alpha `{token}`: {e}")
+                                })?;
+                                if !(0.05..=1.0).contains(&parsed) {
+                                    return Err(anyhow!(
+                                        "surface alpha {parsed} out of range; expected 0.05..=1.0 (use `surface off` for invisible)"
+                                    ));
+                                }
+                                demo.surface_alpha = parsed;
+                                out.line(format!("surface alpha: set to {parsed:.3}"));
+                            }
+                        }
+                        return Ok(());
+                    }
                     let next = match args.first().copied() {
                         Some(token) => SurfaceMode::from_token(token).ok_or_else(|| {
-                            anyhow!("unknown arg `{token}` (try raster|sdf|off)")
+                            anyhow!("unknown arg `{token}` (try raster|sdf|off|scale|alpha)")
                         })?,
                         None => SurfaceMode::Off,
                     };
@@ -1526,20 +2028,23 @@ impl RotatePolytopesApp {
                     Ok(())
                 },
             )
-            .with_args(&[&["raster", "sdf", "off"]])
+            .with_args(&[&["raster", "sdf", "off", "scale", "alpha"]])
             .with_long_help(
                 "Selects how the six regular convex 4-polytopes (5-cell, tesseract, 16-cell,\n\
-                 24-cell, 120-cell, 600-cell) are rendered.\n\
+                 24-cell, 120-cell, 600-cell) are rendered, plus runtime scale + alpha knobs.\n\
                  \n\
                  subcommands:\n  \
-                 raster  Rasterized cross-section cell-caps (the default). Face-normal Lambert\n                         lit, per-body solid color. Much faster for the 120-cell + 600-cell\n                         and exact (no SDF approximation).\n  \
-                 sdf     SDF raymarch. The historical pre-rasterizer path; smoother shading\n                         but the 120-cell and 600-cell carry a face-plane approximation BUG.\n                         Kept for visual comparison.\n  \
-                 off     No surface rendered. Wireframe overlay + cross-section perimeter\n                         stay visible if enabled; the cap interiors are blank. Useful for\n                         inspecting the wireframe on its own.\n\
+                 raster      Rasterized cross-section cell-caps (the default). Face-normal\n                             Lambert lit, per-body solid color. Much faster for the\n                             120-cell + 600-cell and exact (no SDF approximation).\n  \
+                 sdf         SDF raymarch. The historical pre-rasterizer path; smoother\n                             shading but the 120-cell and 600-cell carry a face-plane\n                             approximation BUG. Kept for visual comparison.\n  \
+                 off         No surface rendered. Wireframe overlay + cross-section\n                             perimeter stay visible if enabled; the cap interiors are\n                             blank. Useful for inspecting the wireframe on its own.\n  \
+                 scale <N>   Multiply the canonical body radius by N (default 1.0; range\n                             0.05..=10.0). Affects SDF kernel, raster cross-section caps,\n                             wireframe overlay, perimeter, and points sprites uniformly.\n  \
+                 alpha <N>   Section-faces opacity (default 1.0; range 0.05..=1.0). Below\n                             1.0 the cap renders through a no-depth-write pipeline so\n                             the parent wireframe behind composes through. Use `surface\n                             off` for fully invisible caps.\n\
                  \n\
                  Bare `surface` (no argument) is shorthand for `surface off`.\n\
                  \n\
                  Smooth-surface shapes (Clifford torus, duocylinder, spherinder, 3-sphere)\n\
-                 ignore this and always render via the SDF; they have no rasterizer path.",
+                 ignore the mode and always render via the SDF; they have no rasterizer\n\
+                 path. Surface scale still applies to their SDF body radius.",
             ),
         );
 
@@ -1576,11 +2081,87 @@ impl RotatePolytopesApp {
         // default distance + pitch so the camera returns to a known framing
         // around the world origin; `camera freecam` seeds the free-roam
         // position from the camera's current location.
+        //
+        // Freecam tuning subcommands (do NOT change mode):
+        //   `camera freecam speed=<N>`        WASD/Space/Shift units/sec.
+        //   `camera freecam speed`            Print the current speed.
+        //   `camera freecam cursor_mode <m>`  `toggle` (default, FPS) or `hold` (MMO).
+        //   `camera freecam cursor_mode`      Print the current mode.
         c.register(
             rye_egui::cmd::<Demo, _>(
                 "camera",
-                "camera mode: orbit (default) or freecam (WASD + mouse-look). Bare cycles.",
+                "camera mode: orbit | freecam; bare cycles. `camera freecam speed=<N>` / `cursor_mode hold|toggle` tune the preset",
                 |args, demo, out| {
+                    // Freecam-tuning forms have a second positional token.
+                    // `speed=<N>` is parsed as one token (matches the user's
+                    // `speed=<N>` spec); `speed` alone queries; `cursor_mode
+                    // <m>` is two tokens.
+                    if matches!(args.first().copied(), Some("freecam")) && args.len() >= 2 {
+                        let second = args[1];
+                        // `speed=<N>` and `speed <N>` and bare `speed`.
+                        if let Some(value) = second.strip_prefix("speed=") {
+                            let parsed: f32 = value
+                                .parse()
+                                .map_err(|e| anyhow!("invalid speed `{value}`: {e}"))?;
+                            if !(0.1..=200.0).contains(&parsed) {
+                                return Err(anyhow!(
+                                    "camera freecam speed {parsed} out of range; expected 0.1..=200.0"
+                                ));
+                            }
+                            demo.freecam.speed = parsed;
+                            out.line(format!("camera freecam speed: set to {parsed:.2} u/sec"));
+                            return Ok(());
+                        }
+                        if second == "speed" {
+                            if let Some(value) = args.get(2) {
+                                let parsed: f32 = value.parse().map_err(|e| {
+                                    anyhow!("invalid speed `{value}`: {e}")
+                                })?;
+                                if !(0.1..=200.0).contains(&parsed) {
+                                    return Err(anyhow!(
+                                        "camera freecam speed {parsed} out of range; expected 0.1..=200.0"
+                                    ));
+                                }
+                                demo.freecam.speed = parsed;
+                                out.line(format!(
+                                    "camera freecam speed: set to {parsed:.2} u/sec"
+                                ));
+                            } else {
+                                out.line(format!(
+                                    "camera freecam speed: {:.2} u/sec",
+                                    demo.freecam.speed
+                                ));
+                            }
+                            return Ok(());
+                        }
+                        if second == "cursor_mode" {
+                            match args.get(2).copied() {
+                                None => {
+                                    out.line(format!(
+                                        "camera freecam cursor_mode: {}",
+                                        demo.freecam.cursor_mode().token()
+                                    ));
+                                }
+                                Some(token) => {
+                                    let mode = CursorMode::from_token(token).ok_or_else(|| {
+                                        anyhow!(
+                                            "unknown cursor_mode `{token}` (try hold|toggle)"
+                                        )
+                                    })?;
+                                    demo.freecam.set_cursor_mode(mode);
+                                    out.line(format!(
+                                        "camera freecam cursor_mode: set to {}",
+                                        mode.token()
+                                    ));
+                                }
+                            }
+                            return Ok(());
+                        }
+                        // Unknown second token under `camera freecam`: fall
+                        // through to the mode-switch path which will yell
+                        // about it.
+                    }
+
                     let next = match args.first().copied() {
                         None => match demo.camera_mode {
                             CameraMode::Orbit => CameraMode::FreeRoam,
@@ -1620,16 +2201,44 @@ impl RotatePolytopesApp {
                     Ok(())
                 },
             )
-            .with_args(&[&["orbit", "freecam"]]),
+            .with_args(&[
+                &["orbit", "freecam"],
+                &["speed=", "cursor_mode"],
+                &["hold", "toggle"],
+            ]),
         );
 
-        // The `floor` toggle the user asked for is deferred. The SDF ground
-        // (a y=0 HalfSpace4D in the scene composition) is baked into the
-        // shader module at App::setup time via `Scene4::to_hyperslice_wgsl`,
-        // so toggling visibility at runtime requires either recompiling the
-        // shader (cheap, ~100-300ms wasm) or adding a kernel-uniform flag to
-        // rye-scene (cheaper per-toggle but engine-level work). Tracked as
-        // follow-up; not part of this polish pass.
+        // Floor toggle for the y=0 hyperplane ground. On by default. The
+        // SDF kernel reads `u.params[0]` (set in `Demo::update`); when 0.0
+        // the wrapper around `rye_scene_sdf` (injected into the shader at
+        // setup time) short-circuits to a huge distance, so the marcher
+        // never converges on the floor and the checkerboard never paints.
+        // Bare `floor` flips the flag; `floor on|off` is the explicit form.
+        c.register(
+            rye_egui::cmd::<Demo, _>(
+                "floor",
+                "toggle the y=0 hyperplane ground (on | off; bare flips)",
+                |args, demo, out| {
+                    let next = match args.first().copied() {
+                        None => !demo.floor_enabled,
+                        Some("on") => true,
+                        Some("off") => false,
+                        Some(other) => {
+                            return Err(anyhow!(
+                                "floor: unknown arg `{other}` (try on|off)"
+                            ));
+                        }
+                    };
+                    demo.floor_enabled = next;
+                    out.line(format!(
+                        "floor: {}",
+                        if next { "on" } else { "off" }
+                    ));
+                    Ok(())
+                },
+            )
+            .with_args(&[&["on", "off"]]),
+        );
 
         c
     }
@@ -1646,6 +2255,7 @@ impl App for RotatePolytopesApp {
             console,
             last_egui_keyboard: false,
             capture_panel: rye_app::capture::CapturePanel::new(),
+            perf: rye_app::trace::PerfOverlay::new(),
         })
     }
 
@@ -1660,6 +2270,10 @@ impl App for RotatePolytopesApp {
     fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
         self.demo.ui(ctx, frame);
         self.capture_panel.show(ctx);
+        // F3-toggle perf overlay (FPS / frame-time / between-frames). Reads
+        // its hotkey state from the same egui Context the rest of the UI uses,
+        // so the demo doesn't need to forward F3. Cheap when hidden.
+        self.perf.show(ctx);
         // Pump any pending tracing events into the console scrollback BEFORE rendering
         // it, so the user sees mirrored log lines this frame instead of next.
         rye_app::log::pump_into(&mut self.console);
@@ -1724,6 +2338,227 @@ fn main() -> Result<()> {
 //
 // `egui::Context` works fine without a renderer for layout-only
 // tests; nothing here touches the GPU.
+
+#[cfg(test)]
+mod color_tests {
+    //! Unit tests for the pure color/topology helpers used by `render_wireframe_overlay`
+    //! and `render_points`. These are load-bearing primitives behind every wireframe
+    //! color mode; a sign flip or off-by-one would slip past clippy + the GPU-side
+    //! kernel parse tests.
+    use super::*;
+
+    // ---- hsv_to_rgb ------------------------------------------------------
+
+    /// HSV anchor cases against the standard reference. h=0 -> red, h=1/3 -> green,
+    /// h=2/3 -> blue. Saturation 1, value 1, so output is the pure primary.
+    #[test]
+    fn hsv_to_rgb_primaries() {
+        let red = hsv_to_rgb(0.0, 1.0, 1.0);
+        assert!((red[0] - 1.0).abs() < 1e-5);
+        assert!(red[1].abs() < 1e-5);
+        assert!(red[2].abs() < 1e-5);
+
+        let green = hsv_to_rgb(1.0 / 3.0, 1.0, 1.0);
+        assert!(green[0].abs() < 1e-5);
+        assert!((green[1] - 1.0).abs() < 1e-5);
+        assert!(green[2].abs() < 1e-5);
+
+        let blue = hsv_to_rgb(2.0 / 3.0, 1.0, 1.0);
+        assert!(blue[0].abs() < 1e-5);
+        assert!(blue[1].abs() < 1e-5);
+        assert!((blue[2] - 1.0).abs() < 1e-5);
+    }
+
+    /// Zero saturation collapses to gray regardless of hue: r == g == b == value.
+    #[test]
+    fn hsv_to_rgb_zero_saturation_is_gray() {
+        for h in [0.0, 0.25, 0.5, 0.75, 0.999_f32] {
+            let rgb = hsv_to_rgb(h, 0.0, 0.7);
+            assert!((rgb[0] - 0.7).abs() < 1e-5, "h={h}: r should be 0.7");
+            assert!((rgb[1] - 0.7).abs() < 1e-5, "h={h}: g should be 0.7");
+            assert!((rgb[2] - 0.7).abs() < 1e-5, "h={h}: b should be 0.7");
+        }
+    }
+
+    /// Zero value collapses to black regardless of hue/saturation.
+    #[test]
+    fn hsv_to_rgb_zero_value_is_black() {
+        let rgb = hsv_to_rgb(0.5, 0.8, 0.0);
+        assert!(rgb.iter().all(|c| c.abs() < 1e-5));
+    }
+
+    // ---- unique_edge_palette --------------------------------------------
+
+    /// Adjacent edges (sharing a vertex) get different palette colors. This is the
+    /// defining invariant of the greedy graph-coloring on the line graph; if it
+    /// fails, the whole point of the mode is broken.
+    #[test]
+    fn unique_edge_palette_separates_adjacent_edges() {
+        // A simple line graph: three edges meeting at vertex 0.
+        //     1
+        //     |
+        // 2 - 0 - 3
+        let edges: &[[u32; 2]] = &[[0, 1], [0, 2], [0, 3]];
+        let palette = unique_edge_palette(edges);
+        assert_eq!(palette.len(), 3, "one color per edge");
+        // All three edges share vertex 0, so all three must be distinct in the line graph.
+        for i in 0..palette.len() {
+            for j in (i + 1)..palette.len() {
+                assert_ne!(
+                    palette[i], palette[j],
+                    "edges {i} and {j} share vertex 0; palette must differ"
+                );
+            }
+        }
+    }
+
+    /// Edges with no shared vertex are NOT adjacent in the line graph and CAN end up
+    /// sharing palette indices (greedy first-fit will reuse index 0 for both).
+    #[test]
+    fn unique_edge_palette_non_adjacent_edges_may_share_color() {
+        // Two disconnected edges: (0,1) and (2,3). No shared vertex.
+        let edges: &[[u32; 2]] = &[[0, 1], [2, 3]];
+        let palette = unique_edge_palette(edges);
+        assert_eq!(palette.len(), 2);
+        // Greedy first-fit assigns index 0 to both since they're not adjacent.
+        assert_eq!(palette[0], palette[1]);
+    }
+
+    /// Determinism: calling twice on the same edge slice yields identical output.
+    /// Critical for caching by `Polytope4` variant (`unique_edge_palette_cache`).
+    #[test]
+    fn unique_edge_palette_is_deterministic() {
+        let edges: &[[u32; 2]] = &[[0, 1], [1, 2], [2, 3], [0, 3]];
+        let a = unique_edge_palette(edges);
+        let b = unique_edge_palette(edges);
+        assert_eq!(a, b);
+    }
+
+    // ---- w_depth_color --------------------------------------------------
+
+    /// At w = 0 (the slice plane), the color sits exactly midway between back and front.
+    /// `t = 0.5` means RGB is the literal midpoint of W_DEPTH_BACK and W_DEPTH_FRONT.
+    #[test]
+    fn w_depth_color_zero_w_is_midpoint() {
+        let c = w_depth_color(0.0, 1.0);
+        for ch in 0..3 {
+            let expected = (W_DEPTH_BACK[ch] + W_DEPTH_FRONT[ch]) * 0.5;
+            assert!(
+                (c[ch] - expected).abs() < 1e-5,
+                "channel {ch}: expected {expected}, got {}",
+                c[ch],
+            );
+        }
+        assert!((c[3] - 1.0).abs() < 1e-5, "alpha is 1.0");
+    }
+
+    /// At w = -extent the color is the back tint (cool blue).
+    #[test]
+    fn w_depth_color_neg_extent_is_back() {
+        let c = w_depth_color(-1.0, 1.0);
+        for ch in 0..3 {
+            assert!(
+                (c[ch] - W_DEPTH_BACK[ch]).abs() < 1e-5,
+                "channel {ch}: expected back tint",
+            );
+        }
+    }
+
+    /// At w = +extent the color is the front tint (warm orange).
+    #[test]
+    fn w_depth_color_pos_extent_is_front() {
+        let c = w_depth_color(1.0, 1.0);
+        for ch in 0..3 {
+            assert!(
+                (c[ch] - W_DEPTH_FRONT[ch]).abs() < 1e-5,
+                "channel {ch}: expected front tint",
+            );
+        }
+    }
+
+    /// Vertices past the extent (a polytope canonical max underestimate, or
+    /// numeric drift) clamp to the endpoint colors rather than over-saturating.
+    #[test]
+    fn w_depth_color_clamps_past_extent() {
+        let c_far = w_depth_color(5.0, 1.0);
+        let c_at_extent = w_depth_color(1.0, 1.0);
+        assert_eq!(c_far, c_at_extent, "+w past extent should clamp to front");
+
+        let c_back = w_depth_color(-5.0, 1.0);
+        let c_at_neg_extent = w_depth_color(-1.0, 1.0);
+        assert_eq!(c_back, c_at_neg_extent, "-w past extent should clamp to back");
+    }
+
+    // ---- compute_cell_strengths -----------------------------------------
+
+    /// Slice at the cell's w-midpoint produces strength = 1 (cap is widest there).
+    #[test]
+    fn cell_strength_at_midpoint_is_one() {
+        // Single cell with two vertices at w = -0.5 and w = +0.5. Midpoint w = 0.
+        let cells: [&[u32]; 1] = [&[0, 1]];
+        let local_vertices = [
+            glam::Vec4::new(0.0, 0.0, 0.0, -0.5),
+            glam::Vec4::new(0.0, 0.0, 0.0, 0.5),
+        ];
+        let strengths = compute_cell_strengths(&cells, &local_vertices, 0.0);
+        assert_eq!(strengths.len(), 1);
+        assert!((strengths[0] - 1.0).abs() < 1e-5);
+    }
+
+    /// Slice outside the cell's w-range produces strength = 0 (cap doesn't exist).
+    #[test]
+    fn cell_strength_outside_range_is_zero() {
+        let cells: [&[u32]; 1] = [&[0, 1]];
+        let local_vertices = [
+            glam::Vec4::new(0.0, 0.0, 0.0, -0.5),
+            glam::Vec4::new(0.0, 0.0, 0.0, 0.5),
+        ];
+        let strengths = compute_cell_strengths(&cells, &local_vertices, 5.0);
+        assert!(strengths[0].abs() < 1e-5);
+    }
+
+    /// Slice at the cell's w-boundary produces strength = 0 (cap is degenerate).
+    #[test]
+    fn cell_strength_at_boundary_is_zero() {
+        let cells: [&[u32]; 1] = [&[0, 1]];
+        let local_vertices = [
+            glam::Vec4::new(0.0, 0.0, 0.0, -0.5),
+            glam::Vec4::new(0.0, 0.0, 0.0, 0.5),
+        ];
+        // Slice exactly at the +w extreme: dist = 0.5, half_extent = 0.5,
+        // strength = 1 - 1 = 0.
+        let strengths = compute_cell_strengths(&cells, &local_vertices, 0.5);
+        assert!(strengths[0].abs() < 1e-5);
+    }
+
+    /// Halfway between midpoint and boundary yields strength = 0.5 (linear in
+    /// `|w_slice - mid| / half_extent`).
+    #[test]
+    fn cell_strength_is_linear() {
+        let cells: [&[u32]; 1] = [&[0, 1]];
+        let local_vertices = [
+            glam::Vec4::new(0.0, 0.0, 0.0, -0.5),
+            glam::Vec4::new(0.0, 0.0, 0.0, 0.5),
+        ];
+        // midpoint = 0, half_extent = 0.5; slice at 0.25 -> dist 0.25 -> 1 - 0.5 = 0.5.
+        let strengths = compute_cell_strengths(&cells, &local_vertices, 0.25);
+        assert!((strengths[0] - 0.5).abs() < 1e-5);
+    }
+
+    /// Degenerate cell (all vertices at the same w) yields strength = 0; the half-extent
+    /// is zero so the gradient has nothing to interpolate. The function returns 0 rather
+    /// than divide-by-zero, which is what the wireframe overlay path expects.
+    #[test]
+    fn cell_strength_degenerate_cell_is_zero() {
+        let cells: [&[u32]; 1] = [&[0, 1]];
+        let local_vertices = [
+            glam::Vec4::new(0.0, 0.0, 0.0, 0.0),
+            glam::Vec4::new(1.0, 0.0, 0.0, 0.0),
+        ];
+        let strengths = compute_cell_strengths(&cells, &local_vertices, 0.0);
+        assert!(strengths[0].abs() < 1e-5);
+    }
+}
 
 #[cfg(test)]
 mod alignment_tests {
