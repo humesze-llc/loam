@@ -10,9 +10,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{
-    HtmlButtonElement, HtmlCanvasElement, MessageEvent, Worker, WorkerOptions, WorkerType,
-};
+use web_sys::{HtmlCanvasElement, MessageEvent, Worker, WorkerOptions, WorkerType};
 
 /// Main-thread entry point for worker mode. Wires the launch button so a
 /// click transfers the page's canvas to a freshly-spawned worker, which
@@ -74,7 +72,7 @@ fn read_wasm_bundle_url() -> Result<String> {
 /// wire the launch-overlay click handler that posts the `Start`
 /// message + removes the overlay on click. Called once at page load
 /// from `launch_on_click`.
-fn spawn_worker_for_preview(canvas_id: &str, _host_id: &str, button_id: &str) -> Result<()> {
+fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> Result<()> {
     let document = web_sys::window()
         .and_then(|w| w.document())
         .ok_or_else(|| anyhow!("no document on global window"))?;
@@ -83,11 +81,12 @@ fn spawn_worker_for_preview(canvas_id: &str, _host_id: &str, button_id: &str) ->
         .ok_or_else(|| anyhow!("no element with id '{canvas_id}'"))?
         .dyn_into::<HtmlCanvasElement>()
         .map_err(|_| anyhow!("element '{canvas_id}' is not a canvas"))?;
-    let launch_overlay = document
-        .get_element_by_id(button_id)
-        .ok_or_else(|| anyhow!("no element with id '{button_id}'"))?
-        .dyn_into::<HtmlButtonElement>()
-        .map_err(|_| anyhow!("element '{button_id}' is not a button"))?;
+    // Engine owns the overlay markup + CSS. `inject_launch_overlay` is
+    // idempotent: returns an existing button with `button_id` if the
+    // demo's `index.html` shipped one (legacy demos), otherwise creates
+    // it as a child of `host_id` and injects the default CSS into
+    // `<head>` exactly once per page.
+    let launch_overlay = super::launch::inject_launch_overlay(host_id, button_id)?;
 
     // Size the canvas's pixel backing-store to match its DISPLAYED size
     // × device pixel ratio. The HTML's `width`/`height` attributes are a

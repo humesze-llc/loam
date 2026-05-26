@@ -82,6 +82,10 @@ web-sys = { version = "0.3", features = [
     "Element",
     "HtmlCanvasElement",
     "HtmlButtonElement",
+    # `HtmlStyleElement` + `HtmlHeadElement` for `inject_launch_overlay`
+    # (engine-side click-to-start markup + CSS injection).
+    "HtmlStyleElement",
+    "HtmlHeadElement",
     "Location",
     "UrlSearchParams",
     "Performance",
