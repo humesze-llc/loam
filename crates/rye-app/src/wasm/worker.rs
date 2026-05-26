@@ -35,11 +35,12 @@ use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, OffscreenCanvas};
 
 use super::messages::{self, InputMessage};
 use super::worker_ui::WorkerUi;
-use crate::{App, FrameCtx, RenderCtx, SetupCtx};
+use crate::{App, FrameCtx, RenderCtx, SetupCtx, TickCtx};
 use rye_asset::AssetWatcher;
 use rye_input::InputState;
 use rye_render::device::RenderDevice;
 use rye_shader::ShaderDb;
+use rye_time::FixedTimestep;
 use winit::event::{ElementState, MouseScrollDelta};
 use winit::keyboard::PhysicalKey;
 
@@ -404,6 +405,18 @@ where
     start: web_time::Instant,
     last_update_at: Option<web_time::Instant>,
     tick_index: u64,
+    /// Fixed-timestep accumulator. Matches the windowed runner so demos
+    /// that read `FrameCtx::n_ticks` (e.g. `dt_secs = n_ticks / 60.0`)
+    /// see ticks fire on the same cadence in browser as on native.
+    /// Hardcoded to 60Hz to match `RunConfig::default()`; if any demo
+    /// ever wants a different rate, RunConfig will need to be wired
+    /// through to the worker (currently set up via postMessage with no
+    /// config payload).
+    timestep: FixedTimestep,
+    /// Mirror of the windowed runner's `max_ticks_per_frame` cap, kept
+    /// at the windowed default (4) so a slow-rendering frame doesn't
+    /// catch up by running 60 ticks in a row and spiraling further.
+    max_ticks_per_frame: usize,
     _marker: PhantomData<A::Space>,
 }
 
@@ -469,6 +482,8 @@ where
             start: web_time::Instant::now(),
             last_update_at: None,
             tick_index: 0,
+            timestep: FixedTimestep::new(60),
+            max_ticks_per_frame: 4,
             _marker: PhantomData,
         })
     }
@@ -597,7 +612,27 @@ where
             None => 1.0 / 60.0,
         };
         self.last_update_at = Some(now);
-        self.tick_index = self.tick_index.wrapping_add(1);
+
+        // Fixed-timestep ticks. Mirrors the windowed runner's structure
+        // so demos that read `FrameCtx::n_ticks` (or compute `dt_secs =
+        // n_ticks / 60.0` to integrate spin / freecam translation /
+        // similar) behave the same in browser as on native.
+        let n_capped;
+        {
+            let _scope = rye_time::frame_trace::scope("sim-ticks");
+            let ticks = self.timestep.advance(now);
+            let n_ticks = ticks.count();
+            n_capped = n_ticks.min(self.max_ticks_per_frame);
+            let tick_dt = 1.0 / 60.0;
+            for _ in 0..n_capped {
+                let mut tctx = TickCtx {
+                    time: self.start.elapsed().as_secs_f32(),
+                    tick: self.tick_index,
+                };
+                self.app.tick(tick_dt, &mut tctx);
+                self.tick_index = self.tick_index.wrapping_add(1);
+            }
+        }
 
         // App::update with the FrameInput accumulated from this frame's
         // InputMessage events. `take_frame` returns the drained snapshot
@@ -611,7 +646,7 @@ where
                 input,
                 time: self.start.elapsed().as_secs_f32(),
                 fps: 0.0, // worker-side FPS bookkeeping not yet wired; reads as 0.0.
-                n_ticks: 0,
+                n_ticks: n_capped,
                 tick: self.tick_index,
                 dt,
                 ui_has_focus,
