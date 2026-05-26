@@ -489,6 +489,14 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
     for (event_name, pressed) in [("mousedown", true), ("mouseup", false)] {
         let worker = worker.clone();
         let cb = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
+            // Suppress browser default for right (2) + middle (1) button
+            // so right-click context menu and middle-click autoscroll
+            // don't fire ahead of the app receiving the press. Left
+            // button (0) is left alone; demos that pointer-lock will
+            // request the lock on left-click themselves.
+            if ev.button() != 0 {
+                ev.prevent_default();
+            }
             let msg = build_msg("mouse_button");
             set_msg_f32(&msg, "x", ev.offset_x() as f32);
             set_msg_f32(&msg, "y", ev.offset_y() as f32);
@@ -499,6 +507,20 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
         canvas
             .add_event_listener_with_callback(event_name, cb.as_ref().unchecked_ref())
             .map_err(|e| anyhow!("{event_name} listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    // Block the browser context menu so right-click reaches the app.
+    // Separate from `mousedown`'s suppression because `contextmenu` also
+    // fires for keyboard triggers (Shift+F10, the dedicated context-menu
+    // key) which `mousedown` never sees.
+    {
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::Event| {
+            ev.prevent_default();
+        }) as Box<dyn FnMut(web_sys::Event)>);
+        canvas
+            .add_event_listener_with_callback("contextmenu", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("contextmenu listener: {e:?}"))?;
         cb.forget();
     }
 
@@ -525,9 +547,34 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
 
     // Keyboard: listen on document so keys reach us regardless of which
     // element has focus (game convention).
+    //
+    // `preventDefault()` is selective. The browser owns reload (F5,
+    // Ctrl+R), devtools (F12), fullscreen (F11), and Ctrl/Meta/Alt
+    // combinations generally; we leave those alone so the user retains
+    // an escape hatch. The demo owns Tab (otherwise focus walks to
+    // off-canvas DOM elements and subsequent keys never reach us),
+    // Space + arrows (otherwise the browser scrolls or activates a
+    // focused button), and slash + quote (Firefox quick-find). Letter
+    // keys never trigger a browser default action at the page level,
+    // so WASD / T / etc. need no special handling.
     for (event_name, pressed) in [("keydown", true), ("keyup", false)] {
         let worker = worker.clone();
         let cb = Closure::wrap(Box::new(move |ev: web_sys::KeyboardEvent| {
+            let no_modifier = !ev.ctrl_key() && !ev.alt_key() && !ev.meta_key();
+            let owned = matches!(
+                ev.code().as_str(),
+                "Tab"
+                    | "Space"
+                    | "ArrowLeft"
+                    | "ArrowRight"
+                    | "ArrowUp"
+                    | "ArrowDown"
+                    | "Slash"
+                    | "Quote",
+            );
+            if owned && no_modifier {
+                ev.prevent_default();
+            }
             let msg = build_msg("key");
             set_msg_string(&msg, "code", &ev.code());
             set_msg_string(&msg, "key", &ev.key());
