@@ -88,3 +88,21 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace
+
+  wasm-build:
+    name: wasm32 build (polytope_playground)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Regression gate for the wasm32 target. M5/M6/M7 work touches
+      # rye-app / rye-render / rye-egui, any of which can silently break
+      # the wasm bundle (cfg-shims, web-time, OffscreenCanvas worker
+      # plumbing). `--no-default-features` drops polytope_playground's
+      # native-only `capture` feature so the native encoder crates stay
+      # out of the wasm dep tree, matching `index.html`'s
+      # `data-cargo-no-default-features` directive.
+      - run: cargo build --target wasm32-unknown-unknown -p polytope_playground --no-default-features
