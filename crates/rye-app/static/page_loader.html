@@ -15,16 +15,16 @@
      `#rye-launch` overlay takes over the visual layer with the
      click-to-start affordance. -->
 <style>
-    /* Force this element onto its own compositor layer via `translateZ(0)`
-       (the classic "null 3D transform" trick) AND `contain: strict` to
-       isolate it from layout / paint / style invalidations elsewhere in
-       the document. Without this, browsers may compose the spinner on
-       the same layer as `#rye-canvas-host`, which churns whenever the
-       canvas is touched or the launch overlay is injected -- visible as
-       the spinner stuttering or freezing during heavy main-thread work
-       (wasm init, worker spawn, OffscreenCanvas transfer). With the
-       layer pinned, the `transform: rotate` keyframe animation runs on
-       the compositor thread regardless of main-thread load. */
+    /* Layer promotion lives on the PARENT (`translateZ(0)` + `contain:
+       layout paint` to isolate it from layout/paint invalidations
+       elsewhere in the document, without the `size` containment that
+       `contain: strict` includes -- size containment collapses an
+       inset:0 element to 0x0). The spinner `::before` inherits the
+       compositor layer from the parent. Putting layer-promotion
+       transforms on the spinner itself collides with the rotation
+       animation's transform (CSS can't interpolate cleanly across
+       transform function-list mismatches between the static value and
+       the keyframe), which is what froze the animation. */
     #rye-page-loader {
         position: fixed;
         inset: 0;
@@ -34,7 +34,7 @@
         background: #0e0e12;
         z-index: 1;
         transform: translateZ(0);
-        contain: strict;
+        contain: layout paint;
         pointer-events: none;
     }
     #rye-page-loader::before {
@@ -46,11 +46,10 @@
         border-top-color: rgba(230, 230, 245, 0.95);
         border-radius: 50%;
         animation: rye-page-loader-spin 0.9s linear infinite;
-        will-change: transform;
-        transform: translateZ(0);
     }
     @keyframes rye-page-loader-spin {
-        to { transform: rotate(360deg) translateZ(0); }
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
     }
 </style>
 <div id="rye-page-loader"></div>
