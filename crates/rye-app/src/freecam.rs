@@ -7,19 +7,23 @@
 //!
 //! ## What a Freecam does each frame
 //!
-//! When [`Freecam::active`] is `true` AND [`Freecam::cursor_grabbed`] is
-//! `true`:
+//! When [`Freecam::active`] is `true`:
 //!
-//! 1. The internal [`FirstPersonController`] consumes
+//! 1. WASD + Space/Shift on `FrameInput` integrate the world-space
+//!    `position` field at `speed` units/sec. Runs whenever active,
+//!    independent of cursor grab.
+//! 2. **When [`Freecam::cursor_grabbed`] is `true` as well**, the
+//!    internal [`FirstPersonController`] consumes
 //!    `FrameInput::mouse_raw_delta` to update yaw + pitch.
-//! 2. WASD + Space/Shift on `FrameInput` integrate the world-space
-//!    `position` field at `speed` units/sec.
 //! 3. The owning `Camera<EuclideanR3>` has its `position` + basis updated.
 //!
-//! When `active = false` OR `cursor_grabbed = false`: [`Freecam::advance`]
-//! is a no-op. The cursor-grab toggle lets the user release the mouse for
-//! UI access without leaving freecam mode entirely (the position + look
-//! direction freeze in place; resuming the grab continues from there).
+//! When `active = false`: [`Freecam::advance`] is a no-op. When
+//! `cursor_grabbed = false`: look-direction freezes (so releasing the
+//! cursor for UI access doesn't drag the camera), but WASD translation
+//! continues. This split is what lets the browser flavor work at all --
+//! on wasm, Pointer Lock requires a user gesture the engine doesn't
+//! deliver, so `cursor_grabbed` is permanently false; gating WASD on it
+//! would freeze freecam translation entirely there.
 //!
 //! ## Activation contract
 //!
@@ -278,14 +282,28 @@ impl Freecam {
     /// Caller still owns the higher-level mode switch (orbit vs freecam);
     /// this method assumes `Freecam` IS the active controller this frame.
     pub fn advance(&mut self, input: FrameInput, camera: &mut Camera<EuclideanR3>, dt: f32) {
-        if !self.active || !self.cursor_grabbed {
+        if !self.active {
             return;
         }
-        // Look direction: controller reads raw delta, updates yaw + pitch,
-        // writes the camera's right/up/forward.
-        self.controller.advance(input, camera, &EuclideanR3, dt);
-        // Position: integrate the WASD + Space/Shift axes in the camera's
-        // local frame.
+        // Look direction: needs `cursor_grabbed` because the controller
+        // reads raw mouse deltas, which only make sense while the OS has
+        // the pointer trapped inside the window (or, on wasm, while
+        // Pointer Lock is engaged). When the cursor is voluntarily
+        // released via Alt for UI access, look-direction freezes so the
+        // mouse can move over UI without dragging the camera with it.
+        if self.cursor_grabbed {
+            self.controller.advance(input, camera, &EuclideanR3, dt);
+        }
+        // Position: integrates WASD + Space/Shift in the camera's local
+        // frame whenever freecam is active. Keyboard input doesn't depend
+        // on cursor grab, and on wasm `cursor_grabbed` is always false
+        // because Pointer Lock requires a user gesture that the current
+        // engine plumbing doesn't deliver -- gating WASD on it would
+        // freeze translation in the browser permanently. On native this
+        // also keeps WASD moving while the user has Alt-released the
+        // cursor; in practice the demo's `if !ctx.ui_has_focus` gate
+        // upstream blocks the call once the user actually clicks into
+        // the UI, so the change is mostly transparent.
         let mut delta = camera.forward * input.move_forward
             + camera.right * input.move_right
             + Vec3::Y * input.move_up;
@@ -421,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_noop_when_cursor_released() {
+    fn advance_with_cursor_released_freezes_look_but_keeps_wasd() {
         let mut f = Freecam::new();
         f.set_active(true, Vec3::ZERO);
         f.toggle_cursor_grab(); // release
@@ -433,7 +451,14 @@ mod tests {
             ..Default::default()
         };
         f.advance(input, &mut cam, 0.016);
-        assert_eq!(cam.forward, cam_before.forward, "look frozen when released");
+        assert_eq!(
+            cam.forward, cam_before.forward,
+            "look frozen when cursor released"
+        );
+        assert_ne!(
+            cam.position, cam_before.position,
+            "WASD continues to translate when cursor released (matches wasm where Pointer Lock never engages)"
+        );
     }
 
     #[test]
