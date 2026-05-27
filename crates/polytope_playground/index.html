@@ -59,7 +59,11 @@
         }
         /* `.rye-demo-launch` (the click-to-start overlay) is injected by
            `rye_app::wasm::launch::inject_launch_overlay` along with its
-           CSS. Override by shipping a stylesheet later in the cascade. */
+           CSS. Override by shipping a stylesheet later in the cascade.
+           The static `#rye-page-loader` spinner that covers the
+           wasm-init window is inlined into `#rye-canvas-host` below
+           via `data-trunk rel="inline"`; the engine removes it once
+           the worker posts `preview_ready`. */
     </style>
 </head>
 <body>
@@ -71,6 +75,10 @@
          on page load (legacy main-thread mode). -->
     <div id="rye-canvas-host" data-mode="manual">
         <canvas id="rye-canvas" width="1280" height="800"></canvas>
+        <!-- Engine-owned static spinner. The fragment lives in
+             `crates/rye-app/static/page_loader.html`; Trunk inlines it
+             here at build time. -->
+        <link data-trunk rel="inline" href="../rye-app/static/page_loader.html" />
     </div>
 </body>
 </html>

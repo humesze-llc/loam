@@ -1,0 +1,42 @@
+<!-- Static page-load spinner. Engine-owned, inlined by demos via:
+       <link data-trunk rel="inline" href="../rye-app/static/page_loader.html" />
+     placed inside the `#rye-canvas-host` div.
+
+     Renders on first paint (before the wasm bundle has finished
+     downloading and `inject_launch_overlay` runs), so the user sees
+     "something's happening" immediately on page load instead of a
+     blank canvas. The CSS-only `transform` animation runs on the
+     compositor thread so the rotation stays smooth even while the
+     main thread is busy compiling shaders or running wasm-init work.
+
+     Removed by the wasm runtime (`install_preview_ready_handler` in
+     `rye_app::wasm::main_launcher`) when the worker posts
+     `preview_ready`, at which point the engine-injected
+     `#rye-launch` overlay takes over the visual layer with the
+     click-to-start affordance. -->
+<style>
+    #rye-page-loader {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #0e0e12;
+        z-index: 1;
+    }
+    #rye-page-loader::before {
+        content: '';
+        display: inline-block;
+        width: 56px;
+        height: 56px;
+        border: 5px solid rgba(200, 200, 220, 0.2);
+        border-top-color: rgba(230, 230, 245, 0.95);
+        border-radius: 50%;
+        animation: rye-page-loader-spin 0.9s linear infinite;
+        will-change: transform;
+    }
+    @keyframes rye-page-loader-spin {
+        to { transform: rotate(360deg); }
+    }
+</style>
+<div id="rye-page-loader"></div>

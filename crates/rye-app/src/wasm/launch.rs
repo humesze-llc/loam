@@ -191,12 +191,14 @@ pub fn inject_launch_overlay(host_id: &str, button_id: &str) -> Result<HtmlButto
         .dyn_into::<HtmlButtonElement>()
         .map_err(|_| anyhow!("created element is not HtmlButtonElement"))?;
     button.set_id(button_id);
-    // Starts in `initializing` state: cursor=wait, label="Initializing…",
-    // spinner running. The worker's `preview_ready` message promotes
-    // the overlay to `.ready` once the blurred-preview frame is on the
-    // canvas; the click handler then promotes to `.loading` on user
-    // click; the `demo_ready` message removes the overlay entirely.
-    button.set_class_name("rye-demo-launch initializing");
+    // Starts with no state class -> CSS defaults hide the chip + spinner
+    // (only the blurred background + base layout apply). The static
+    // `#rye-page-loader` element in the demo's `index.html` carries the
+    // visible spinner from page load until the worker posts
+    // `preview_ready`; at that point the static loader is removed and
+    // this overlay gets the `.ready` class to show the click affordance.
+    // Click then removes the overlay entirely.
+    button.set_class_name("rye-demo-launch");
     button.set_type("button");
     button
         .set_attribute("aria-label", "Launch demo")

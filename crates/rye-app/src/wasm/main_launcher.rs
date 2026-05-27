@@ -711,6 +711,11 @@ fn install_preview_ready_handler(worker: &Worker, button_id: &str) -> Result<()>
         let Some(document) = web_sys::window().and_then(|w| w.document()) else {
             return;
         };
+        // Remove the static page-load spinner from `index.html`. The
+        // wasm overlay (below) takes over the visual layer from here.
+        if let Some(loader) = document.get_element_by_id("rye-page-loader") {
+            loader.remove();
+        }
         if let Some(overlay) = document.get_element_by_id(&button_id_owned) {
             overlay.set_class_name("rye-demo-launch ready");
         }
