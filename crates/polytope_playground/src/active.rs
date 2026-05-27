@@ -15,6 +15,20 @@ use rye_app::egui;
 use rye_math::Plane4;
 
 use crate::consts::CONTROL_H;
+
+/// Wrap a degree value into `(-720, 720]` so the slider handle stays
+/// inside the widget's clamping range while continuous spin advances
+/// the raw angle past one period. `1440` is the full two-cycle range
+/// (`+720` minus `-720`); `rem_euclid` keeps the result non-negative,
+/// then we re-center.
+fn wrap_slider_deg(d: f32) -> f32 {
+    let m = d.rem_euclid(1440.0);
+    if m > 720.0 {
+        m - 1440.0
+    } else {
+        m
+    }
+}
 use crate::state::Demo;
 
 /// Name a recognizable combination of active planes. Indices match
@@ -118,12 +132,18 @@ impl Demo {
         value_w: f32,
     ) {
         let plane = Plane4::ALL[plane_idx];
-        // Slider value is the *displayed* angle (base + spin contribution).
-        // Range is the rotor's full period in Spin(4): 720° for a single
-        // plane (going around once in physical rotation flips the rotor to
-        // -1; twice returns to +1). Wider than -360..=360 so the user can
-        // see the full cycle without the slider clamping mid-rotation.
-        let mut deg = self.active_displayed_angle(plane_idx).to_degrees();
+        // Slider value is the *displayed* angle (base + spin contribution),
+        // wrapped into (-720°, 720°]. The wrap is purely for the slider
+        // handle: during continuous spin the raw displayed angle grows
+        // unboundedly, which would pin the slider against its 720° clamp
+        // and stop showing motion. Wrapping into the period keeps the
+        // handle moving cyclically. `active_rotor()` uses the RAW
+        // displayed angle (no wrap), so the rotor itself is identical
+        // regardless of how this value is normalized for display --
+        // `exp(plane * (x + 2π·k))` is the same rotor for any integer k
+        // when the plane is a simple unit bivector.
+        let raw_deg = self.active_displayed_angle(plane_idx).to_degrees();
+        let mut deg = wrap_slider_deg(raw_deg);
         ui.add_sized(
             [checkbox_w, 18.0],
             egui::Checkbox::new(&mut self.active[plane_idx], ""),
