@@ -91,6 +91,44 @@ const LAUNCH_OVERLAY_CSS: &str = r#"
 .rye-demo-launch:active {
     background: rgba(14, 14, 18, 0.4);
 }
+/* Loading state: applied to the overlay after the user clicks, before
+   the worker has rendered enough frames to be smooth. Cursor stays
+   default (not pointer), the click handler short-circuits subsequent
+   clicks, and a small spinner appears next to the label. The overlay
+   stays opaque (no pointer-events: none yet) so accidental click-spam
+   doesn't cascade into the canvas underneath while the demo is still
+   warming up. */
+.rye-demo-launch.loading {
+    cursor: wait;
+}
+.rye-demo-launch.loading::after {
+    content: 'Loading\2026';
+    padding-right: 56px;
+    background-image: linear-gradient(
+        from-left,
+        transparent,
+        transparent
+    );
+}
+.rye-demo-launch.loading::before {
+    content: '';
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    /* Same coordinate system as the chip text so the spinner sits
+       next to it. CSS pseudo-elements share the parent's flex layout
+       only if they're sized; we absolute-position relative to the
+       chip's rect via the parent's `display: flex; align-items:
+       center` and a small negative offset. */
+    right: calc(50% - 110px);
+    border: 2px solid rgba(200, 200, 220, 0.25);
+    border-top-color: rgba(220, 220, 240, 0.9);
+    border-radius: 50%;
+    animation: rye-demo-spinner 0.9s linear infinite;
+}
+@keyframes rye-demo-spinner {
+    to { transform: rotate(360deg); }
+}
 "#;
 
 const OVERLAY_STYLE_ID: &str = "rye-launch-overlay-styles";

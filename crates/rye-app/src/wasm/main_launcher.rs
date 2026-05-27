@@ -238,6 +238,13 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
     // only be called from main thread.
     install_host_action_handler(&worker, &canvas).context("install_host_action_handler")?;
 
+    // Listen for the worker's "demo_ready" signal -- sent once after the
+    // worker has rendered enough frames to be smooth (pipelines compiled,
+    // first sim ticks settled). On receipt, remove the launch overlay so
+    // input flows to the canvas; until then the overlay's `.loading`
+    // state absorbs the user's spam clicks.
+    install_demo_ready_handler(&worker, button_id)?;
+
     // Launch-overlay click handler. Spam-click defensive:
     // - FnMut closure (not `Closure::once`) so repeat invocations are
     //   guaranteed to be safe no-ops via the `fired` Cell guard. The
@@ -290,28 +297,17 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
                 }
             }
 
-            // Hide via pointer-events first (in case any queued clicks
-            // are still in-flight after our handler runs), THEN remove
-            // from the DOM on the next microtask. The
-            // pointer-events-none style alone would be sufficient to
-            // ignore subsequent clicks; the .remove() is cosmetic
-            // (the canvas underneath is what the viewer should see).
-            let style = overlay_for_click.style();
-            let _ = style.set_property("pointer-events", "none");
-            let _ = style.set_property("opacity", "0");
-            // Defer the actual DOM removal so the opacity transition
-            // (configured in CSS) can play out. 200ms matches the CSS
-            // `transition: opacity 200ms ease`.
-            let overlay_for_remove = overlay_for_click.clone();
-            let remove_cb = Closure::once_into_js(Box::new(move || {
-                overlay_for_remove.remove();
-            }) as Box<dyn FnOnce()>);
-            if let Some(window) = web_sys::window() {
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                    remove_cb.unchecked_ref(),
-                    200,
-                );
-            }
+            // Switch the overlay to its loading state (spinner + "Loading…"
+            // chip text). We DON'T remove the overlay yet -- the worker
+            // is still warming pipelines / cycling first frames and any
+            // clicks landing on the canvas during that window are wasted
+            // work that contributes to the perceived hitching. The
+            // overlay's `pointer-events` stays auto so subsequent clicks
+            // hit it and the `fired` cell short-circuits them; once the
+            // worker reports steady-state via `demo_ready`, the inbound
+            // message listener (`install_demo_ready_handler`) removes the
+            // overlay and the demo becomes interactive.
+            overlay_for_click.set_class_name("rye-demo-launch loading");
         }) as Box<dyn FnMut()>);
         launch_overlay
             .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())
@@ -680,6 +676,44 @@ fn set_msg_bool(obj: &js_sys::Object, key: &str, v: bool) {
 
 fn set_msg_string(obj: &js_sys::Object, key: &str, v: &str) {
     let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), &JsValue::from_str(v));
+}
+
+/// Listen for the worker's once-only `{kind: "demo_ready"}` message and
+/// remove the launch overlay when it arrives. The worker sends this
+/// after rendering a handful of warm-up frames (currently 10, per
+/// `worker.rs::DEMO_READY_FRAMES`), which is enough for the heavy
+/// per-pipeline shader compilations to settle and the first sim ticks
+/// to land at the target rate. Until then the launch overlay's
+/// `.loading` state absorbs spam clicks so they don't compound the
+/// startup hitch.
+fn install_demo_ready_handler(worker: &Worker, button_id: &str) -> Result<()> {
+    let button_id_owned: String = button_id.to_string();
+    let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data: JsValue = event.data();
+        let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|v| v.as_string());
+        if kind.as_deref() != Some("demo_ready") {
+            return;
+        }
+        // Find the launch overlay by id and remove it. The overlay was
+        // injected by `inject_launch_overlay` so we look it up via
+        // `document.getElementById` rather than threading the element
+        // through this listener -- the lookup is once-per-page (the
+        // worker only sends `demo_ready` once) and avoids a long-lived
+        // Rc capture.
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        if let Some(overlay) = document.get_element_by_id(&button_id_owned) {
+            overlay.remove();
+        }
+    }) as Box<dyn FnMut(MessageEvent)>);
+    worker
+        .add_event_listener_with_callback("message", cb.as_ref().unchecked_ref())
+        .map_err(|e| anyhow!("worker.addEventListener('message') for demo_ready: {e:?}"))?;
+    cb.forget();
+    Ok(())
 }
 
 /// Install the worker → main DOM-action handler, the
