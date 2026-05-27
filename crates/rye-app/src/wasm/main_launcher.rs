@@ -232,6 +232,12 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
     // (or via the worker's handle_message queue) and applied on first frame.
     install_dom_input_forwarders(&worker, &canvas).context("install_dom_input_forwarders")?;
 
+    // Worker → main DOM-action channel + pointerlockchange forwarder +
+    // canvas click-to-re-engage. This is the standard OffscreenCanvas-
+    // in-Worker pattern for letting the worker drive DOM APIs that can
+    // only be called from main thread.
+    install_host_action_handler(&worker, &canvas).context("install_host_action_handler")?;
+
     // Launch-overlay click handler. Spam-click defensive:
     // - FnMut closure (not `Closure::once`) so repeat invocations are
     //   guaranteed to be safe no-ops via the `fired` Cell guard. The
@@ -440,13 +446,26 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
     // latest position. Result: at most 60 mouse-move postMessages per
     // second regardless of input device frequency.
     {
-        let pending: Rc<RefCell<Option<(f32, f32, u32)>>> = Rc::new(RefCell::new(None));
+        // Pending state carries: latest (x, y, buttons) plus the *summed*
+        // `movementX/Y` across all coalesced events since the last RAF
+        // tick. Latest absolute position is what the worker uses for the
+        // egui cursor; summed deltas are what the worker uses for FPS
+        // mouse-look (`mouse_raw_delta`) so intermediate sub-frame motion
+        // isn't lost when we coalesce.
+        let pending: Rc<RefCell<Option<(f32, f32, u32, f32, f32)>>> = Rc::new(RefCell::new(None));
         let pending_for_listener = pending.clone();
         let cb = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
-            *pending_for_listener.borrow_mut() = Some((
+            let mut p = pending_for_listener.borrow_mut();
+            let (sum_dx, sum_dy) = match *p {
+                Some((_, _, _, dx, dy)) => (dx, dy),
+                None => (0.0, 0.0),
+            };
+            *p = Some((
                 ev.offset_x() as f32,
                 ev.offset_y() as f32,
                 ev.buttons() as u32,
+                sum_dx + ev.movement_x() as f32,
+                sum_dy + ev.movement_y() as f32,
             ));
         }) as Box<dyn FnMut(web_sys::MouseEvent)>);
         canvas
@@ -460,11 +479,13 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
         let raf_cb: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
         let raf_cb_for_closure = raf_cb.clone();
         *raf_cb.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-            if let Some((x, y, buttons)) = pending_for_raf.borrow_mut().take() {
+            if let Some((x, y, buttons, dx, dy)) = pending_for_raf.borrow_mut().take() {
                 let msg = build_msg("mouse_move");
                 set_msg_f32(&msg, "x", x);
                 set_msg_f32(&msg, "y", y);
                 set_msg_u32(&msg, "buttons", buttons);
+                set_msg_f32(&msg, "dx", dx);
+                set_msg_f32(&msg, "dy", dy);
                 let _ = worker_for_raf.post_message(&msg);
             }
             let cb_ref = raf_cb_for_closure.borrow();
@@ -548,20 +569,29 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
     // element has focus (game convention).
     //
     // `preventDefault()` is selective. The browser owns reload (F5,
-    // Ctrl+R), devtools (F12), fullscreen (F11), and Ctrl/Meta/Alt
-    // combinations generally; we leave those alone so the user retains
-    // an escape hatch. The demo owns Tab (otherwise focus walks to
-    // off-canvas DOM elements and subsequent keys never reach us),
-    // Space + arrows (otherwise the browser scrolls or activates a
-    // focused button), and slash + quote (Firefox quick-find). Letter
-    // keys never trigger a browser default action at the page level,
-    // so WASD / T / etc. need no special handling.
+    // Ctrl+R), devtools (F12), tab/window management (Ctrl+T / Ctrl+W /
+    // Ctrl+Tab), fullscreen (F11), and most modifier combos; we leave
+    // those alone so the user retains an escape hatch. The demo owns
+    // Tab (otherwise focus walks to off-canvas DOM elements and
+    // subsequent keys never reach us), Space + arrows (otherwise the
+    // browser scrolls or activates a focused button), slash + quote
+    // (Firefox quick-find), and Alt (Chrome/Firefox treat lone-Alt taps
+    // as menu-bar activation on the keyup edge; preventDefault on both
+    // edges suppresses). Letter keys never trigger a browser default
+    // action at the page level, so WASD / T / etc. need no handling.
     for (event_name, pressed) in [("keydown", true), ("keyup", false)] {
         let worker = worker.clone();
         let cb = Closure::wrap(Box::new(move |ev: web_sys::KeyboardEvent| {
+            let code = ev.code();
             let no_modifier = !ev.ctrl_key() && !ev.alt_key() && !ev.meta_key();
-            let owned = matches!(
-                ev.code().as_str(),
+            // Alt as the key itself: the `no_modifier` check excludes
+            // this case (ev.alt_key is true while Alt is the down key),
+            // so it gets its own check. Skip when Ctrl/Cmd is held so
+            // Ctrl+Alt / Cmd+Alt combos still work as intended.
+            let is_alt_self = matches!(code.as_str(), "AltLeft" | "AltRight");
+            let suppress_alt = is_alt_self && !ev.ctrl_key() && !ev.meta_key();
+            let owned_unmodified = matches!(
+                code.as_str(),
                 "Tab"
                     | "Space"
                     | "ArrowLeft"
@@ -571,11 +601,11 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
                     | "Slash"
                     | "Quote",
             );
-            if owned && no_modifier {
+            if suppress_alt || (owned_unmodified && no_modifier) {
                 ev.prevent_default();
             }
             let msg = build_msg("key");
-            set_msg_string(&msg, "code", &ev.code());
+            set_msg_string(&msg, "code", &code);
             set_msg_string(&msg, "key", &ev.key());
             set_msg_bool(&msg, "pressed", pressed);
             set_msg_bool(&msg, "repeat", ev.repeat());
@@ -650,4 +680,170 @@ fn set_msg_bool(obj: &js_sys::Object, key: &str, v: bool) {
 
 fn set_msg_string(obj: &js_sys::Object, key: &str, v: &str) {
     let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), &JsValue::from_str(v));
+}
+
+/// Install the worker → main DOM-action handler, the
+/// `pointerlockchange` → worker forwarder, and the canvas
+/// click-to-re-engage Pointer Lock helper.
+///
+/// ## Architecture
+///
+/// The worker (in `wasm::worker`) posts
+/// `{kind: "host_action", actions: [{kind: "pointer_lock_request"}, ...]}`
+/// messages whenever an engine module (`rye_app::cursor`, future
+/// `fullscreen` / `clipboard` / ...) queues a DOM-touching action. Every
+/// browser API that needs DOM access has to round-trip through here
+/// because the worker has no `document` / `window` / canvas-element
+/// handle of its own; it owns only the `OffscreenCanvas` bitmap surface.
+///
+/// ## Pointer Lock specifically
+///
+/// `canvas.requestPointerLock()` succeeds when called inside the
+/// transient-activation window (~5 sec) opened by the user's last
+/// key/click. The worker can't see the activation token, but the main
+/// thread can: a console-driven freecam toggle starts as an `Enter`
+/// keydown on `document`, the worker processes it on the next frame,
+/// queues a `PointerLockRequest`, and the round-trip from key-event to
+/// `requestPointerLock` call is comfortably under that 5 sec window.
+///
+/// `document.exitPointerLock()` is always allowed (no activation
+/// needed); the browser also auto-releases on Esc, on tab switch, on
+/// visibility change. Each of those produces a `pointerlockchange`
+/// event we forward back to the worker as
+/// `InputMessage::PointerLockChanged(false)` so the engine cursor state
+/// stays accurate.
+///
+/// ## Click-to-re-engage
+///
+/// When the browser auto-releases lock (e.g., Esc) but the demo still
+/// wants it (the worker last requested grab; `want_locked = true`),
+/// clicking the canvas re-requests the lock. This is the standard
+/// WebGL-game pattern.
+fn install_host_action_handler(worker: &Worker, canvas: &HtmlCanvasElement) -> Result<()> {
+    let window = web_sys::window().ok_or_else(|| anyhow!("no global window"))?;
+    let document = window
+        .document()
+        .ok_or_else(|| anyhow!("no document on window"))?;
+
+    // Demo's desired lock state, as last requested by the worker. Lives
+    // here on the main thread (the worker's mirror via
+    // `cursor::current_state` updates from `pointerlockchange` events
+    // we forward back). Drives the canvas-click re-engagement decision:
+    // if want_locked is true but the actual lock dropped (Esc, tab
+    // switch), the next click re-requests. If want_locked is false (the
+    // demo voluntarily released), the click does nothing.
+    let want_locked: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+    // Worker → main: drain a `host_action` message into DOM calls.
+    {
+        let canvas_for_dispatch = canvas.clone();
+        let document_for_dispatch = document.clone();
+        let want_locked_for_dispatch = want_locked.clone();
+        let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
+            let data: JsValue = event.data();
+            let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
+                .ok()
+                .and_then(|v| v.as_string());
+            if kind.as_deref() != Some("host_action") {
+                return;
+            }
+            let actions = match js_sys::Reflect::get(&data, &JsValue::from_str("actions")) {
+                Ok(arr) => arr,
+                Err(_) => return,
+            };
+            let arr = match actions.dyn_into::<js_sys::Array>() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            for i in 0..arr.length() {
+                let item = arr.get(i);
+                let action_kind = js_sys::Reflect::get(&item, &JsValue::from_str("kind"))
+                    .ok()
+                    .and_then(|v| v.as_string());
+                match action_kind.as_deref() {
+                    Some("pointer_lock_request") => {
+                        *want_locked_for_dispatch.borrow_mut() = true;
+                        // `requestPointerLock` resolves async; the
+                        // `pointerlockchange` listener below relays
+                        // success/failure back to the worker. Failure
+                        // can mean "no transient activation" or "another
+                        // tab already has lock"; in either case the
+                        // demo learns via the relay and can act on it
+                        // (e.g., the user clicks again and we retry).
+                        canvas_for_dispatch.request_pointer_lock();
+                    }
+                    Some("pointer_lock_release") => {
+                        *want_locked_for_dispatch.borrow_mut() = false;
+                        document_for_dispatch.exit_pointer_lock();
+                    }
+                    Some(other) => {
+                        tracing::warn!(
+                            "rye_app::wasm: unknown host_action kind '{other}'; dropping"
+                        );
+                    }
+                    None => {
+                        tracing::warn!("rye_app::wasm: host_action item missing 'kind'");
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        worker
+            .add_event_listener_with_callback("message", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("worker.addEventListener('message') for host_action: {e:?}"))?;
+        cb.forget();
+    }
+
+    // `pointerlockchange` on document: tells us the truth about the
+    // browser's current lock state, whether we triggered it (requestPointerLock
+    // / exitPointerLock) or the user did (Esc, tab switch). Forward to
+    // the worker so `cursor::mark_applied` reflects reality.
+    {
+        let worker_for_change = worker.clone();
+        let document_for_change = document.clone();
+        let canvas_for_change = canvas.clone();
+        let cb = Closure::wrap(Box::new(move || {
+            let locked = document_for_change
+                .pointer_lock_element()
+                .as_ref()
+                .map(|el| el == canvas_for_change.as_ref())
+                .unwrap_or(false);
+            let msg = build_msg("pointer_lock_changed");
+            set_msg_bool(&msg, "locked", locked);
+            let _ = worker_for_change.post_message(&msg);
+        }) as Box<dyn FnMut()>);
+        document
+            .add_event_listener_with_callback("pointerlockchange", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("pointerlockchange listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    // Canvas click: re-engage Pointer Lock if the demo last requested
+    // grab but the browser dropped it (Esc). No-op if want_locked is
+    // false (release was voluntary) or if the browser already has lock
+    // (the click landed during normal interaction, no work to do).
+    {
+        let canvas_for_click = canvas.clone();
+        let document_for_click = document.clone();
+        let want_locked_for_click = want_locked.clone();
+        let cb = Closure::wrap(Box::new(move |_ev: web_sys::MouseEvent| {
+            if !*want_locked_for_click.borrow() {
+                return;
+            }
+            let already_locked = document_for_click
+                .pointer_lock_element()
+                .as_ref()
+                .map(|el| el == canvas_for_click.as_ref())
+                .unwrap_or(false);
+            if already_locked {
+                return;
+            }
+            canvas_for_click.request_pointer_lock();
+        }) as Box<dyn FnMut(web_sys::MouseEvent)>);
+        canvas
+            .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("canvas click listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    Ok(())
 }

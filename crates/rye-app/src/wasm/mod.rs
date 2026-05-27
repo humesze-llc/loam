@@ -12,6 +12,7 @@
 //! `rye-time::frame_trace` registers) live at the module root so the
 //! `rye_app::wasm::*` import path stays flat for the common cases.
 
+pub mod host_action;
 pub mod launch;
 pub mod main_launcher;
 pub mod messages;

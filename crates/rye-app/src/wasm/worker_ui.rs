@@ -160,8 +160,13 @@ impl WorkerUi {
             }
             // Non-egui-relevant variants: Resize is handled by the
             // runner; Visibility hasn't been wired up; Start fires
-            // outside the frame loop entirely (handled in handle_message).
-            InputMessage::Resize { .. } | InputMessage::Visibility(_) | InputMessage::Start => {}
+            // outside the frame loop entirely (handled in handle_message);
+            // PointerLockChanged is consumed by the worker's cursor state
+            // mirror, not egui.
+            InputMessage::Resize { .. }
+            | InputMessage::Visibility(_)
+            | InputMessage::Start
+            | InputMessage::PointerLockChanged(_) => {}
         }
     }
 

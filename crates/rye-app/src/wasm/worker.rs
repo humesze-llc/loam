@@ -404,11 +404,6 @@ where
     pixels_per_point: f32,
     start: web_time::Instant,
     last_update_at: Option<web_time::Instant>,
-    /// Previous mousemove position, used to synthesize `mouse_raw_delta`
-    /// on wasm where `DeviceEvent::MouseMotion` doesn't exist. None
-    /// before the first mousemove, then `Some((x, y))` from the last
-    /// `InputMessage::MouseMove` for delta computation.
-    prev_mouse_pos: Option<(f32, f32)>,
     /// Anchor for the fps cap. Set to the previous frame's IDEAL deadline
     /// (not its wake-up time), so RAF jitter doesn't compound into
     /// alternating-skip behavior at the boundary between the target
@@ -493,7 +488,6 @@ where
             pixels_per_point,
             start: web_time::Instant::now(),
             last_update_at: None,
-            prev_mouse_pos: None,
             last_redraw_anchor: None,
             tick_index: 0,
             timestep: FixedTimestep::new(60),
@@ -550,20 +544,15 @@ where
                     tracing::error!("rye_app::wasm::worker: post-resize frame failed: {e:#}");
                 }
             }
-            InputMessage::MouseMove { x, y, .. } => {
-                // Browser has no `DeviceEvent::MouseMotion` equivalent that
-                // the worker can subscribe to without engaging Pointer Lock
-                // (which needs a user gesture the engine doesn't deliver).
-                // So `mouse_raw_delta` is permanently zero on wasm unless
-                // we synthesize it from successive absolute positions.
-                // The deltas are RAF-coalesced (one per browser frame) and
-                // therefore smoother than a real raw-device stream, but
-                // that's enough for FPS mouse-look on a polychoral demo.
-                if let Some((prev_x, prev_y)) = self.prev_mouse_pos {
-                    self.input
-                        .accumulate_raw_motion((x - prev_x) as f64, (y - prev_y) as f64);
-                }
-                self.prev_mouse_pos = Some((x, y));
+            InputMessage::MouseMove { x, y, dx, dy, .. } => {
+                // `dx`/`dy` are `MouseEvent.movementX/Y` summed across any
+                // RAF-coalesced intermediate events. This is the correct
+                // raw-motion source whether Pointer Lock is engaged (where
+                // `offsetX/Y` is pinned to the locked center and absolute-
+                // position diffing would always read zero) or not. Browser
+                // movementX/Y has been universal since ~2013, so we don't
+                // bother with a fallback path.
+                self.input.accumulate_raw_motion(dx as f64, dy as f64);
                 self.input.cursor_moved(x as f64, y as f64);
             }
             InputMessage::MouseButton {
@@ -614,11 +603,9 @@ where
                 if !focused {
                     // Mirror rye-input's focus-loss convention: drop held
                     // buttons + invalidate cursor delta so re-focus doesn't
-                    // snap. `prev_mouse_pos` matches the same lifecycle so
-                    // the synthesized raw delta doesn't jump on re-focus.
+                    // snap.
                     self.input.release_buttons();
                     self.input.cursor_invalidated();
-                    self.prev_mouse_pos = None;
                 }
             }
             InputMessage::Visibility(_) => {
@@ -631,6 +618,27 @@ where
                 // the RAF loop starts; the per-frame queue only drains
                 // inside that loop, so routing through it would
                 // deadlock.
+            }
+            InputMessage::PointerLockChanged(locked) => {
+                // The main thread's `pointerlockchange` listener tells us
+                // when the browser actually engaged/released the lock
+                // (user pressed Esc, switched tabs, our request was
+                // denied for lack of activation, etc.). Mirror the truth
+                // into the cursor module so `current_state()` reads what
+                // the browser actually has. Demos can observe a release
+                // they didn't request and switch back to a "click to
+                // re-engage" prompt (the main thread also wires a
+                // canvas-click handler to re-request the lock when our
+                // last-requested state was Locked but the browser dropped
+                // it; this update is the worker-side signal it succeeded).
+                let grab = if locked {
+                    crate::cursor::GrabMode::Locked
+                } else {
+                    crate::cursor::GrabMode::None
+                };
+                // Visibility on wasm is implied by lock state: Pointer
+                // Lock auto-hides; release auto-shows.
+                crate::cursor::mark_applied(grab, !locked);
             }
         }
     }
@@ -798,6 +806,35 @@ where
             let _scope = rye_time::frame_trace::scope("present");
             self.rd.queue.submit(Some(encoder.finish()));
             frame.present();
+        }
+
+        // Drain pending cursor / DOM-action requests produced during this
+        // frame (`freecam.set_active` calls `cursor::request_grab`, etc.)
+        // and post them to the main thread as one batched `host_action`
+        // message. Doing it after `present()` keeps the GPU submission
+        // critical path free of postMessage latency and matches the
+        // native runner's pattern (which applies cursor changes at the
+        // end of redraw, after the surface present).
+        let (pending_grab, _pending_visible) = crate::cursor::take_pending();
+        if let Some(grab) = pending_grab {
+            let action = match grab {
+                crate::cursor::GrabMode::Locked | crate::cursor::GrabMode::Confined => {
+                    super::host_action::HostAction::PointerLockRequest
+                }
+                crate::cursor::GrabMode::None => super::host_action::HostAction::PointerLockRelease,
+            };
+            super::host_action::queue(action);
+        }
+        // `take_pending_warp_center` is drained to clear the flag even
+        // though warp-to-center is a no-op on wasm (browsers don't
+        // expose a cursor-position write). Without the drain the flag
+        // would stick and a later native build (or different wasm
+        // implementation) would observe it.
+        let _ = crate::cursor::take_pending_warp_center();
+        if let Ok(scope) = worker_scope() {
+            if let Err(e) = super::host_action::post_pending_actions(&scope) {
+                tracing::warn!("rye_app::wasm::worker: post host_action failed: {e:#}");
+            }
         }
 
         rye_time::frame_trace::end_frame();

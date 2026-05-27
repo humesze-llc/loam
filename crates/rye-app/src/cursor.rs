@@ -36,13 +36,30 @@
 //!
 //! ## Wasm note
 //!
-//! Browser Pointer Lock API requires "transient activation" (a recent user
-//! gesture) before `element.requestPointerLock()` succeeds. Console
-//! commands issued via keystrokes do NOT count as the gesture from the
-//! browser's perspective. The runner's wasm path therefore does not call
-//! Pointer Lock at all today; a request on wasm emits a one-time
-//! [`tracing::warn!`] so the demo author notices the no-op, then stays
-//! silent for the rest of the session.
+//! On wasm32 the request channel routes through the worker → main DOM-
+//! action plumbing in [`crate::wasm::host_action`]. The worker drains
+//! [`take_pending`] at the end of each frame, translates the grab mode
+//! to a [`HostAction::PointerLockRequest`](crate::wasm::host_action::HostAction::PointerLockRequest)
+//! or [`HostAction::PointerLockRelease`](crate::wasm::host_action::HostAction::PointerLockRelease),
+//! and posts to the main thread. The main thread calls
+//! `canvas.requestPointerLock()` / `document.exitPointerLock()` and
+//! relays the resulting `pointerlockchange` event back to the worker as
+//! `InputMessage::PointerLockChanged`, which calls [`mark_applied`] so
+//! [`current_state`] stays accurate.
+//!
+//! Browser Pointer Lock requires "transient activation" (a recent user
+//! gesture). The keystroke that produced the console command opens a
+//! ~5-second window; the worker → main round-trip is sub-millisecond,
+//! so the activation token is still valid when `requestPointerLock`
+//! runs. If the user releases the lock with Esc (a browser-hardcoded
+//! shortcut we can't suppress), the demo learns via
+//! `PointerLockChanged(false)` and a canvas click re-engages it if the
+//! demo last requested grab.
+//!
+//! The [`GrabMode::Confined`] variant has no direct browser equivalent
+//! and is treated as a Pointer Lock request (the closest behavior we
+//! can deliver). Visibility requests are implicit on wasm: Pointer Lock
+//! auto-hides, release auto-shows.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -105,11 +122,6 @@ static PENDING_WARP_CENTER: AtomicBool = AtomicBool::new(false);
 static APPLIED_GRAB: AtomicU8 = AtomicU8::new(GRAB_NONE);
 static APPLIED_VISIBLE: AtomicBool = AtomicBool::new(true);
 
-// One-time wasm "this API is a no-op here" warn flag. Avoids per-frame
-// spam if a demo polls request_grab in update() by mistake.
-#[cfg(target_arch = "wasm32")]
-static WASM_WARNED: AtomicBool = AtomicBool::new(false);
-
 fn grab_mode_to_code(mode: GrabMode) -> u8 {
     match mode {
         GrabMode::None => GRAB_NONE,
@@ -129,8 +141,6 @@ fn code_to_grab_mode(code: u8) -> GrabMode {
 /// Request the runner change the grab mode on its next redraw.
 pub fn request_grab_mode(mode: GrabMode) {
     PENDING_GRAB.store(grab_mode_to_code(mode), Ordering::Release);
-    #[cfg(target_arch = "wasm32")]
-    warn_wasm_once_if_grabbing(mode);
 }
 
 /// Request the runner show or hide the cursor on its next redraw.
@@ -200,19 +210,6 @@ pub fn current_state() -> CursorState {
     CursorState {
         grab: code_to_grab_mode(APPLIED_GRAB.load(Ordering::Acquire)),
         visible: APPLIED_VISIBLE.load(Ordering::Acquire),
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn warn_wasm_once_if_grabbing(mode: GrabMode) {
-    if mode != GrabMode::None && !WASM_WARNED.swap(true, Ordering::AcqRel) {
-        tracing::warn!(
-            "rye_app::cursor: grab requested on wasm32, but Pointer Lock \
-             requires a recent user gesture that console-driven commands \
-             don't satisfy. The request is silently a no-op; the cursor \
-             will not be confined or hidden. See the cursor module doc \
-             for the architectural fix (main-thread click handler)."
-        );
     }
 }
 
