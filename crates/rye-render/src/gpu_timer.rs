@@ -283,7 +283,21 @@ impl GpuTimer {
                     let end_ticks = u64::from_le_bytes(end_bytes);
                     let delta_ticks = end_ticks.saturating_sub(start_ticks);
                     let delta_ns = (delta_ticks as f64 * period_ns as f64) as u64;
-                    let _ = tx.send(Duration::from_nanos(delta_ns));
+                    // Reject implausible deltas. At display refresh rates above
+                    // ~120 Hz the triple-buffer cycle can race on some drivers
+                    // (Vulkan validation reports the writes are correctly
+                    // ordered but the resolved values appear to pair a start
+                    // tick from one cycle with an end tick several cycles
+                    // later, yielding deltas that grow linearly with elapsed
+                    // wall time). A real frame's GPU work is sub-100ms even on
+                    // the heaviest scenes; anything beyond that is a desynced
+                    // slot, not a stall. Dropping the sample keeps `gpu-total`
+                    // in `trace summary` honest and avoids spamming the
+                    // frame-trace spike WARN at high refresh rates.
+                    const MAX_PLAUSIBLE_FRAME_NS: u64 = 1_000_000_000 / 10;
+                    if delta_ns <= MAX_PLAUSIBLE_FRAME_NS {
+                        let _ = tx.send(Duration::from_nanos(delta_ns));
+                    }
                 }
                 drop(view);
                 buffer_for_callback.unmap();
