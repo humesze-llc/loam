@@ -548,8 +548,9 @@ impl Demo {
         }
 
         // Time scrub (t axis, left/right arrow keys). Mirrors the
-        // t-slider drag: rebuild `rot_state` from the new
-        // `rot_time` via `exp(omega_animation * rot_time)`.
+        // t-slider drag: rebuild `rot_state` from the new `rot_time`
+        // via `rotor_at_time`, which dispatches Active (product) vs
+        // Composer (sum) so the scrub matches the spin path's math.
         // Right = forward in time, left = back. Floors `rot_time`
         // at zero (the t slider's lower bound).
         let t_dir = (self.slider_right_held as i32 - self.slider_left_held as i32) as f32;
@@ -565,8 +566,7 @@ impl Demo {
                     self.rot_time = T_SLIDER_CAP;
                 }
             }
-            let omega = self.omega_animation();
-            self.rot_state = (omega * self.rot_time).exp().normalize();
+            self.rot_state = self.rotor_at_time(self.rot_time);
         }
 
         // 4D rotation animation. Both bodies share the same rotor
@@ -955,7 +955,6 @@ impl Demo {
                 (false, false) => (1, 1, true),
             };
             let col_vps = viewport.split_horizontal(cols as u32);
-            let omega = self.omega_animation();
             let mut grid_cells: Vec<(Viewport, f32, BodyUniform)> = Vec::with_capacity(cols * rows);
             for (col_idx, col_vp) in col_vps.into_iter().enumerate() {
                 let row_vps = col_vp.split_vertical(rows as u32);
@@ -985,12 +984,17 @@ impl Demo {
                         let t_norm = t_idx as f32 / (t_n - 1) as f32;
                         t_norm * self.strip_t_extent
                     };
-                    // Cell's rotor: spin from `rot_state` by
-                    // `omega * t_offset` (animation-time offset).
+                    // Cell's rotor: the orientation at animation time
+                    // `rot_time + t_offset`, via the same `rotor_at_time`
+                    // dispatch the spin + t-scrub use. For Composer this
+                    // equals the old `exp(omega * t_offset) * rot_state`
+                    // (omega commutes with itself); for Active it's the
+                    // product-of-exp sampled at the future time, which the
+                    // old sum-based offset got wrong with 2+ active planes.
                     let cell_rotor = if t_offset == 0.0 {
                         self.rot_state
                     } else {
-                        ((omega * t_offset).exp() * self.rot_state).normalize()
+                        self.rotor_at_time(self.rot_time + t_offset)
                     };
                     let body = BodyUniform::polytope_with_rotor(
                         [0.0, BODY_Y, 0.0, 0.0],

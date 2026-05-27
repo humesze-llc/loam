@@ -199,7 +199,7 @@ pub trait App: Sized + 'static {
     /// `on_key` see hotkeys on both native and wasm.
     ///
     /// Continuous WASD-style integration belongs in [`App::update`] reading
-    /// [`FrameInput`](rye_input::FrameInput) (held-key axes); use `on_key`
+    /// [`rye_input::FrameInput`] (held-key axes); use `on_key`
     /// for edge-triggered toggles (Space, Tab, T, R, digits, etc.).
     fn on_key(
         &mut self,

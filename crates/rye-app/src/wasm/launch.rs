@@ -34,14 +34,13 @@
 //! [`inject_launch_overlay`] reuses an existing element rather than duplicating
 //! it when one is already in the DOM.
 //!
-//! ## Non-goals (v1)
+//! ## Non-goals
 //!
-//! - **Pause / resume on IntersectionObserver.** Coming in v2 once the lifecycle
-//!   handle returned by `run_with_config` exposes a way to stop the redraw loop
-//!   without tearing down the wgpu device.
-//! - **Loading-progress UI.** The current implementation hides the launch button on
-//!   click and lets the canvas appear when ready (~the same time as the first
-//!   `RenderDevice::new` resolve). Pipeline-warming progress UI is a v2 piece.
+//! - **Pause / resume on scroll-out.** When a demo scrolls out of view in a
+//!   blog embed, the ideal behavior is to pause its RAF loop and reclaim GPU
+//!   resources. That belongs in the JS embed wrapper (an `IntersectionObserver`
+//!   that posts a `pause` message to the worker), not in this engine path; the
+//!   worker already has the lifecycle hooks a wrapper would drive.
 
 use anyhow::{anyhow, Context, Result};
 use wasm_bindgen::prelude::Closure;

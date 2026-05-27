@@ -1,4 +1,4 @@
-//! Worker → main-thread channel for DOM-touching actions.
+//! Worker -> main-thread channel for DOM-touching actions.
 //!
 //! ## Why this module exists
 //!
@@ -10,15 +10,14 @@
 //! Wake Lock, Audio focus resumption, the File System Access pickers --
 //! has to round-trip to the main thread.
 //!
-//! This module is the engine-side primitive for that round-trip. Demos
-//! call high-level APIs (`rye_app::cursor::request_grab`,
+//! This module is the engine-side primitive for that round-trip. Demos call
+//! high-level APIs (`rye_app::cursor::request_grab`, a future
 //! `rye_app::fullscreen::request_enter`, etc.); those APIs queue a
-//! [`HostAction`]; the worker's frame loop drains pending actions once
-//! per frame and posts them to the main thread via
-//! [`post_pending_actions`]. The main thread's listener in
-//! `main_launcher::install_host_action_handler` dispatches each one to
-//! the matching DOM call and (for stateful actions) listens for the
-//! browser's state-change event to ping the worker back.
+//! [`HostAction`]; the worker's frame loop drains pending actions once per
+//! frame and posts them to the main thread via [`post_pending_actions`]. The
+//! main thread's listener in `main_launcher::install_host_action_handler`
+//! dispatches each one to the matching DOM call and (for stateful actions)
+//! listens for the browser's state-change event to ping the worker back.
 //!
 //! ## Why not synchronous RPC
 //!
@@ -57,30 +56,28 @@ use std::cell::RefCell;
 
 use wasm_bindgen::JsValue;
 
-/// One worker → main DOM action. Variants name *intent*; the main
+/// One worker -> main DOM action. Variants name *intent*; the main
 /// thread translates each to the matching DOM call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostAction {
-    /// Engage Pointer Lock on the canvas. Locks the cursor to the
-    /// canvas center and reports raw motion deltas via
-    /// `MouseEvent.movementX/Y`. The main thread calls
-    /// `canvas.requestPointerLock()`; the actual transition fires a
-    /// `pointerlockchange` event the main thread relays back via
+    /// Engage Pointer Lock on the canvas. Locks the cursor to the canvas
+    /// center and reports raw motion deltas via `MouseEvent.movementX/Y`. The
+    /// main thread calls `canvas.requestPointerLock()`; the actual transition
+    /// fires a `pointerlockchange` event the main thread relays back via
     /// `InputMessage::PointerLockChanged(true)`.
     PointerLockRequest,
-    /// Release Pointer Lock. Main thread calls
-    /// `document.exitPointerLock()`. Browser also auto-releases on Esc
-    /// or tab switch; either path produces the same
-    /// `pointerlockchange` round-trip.
+    /// Release Pointer Lock. Main thread calls `document.exitPointerLock()`.
+    /// The browser also auto-releases on Esc or tab switch; either path
+    /// produces the same `pointerlockchange` round-trip back to the worker.
     PointerLockRelease,
 }
 
 thread_local! {
-    /// Per-worker pending action queue. Drained at the end of each
-    /// frame by [`post_pending_actions`]. A `thread_local` because the
-    /// engine APIs that produce these (`rye_app::cursor`,
-    /// `rye_app::fullscreen` later) have no direct handle to the worker
-    /// runner; they push into this static and the runner reads it.
+    /// Per-worker pending action queue. Drained at the end of each frame by
+    /// [`post_pending_actions`]. A `thread_local` because the engine APIs that
+    /// produce these (`rye_app::cursor`, a future `rye_app::fullscreen`) have
+    /// no direct handle to the worker runner; they push into this static and
+    /// the runner reads it.
     static PENDING: RefCell<Vec<HostAction>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -113,9 +110,12 @@ pub fn post_pending_actions(scope: &web_sys::DedicatedWorkerGlobalScope) -> anyh
 
 /// Build the `{kind: "host_action", actions: [...]}` JS object for a
 /// drained action list. Each action is encoded as `{kind: "<variant
-/// lowercase>"}` with any per-variant fields tacked on. Kept separate
-/// from `post_pending_actions` so unit tests can exercise the encoding
-/// without needing a real `DedicatedWorkerGlobalScope`.
+/// lowercase>"}` with any per-variant fields tacked on. Split out from
+/// `post_pending_actions` so the encoding is exercisable in isolation
+/// (the natural home is a `wasm-bindgen-test`, since the `js_sys` /
+/// `JsValue` types only exist on the wasm target; that test harness is
+/// not yet wired into CI, so the encoding is currently covered only by
+/// the demos running without a malformed-message panic).
 fn encode_actions(actions: &[HostAction]) -> anyhow::Result<JsValue> {
     let msg = js_sys::Object::new();
     js_sys::Reflect::set(

@@ -36,20 +36,22 @@
 //!
 //! ## Wasm note
 //!
-//! On wasm32 the request channel routes through the worker → main DOM-
-//! action plumbing in [`crate::wasm::host_action`]. The worker drains
-//! [`take_pending`] at the end of each frame, translates the grab mode
-//! to a [`HostAction::PointerLockRequest`](crate::wasm::host_action::HostAction::PointerLockRequest)
-//! or [`HostAction::PointerLockRelease`](crate::wasm::host_action::HostAction::PointerLockRelease),
-//! and posts to the main thread. The main thread calls
-//! `canvas.requestPointerLock()` / `document.exitPointerLock()` and
-//! relays the resulting `pointerlockchange` event back to the worker as
+//! On wasm32 the request channel routes through the worker -> main DOM-
+//! action plumbing in `wasm::host_action` (plain reference, not an
+//! intra-doc link: that module is `#[cfg(target_arch = "wasm32")]` so
+//! it doesn't exist when docs build for the native target). The worker
+//! drains [`take_pending`] at the end of each frame, translates the
+//! grab mode to a `HostAction::PointerLockRequest` or
+//! `HostAction::PointerLockRelease`, and posts to the main thread. The
+//! main thread calls `canvas.requestPointerLock()` /
+//! `document.exitPointerLock()` and relays the resulting
+//! `pointerlockchange` event back to the worker as
 //! `InputMessage::PointerLockChanged`, which calls [`mark_applied`] so
 //! [`current_state`] stays accurate.
 //!
 //! Browser Pointer Lock requires "transient activation" (a recent user
 //! gesture). The keystroke that produced the console command opens a
-//! ~5-second window; the worker → main round-trip is sub-millisecond,
+//! ~5-second window; the worker -> main round-trip is sub-millisecond,
 //! so the activation token is still valid when `requestPointerLock`
 //! runs. If the user releases the lock with Esc (a browser-hardcoded
 //! shortcut we can't suppress), the demo learns via

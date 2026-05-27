@@ -1,6 +1,26 @@
-//! Active-set rotation mode: six basis-plane checkboxes drive the
-//! angular velocity. Sum-of-bivectors is commutative, so toggle order
-//! doesn't matter; only the active set does.
+//! Active-set rotation mode: six basis-plane checkboxes + per-plane angle
+//! sliders.
+//!
+//! ## Source of truth
+//!
+//! Active mode's orientation is NOT stored in `rot_state` directly; it is
+//! DERIVED each frame. The truth is `Demo::base_angles[6]` (the user's set
+//! angle per plane) plus `Demo::rot_time` (the spin clock). The displayed
+//! angle of plane `i` is `base_angles[i] + (rot_time * rate if active[i])`,
+//! and the rotor is the ORDERED PRODUCT `∏ᵢ exp(planeᵢ · displayed_angle[i])`
+//! (see `Demo::active_rotor` / `Demo::active_rotor_at`). `rot_state` is
+//! recomputed from that product every frame.
+//!
+//! This is a product, not a sum: `exp(a·xy) · exp(b·xz) ≠ exp(a·xy + b·xz)`
+//! when the planes don't commute (Baker-Campbell-Hausdorff). The product form
+//! is what makes each slider an independent factor, so dragging one slider
+//! doesn't redistribute the others. The cost is that the rotor is BCH-coupled
+//! internally and `log(rot_state)` will NOT return the user-set angles -- so
+//! Active mode never reads back through `log`; the sliders are the source of
+//! truth. Composer mode, by contrast, keeps the sum-of-bivectors model
+//! throughout. Every t-scrub / filmstrip site routes through
+//! `Demo::rotor_at_time`, which dispatches between the two so the scrub
+//! matches the spin path's math in either mode.
 //!
 //! This module owns:
 //!
@@ -198,6 +218,56 @@ impl Demo {
             self.base_angles[plane_idx] = target_rad - spin_contribution;
             self.rot_state = self.active_rotor();
             self.write_all(self.rot_state);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_slider_deg;
+
+    #[test]
+    fn wrap_is_identity_inside_range() {
+        // Values already in (-720, 720] pass through unchanged.
+        for d in [0.0_f32, 359.0, -359.0, 720.0, -719.0, 123.456] {
+            assert_eq!(wrap_slider_deg(d), d, "in-range value {d} changed");
+        }
+    }
+
+    #[test]
+    fn wrap_folds_one_period_past_the_top() {
+        // 721 is one degree past the +720 top; folds to -719.
+        assert_eq!(wrap_slider_deg(721.0), -719.0);
+        // 1080 (1.5 periods) folds to -360.
+        assert_eq!(wrap_slider_deg(1080.0), -360.0);
+    }
+
+    #[test]
+    fn wrap_folds_below_the_bottom() {
+        // -721 is one degree below the -720 bottom; folds to +719.
+        assert_eq!(wrap_slider_deg(-721.0), 719.0);
+    }
+
+    #[test]
+    fn wrap_period_multiples_land_on_zero() {
+        // Exact multiples of the 1440 two-cycle period map to 0.
+        assert_eq!(wrap_slider_deg(1440.0), 0.0);
+        assert_eq!(wrap_slider_deg(-1440.0), 0.0);
+        assert_eq!(wrap_slider_deg(2880.0), 0.0);
+    }
+
+    #[test]
+    fn wrap_result_always_in_range() {
+        // Sweep a wide span (continuous spin pushes the raw angle far past
+        // one period) and confirm every result lands in (-720, 720].
+        let mut d = -5000.0_f32;
+        while d <= 5000.0 {
+            let w = wrap_slider_deg(d);
+            assert!(
+                w > -720.0 && w <= 720.0,
+                "d={d} wrapped to {w} out of range"
+            );
+            d += 7.3;
         }
     }
 }

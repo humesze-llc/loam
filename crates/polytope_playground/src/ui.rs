@@ -13,7 +13,7 @@ use rye_egui::{
     media::{chevron_button, play_pause_button, rate_toggle, refresh_button},
     slider_with_edit,
 };
-use rye_math::{Bivector, Rotor4};
+use rye_math::Rotor4;
 
 use crate::consts::{CONTROL_H, CONTROL_W, PLAY_PAUSE_W};
 use crate::state::{
@@ -356,8 +356,8 @@ impl Demo {
         // Falls back to the window width if the window is narrower.
         const OVERLAY_MAX_WIDTH: f32 = 768.0;
         const OVERLAY_MIN_WIDTH: f32 = 280.0;
-        let natural_w = (screen.width() - 2.0 * pad).max(OVERLAY_MIN_WIDTH);
-        let area_w = natural_w.min(OVERLAY_MAX_WIDTH).max(OVERLAY_MIN_WIDTH);
+        let natural_w = screen.width() - 2.0 * pad;
+        let area_w = natural_w.clamp(OVERLAY_MIN_WIDTH, OVERLAY_MAX_WIDTH);
         // `overlay_pinned_width` is kept for backwards compatibility
         // with any saved state but no longer load-bearing now that the
         // width is capped.
@@ -475,13 +475,11 @@ impl Demo {
             t_dragged = interaction.dragged;
         });
         if t_dragged {
-            // Scrub uses the rate-independent `omega_animation`;
-            // `rot_time` is animation time (already rate-scaled at
-            // integration), so `exp(omega_animation * rot_time)`
-            // equals what the continuous-spin path would have
-            // integrated.
-            let omega = self.omega_animation();
-            self.rot_state = (omega * self.rot_time).exp().normalize();
+            // `rotor_at_time` dispatches Active (product-of-exp) vs
+            // Composer (sum-of-bivectors), so scrubbing the t slider
+            // reproduces exactly what the continuous-spin path would
+            // have integrated to at this `rot_time` in either mode.
+            self.rot_state = self.rotor_at_time(self.rot_time);
             self.write_all(self.rot_state);
         }
     }

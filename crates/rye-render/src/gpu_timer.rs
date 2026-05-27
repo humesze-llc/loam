@@ -73,6 +73,25 @@ use wgpu::{
 /// contention.
 const FRAMES_IN_FLIGHT: usize = 3;
 
+/// Upper bound on a believable single-frame GPU time. A real frame's GPU work is
+/// sub-100ms even on the heaviest scenes; anything beyond that is a desynced
+/// triple-buffer slot, not a stall.
+const MAX_PLAUSIBLE_FRAME_NS: u64 = 1_000_000_000 / 10;
+
+/// Whether a resolved GPU-timer delta is small enough to be a real frame time.
+///
+/// At display refresh rates above ~120 Hz the triple-buffer cycle can race on
+/// some drivers: Vulkan validation reports the `write_timestamp` /
+/// `resolve_query_set` calls are correctly ordered, but the resolved values
+/// appear to pair a start tick from one cycle with an end tick several cycles
+/// later, yielding deltas that grow linearly with elapsed wall time. Dropping
+/// the over-budget sample keeps `gpu-total` in `trace summary` honest and stops
+/// the frame-trace spike WARN from spamming at high refresh rates. Pulled out as
+/// a free function so the threshold logic is unit-testable without a GPU.
+fn is_plausible_frame_delta_ns(delta_ns: u64) -> bool {
+    delta_ns <= MAX_PLAUSIBLE_FRAME_NS
+}
+
 /// Bytes per resolved slot pair (two `u64` ticks).
 const BYTES_PER_SLOT: u64 = 16;
 
@@ -283,19 +302,7 @@ impl GpuTimer {
                     let end_ticks = u64::from_le_bytes(end_bytes);
                     let delta_ticks = end_ticks.saturating_sub(start_ticks);
                     let delta_ns = (delta_ticks as f64 * period_ns as f64) as u64;
-                    // Reject implausible deltas. At display refresh rates above
-                    // ~120 Hz the triple-buffer cycle can race on some drivers
-                    // (Vulkan validation reports the writes are correctly
-                    // ordered but the resolved values appear to pair a start
-                    // tick from one cycle with an end tick several cycles
-                    // later, yielding deltas that grow linearly with elapsed
-                    // wall time). A real frame's GPU work is sub-100ms even on
-                    // the heaviest scenes; anything beyond that is a desynced
-                    // slot, not a stall. Dropping the sample keeps `gpu-total`
-                    // in `trace summary` honest and avoids spamming the
-                    // frame-trace spike WARN at high refresh rates.
-                    const MAX_PLAUSIBLE_FRAME_NS: u64 = 1_000_000_000 / 10;
-                    if delta_ns <= MAX_PLAUSIBLE_FRAME_NS {
+                    if is_plausible_frame_delta_ns(delta_ns) {
                         let _ = tx.send(Duration::from_nanos(delta_ns));
                     }
                 }
@@ -440,6 +447,22 @@ mod tests {
         // comment "Clear the flag whether the read succeeded or not").
         flag.store(false, Ordering::Release);
         assert!(!flag.load(Ordering::Acquire), "callback re-arms the slot");
+    }
+
+    #[test]
+    fn plausible_frame_delta_rejects_over_budget() {
+        // A 4ms frame (240 Hz) is plausible.
+        assert!(is_plausible_frame_delta_ns(4_000_000));
+        // 16.7ms (60 Hz) is plausible.
+        assert!(is_plausible_frame_delta_ns(16_666_667));
+        // Exactly the 100ms cap is the inclusive boundary.
+        assert!(is_plausible_frame_delta_ns(MAX_PLAUSIBLE_FRAME_NS));
+        // 250ms+ is the desynced-slot garbage the filter exists to drop
+        // (these were the 250-950ms spike-WARN values at 240 Hz).
+        assert!(!is_plausible_frame_delta_ns(250_000_000));
+        assert!(!is_plausible_frame_delta_ns(950_000_000));
+        // Zero (a slot that resolved start == end) is plausible, not a stall.
+        assert!(is_plausible_frame_delta_ns(0));
     }
 
     #[test]

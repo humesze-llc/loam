@@ -283,7 +283,7 @@ where
     // wgpu's lazy shader compilation (browser WebGPU defers
     // `create_render_pipeline` work until first use) happens BEFORE
     // the user clicks. Without this the user sees a second hitch right
-    // after clicking; with it the click → demo-running transition is
+    // after clicking; with it the click -> demo-running transition is
     // immediate. Safe because the default `rotate` state is false, so
     // warmup frames don't advance any simulation state (rot_time only
     // ticks when self.rotate is true, which it isn't until the user
@@ -292,8 +292,9 @@ where
     // 11 total frames (1 preview + 10 warmup) is empirically enough to
     // cover the first-frame compilation of the polytope_playground
     // pipelines on Chrome and Firefox WebGPU; more is harmless but
-    // lengthens the perceived initialization wait. Reassess if a
-    // heavier demo (M5+ projections with multiple new pipelines) lands.
+    // lengthens the perceived initialization wait. Reassess if a demo
+    // lands that builds several new render pipelines not exercised by
+    // the default scene.
     //
     // Each frame fires a `preview_progress` message so the main
     // thread's static `#rye-page-loader` bar can advance. During the
@@ -711,10 +712,24 @@ where
         }
     }
 
-    /// One frame: drain input queue, dt, App::update, begin_frame,
-    /// App::record, composite, submit, present. Wraps
-    /// `rye_time::frame_trace::scope` so the same telemetry the windowed
-    /// runner emits is available here.
+    /// One frame of the worker's RAF loop. Phases, in order:
+    ///
+    /// 1. **FPS cap** -- drop this callback if it fired before the next
+    ///    deadline (deadline-anchored, see below).
+    /// 2. **Input drain** -- apply every queued `InputMessage` (resize,
+    ///    mouse, key, focus, pointer-lock-state).
+    /// 3. **Fixed-timestep ticks** -- advance the accumulator, run
+    ///    `App::tick` per tick, count them into `FrameCtx::n_ticks`.
+    /// 4. **App::update + App::ui** -- per-frame update with drained input,
+    ///    then the egui pass.
+    /// 5. **Render** -- `begin_frame`, `App::record`, composite, submit,
+    ///    present.
+    /// 6. **End-of-frame host actions** -- drain `cursor::take_pending`,
+    ///    translate to `host_action`s, post the batched message to the
+    ///    main thread; emit the per-frame `preview_progress` during warmup.
+    ///
+    /// Wraps `rye_time::frame_trace::scope` so the same telemetry the
+    /// windowed runner emits is available here.
     fn frame(&mut self) -> Result<()> {
         // FPS cap: drop RAF callbacks that fire before the next ideal
         // deadline (= previous anchor + target period). Anchoring on

@@ -313,6 +313,32 @@ pub(crate) fn render_bivector_sum(parts: &[String]) -> Option<String> {
 /// one unit term with `scalar = None`. The app-level `omega_per_sec` dispatcher inlines
 /// that walk over the `[bool; 6]` directly to avoid allocating a transient seq each
 /// frame.
+/// Displayed angle of one Active-mode plane at animation time `t`: the user's
+/// baseline plus the spin contribution `t * BASE_ROTATION_RATE` when the plane
+/// is active. Free function (not a `Demo` method) so the rotor composition is
+/// unit-testable without a GPU-backed `Demo`.
+pub(crate) fn active_plane_angle(base: f32, active: bool, t: f32) -> f32 {
+    base + if active { t * BASE_ROTATION_RATE } else { 0.0 }
+}
+
+/// Active-mode rotor at animation time `t`: the ORDERED PRODUCT
+/// `∏ᵢ exp(planeᵢ · active_plane_angle(base[i], active[i], t))` over the six
+/// planes in `Plane4::ALL` order. See the module doc of `active.rs` for why
+/// this is a product (independent sliders) rather than a single
+/// `exp(sum)` (which would reintroduce BCH coupling). Free function so the
+/// composition is testable without constructing a `Demo`.
+pub(crate) fn compose_active_rotor(base_angles: &[f32; 6], active: &[bool; 6], t: f32) -> Rotor4 {
+    let mut r = Rotor4::IDENTITY;
+    for i in 0..6 {
+        let angle = active_plane_angle(base_angles[i], active[i], t);
+        if angle != 0.0 {
+            let bivec = Plane4::ALL[i].unit_bivector() * angle;
+            r = bivec.exp() * r;
+        }
+    }
+    r.normalize()
+}
+
 pub(crate) fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> Bivector4 {
     let mut omega = Bivector4::ZERO;
     for term in seq {
@@ -678,7 +704,7 @@ impl Demo {
     /// animation time, produces `rot_state`). Independent of `rate_scale`. Active mode
     /// sums the toggled basis bivectors; Composer mode delegates to the seq walker.
     ///
-    /// Note: Active mode composes its rotor as a *product* (see [`active_rotor`]), so
+    /// Note: Active mode composes its rotor as a *product* (see [`Self::active_rotor`]), so
     /// the returned bivector is only meaningful in the BCH-trivial direction (single
     /// active plane) or as a coarse "this is the direction the rotation is going."
     /// Composer mode uses the sum semantics throughout, so its omega is exact.
@@ -697,38 +723,61 @@ impl Demo {
         }
     }
 
-    /// Displayed angle for plane `i` in Active mode: the user's stored baseline
-    /// plus, if the plane is active, the spin's accumulated contribution at
-    /// `rot_time`. The slider reads this value; writing the slider sets
-    /// `base_angles[i]` so the new displayed value matches what the user dropped
-    /// the handle at (so dragging a spinning slider doesn't snap back to the
-    /// pre-drag baseline).
-    pub(crate) fn active_displayed_angle(&self, plane_idx: usize) -> f32 {
-        let spin = if self.active[plane_idx] {
-            self.rot_time * BASE_ROTATION_RATE
-        } else {
-            0.0
-        };
-        self.base_angles[plane_idx] + spin
+    /// Angle for plane `i` in Active mode at animation time `t`: the user's
+    /// stored baseline plus, if the plane is active, the spin's accumulated
+    /// contribution `t * BASE_ROTATION_RATE`. Parameterized over `t` so the
+    /// filmstrip can sample future times; [`Self::active_displayed_angle`]
+    /// is the `t = rot_time` specialization the sliders read.
+    pub(crate) fn active_angle_at(&self, plane_idx: usize, t: f32) -> f32 {
+        active_plane_angle(self.base_angles[plane_idx], self.active[plane_idx], t)
     }
 
-    /// Active-mode rotor: ORDERED PRODUCT of per-plane simple rotations in
-    /// `Plane4::ALL` order. Sliders are independent because each `base_angles[i]`
-    /// contributes to exactly one factor; changing one slider only mutates one
-    /// factor in the product. The product across non-commuting planes is still
-    /// BCH-coupled in the rotor itself (so `log(rot_state).component(plane)`
-    /// won't give back the user-set angles), but we don't read back through `log`
-    /// in Active mode -- the sliders are the source of truth.
+    /// Displayed angle for plane `i` in Active mode at the current `rot_time`.
+    /// The slider reads this; writing the slider sets `base_angles[i]` so the
+    /// new displayed value matches where the user dropped the handle (dragging
+    /// a spinning slider doesn't snap back to the pre-drag baseline).
+    pub(crate) fn active_displayed_angle(&self, plane_idx: usize) -> f32 {
+        self.active_angle_at(plane_idx, self.rot_time)
+    }
+
+    /// Active-mode rotor at animation time `t`: ORDERED PRODUCT of per-plane
+    /// simple rotations in `Plane4::ALL` order. Sliders are independent because
+    /// each `base_angles[i]` contributes to exactly one factor; changing one
+    /// slider only mutates one factor in the product. The product across
+    /// non-commuting planes is still BCH-coupled in the rotor itself (so
+    /// `log(rot_state).component(plane)` won't give back the user-set angles),
+    /// but we don't read back through `log` in Active mode -- the sliders are
+    /// the source of truth.
+    pub(crate) fn active_rotor_at(&self, t: f32) -> Rotor4 {
+        compose_active_rotor(&self.base_angles, &self.active, t)
+    }
+
+    /// Active-mode rotor at the current `rot_time`. The `t = rot_time`
+    /// specialization of [`Self::active_rotor_at`].
     pub(crate) fn active_rotor(&self) -> Rotor4 {
-        let mut r = Rotor4::IDENTITY;
-        for i in 0..6 {
-            let angle = self.active_displayed_angle(i);
-            if angle != 0.0 {
-                let bivec = Plane4::ALL[i].unit_bivector() * angle;
-                r = bivec.exp() * r;
-            }
+        self.active_rotor_at(self.rot_time)
+    }
+
+    /// Orientation rotor at animation time `t`, dispatched on the active
+    /// rotation mode. This is the single source of truth for "what does the
+    /// orientation look like at animation time `t`" and MUST be used by every
+    /// t-scrub and filmstrip-offset site so they agree with the spin path:
+    ///
+    /// - **Active**: product-of-exp via [`Self::active_rotor_at`]. The 6 plane
+    ///   sliders are independent factors; summing them (the Composer model)
+    ///   would reintroduce the BCH coupling the Active rework removed.
+    /// - **Composer**: `exp(omega_animation * t)`, the sum-of-bivectors model
+    ///   the Composer UI is built around.
+    ///
+    /// For a single active plane the two modes coincide (no BCH coupling); the
+    /// distinction only bites with two or more non-commuting active planes,
+    /// which is exactly where a naive sum-everywhere t-scrub diverged from the
+    /// product-based spin.
+    pub(crate) fn rotor_at_time(&self, t: f32) -> Rotor4 {
+        match self.rotation_mode {
+            RotationMode::Active => self.active_rotor_at(t),
+            RotationMode::Composer => (self.omega_animation() * t).exp().normalize(),
         }
-        r.normalize()
     }
 
     /// Build the SDF body uniform for a single row entry, with polychora opt-out based on
@@ -853,5 +902,95 @@ impl Demo {
         self.t_slider_max = T_SLIDER_INITIAL;
         self.draft.clear();
         self.write_all(Rotor4::IDENTITY);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{active_plane_angle, compose_active_rotor, BASE_ROTATION_RATE};
+    use rye_math::{Bivector, Plane4, Rotor4};
+
+    const NONE: [bool; 6] = [false; 6];
+
+    fn rotor_close(a: Rotor4, b: Rotor4, eps: f32) -> bool {
+        (a.s - b.s).abs() < eps
+            && (a.xy - b.xy).abs() < eps
+            && (a.xz - b.xz).abs() < eps
+            && (a.xw - b.xw).abs() < eps
+            && (a.yz - b.yz).abs() < eps
+            && (a.yw - b.yw).abs() < eps
+            && (a.zw - b.zw).abs() < eps
+            && (a.xyzw - b.xyzw).abs() < eps
+    }
+
+    #[test]
+    fn active_plane_angle_adds_spin_only_when_active() {
+        // Inactive plane: angle is the baseline regardless of t.
+        assert_eq!(active_plane_angle(0.5, false, 3.0), 0.5);
+        // Active plane: baseline plus t * rate.
+        assert_eq!(
+            active_plane_angle(0.5, true, 2.0),
+            0.5 + 2.0 * BASE_ROTATION_RATE
+        );
+        // t = 0 collapses to the baseline even when active.
+        assert_eq!(active_plane_angle(0.5, true, 0.0), 0.5);
+    }
+
+    #[test]
+    fn compose_all_zero_is_identity() {
+        let r = compose_active_rotor(&[0.0; 6], &NONE, 0.0);
+        assert!(rotor_close(r, Rotor4::IDENTITY, 1e-6), "got {r:?}");
+    }
+
+    #[test]
+    fn compose_is_always_unit_norm() {
+        // A messy multi-plane configuration must still produce a unit rotor
+        // (the function normalizes). Norm-squared within 1e-5 of 1.
+        let base = [0.3, -1.1, 2.0, 0.7, -0.4, 1.6];
+        let active = [true, false, true, true, false, true];
+        for &t in &[0.0_f32, 0.5, 3.0, 50.0] {
+            let n2 = compose_active_rotor(&base, &active, t).norm_squared();
+            assert!((n2 - 1.0).abs() < 1e-5, "t={t} norm_squared={n2}");
+        }
+    }
+
+    #[test]
+    fn compose_single_plane_equals_direct_exp() {
+        // One plane (xw = index 2) at a baseline angle, no spin: the product
+        // collapses to a single factor, which must equal exp(plane * angle)
+        // directly. This is the BCH-trivial case where product == the obvious
+        // single rotation.
+        let theta = 0.8_f32;
+        let mut base = [0.0; 6];
+        base[2] = theta; // Plane4::Xw
+        let composed = compose_active_rotor(&base, &NONE, 0.0);
+        let direct = (Plane4::Xw.unit_bivector() * theta).exp().normalize();
+        assert!(
+            rotor_close(composed, direct, 1e-6),
+            "{composed:?} vs {direct:?}"
+        );
+    }
+
+    #[test]
+    fn compose_orthogonal_pair_is_order_independent() {
+        // xy (index 0) and zw (index 5) are absolutely orthogonal: their
+        // bivectors commute, so exp(a*xy) * exp(b*zw) == exp(b*zw) * exp(a*xy).
+        // `compose_active_rotor` walks Plane4::ALL order (xy before zw); build
+        // the reverse by hand and confirm they match. (This is the case where
+        // the product genuinely equals exp(sum); the non-commuting case is
+        // exactly why Active mode uses the product, tested implicitly by the
+        // unit-norm + single-plane invariants above.)
+        let (a, b) = (0.6_f32, -0.9_f32);
+        let mut base = [0.0; 6];
+        base[0] = a; // xy
+        base[5] = b; // zw
+        let composed = compose_active_rotor(&base, &NONE, 0.0);
+        let xy = (Plane4::Xy.unit_bivector() * a).exp();
+        let zw = (Plane4::Zw.unit_bivector() * b).exp();
+        let reverse = (xy * zw).normalize();
+        assert!(
+            rotor_close(composed, reverse, 1e-6),
+            "{composed:?} vs {reverse:?}"
+        );
     }
 }

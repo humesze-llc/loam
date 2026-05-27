@@ -232,7 +232,7 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
     // (or via the worker's handle_message queue) and applied on first frame.
     install_dom_input_forwarders(&worker, &canvas).context("install_dom_input_forwarders")?;
 
-    // Worker → main DOM-action channel + pointerlockchange forwarder +
+    // Worker -> main DOM-action channel + pointerlockchange forwarder +
     // canvas click-to-re-engage. This is the standard OffscreenCanvas-
     // in-Worker pattern for letting the worker drive DOM APIs that can
     // only be called from main thread.
@@ -310,7 +310,7 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
 
             // Worker pre-warmed pipelines before posting preview_ready,
             // so the demo is genuinely ready right now. Just remove the
-            // overlay; click → demo is one transition, no second wait.
+            // overlay; click -> demo is one transition, no second wait.
             overlay_for_click.remove();
         }) as Box<dyn FnMut()>);
         launch_overlay
@@ -761,8 +761,8 @@ fn install_preview_ready_handler(worker: &Worker, button_id: &str) -> Result<()>
     Ok(())
 }
 
-/// Install the worker → main DOM-action handler, the
-/// `pointerlockchange` → worker forwarder, and the canvas
+/// Install the worker -> main DOM-action handler, the
+/// `pointerlockchange` -> worker forwarder, and the canvas
 /// click-to-re-engage Pointer Lock helper.
 ///
 /// ## Architecture
@@ -813,7 +813,7 @@ fn install_host_action_handler(worker: &Worker, canvas: &HtmlCanvasElement) -> R
     // demo voluntarily released), the click does nothing.
     let want_locked: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
-    // Worker → main: drain a `host_action` message into DOM calls.
+    // Worker -> main: drain a `host_action` message into DOM calls.
     {
         let canvas_for_dispatch = canvas.clone();
         let document_for_dispatch = document.clone();
