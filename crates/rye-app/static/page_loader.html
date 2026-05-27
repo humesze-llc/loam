@@ -15,16 +15,6 @@
      `#rye-launch` overlay takes over the visual layer with the
      click-to-start affordance. -->
 <style>
-    /* Layer promotion lives on the PARENT (`translateZ(0)` + `contain:
-       layout paint` to isolate it from layout/paint invalidations
-       elsewhere in the document, without the `size` containment that
-       `contain: strict` includes -- size containment collapses an
-       inset:0 element to 0x0). The spinner `::before` inherits the
-       compositor layer from the parent. Putting layer-promotion
-       transforms on the spinner itself collides with the rotation
-       animation's transform (CSS can't interpolate cleanly across
-       transform function-list mismatches between the static value and
-       the keyframe), which is what froze the animation. */
     #rye-page-loader {
         position: fixed;
         inset: 0;
@@ -33,23 +23,41 @@
         justify-content: center;
         background: #0e0e12;
         z-index: 1;
-        transform: translateZ(0);
-        contain: layout paint;
         pointer-events: none;
     }
-    #rye-page-loader::before {
-        content: '';
-        display: inline-block;
-        width: 56px;
-        height: 56px;
-        border: 5px solid rgba(200, 200, 220, 0.2);
-        border-top-color: rgba(230, 230, 245, 0.95);
-        border-radius: 50%;
-        animation: rye-page-loader-spin 0.9s linear infinite;
-    }
-    @keyframes rye-page-loader-spin {
-        from { transform: rotate(0deg); }
-        to { transform: rotate(360deg); }
-    }
 </style>
-<div id="rye-page-loader"></div>
+<!-- SVG SMIL animation rather than CSS keyframes: SMIL runs on the
+     browser's SVG timing engine, which keeps ticking even when CSS
+     animations stall on heavy main-thread work (wasm download +
+     compile + worker spawn + OffscreenCanvas transfer all happen in
+     the gap before `preview_ready`, and CSS animations on `transform`
+     are NOT guaranteed to run on the compositor thread in every
+     browser configuration -- `will-change` and `translateZ` are hints
+     the browser may ignore). SMIL is widely supported across modern
+     browsers and is the most reliable "keep spinning regardless"
+     primitive. -->
+<div id="rye-page-loader">
+    <svg width="56" height="56" viewBox="0 0 56 56" xmlns="http://www.w3.org/2000/svg">
+        <!-- Faint track ring (always visible, no animation). -->
+        <circle cx="28" cy="28" r="22"
+                fill="none"
+                stroke="rgba(200, 200, 220, 0.2)"
+                stroke-width="5" />
+        <!-- Animated arc: a 90deg slice (~half the circumference of the
+             full ring, then most is dashed off so only ~35 units of
+             arc length show). The whole arc spins via animateTransform. -->
+        <circle cx="28" cy="28" r="22"
+                fill="none"
+                stroke="rgba(230, 230, 245, 0.95)"
+                stroke-width="5"
+                stroke-linecap="round"
+                stroke-dasharray="35 200">
+            <animateTransform attributeName="transform"
+                              type="rotate"
+                              from="0 28 28"
+                              to="360 28 28"
+                              dur="0.9s"
+                              repeatCount="indefinite" />
+        </circle>
+    </svg>
+</div>
