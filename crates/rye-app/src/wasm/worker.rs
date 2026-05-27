@@ -280,14 +280,32 @@ where
     // displayed via the placeholder canvas instead of through a live
     // RAF loop.
     runner.frame().context("preview frame")?;
+    // Pre-Start warmup: render extra frames so wgpu's lazy shader
+    // compilation (browser WebGPU defers `create_render_pipeline` work
+    // until first use) happens BEFORE the user clicks. Without this
+    // the user sees a second hitch right after clicking; with it the
+    // click → demo-running transition is immediate. Safe because the
+    // default `rotate` state is false, so warmup frames don't advance
+    // any simulation state (rot_time only ticks when self.rotate is
+    // true, which it isn't until the user toggles it).
+    //
+    // 10 frames is empirically enough to cover the first-frame
+    // compilation of the polytope_playground pipelines on Chrome and
+    // Firefox WebGPU; more is harmless but lengthens the perceived
+    // initialization wait. Reassess if a heavier demo (M5+ projections
+    // with multiple new pipelines) lands.
+    const WARMUP_FRAMES: usize = 10;
+    for _ in 0..WARMUP_FRAMES {
+        runner.frame().context("warmup frame")?;
+    }
     tracing::info!(
-        "rye_app::wasm::worker: preview frame rendered; awaiting Start to begin RAF loop"
+        "rye_app::wasm::worker: preview + {WARMUP_FRAMES} warmup frames rendered; \
+         awaiting Start to begin RAF loop"
     );
-    // Tell main thread the preview frame is on the canvas so it can
-    // promote the launch overlay from its "Initializing…" warmup state
-    // to "Click to launch". Posting before the RAF kickoff lets the
-    // main thread reveal the click affordance the instant the blurred
-    // backdrop has something behind it to blur.
+    // Tell main thread the worker is fully ready: preview frame is on
+    // the canvas AND pipelines are warmed. Main thread promotes the
+    // launch overlay to `.ready` so the click affordance becomes
+    // visible; click then triggers an instant Start (no loading state).
     {
         let msg = js_sys::Object::new();
         let _ = js_sys::Reflect::set(
@@ -420,16 +438,6 @@ where
     pixels_per_point: f32,
     start: web_time::Instant,
     last_update_at: Option<web_time::Instant>,
-    /// Number of frames the worker has rendered post-Start. Used to
-    /// trigger the one-shot `demo_ready` notification to the main
-    /// thread after the warm-up cycle completes (pipelines compiled,
-    /// first sim ticks settled). The main thread leaves the launch
-    /// overlay visible-but-loading until this fires so the user's
-    /// initial click-spam doesn't compound the startup hitch.
-    frames_since_start: u32,
-    /// Has `demo_ready` already been posted? One-shot guard so the
-    /// notification doesn't fire repeatedly each frame.
-    demo_ready_sent: bool,
     /// Anchor for the fps cap. Set to the previous frame's IDEAL deadline
     /// (not its wake-up time), so RAF jitter doesn't compound into
     /// alternating-skip behavior at the boundary between the target
@@ -514,8 +522,6 @@ where
             pixels_per_point,
             start: web_time::Instant::now(),
             last_update_at: None,
-            frames_since_start: 0,
-            demo_ready_sent: false,
             last_redraw_anchor: None,
             tick_index: 0,
             timestep: FixedTimestep::new(60),
@@ -871,29 +877,6 @@ where
         if let Ok(scope) = worker_scope() {
             if let Err(e) = super::host_action::post_pending_actions(&scope) {
                 tracing::warn!("rye_app::wasm::worker: post host_action failed: {e:#}");
-            }
-            // After warm-up, signal the main thread once so it can
-            // remove the launch overlay's loading state. 10 frames is
-            // empirically enough to cover the first pass of wgpu
-            // pipeline compilation on Chrome/Firefox WebGPU and the
-            // first sim ticks landing. Posting more than once would be
-            // harmless (the main thread short-circuits on the same
-            // listener) but we guard with `demo_ready_sent` anyway
-            // because each post is a JS object allocation.
-            const DEMO_READY_FRAMES: u32 = 10;
-            self.frames_since_start = self.frames_since_start.saturating_add(1);
-            if !self.demo_ready_sent && self.frames_since_start >= DEMO_READY_FRAMES {
-                let msg = js_sys::Object::new();
-                let _ = js_sys::Reflect::set(
-                    &msg,
-                    &JsValue::from_str("kind"),
-                    &JsValue::from_str("demo_ready"),
-                );
-                if let Err(e) = scope.post_message(&msg) {
-                    tracing::warn!("rye_app::wasm::worker: post demo_ready failed: {e:?}");
-                } else {
-                    self.demo_ready_sent = true;
-                }
             }
         }
 

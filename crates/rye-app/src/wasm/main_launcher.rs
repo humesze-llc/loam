@@ -239,19 +239,12 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
     install_host_action_handler(&worker, &canvas).context("install_host_action_handler")?;
 
     // Listen for the worker's "preview_ready" signal -- sent once after
-    // the worker has rendered the first preview frame. On receipt,
-    // promote the overlay from `.initializing` to `.ready` so the user
-    // sees "Click to launch" only after there's actually a blurred
-    // backdrop behind it. Before this, the overlay shows "Initializing…"
-    // with a spinner and blocks clicks.
+    // the worker has rendered the preview frame AND pre-warmed
+    // pipelines. On receipt, promote the overlay from `.initializing`
+    // to `.ready` so the user sees the click-to-launch affordance only
+    // when the demo is genuinely ready. Click then removes the overlay
+    // and starts the RAF loop without any further wait.
     install_preview_ready_handler(&worker, button_id)?;
-
-    // Listen for the worker's "demo_ready" signal -- sent once after the
-    // worker has rendered enough frames to be smooth (pipelines compiled,
-    // first sim ticks settled). On receipt, remove the launch overlay so
-    // input flows to the canvas; until then the overlay's `.loading`
-    // state absorbs the user's spam clicks.
-    install_demo_ready_handler(&worker, button_id)?;
 
     // Launch-overlay click handler. Spam-click defensive:
     // - FnMut closure (not `Closure::once`) so repeat invocations are
@@ -317,17 +310,10 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
                 }
             }
 
-            // Switch the overlay to its loading state (spinner + "Loading…"
-            // chip text). We DON'T remove the overlay yet -- the worker
-            // is still warming pipelines / cycling first frames and any
-            // clicks landing on the canvas during that window are wasted
-            // work that contributes to the perceived hitching. The
-            // overlay's `pointer-events` stays auto so subsequent clicks
-            // hit it and the `fired` cell short-circuits them; once the
-            // worker reports steady-state via `demo_ready`, the inbound
-            // message listener (`install_demo_ready_handler`) removes the
-            // overlay and the demo becomes interactive.
-            overlay_for_click.set_class_name("rye-demo-launch loading");
+            // Worker pre-warmed pipelines before posting preview_ready,
+            // so the demo is genuinely ready right now. Just remove the
+            // overlay; click → demo is one transition, no second wait.
+            overlay_for_click.remove();
         }) as Box<dyn FnMut()>);
         launch_overlay
             .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())
@@ -732,36 +718,6 @@ fn install_preview_ready_handler(worker: &Worker, button_id: &str) -> Result<()>
     worker
         .add_event_listener_with_callback("message", cb.as_ref().unchecked_ref())
         .map_err(|e| anyhow!("worker.addEventListener('message') for preview_ready: {e:?}"))?;
-    cb.forget();
-    Ok(())
-}
-
-fn install_demo_ready_handler(worker: &Worker, button_id: &str) -> Result<()> {
-    let button_id_owned: String = button_id.to_string();
-    let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
-        let data: JsValue = event.data();
-        let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
-            .ok()
-            .and_then(|v| v.as_string());
-        if kind.as_deref() != Some("demo_ready") {
-            return;
-        }
-        // Find the launch overlay by id and remove it. The overlay was
-        // injected by `inject_launch_overlay` so we look it up via
-        // `document.getElementById` rather than threading the element
-        // through this listener -- the lookup is once-per-page (the
-        // worker only sends `demo_ready` once) and avoids a long-lived
-        // Rc capture.
-        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-            return;
-        };
-        if let Some(overlay) = document.get_element_by_id(&button_id_owned) {
-            overlay.remove();
-        }
-    }) as Box<dyn FnMut(MessageEvent)>);
-    worker
-        .add_event_listener_with_callback("message", cb.as_ref().unchecked_ref())
-        .map_err(|e| anyhow!("worker.addEventListener('message') for demo_ready: {e:?}"))?;
     cb.forget();
     Ok(())
 }

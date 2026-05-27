@@ -89,41 +89,47 @@ const LAUNCH_OVERLAY_CSS: &str = r#"
     background: rgba(20, 20, 28, 0.55);
 }
 
-/* Spinner overlay used by both `.initializing` and `.loading`. */
-.rye-demo-launch.initializing::before,
-.rye-demo-launch.loading::before {
-    content: '';
-    position: absolute;
-    width: 18px;
-    height: 18px;
-    right: calc(50% - 110px);
-    border: 2px solid rgba(200, 200, 220, 0.25);
-    border-top-color: rgba(220, 220, 240, 0.9);
-    border-radius: 50%;
-    animation: rye-demo-spinner 0.9s linear infinite;
+/* Default: chip + spinner both hidden. State classes opt in. */
+.rye-demo-launch::before,
+.rye-demo-launch::after {
+    display: none;
 }
 @keyframes rye-demo-spinner {
     to { transform: rotate(360deg); }
 }
 
-/* Initializing: the page just loaded; worker is spawning + the
-   preview frame hasn't rendered yet. Clicks blocked at the JS layer
-   (`fired` short-circuits) and the cursor reads as wait so the user
-   doesn't get hopeful. */
+/* Initializing: large centered spinner, no chip, no text. The worker
+   is spawning + warming pipelines; the user can't do anything yet,
+   so the visual is just "something's happening." Clicks blocked at
+   the JS layer (the `ready` class-name gate in `on_click`). */
 .rye-demo-launch.initializing {
     cursor: wait;
 }
-.rye-demo-launch.initializing::after {
-    content: 'Initializing\2026';
-    padding-right: 56px;
+.rye-demo-launch.initializing::before {
+    content: '';
+    display: inline-block;
+    width: 56px;
+    height: 56px;
+    border: 5px solid rgba(200, 200, 220, 0.2);
+    border-top-color: rgba(230, 230, 245, 0.95);
+    border-radius: 50%;
+    animation: rye-demo-spinner 0.9s linear infinite;
 }
 
-/* Ready: preview frame is behind the blur, click affordance live. */
+/* Ready: preview frame is behind the blur AND warmup is complete,
+   click affordance live. Clicking removes the overlay immediately
+   and starts the RAF loop -- no second loading state because the
+   worker pre-warmed pipelines before getting here. */
 .rye-demo-launch.ready {
     cursor: pointer;
 }
 .rye-demo-launch.ready::after {
+    display: inline-block;
     content: 'Click anywhere to launch';
+    padding: 14px 28px;
+    border: 1px solid rgba(200, 200, 220, 0.5);
+    border-radius: 6px;
+    background: rgba(20, 20, 28, 0.55);
 }
 .rye-demo-launch.ready:hover {
     background: rgba(14, 14, 18, 0.25);
@@ -134,16 +140,6 @@ const LAUNCH_OVERLAY_CSS: &str = r#"
 }
 .rye-demo-launch.ready:active {
     background: rgba(14, 14, 18, 0.4);
-}
-
-/* Loading: user clicked; worker is warming pipelines + cycling first
-   frames. Clicks blocked the same way as `.initializing`. */
-.rye-demo-launch.loading {
-    cursor: wait;
-}
-.rye-demo-launch.loading::after {
-    content: 'Loading\2026';
-    padding-right: 56px;
 }
 "#;
 
