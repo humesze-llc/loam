@@ -533,15 +533,24 @@ where
         match msg {
             InputMessage::Resize { width, height } => {
                 self.resize(width, height);
-                // Render one frame at the new size so the preview
-                // refreshes (no CSS-stretched display). When the RAF
-                // loop is already running this is just one extra frame
-                // before the next RAF tick; harmless. When we're in
-                // pre-Start preview mode, this is the only frame that
-                // happens, and it's what the launch overlay's
-                // backdrop-filter blurs.
-                if let Err(e) = self.frame() {
-                    tracing::error!("rye_app::wasm::worker: post-resize frame failed: {e:#}");
+                // Render one frame at the new size ONLY when we're in
+                // pre-Start preview mode. After Start kicks the RAF
+                // loop, the next RAF tick naturally renders at the
+                // new size. The recursive frame() call was crashing
+                // the demo on rapid resize because each Resize event
+                // re-enters the frame loop, which drains MORE Resize
+                // events from the queue, each triggering another
+                // frame(); under sustained drag the recursion either
+                // overflows wgpu's command queue or trips a
+                // surface-reconfigure race. Pre-Start there's no RAF
+                // loop yet, so we have to render once to refresh the
+                // backdrop-blur thumbnail.
+                if self.last_update_at.is_none() {
+                    if let Err(e) = self.frame() {
+                        tracing::error!(
+                            "rye_app::wasm::worker: pre-Start resize frame failed: {e:#}"
+                        );
+                    }
                 }
             }
             InputMessage::MouseMove { x, y, dx, dy, .. } => {
