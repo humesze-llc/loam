@@ -713,7 +713,11 @@ fn install_preview_progress_handler(worker: &Worker) -> Result<()> {
             });
         }
         // Mirror the width into the progressbar's announced value.
-        if let Some(track) = document.query_selector("#rye-page-loader .rye-progress-track").ok().flatten() {
+        if let Some(track) = document
+            .query_selector("#rye-page-loader .rye-progress-track")
+            .ok()
+            .flatten()
+        {
             let _ = track.set_attribute("aria-valuenow", &format!("{}", percent.round() as i32));
         }
     }) as Box<dyn FnMut(MessageEvent)>);

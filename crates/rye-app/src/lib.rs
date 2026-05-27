@@ -1294,29 +1294,29 @@ impl<A: App> Runner<A> {
         // longer than the period), we set `last_redraw_at = now` to "catch
         // up" instead of falling further behind on every subsequent frame.
         let now = Instant::now();
-        let frame_anchor =
-            if let (Some(period), Some(last)) = (frame_pacing::target_period(), self.last_redraw_at)
-            {
-                let deadline = last + period;
-                if now < deadline {
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        win.request_redraw();
-                        return;
-                    }
-                    // Native: sleep out the remainder and anchor on the
-                    // ideal deadline, not the wake-up time.
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        frame_pacing::precise_sleep_until(deadline);
-                        deadline
-                    }
-                } else {
-                    now
+        let frame_anchor = if let (Some(period), Some(last)) =
+            (frame_pacing::target_period(), self.last_redraw_at)
+        {
+            let deadline = last + period;
+            if now < deadline {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    win.request_redraw();
+                    return;
+                }
+                // Native: sleep out the remainder and anchor on the
+                // ideal deadline, not the wake-up time.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    frame_pacing::precise_sleep_until(deadline);
+                    deadline
                 }
             } else {
                 now
-            };
+            }
+        } else {
+            now
+        };
         self.last_redraw_at = Some(frame_anchor);
 
         // Mark frame start for `idle` measurement. `end_frame` subtracts this from
