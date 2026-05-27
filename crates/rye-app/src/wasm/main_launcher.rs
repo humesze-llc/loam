@@ -238,12 +238,10 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
     // only be called from main thread.
     install_host_action_handler(&worker, &canvas).context("install_host_action_handler")?;
 
-    // Listen for the worker's "preview_ready" signal -- sent once after
-    // the worker has rendered the preview frame AND pre-warmed
-    // pipelines. On receipt, promote the overlay from `.initializing`
-    // to `.ready` so the user sees the click-to-launch affordance only
-    // when the demo is genuinely ready. Click then removes the overlay
-    // and starts the RAF loop without any further wait.
+    // Listen for the worker's incremental "preview_progress" updates
+    // (one per warmup frame) to drive the static page-loader bar, and
+    // for the terminal "preview_ready" that removes the bar entirely.
+    install_preview_progress_handler(&worker)?;
     install_preview_ready_handler(&worker, button_id)?;
 
     // Launch-overlay click handler. Spam-click defensive:
@@ -692,6 +690,42 @@ fn set_msg_string(obj: &js_sys::Object, key: &str, v: &str) {
 /// to land at the target rate. Until then the launch overlay's
 /// `.loading` state absorbs spam clicks so they don't compound the
 /// startup hitch.
+/// Listen for `{kind: "preview_progress", pct: f64}` updates from the
+/// worker and drive the static `#rye-page-loader-fill` element's width.
+/// The bar is in `crates/rye-app/static/page_loader.html` (engine-owned,
+/// inlined into the demo's `index.html` via `data-trunk rel="inline"`).
+fn install_preview_progress_handler(worker: &Worker) -> Result<()> {
+    let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data: JsValue = event.data();
+        let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|v| v.as_string());
+        if kind.as_deref() != Some("preview_progress") {
+            return;
+        }
+        let pct = js_sys::Reflect::get(&data, &JsValue::from_str("pct"))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        if let Some(fill) = document.get_element_by_id("rye-page-loader-fill") {
+            let _ = fill.dyn_into::<web_sys::HtmlElement>().map(|el| {
+                let _ = el
+                    .style()
+                    .set_property("width", &format!("{}%", pct * 100.0));
+            });
+        }
+    }) as Box<dyn FnMut(MessageEvent)>);
+    worker
+        .add_event_listener_with_callback("message", cb.as_ref().unchecked_ref())
+        .map_err(|e| anyhow!("worker.addEventListener('message') for preview_progress: {e:?}"))?;
+    cb.forget();
+    Ok(())
+}
+
 /// Listen for the worker's once-only `{kind: "preview_ready"}` message
 /// and promote the launch overlay from `.initializing` to `.ready` so
 /// the "Click to launch" affordance becomes visible only after the

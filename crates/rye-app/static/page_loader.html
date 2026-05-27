@@ -15,6 +15,17 @@
      `#rye-launch` overlay takes over the visual layer with the
      click-to-start affordance. -->
 <style>
+    /* Why a progress bar instead of a spinner: WebGPU pipeline
+       compilation happens in the browser's GPU process, which is
+       shared with the compositor. While shaders compile, the GPU
+       process is blocked and EVERY animation on the page stalls --
+       CSS, SVG SMIL, even animated GIFs all freeze because they
+       depend on the compositor producing frames. A progress bar
+       sidesteps this: it doesn't pretend to animate smoothly, it
+       jumps to discrete positions as the worker emits
+       `preview_progress` messages. The gaps between jumps tell the
+       viewer "compilation in progress" without the false-confidence
+       of a frozen spinner. */
     #rye-page-loader {
         position: fixed;
         inset: 0;
@@ -25,39 +36,23 @@
         z-index: 1;
         pointer-events: none;
     }
+    #rye-page-loader .rye-progress-track {
+        width: 240px;
+        height: 4px;
+        background: rgba(200, 200, 220, 0.15);
+        border-radius: 2px;
+        overflow: hidden;
+    }
+    #rye-page-loader .rye-progress-fill {
+        height: 100%;
+        background: rgba(230, 230, 245, 0.9);
+        border-radius: 2px;
+        width: 0%;
+        transition: width 200ms ease-out;
+    }
 </style>
-<!-- SVG SMIL animation rather than CSS keyframes: SMIL runs on the
-     browser's SVG timing engine, which keeps ticking even when CSS
-     animations stall on heavy main-thread work (wasm download +
-     compile + worker spawn + OffscreenCanvas transfer all happen in
-     the gap before `preview_ready`, and CSS animations on `transform`
-     are NOT guaranteed to run on the compositor thread in every
-     browser configuration -- `will-change` and `translateZ` are hints
-     the browser may ignore). SMIL is widely supported across modern
-     browsers and is the most reliable "keep spinning regardless"
-     primitive. -->
 <div id="rye-page-loader">
-    <svg width="56" height="56" viewBox="0 0 56 56" xmlns="http://www.w3.org/2000/svg">
-        <!-- Faint track ring (always visible, no animation). -->
-        <circle cx="28" cy="28" r="22"
-                fill="none"
-                stroke="rgba(200, 200, 220, 0.2)"
-                stroke-width="5" />
-        <!-- Animated arc: a 90deg slice (~half the circumference of the
-             full ring, then most is dashed off so only ~35 units of
-             arc length show). The whole arc spins via animateTransform. -->
-        <circle cx="28" cy="28" r="22"
-                fill="none"
-                stroke="rgba(230, 230, 245, 0.95)"
-                stroke-width="5"
-                stroke-linecap="round"
-                stroke-dasharray="35 200">
-            <animateTransform attributeName="transform"
-                              type="rotate"
-                              from="0 28 28"
-                              to="360 28 28"
-                              dur="0.9s"
-                              repeatCount="indefinite" />
-        </circle>
-    </svg>
+    <div class="rye-progress-track">
+        <div class="rye-progress-fill" id="rye-page-loader-fill"></div>
+    </div>
 </div>

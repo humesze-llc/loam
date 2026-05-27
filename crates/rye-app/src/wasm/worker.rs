@@ -279,24 +279,49 @@ where
     // would render on the very first RAF tick if it had started, just
     // displayed via the placeholder canvas instead of through a live
     // RAF loop.
-    runner.frame().context("preview frame")?;
-    // Pre-Start warmup: render extra frames so wgpu's lazy shader
-    // compilation (browser WebGPU defers `create_render_pipeline` work
-    // until first use) happens BEFORE the user clicks. Without this
-    // the user sees a second hitch right after clicking; with it the
-    // click → demo-running transition is immediate. Safe because the
-    // default `rotate` state is false, so warmup frames don't advance
-    // any simulation state (rot_time only ticks when self.rotate is
-    // true, which it isn't until the user toggles it).
+    // Pre-Start warmup: render the preview frame plus extra frames so
+    // wgpu's lazy shader compilation (browser WebGPU defers
+    // `create_render_pipeline` work until first use) happens BEFORE
+    // the user clicks. Without this the user sees a second hitch right
+    // after clicking; with it the click → demo-running transition is
+    // immediate. Safe because the default `rotate` state is false, so
+    // warmup frames don't advance any simulation state (rot_time only
+    // ticks when self.rotate is true, which it isn't until the user
+    // toggles it).
     //
-    // 10 frames is empirically enough to cover the first-frame
-    // compilation of the polytope_playground pipelines on Chrome and
-    // Firefox WebGPU; more is harmless but lengthens the perceived
-    // initialization wait. Reassess if a heavier demo (M5+ projections
-    // with multiple new pipelines) lands.
+    // 11 total frames (1 preview + 10 warmup) is empirically enough to
+    // cover the first-frame compilation of the polytope_playground
+    // pipelines on Chrome and Firefox WebGPU; more is harmless but
+    // lengthens the perceived initialization wait. Reassess if a
+    // heavier demo (M5+ projections with multiple new pipelines) lands.
+    //
+    // Each frame fires a `preview_progress` message so the main
+    // thread's static `#rye-page-loader` bar can advance. During the
+    // first frame (when pipeline compilation actually happens) the GPU
+    // process is blocked and the bar can't visually update -- but the
+    // discrete progress steps before and after the freeze frame the
+    // wait so it doesn't read as a hang.
     const WARMUP_FRAMES: usize = 10;
-    for _ in 0..WARMUP_FRAMES {
+    const TOTAL_FRAMES: usize = 1 + WARMUP_FRAMES;
+    let post_progress = |step: usize| {
+        let msg = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("kind"),
+            &JsValue::from_str("preview_progress"),
+        );
+        let _ = js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("pct"),
+            &JsValue::from_f64(step as f64 / TOTAL_FRAMES as f64),
+        );
+        let _ = scope.post_message(&msg);
+    };
+    runner.frame().context("preview frame")?;
+    post_progress(1);
+    for i in 0..WARMUP_FRAMES {
         runner.frame().context("warmup frame")?;
+        post_progress(2 + i);
     }
     tracing::info!(
         "rye_app::wasm::worker: preview + {WARMUP_FRAMES} warmup frames rendered; \
