@@ -849,16 +849,15 @@ impl Demo {
         );
     }
 
-    pub(crate) fn on_event(&mut self, ev: &winit::event::WindowEvent, _ctx: &mut FrameCtx<'_>) {
-        use winit::event::{ElementState, WindowEvent};
-        use winit::keyboard::{KeyCode, PhysicalKey};
-        let WindowEvent::KeyboardInput { event, .. } = ev else {
-            return;
-        };
-        let PhysicalKey::Code(kc) = event.physical_key else {
-            return;
-        };
-        let pressed = event.state == ElementState::Pressed;
+    pub(crate) fn on_key(
+        &mut self,
+        kc: winit::keyboard::KeyCode,
+        state: winit::event::ElementState,
+        _ctx: &mut FrameCtx<'_>,
+    ) {
+        use winit::event::ElementState;
+        use winit::keyboard::KeyCode;
+        let pressed = state == ElementState::Pressed;
         match kc {
             KeyCode::ArrowUp => self.slider_up_held = pressed,
             KeyCode::ArrowDown => self.slider_down_held = pressed,
@@ -2282,16 +2281,21 @@ impl App for RotatePolytopesApp {
         self.last_egui_keyboard = ctx.wants_keyboard_input();
     }
 
-    fn on_event(&mut self, ev: &winit::event::WindowEvent, ctx: &mut FrameCtx<'_>) {
+    fn on_key(
+        &mut self,
+        code: winit::keyboard::KeyCode,
+        state: winit::event::ElementState,
+        ctx: &mut FrameCtx<'_>,
+    ) {
         // Suppress demo keybinds when egui is actively capturing
         // keyboard input (any TextEdit focused: console, formula
         // bar, etc.) so typing `reset` into the console doesn't
         // also fire the R hotkey, etc. When the user clicks
         // outside the egui widget that had focus, egui releases
-        // keyboard focus and the next frame's `on_event` routes
+        // keyboard focus and the next frame's `on_key` routes
         // hotkeys back to the demo as normal.
         if !self.last_egui_keyboard {
-            self.demo.on_event(ev, ctx);
+            self.demo.on_key(code, state, ctx);
         }
     }
 

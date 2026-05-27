@@ -563,8 +563,25 @@ where
                         ElementState::Released
                     };
                     self.input.key_input(PhysicalKey::Code(code), state);
+                    // Route to `App::on_key` so hotkeys (spin toggle, R, T,
+                    // digit plane toggles, etc.) work the same on wasm as on
+                    // native. The framework can't dispatch to `App::on_event`
+                    // here because winit's `KeyEvent` has a `pub(crate)`
+                    // field we can't construct from outside the crate.
+                    let ui_has_focus = self.ui.wants_input;
+                    let mut fctx = FrameCtx {
+                        rd: &self.rd,
+                        input: rye_input::FrameInput::default(),
+                        time: self.start.elapsed().as_secs_f32(),
+                        fps: 0.0,
+                        n_ticks: 0,
+                        tick: self.tick_index,
+                        dt: 0.0,
+                        ui_has_focus,
+                        _non_exhaustive: PhantomData,
+                    };
+                    self.app.on_key(code, state, &mut fctx);
                 }
-                // Hotkey routing via App::on_event deferred (see fn doc).
             }
             InputMessage::Focus(focused) => {
                 if !focused {
