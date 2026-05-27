@@ -404,6 +404,18 @@ where
     pixels_per_point: f32,
     start: web_time::Instant,
     last_update_at: Option<web_time::Instant>,
+    /// Previous mousemove position, used to synthesize `mouse_raw_delta`
+    /// on wasm where `DeviceEvent::MouseMotion` doesn't exist. None
+    /// before the first mousemove, then `Some((x, y))` from the last
+    /// `InputMessage::MouseMove` for delta computation.
+    prev_mouse_pos: Option<(f32, f32)>,
+    /// Anchor for the fps cap. Set to the previous frame's IDEAL deadline
+    /// (not its wake-up time), so RAF jitter doesn't compound into
+    /// alternating-skip behavior at the boundary between the target
+    /// period and the display refresh rate. Mirrors the native runner's
+    /// `last_redraw_at` invariant. `None` when uncapped (so the next
+    /// frame's first-cap-tick anchors against `now`).
+    last_redraw_anchor: Option<web_time::Instant>,
     tick_index: u64,
     /// Fixed-timestep accumulator. Matches the windowed runner so demos
     /// that read `FrameCtx::n_ticks` (e.g. `dt_secs = n_ticks / 60.0`)
@@ -481,6 +493,8 @@ where
             pixels_per_point,
             start: web_time::Instant::now(),
             last_update_at: None,
+            prev_mouse_pos: None,
+            last_redraw_anchor: None,
             tick_index: 0,
             timestep: FixedTimestep::new(60),
             max_ticks_per_frame: 4,
@@ -537,6 +551,19 @@ where
                 }
             }
             InputMessage::MouseMove { x, y, .. } => {
+                // Browser has no `DeviceEvent::MouseMotion` equivalent that
+                // the worker can subscribe to without engaging Pointer Lock
+                // (which needs a user gesture the engine doesn't deliver).
+                // So `mouse_raw_delta` is permanently zero on wasm unless
+                // we synthesize it from successive absolute positions.
+                // The deltas are RAF-coalesced (one per browser frame) and
+                // therefore smoother than a real raw-device stream, but
+                // that's enough for FPS mouse-look on a polychoral demo.
+                if let Some((prev_x, prev_y)) = self.prev_mouse_pos {
+                    self.input
+                        .accumulate_raw_motion((x - prev_x) as f64, (y - prev_y) as f64);
+                }
+                self.prev_mouse_pos = Some((x, y));
                 self.input.cursor_moved(x as f64, y as f64);
             }
             InputMessage::MouseButton {
@@ -587,9 +614,11 @@ where
                 if !focused {
                     // Mirror rye-input's focus-loss convention: drop held
                     // buttons + invalidate cursor delta so re-focus doesn't
-                    // snap.
+                    // snap. `prev_mouse_pos` matches the same lifecycle so
+                    // the synthesized raw delta doesn't jump on re-focus.
                     self.input.release_buttons();
                     self.input.cursor_invalidated();
+                    self.prev_mouse_pos = None;
                 }
             }
             InputMessage::Visibility(_) => {
@@ -611,20 +640,43 @@ where
     /// `rye_time::frame_trace::scope` so the same telemetry the windowed
     /// runner emits is available here.
     fn frame(&mut self) -> Result<()> {
-        // FPS cap: if the user has set a target frame period via the
-        // `fps` console command, drop RAF ticks that fired sooner than
-        // that period. The RAF callback re-schedules unconditionally,
-        // so dropping a tick just means the next callback fires and
-        // re-checks. Note this can only lower the rate below the
-        // browser RAF cadence (typically display refresh); raising fps
-        // above that isn't possible without changing the surface
-        // PresentMode, which browsers don't expose anyway.
-        if let Some(target) = crate::frame_pacing::target_period() {
-            if let Some(prev) = self.last_update_at {
-                let elapsed = web_time::Instant::now().duration_since(prev);
-                if elapsed < target {
-                    return Ok(());
+        // FPS cap: drop RAF callbacks that fire before the next ideal
+        // deadline (= previous anchor + target period). Anchoring on
+        // the IDEAL deadline (not the actual wake-up time) absorbs RAF
+        // jitter -- without this, a target that matches the display
+        // refresh rate suffers alternating-skip (callbacks fire ~0.5ms
+        // early due to jitter, get skipped, the next one fires ~3.7ms
+        // later, half-rate). Mirrors the native runner's pattern at
+        // `lib.rs:1297-1311`. Can only lower the rate below the browser
+        // RAF cadence (typically display refresh); raising above that
+        // isn't possible without changing the surface PresentMode,
+        // which browsers don't expose anyway.
+        let now_raf = web_time::Instant::now();
+        match crate::frame_pacing::target_period() {
+            Some(target) => {
+                if let Some(last) = self.last_redraw_anchor {
+                    let deadline = last + target;
+                    if now_raf < deadline {
+                        return Ok(());
+                    }
+                    // Clamp catch-up: if we drifted multiple periods
+                    // behind (tab backgrounded, etc.), don't queue all
+                    // the missed frames at once -- snap forward to at
+                    // most one period behind `now_raf` so pacing
+                    // resumes cleanly when the tab returns to focus.
+                    let catch_up_floor = now_raf.checked_sub(target).unwrap_or(now_raf);
+                    self.last_redraw_anchor = Some(deadline.max(catch_up_floor));
+                } else {
+                    // First frame under an active cap: start the
+                    // schedule from `now` so the first inter-frame
+                    // interval respects the target period.
+                    self.last_redraw_anchor = Some(now_raf);
                 }
+            }
+            None => {
+                // Uncapped: clear the anchor so a later `fps <N>`
+                // command starts a fresh schedule from that moment.
+                self.last_redraw_anchor = None;
             }
         }
 
