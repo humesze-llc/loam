@@ -238,6 +238,14 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
     // only be called from main thread.
     install_host_action_handler(&worker, &canvas).context("install_host_action_handler")?;
 
+    // Listen for the worker's "preview_ready" signal -- sent once after
+    // the worker has rendered the first preview frame. On receipt,
+    // promote the overlay from `.initializing` to `.ready` so the user
+    // sees "Click to launch" only after there's actually a blurred
+    // backdrop behind it. Before this, the overlay shows "Initializing…"
+    // with a spinner and blocks clicks.
+    install_preview_ready_handler(&worker, button_id)?;
+
     // Listen for the worker's "demo_ready" signal -- sent once after the
     // worker has rendered enough frames to be smooth (pipelines compiled,
     // first sim ticks settled). On receipt, remove the launch overlay so
@@ -267,6 +275,18 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
         let on_click = Closure::wrap(Box::new(move || {
             if fired.get() {
                 tracing::debug!("rye_app::wasm::worker: launch click ignored (already fired)");
+                return;
+            }
+            // Gate on the overlay being in `.ready` state. Clicks during
+            // `.initializing` (worker still spawning + preview frame not
+            // rendered) are absorbed silently so the user can spam-click
+            // without queueing a Start that fires before the worker is
+            // actually ready to handle it.
+            if !overlay_for_click.class_name().contains("ready") {
+                tracing::debug!(
+                    "rye_app::wasm::worker: launch click ignored (not yet ready, overlay state = {})",
+                    overlay_for_click.class_name()
+                );
                 return;
             }
             fired.set(true);
@@ -686,6 +706,36 @@ fn set_msg_string(obj: &js_sys::Object, key: &str, v: &str) {
 /// to land at the target rate. Until then the launch overlay's
 /// `.loading` state absorbs spam clicks so they don't compound the
 /// startup hitch.
+/// Listen for the worker's once-only `{kind: "preview_ready"}` message
+/// and promote the launch overlay from `.initializing` to `.ready` so
+/// the "Click to launch" affordance becomes visible only after the
+/// blurred preview frame has actually rendered. Before this, the
+/// overlay shows "Initializing…" with a spinner and the click handler
+/// short-circuits so spam clicks are absorbed.
+fn install_preview_ready_handler(worker: &Worker, button_id: &str) -> Result<()> {
+    let button_id_owned: String = button_id.to_string();
+    let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data: JsValue = event.data();
+        let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|v| v.as_string());
+        if kind.as_deref() != Some("preview_ready") {
+            return;
+        }
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        if let Some(overlay) = document.get_element_by_id(&button_id_owned) {
+            overlay.set_class_name("rye-demo-launch ready");
+        }
+    }) as Box<dyn FnMut(MessageEvent)>);
+    worker
+        .add_event_listener_with_callback("message", cb.as_ref().unchecked_ref())
+        .map_err(|e| anyhow!("worker.addEventListener('message') for preview_ready: {e:?}"))?;
+    cb.forget();
+    Ok(())
+}
+
 fn install_demo_ready_handler(worker: &Worker, button_id: &str) -> Result<()> {
     let button_id_owned: String = button_id.to_string();
     let cb = Closure::wrap(Box::new(move |event: MessageEvent| {

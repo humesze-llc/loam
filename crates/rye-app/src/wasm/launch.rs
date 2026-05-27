@@ -55,6 +55,15 @@ use web_sys::{HtmlButtonElement, HtmlStyleElement};
 /// reads the canvas underneath, so the worker's preview frame appears as
 /// a softened thumbnail until the viewer clicks.
 const LAUNCH_OVERLAY_CSS: &str = r#"
+/* Base: shared chrome (positioning, blur, font, transitions). State-
+   specific text + cursor + spinner live in the `.initializing`,
+   `.ready`, `.loading` subclasses below. `.initializing` is the
+   default injected at startup (worker still spawning + first frame
+   not rendered yet); the worker promotes the overlay to `.ready`
+   via the `preview_ready` message once the blurred-backdrop frame
+   is on the canvas, and the click handler promotes to `.loading`
+   when the user clicks. The `demo_ready` message removes the
+   overlay entirely. */
 .rye-demo-launch {
     position: absolute;
     top: 0; left: 0; right: 0; bottom: 0;
@@ -70,56 +79,23 @@ const LAUNCH_OVERLAY_CSS: &str = r#"
     backdrop-filter: blur(14px);
     -webkit-backdrop-filter: blur(14px);
     border: none;
-    cursor: pointer;
     transition: background 200ms ease, opacity 200ms ease;
 }
 .rye-demo-launch::after {
-    content: 'Click anywhere to launch';
     display: inline-block;
     padding: 14px 28px;
     border: 1px solid rgba(200, 200, 220, 0.5);
     border-radius: 6px;
     background: rgba(20, 20, 28, 0.55);
 }
-.rye-demo-launch:hover {
-    background: rgba(14, 14, 18, 0.25);
-}
-.rye-demo-launch:hover::after {
-    background: rgba(28, 28, 38, 0.65);
-    border-color: rgba(220, 220, 240, 0.7);
-}
-.rye-demo-launch:active {
-    background: rgba(14, 14, 18, 0.4);
-}
-/* Loading state: applied to the overlay after the user clicks, before
-   the worker has rendered enough frames to be smooth. Cursor stays
-   default (not pointer), the click handler short-circuits subsequent
-   clicks, and a small spinner appears next to the label. The overlay
-   stays opaque (no pointer-events: none yet) so accidental click-spam
-   doesn't cascade into the canvas underneath while the demo is still
-   warming up. */
-.rye-demo-launch.loading {
-    cursor: wait;
-}
-.rye-demo-launch.loading::after {
-    content: 'Loading\2026';
-    padding-right: 56px;
-    background-image: linear-gradient(
-        from-left,
-        transparent,
-        transparent
-    );
-}
+
+/* Spinner overlay used by both `.initializing` and `.loading`. */
+.rye-demo-launch.initializing::before,
 .rye-demo-launch.loading::before {
     content: '';
     position: absolute;
     width: 18px;
     height: 18px;
-    /* Same coordinate system as the chip text so the spinner sits
-       next to it. CSS pseudo-elements share the parent's flex layout
-       only if they're sized; we absolute-position relative to the
-       chip's rect via the parent's `display: flex; align-items:
-       center` and a small negative offset. */
     right: calc(50% - 110px);
     border: 2px solid rgba(200, 200, 220, 0.25);
     border-top-color: rgba(220, 220, 240, 0.9);
@@ -128,6 +104,46 @@ const LAUNCH_OVERLAY_CSS: &str = r#"
 }
 @keyframes rye-demo-spinner {
     to { transform: rotate(360deg); }
+}
+
+/* Initializing: the page just loaded; worker is spawning + the
+   preview frame hasn't rendered yet. Clicks blocked at the JS layer
+   (`fired` short-circuits) and the cursor reads as wait so the user
+   doesn't get hopeful. */
+.rye-demo-launch.initializing {
+    cursor: wait;
+}
+.rye-demo-launch.initializing::after {
+    content: 'Initializing\2026';
+    padding-right: 56px;
+}
+
+/* Ready: preview frame is behind the blur, click affordance live. */
+.rye-demo-launch.ready {
+    cursor: pointer;
+}
+.rye-demo-launch.ready::after {
+    content: 'Click anywhere to launch';
+}
+.rye-demo-launch.ready:hover {
+    background: rgba(14, 14, 18, 0.25);
+}
+.rye-demo-launch.ready:hover::after {
+    background: rgba(28, 28, 38, 0.65);
+    border-color: rgba(220, 220, 240, 0.7);
+}
+.rye-demo-launch.ready:active {
+    background: rgba(14, 14, 18, 0.4);
+}
+
+/* Loading: user clicked; worker is warming pipelines + cycling first
+   frames. Clicks blocked the same way as `.initializing`. */
+.rye-demo-launch.loading {
+    cursor: wait;
+}
+.rye-demo-launch.loading::after {
+    content: 'Loading\2026';
+    padding-right: 56px;
 }
 "#;
 
@@ -179,7 +195,12 @@ pub fn inject_launch_overlay(host_id: &str, button_id: &str) -> Result<HtmlButto
         .dyn_into::<HtmlButtonElement>()
         .map_err(|_| anyhow!("created element is not HtmlButtonElement"))?;
     button.set_id(button_id);
-    button.set_class_name("rye-demo-launch");
+    // Starts in `initializing` state: cursor=wait, label="Initializing…",
+    // spinner running. The worker's `preview_ready` message promotes
+    // the overlay to `.ready` once the blurred-preview frame is on the
+    // canvas; the click handler then promotes to `.loading` on user
+    // click; the `demo_ready` message removes the overlay entirely.
+    button.set_class_name("rye-demo-launch initializing");
     button.set_type("button");
     button
         .set_attribute("aria-label", "Launch demo")

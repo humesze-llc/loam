@@ -283,6 +283,22 @@ where
     tracing::info!(
         "rye_app::wasm::worker: preview frame rendered; awaiting Start to begin RAF loop"
     );
+    // Tell main thread the preview frame is on the canvas so it can
+    // promote the launch overlay from its "Initializing…" warmup state
+    // to "Click to launch". Posting before the RAF kickoff lets the
+    // main thread reveal the click affordance the instant the blurred
+    // backdrop has something behind it to blur.
+    {
+        let msg = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("kind"),
+            &JsValue::from_str("preview_ready"),
+        );
+        if let Err(e) = scope.post_message(&msg) {
+            tracing::warn!("rye_app::wasm::worker: post preview_ready failed: {e:?}");
+        }
+    }
 
     // Self-referential RAF closure. Captures the runner via Rc<RefCell>
     // and re-schedules itself each frame. Standard wasm-bindgen pattern.
