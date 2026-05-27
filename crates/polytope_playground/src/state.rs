@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use rye_app::{freecam::Freecam, Camera, OrbitController};
 use rye_math::{Bivector4, EuclideanR3, Plane4, Rotor4};
 use rye_physics::polytope::Polytope4;
-use rye_render::raymarch::{BodyUniform, Hyperslice4DNode};
+use rye_render::raymarch::{BodyUniform, Hyperslice4DNode, RaymarchShape};
 
 use crate::catalog::ShapeEntry;
 use crate::consts::{BASE_ROTATION_RATE, BODY_SIZE, BODY_X_SPACING, BODY_Y, T_SLIDER_INITIAL};
@@ -710,6 +710,22 @@ impl Demo {
     /// cross-section caps.
     pub(crate) fn effective_body_size(&self) -> f32 {
         BODY_SIZE * self.surface_scale
+    }
+
+    /// True when entering `SurfaceMode::Sdf` would put a 120-cell or
+    /// 600-cell into the live SDF kernel. The 120-cell carries 120 face
+    /// hyperplanes and the 600-cell carries 600; combined with the
+    /// per-pixel Wolfe-greedy projection they exhaust the browser
+    /// WebGPU shader budget (Chrome crashed the tab on first attempt).
+    /// The console `surface sdf` command and the UI radio gate on this
+    /// to keep the demo crash-free.
+    pub(crate) fn sdf_blocked_by_heavy_polychora(&self) -> bool {
+        self.row.iter().any(|e| {
+            matches!(
+                e.shape,
+                RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
+            )
+        })
     }
 
     /// Effective `w` slider half-range after [`Self::surface_scale`]. The

@@ -146,6 +146,9 @@ impl Demo {
         // inside the closure would need `&mut self` while `&mut self.show_render_panel`
         // is still active.
         let prev_surface = self.surface_mode;
+        // Computed BEFORE the destructure so the closure can read it as a captured value
+        // (the destructure exclusively borrows `self.row`).
+        let sdf_disabled = self.sdf_blocked_by_heavy_polychora();
         // Destructure-borrow the fields the panel writes so the closure doesn't capture
         // a whole `&mut self`. This sidesteps the borrow conflict with `show_render_panel`
         // and lets the closure remain a plain `FnOnce(&mut Ui)`.
@@ -171,7 +174,20 @@ impl Demo {
             |ui| {
                 ui.label(egui::RichText::new("Surface").strong());
                 ui.radio_value(surface_mode, SurfaceMode::Raster, "Raster (default)");
-                ui.radio_value(surface_mode, SurfaceMode::Sdf, "SDF raymarch");
+                // SDF disabled when the row contains a 120-cell or 600-cell. Those
+                // SDF kernels overrun the browser's WebGPU shader budget and crash
+                // the tab; the user has to remove the heavy polychora first. The
+                // disabled radio surfaces the reason via tooltip so they're not
+                // wondering why the option grayed out.
+                ui.add_enabled_ui(!sdf_disabled, |ui| {
+                    let resp = ui.radio_value(surface_mode, SurfaceMode::Sdf, "SDF raymarch");
+                    if sdf_disabled {
+                        resp.on_disabled_hover_text(
+                            "Disabled: 120-cell/600-cell SDFs crash the browser tab. \
+                             Remove the heavy polychora to re-enable.",
+                        );
+                    }
+                });
                 ui.radio_value(surface_mode, SurfaceMode::Off, "Off");
                 ui.separator();
 

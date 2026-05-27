@@ -2014,6 +2014,13 @@ impl RotatePolytopesApp {
                         })?,
                         None => SurfaceMode::Off,
                     };
+                    if next == SurfaceMode::Sdf && demo.sdf_blocked_by_heavy_polychora() {
+                        return Err(anyhow!(
+                            "surface sdf disabled while 120-cell or 600-cell is in the row \
+                             (the SDF kernel crashes the browser tab on those); remove the \
+                             heavy polychora first, or use `surface raster`"
+                        ));
+                    }
                     if next != demo.surface_mode {
                         demo.surface_mode = next;
                         // Re-emit the SDF body list: switching INTO Sdf mode makes the
