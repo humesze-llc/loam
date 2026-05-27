@@ -494,6 +494,7 @@ impl Demo {
             // characteristic 4D rotation, pulling the visible x-axis
             // through the hidden w-axis.
             active: [false, false, true, false, false, false],
+            base_angles: [0.0; 6],
             rate_scale: 1.0,
             rot_time: 0.0,
             t_slider_max: T_SLIDER_INITIAL,
@@ -578,13 +579,7 @@ impl Demo {
         if self.rotate {
             // Animation time advances by `dt_real * rate_scale`
             // so the rate buttons make `t` count faster/slower
-            // (per-real-second). The integrated rotation is
-            // `exp(omega_animation * dt_animation)` per frame,
-            // which = `exp(omega_animation * rate_scale * dt_real)`.
-            // This way `rot_state` and `rot_time` stay in sync:
-            // dragging `t` to N reproduces what the spin would
-            // have integrated to at animation time N, regardless
-            // of how the rate varied along the way.
+            // (per-real-second).
             let dt_animation = dt_secs * self.rate_scale;
             self.rot_time += dt_animation;
             // Grow the t-slider's max range when the spin has
@@ -601,10 +596,24 @@ impl Demo {
                     self.rot_time = T_SLIDER_CAP;
                 }
             }
-            let omega = self.omega_animation() * dt_animation;
-            if omega.magnitude_squared() > 0.0 {
-                let delta = omega.exp();
-                self.rot_state = (delta * self.rot_state).normalize();
+        }
+        // Recompose `rot_state` each frame so spin advances (Active mode
+        // reads `rot_time` through `active_displayed_angle`; Composer
+        // integrates the omega-bivector into rot_state directly via the
+        // legacy path below).
+        match self.rotation_mode {
+            RotationMode::Active => {
+                self.rot_state = self.active_rotor();
+            }
+            RotationMode::Composer => {
+                if self.rotate {
+                    let dt_animation = dt_secs * self.rate_scale;
+                    let omega = self.omega_animation() * dt_animation;
+                    if omega.magnitude_squared() > 0.0 {
+                        let delta = omega.exp();
+                        self.rot_state = (delta * self.rot_state).normalize();
+                    }
+                }
             }
         }
         self.write_all(self.rot_state);

@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use rye_app::{freecam::Freecam, Camera, OrbitController};
-use rye_math::{Bivector4, EuclideanR3, Plane4, Rotor4};
+use rye_math::{Bivector, Bivector4, EuclideanR3, Plane4, Rotor4};
 use rye_physics::polytope::Polytope4;
 use rye_render::raymarch::{BodyUniform, Hyperslice4DNode, RaymarchShape};
 
@@ -535,10 +535,22 @@ pub(crate) struct Demo {
 
     pub(crate) rotate: bool,
     pub(crate) rot_state: Rotor4,
-    /// Toggle bitmap for the six rotation planes; sum of active planes' unit bivectors
-    /// becomes the per-frame angular velocity. See [`Plane4::ALL`] for the index ->
-    /// plane mapping.
+    /// Toggle bitmap for the six rotation planes; an active plane participates in the
+    /// spin (`rot_time` advances its displayed angle). See [`Plane4::ALL`] for the
+    /// index -> plane mapping.
     pub(crate) active: [bool; 6],
+    /// User-set baseline angle per plane in radians. Active mode treats the displayed
+    /// angle of plane i as `base_angles[i] + rot_time * RATE * active[i]` and composes
+    /// `rot_state` as the ORDERED PRODUCT `∏ᵢ exp(planeᵢ · displayed_angle[i])`. This
+    /// is the "comprehensive set of rotors" parameterization: each plane is its own
+    /// simple-rotation factor in a product instead of a term in a single summed
+    /// bivector. The sliders read/write `base_angles` directly, so changing one
+    /// slider only mutates that plane's factor; the others stay put. The math
+    /// underneath is still BCH-coupled (the product of exps of non-commuting plane
+    /// bivectors isn't itself an exp of a sum), but the UI commits to "what the user
+    /// set is what we use" instead of trying to read back from `log(rot_state)`,
+    /// which has no faithful decomposition into 6 plane angles.
+    pub(crate) base_angles: [f32; 6],
     pub(crate) rate_scale: f32,
     /// Accumulated time spent rotating (advances only while `rotate == true`; resets on
     /// **R**). Useful for spotting periodicities in compound-bivector animations.
@@ -665,6 +677,11 @@ impl Demo {
     /// Per-animation-second angular velocity (the bivector that, integrated over
     /// animation time, produces `rot_state`). Independent of `rate_scale`. Active mode
     /// sums the toggled basis bivectors; Composer mode delegates to the seq walker.
+    ///
+    /// Note: Active mode composes its rotor as a *product* (see [`active_rotor`]), so
+    /// the returned bivector is only meaningful in the BCH-trivial direction (single
+    /// active plane) or as a coarse "this is the direction the rotation is going."
+    /// Composer mode uses the sum semantics throughout, so its omega is exact.
     pub(crate) fn omega_animation(&self) -> Bivector4 {
         match self.rotation_mode {
             RotationMode::Active => {
@@ -678,6 +695,40 @@ impl Demo {
             }
             RotationMode::Composer => angular_velocity_from_seq(&self.seq, 1.0),
         }
+    }
+
+    /// Displayed angle for plane `i` in Active mode: the user's stored baseline
+    /// plus, if the plane is active, the spin's accumulated contribution at
+    /// `rot_time`. The slider reads this value; writing the slider sets
+    /// `base_angles[i]` so the new displayed value matches what the user dropped
+    /// the handle at (so dragging a spinning slider doesn't snap back to the
+    /// pre-drag baseline).
+    pub(crate) fn active_displayed_angle(&self, plane_idx: usize) -> f32 {
+        let spin = if self.active[plane_idx] {
+            self.rot_time * BASE_ROTATION_RATE
+        } else {
+            0.0
+        };
+        self.base_angles[plane_idx] + spin
+    }
+
+    /// Active-mode rotor: ORDERED PRODUCT of per-plane simple rotations in
+    /// `Plane4::ALL` order. Sliders are independent because each `base_angles[i]`
+    /// contributes to exactly one factor; changing one slider only mutates one
+    /// factor in the product. The product across non-commuting planes is still
+    /// BCH-coupled in the rotor itself (so `log(rot_state).component(plane)`
+    /// won't give back the user-set angles), but we don't read back through `log`
+    /// in Active mode -- the sliders are the source of truth.
+    pub(crate) fn active_rotor(&self) -> Rotor4 {
+        let mut r = Rotor4::IDENTITY;
+        for i in 0..6 {
+            let angle = self.active_displayed_angle(i);
+            if angle != 0.0 {
+                let bivec = Plane4::ALL[i].unit_bivector() * angle;
+                r = bivec.exp() * r;
+            }
+        }
+        r.normalize()
     }
 
     /// Build the SDF body uniform for a single row entry, with polychora opt-out based on
@@ -796,6 +847,7 @@ impl Demo {
         // Restore the xw-only default active set so a first-time
         // user resetting and then hitting Spin sees motion.
         self.active = [false, false, true, false, false, false];
+        self.base_angles = [0.0; 6];
         self.rot_state = Rotor4::IDENTITY;
         self.rot_time = 0.0;
         self.t_slider_max = T_SLIDER_INITIAL;

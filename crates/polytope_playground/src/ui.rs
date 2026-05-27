@@ -357,9 +357,7 @@ impl Demo {
         const OVERLAY_MAX_WIDTH: f32 = 768.0;
         const OVERLAY_MIN_WIDTH: f32 = 280.0;
         let natural_w = (screen.width() - 2.0 * pad).max(OVERLAY_MIN_WIDTH);
-        let area_w = natural_w
-            .min(OVERLAY_MAX_WIDTH)
-            .max(OVERLAY_MIN_WIDTH);
+        let area_w = natural_w.min(OVERLAY_MAX_WIDTH).max(OVERLAY_MIN_WIDTH);
         // `overlay_pinned_width` is kept for backwards compatibility
         // with any saved state but no longer load-bearing now that the
         // width is capped.

@@ -12,7 +12,7 @@
 //!   `render_active_mode` and `render_plane_slider_cell`.
 
 use rye_app::egui;
-use rye_math::{Bivector, Plane4, Rotor};
+use rye_math::Plane4;
 
 use crate::consts::CONTROL_H;
 use crate::state::Demo;
@@ -102,6 +102,12 @@ impl Demo {
     /// One plane cell. All component widths pinned by the caller
     /// so the cell renders identically regardless of which row
     /// or column it's in.
+    ///
+    /// The slider reads/writes `base_angles[plane_idx]` via the
+    /// displayed-angle formula (`base + spin_contribution`), so each
+    /// slider only mutates its own plane's factor in the active-mode
+    /// rotor product. Independent sliders, no log/exp round-trips,
+    /// no cross-slider redistribution.
     pub(crate) fn render_plane_slider_cell(
         &mut self,
         ui: &mut egui::Ui,
@@ -112,15 +118,12 @@ impl Demo {
         value_w: f32,
     ) {
         let plane = Plane4::ALL[plane_idx];
-        let bivec = self.rot_state.log();
-        let current_rad = bivec.component(plane);
-        // Slider range matches the rotor's actual period.
-        // `Rotor4` lives in Spin(4), the double cover of SO(4):
-        // a 360° physical rotation maps to the rotor `-1`, and
-        // 720° brings the rotor back to `+1`. So the natural
-        // period of any single-plane rotor parameter is 720°,
-        // and `Rotor4::log` returns values across [-360, 360].
-        let mut deg = current_rad.to_degrees();
+        // Slider value is the *displayed* angle (base + spin contribution).
+        // Range is the rotor's full period in Spin(4): 720° for a single
+        // plane (going around once in physical rotation flips the rotor to
+        // -1; twice returns to +1). Wider than -360..=360 so the user can
+        // see the full cycle without the slider clamping mid-rotation.
+        let mut deg = self.active_displayed_angle(plane_idx).to_degrees();
         ui.add_sized(
             [checkbox_w, 18.0],
             egui::Checkbox::new(&mut self.active[plane_idx], ""),
@@ -129,7 +132,7 @@ impl Demo {
             [label_w, 18.0],
             egui::Label::new(egui::RichText::new(plane.label()).monospace()),
         );
-        let slider = egui::Slider::new(&mut deg, -360.0..=360.0)
+        let slider = egui::Slider::new(&mut deg, -720.0..=720.0)
             .show_value(false)
             .smart_aim(false)
             .clamping(egui::SliderClamping::Always);
@@ -151,7 +154,7 @@ impl Demo {
                     .context_menu(|ui| {
                         let drag_resp = ui.add(
                             egui::DragValue::new(&mut deg)
-                                .range(-360.0..=360.0)
+                                .range(-720.0..=720.0)
                                 .suffix("°")
                                 .fixed_decimals(1),
                         );
@@ -162,9 +165,18 @@ impl Demo {
             },
         );
         if slider_resp.changed() || popup_changed {
-            let mut new_bivec = bivec;
-            new_bivec.set_component(plane, deg.to_radians());
-            self.rot_state = new_bivec.exp();
+            // Solve for base_angles so the displayed angle matches the
+            // slider's new position:
+            //     displayed = base + spin_contribution
+            //  => base = displayed - spin_contribution
+            let target_rad = deg.to_radians();
+            let spin_contribution = if self.active[plane_idx] {
+                self.rot_time * crate::consts::BASE_ROTATION_RATE
+            } else {
+                0.0
+            };
+            self.base_angles[plane_idx] = target_rad - spin_contribution;
+            self.rot_state = self.active_rotor();
             self.write_all(self.rot_state);
         }
     }
