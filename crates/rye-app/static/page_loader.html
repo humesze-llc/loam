@@ -15,14 +15,27 @@
      `#rye-launch` overlay takes over the visual layer with the
      click-to-start affordance. -->
 <style>
+    /* Force this element onto its own compositor layer via `translateZ(0)`
+       (the classic "null 3D transform" trick) AND `contain: strict` to
+       isolate it from layout / paint / style invalidations elsewhere in
+       the document. Without this, browsers may compose the spinner on
+       the same layer as `#rye-canvas-host`, which churns whenever the
+       canvas is touched or the launch overlay is injected -- visible as
+       the spinner stuttering or freezing during heavy main-thread work
+       (wasm init, worker spawn, OffscreenCanvas transfer). With the
+       layer pinned, the `transform: rotate` keyframe animation runs on
+       the compositor thread regardless of main-thread load. */
     #rye-page-loader {
-        position: absolute;
+        position: fixed;
         inset: 0;
         display: flex;
         align-items: center;
         justify-content: center;
         background: #0e0e12;
         z-index: 1;
+        transform: translateZ(0);
+        contain: strict;
+        pointer-events: none;
     }
     #rye-page-loader::before {
         content: '';
@@ -34,9 +47,10 @@
         border-radius: 50%;
         animation: rye-page-loader-spin 0.9s linear infinite;
         will-change: transform;
+        transform: translateZ(0);
     }
     @keyframes rye-page-loader-spin {
-        to { transform: rotate(360deg); }
+        to { transform: rotate(360deg) translateZ(0); }
     }
 </style>
 <div id="rye-page-loader"></div>
