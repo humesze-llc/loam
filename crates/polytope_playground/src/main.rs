@@ -505,7 +505,6 @@ impl Demo {
                 window_pos: egui::Pos2::new(220.0, 120.0),
                 open: false,
             },
-            overlay_pinned_width: None,
             show_formula: false,
             show_controls: true,
             view_mode: ViewMode::Shapes,

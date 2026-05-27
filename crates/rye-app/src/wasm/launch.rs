@@ -54,15 +54,14 @@ use web_sys::{HtmlButtonElement, HtmlStyleElement};
 /// reads the canvas underneath, so the worker's preview frame appears as
 /// a softened thumbnail until the viewer clicks.
 const LAUNCH_OVERLAY_CSS: &str = r#"
-/* Base: shared chrome (positioning, blur, font, transitions). State-
-   specific text + cursor + spinner live in the `.initializing`,
-   `.ready`, `.loading` subclasses below. `.initializing` is the
-   default injected at startup (worker still spawning + first frame
-   not rendered yet); the worker promotes the overlay to `.ready`
-   via the `preview_ready` message once the blurred-backdrop frame
-   is on the canvas, and the click handler promotes to `.loading`
-   when the user clicks. The `demo_ready` message removes the
-   overlay entirely. */
+/* Base: shared chrome (positioning, blur, font, transitions). The
+   overlay is injected with no state class, so the chip is hidden and
+   only the blurred backdrop shows. The worker's `preview_ready`
+   message promotes it to `.ready` once the blurred preview frame is
+   on the canvas AND pipelines are warm, which reveals the click
+   affordance; clicking then removes the overlay entirely. The
+   pre-`.ready` "something's happening" visual is the static
+   `#rye-page-loader` progress bar, not this overlay. */
 .rye-demo-launch {
     position: absolute;
     top: 0; left: 0; right: 0; bottom: 0;
@@ -80,39 +79,10 @@ const LAUNCH_OVERLAY_CSS: &str = r#"
     border: none;
     transition: background 200ms ease, opacity 200ms ease;
 }
-.rye-demo-launch::after {
-    display: inline-block;
-    padding: 14px 28px;
-    border: 1px solid rgba(200, 200, 220, 0.5);
-    border-radius: 6px;
-    background: rgba(20, 20, 28, 0.55);
-}
 
-/* Default: chip + spinner both hidden. State classes opt in. */
-.rye-demo-launch::before,
+/* Default (no state class): chip hidden. The `.ready` class opts in. */
 .rye-demo-launch::after {
     display: none;
-}
-@keyframes rye-demo-spinner {
-    to { transform: rotate(360deg); }
-}
-
-/* Initializing: large centered spinner, no chip, no text. The worker
-   is spawning + warming pipelines; the user can't do anything yet,
-   so the visual is just "something's happening." Clicks blocked at
-   the JS layer (the `ready` class-name gate in `on_click`). */
-.rye-demo-launch.initializing {
-    cursor: wait;
-}
-.rye-demo-launch.initializing::before {
-    content: '';
-    display: inline-block;
-    width: 56px;
-    height: 56px;
-    border: 5px solid rgba(200, 200, 220, 0.2);
-    border-top-color: rgba(230, 230, 245, 0.95);
-    border-radius: 50%;
-    animation: rye-demo-spinner 0.9s linear infinite;
 }
 
 /* Ready: preview frame is behind the blur AND warmup is complete,

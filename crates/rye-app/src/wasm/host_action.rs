@@ -72,6 +72,20 @@ pub enum HostAction {
     PointerLockRelease,
 }
 
+impl HostAction {
+    /// The `kind` string this action serializes to on the wire. Single
+    /// source of truth for the contract: `encode_actions` writes it into
+    /// the per-action JS object, and `main_launcher`'s `host_action`
+    /// dispatch matches the same literals. Keep the two in lockstep when
+    /// adding a variant.
+    const fn kind_str(self) -> &'static str {
+        match self {
+            HostAction::PointerLockRequest => "pointer_lock_request",
+            HostAction::PointerLockRelease => "pointer_lock_release",
+        }
+    }
+}
+
 thread_local! {
     /// Per-worker pending action queue. Drained at the end of each frame by
     /// [`post_pending_actions`]. A `thread_local` because the engine APIs that
@@ -109,13 +123,13 @@ pub fn post_pending_actions(scope: &web_sys::DedicatedWorkerGlobalScope) -> anyh
 }
 
 /// Build the `{kind: "host_action", actions: [...]}` JS object for a
-/// drained action list. Each action is encoded as `{kind: "<variant
-/// lowercase>"}` with any per-variant fields tacked on. Split out from
-/// `post_pending_actions` so the encoding is exercisable in isolation
-/// (the natural home is a `wasm-bindgen-test`, since the `js_sys` /
-/// `JsValue` types only exist on the wasm target; that test harness is
-/// not yet wired into CI, so the encoding is currently covered only by
-/// the demos running without a malformed-message panic).
+/// drained action list. Each action is encoded as `{kind: <action.kind_str()>}`;
+/// per-variant fields (none today) would be tacked onto `item` here. Split
+/// out from `post_pending_actions` so the encoding is exercisable in
+/// isolation (the natural home is a `wasm-bindgen-test`, since the `js_sys`
+/// / `JsValue` types only exist on the wasm target; that test harness is not
+/// yet wired into CI, so the encoding is currently covered only by the demos
+/// running without a malformed-message panic).
 fn encode_actions(actions: &[HostAction]) -> anyhow::Result<JsValue> {
     let msg = js_sys::Object::new();
     js_sys::Reflect::set(
@@ -127,24 +141,12 @@ fn encode_actions(actions: &[HostAction]) -> anyhow::Result<JsValue> {
     let arr = js_sys::Array::new();
     for action in actions {
         let item = js_sys::Object::new();
-        match action {
-            HostAction::PointerLockRequest => {
-                js_sys::Reflect::set(
-                    &item,
-                    &JsValue::from_str("kind"),
-                    &JsValue::from_str("pointer_lock_request"),
-                )
-                .map_err(|e| anyhow::anyhow!("set pointer_lock_request: {e:?}"))?;
-            }
-            HostAction::PointerLockRelease => {
-                js_sys::Reflect::set(
-                    &item,
-                    &JsValue::from_str("kind"),
-                    &JsValue::from_str("pointer_lock_release"),
-                )
-                .map_err(|e| anyhow::anyhow!("set pointer_lock_release: {e:?}"))?;
-            }
-        }
+        js_sys::Reflect::set(
+            &item,
+            &JsValue::from_str("kind"),
+            &JsValue::from_str(action.kind_str()),
+        )
+        .map_err(|e| anyhow::anyhow!("set action kind: {e:?}"))?;
         arr.push(&item);
     }
     js_sys::Reflect::set(&msg, &JsValue::from_str("actions"), &arr)

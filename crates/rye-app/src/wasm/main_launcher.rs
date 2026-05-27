@@ -268,9 +268,10 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
                 tracing::debug!("rye_app::wasm::worker: launch click ignored (already fired)");
                 return;
             }
-            // Gate on the overlay being in `.ready` state. Clicks during
-            // `.initializing` (worker still spawning + preview frame not
-            // rendered) are absorbed silently so the user can spam-click
+            // Gate on the overlay being in `.ready` state. Before
+            // `preview_ready` lands (worker still spawning + preview
+            // frame not rendered) the overlay has no `.ready` class, so
+            // clicks are absorbed silently and the user can spam-click
             // without queueing a Start that fires before the worker is
             // actually ready to handle it.
             if !overlay_for_click.class_name().contains("ready") {
@@ -682,18 +683,12 @@ fn set_msg_string(obj: &js_sys::Object, key: &str, v: &str) {
     let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), &JsValue::from_str(v));
 }
 
-/// Listen for the worker's once-only `{kind: "demo_ready"}` message and
-/// remove the launch overlay when it arrives. The worker sends this
-/// after rendering a handful of warm-up frames (currently 10, per
-/// `worker.rs::DEMO_READY_FRAMES`), which is enough for the heavy
-/// per-pipeline shader compilations to settle and the first sim ticks
-/// to land at the target rate. Until then the launch overlay's
-/// `.loading` state absorbs spam clicks so they don't compound the
-/// startup hitch.
 /// Listen for `{kind: "preview_progress", pct: f64}` updates from the
-/// worker and drive the static `#rye-page-loader-fill` element's width.
-/// The bar is in `crates/rye-app/static/page_loader.html` (engine-owned,
-/// inlined into the demo's `index.html` via `data-trunk rel="inline"`).
+/// worker and drive the static `#rye-page-loader-fill` element's width
+/// plus the progress track's `aria-valuenow` (so a screen reader
+/// announces the loading percentage instead of silence). The bar is in
+/// `crates/rye-app/static/page_loader.html` (engine-owned, inlined into
+/// the demo's `index.html` via `data-trunk rel="inline"`).
 fn install_preview_progress_handler(worker: &Worker) -> Result<()> {
     let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
         let data: JsValue = event.data();
@@ -708,15 +703,18 @@ fn install_preview_progress_handler(worker: &Worker) -> Result<()> {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0)
             .clamp(0.0, 1.0);
+        let percent = pct * 100.0;
         let Some(document) = web_sys::window().and_then(|w| w.document()) else {
             return;
         };
         if let Some(fill) = document.get_element_by_id("rye-page-loader-fill") {
             let _ = fill.dyn_into::<web_sys::HtmlElement>().map(|el| {
-                let _ = el
-                    .style()
-                    .set_property("width", &format!("{}%", pct * 100.0));
+                let _ = el.style().set_property("width", &format!("{percent}%"));
             });
+        }
+        // Mirror the width into the progressbar's announced value.
+        if let Some(track) = document.query_selector("#rye-page-loader .rye-progress-track").ok().flatten() {
+            let _ = track.set_attribute("aria-valuenow", &format!("{}", percent.round() as i32));
         }
     }) as Box<dyn FnMut(MessageEvent)>);
     worker
@@ -726,12 +724,12 @@ fn install_preview_progress_handler(worker: &Worker) -> Result<()> {
     Ok(())
 }
 
-/// Listen for the worker's once-only `{kind: "preview_ready"}` message
-/// and promote the launch overlay from `.initializing` to `.ready` so
-/// the "Click to launch" affordance becomes visible only after the
-/// blurred preview frame has actually rendered. Before this, the
-/// overlay shows "Initializing…" with a spinner and the click handler
-/// short-circuits so spam clicks are absorbed.
+/// Listen for the worker's once-only `{kind: "preview_ready"}` message,
+/// remove the static `#rye-page-loader` progress bar, and add the
+/// `.ready` class to the launch overlay so the "Click to launch"
+/// affordance becomes visible only after the blurred preview frame has
+/// actually rendered. Before this, the page-loader bar is the visible
+/// state and the click handler short-circuits so spam clicks are absorbed.
 fn install_preview_ready_handler(worker: &Worker, button_id: &str) -> Result<()> {
     let button_id_owned: String = button_id.to_string();
     let cb = Closure::wrap(Box::new(move |event: MessageEvent| {

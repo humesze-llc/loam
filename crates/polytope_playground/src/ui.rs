@@ -358,10 +358,6 @@ impl Demo {
         const OVERLAY_MIN_WIDTH: f32 = 280.0;
         let natural_w = screen.width() - 2.0 * pad;
         let area_w = natural_w.clamp(OVERLAY_MIN_WIDTH, OVERLAY_MAX_WIDTH);
-        // `overlay_pinned_width` is kept for backwards compatibility
-        // with any saved state but no longer load-bearing now that the
-        // width is capped.
-        let _ = self.overlay_pinned_width.get_or_insert(area_w);
 
         let visuals = &ctx.style().visuals;
         let frame = egui::Frame::default()

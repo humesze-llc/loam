@@ -339,6 +339,20 @@ pub(crate) fn compose_active_rotor(base_angles: &[f32; 6], active: &[bool; 6], t
     r.normalize()
 }
 
+/// True when `row` contains a 120-cell or 600-cell, the two polychora whose
+/// SDFs overrun the browser WebGPU shader budget (120 / 600 face hyperplanes
+/// each, against the per-pixel Wolfe-greedy projection) and crash the tab.
+/// Free function so the gate is unit-testable without a GPU-backed `Demo`;
+/// [`Demo::sdf_blocked_by_heavy_polychora`] is the `self.row` specialization.
+pub(crate) fn row_blocks_sdf(row: &[ShapeEntry]) -> bool {
+    row.iter().any(|e| {
+        matches!(
+            e.shape,
+            RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
+        )
+    })
+}
+
 pub(crate) fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> Bivector4 {
     let mut omega = Bivector4::ZERO;
     for term in seq {
@@ -614,11 +628,6 @@ pub(crate) struct Demo {
     /// the same way.
     pub(crate) example_callout: rye_egui::CalloutState,
 
-    /// Cached natural overlay width on first frame. Used as the fixed width of the
-    /// overlay regardless of the current window size, so resizing the demo window
-    /// doesn't stretch the controls. Set lazily on first render.
-    pub(crate) overlay_pinned_width: Option<f32>,
-
     /// Whether the top-right rotation-formula popup is rendered. Off by default; the
     /// formula is dense for newcomers; the expanded section has a checkbox to turn it on
     /// for users who want to see exactly which bivectors and scalars compose into the
@@ -820,12 +829,7 @@ impl Demo {
     /// The console `surface sdf` command and the UI radio gate on this
     /// to keep the demo crash-free.
     pub(crate) fn sdf_blocked_by_heavy_polychora(&self) -> bool {
-        self.row.iter().any(|e| {
-            matches!(
-                e.shape,
-                RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
-            )
-        })
+        row_blocks_sdf(&self.row)
     }
 
     /// Effective `w` slider half-range after [`Self::surface_scale`]. The
@@ -907,8 +911,20 @@ impl Demo {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_plane_angle, compose_active_rotor, BASE_ROTATION_RATE};
+    use super::{active_plane_angle, compose_active_rotor, row_blocks_sdf, BASE_ROTATION_RATE};
+    use crate::catalog::ShapeEntry;
     use rye_math::{Bivector, Plane4, Rotor4};
+    use rye_physics::polytope::Polytope4;
+    use rye_render::raymarch::RaymarchShape;
+
+    fn entry(shape: RaymarchShape) -> ShapeEntry {
+        ShapeEntry {
+            shape,
+            body_color: [0.5, 0.5, 0.5],
+            label: "test",
+            long_name: "test shape",
+        }
+    }
 
     const NONE: [bool; 6] = [false; 6];
 
@@ -992,5 +1008,26 @@ mod tests {
             rotor_close(composed, reverse, 1e-6),
             "{composed:?} vs {reverse:?}"
         );
+    }
+
+    #[test]
+    fn row_blocks_sdf_only_for_heavy_polychora() {
+        // Empty row: nothing to block.
+        assert!(!row_blocks_sdf(&[]));
+        // Lighter shapes (default-row members): SDF stays available.
+        let light = [
+            entry(RaymarchShape::Polytope(Polytope4::Tesseract)),
+            entry(RaymarchShape::Polytope(Polytope4::Cell24)),
+        ];
+        assert!(!row_blocks_sdf(&light));
+        // A 120-cell anywhere in the row blocks SDF.
+        let with_120 = [
+            entry(RaymarchShape::Polytope(Polytope4::Tesseract)),
+            entry(RaymarchShape::Polytope(Polytope4::Cell120)),
+        ];
+        assert!(row_blocks_sdf(&with_120));
+        // A 600-cell does too.
+        let with_600 = [entry(RaymarchShape::Polytope(Polytope4::Cell600))];
+        assert!(row_blocks_sdf(&with_600));
     }
 }
