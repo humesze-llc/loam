@@ -11,9 +11,9 @@
 use std::collections::HashMap;
 
 use rye_app::{freecam::Freecam, Camera, OrbitController};
-use rye_math::{Bivector4, EuclideanR3, Plane4, Rotor4};
+use rye_math::{Bivector, Bivector4, EuclideanR3, Plane4, Rotor4};
 use rye_physics::polytope::Polytope4;
-use rye_render::raymarch::{BodyUniform, Hyperslice4DNode};
+use rye_render::raymarch::{BodyUniform, Hyperslice4DNode, RaymarchShape};
 
 use crate::catalog::ShapeEntry;
 use crate::consts::{BASE_ROTATION_RATE, BODY_SIZE, BODY_X_SPACING, BODY_Y, T_SLIDER_INITIAL};
@@ -313,6 +313,46 @@ pub(crate) fn render_bivector_sum(parts: &[String]) -> Option<String> {
 /// one unit term with `scalar = None`. The app-level `omega_per_sec` dispatcher inlines
 /// that walk over the `[bool; 6]` directly to avoid allocating a transient seq each
 /// frame.
+/// Displayed angle of one Active-mode plane at animation time `t`: the user's
+/// baseline plus the spin contribution `t * BASE_ROTATION_RATE` when the plane
+/// is active. Free function (not a `Demo` method) so the rotor composition is
+/// unit-testable without a GPU-backed `Demo`.
+pub(crate) fn active_plane_angle(base: f32, active: bool, t: f32) -> f32 {
+    base + if active { t * BASE_ROTATION_RATE } else { 0.0 }
+}
+
+/// Active-mode rotor at animation time `t`: the ORDERED PRODUCT
+/// `∏ᵢ exp(planeᵢ · active_plane_angle(base[i], active[i], t))` over the six
+/// planes in `Plane4::ALL` order. See the module doc of `active.rs` for why
+/// this is a product (independent sliders) rather than a single
+/// `exp(sum)` (which would reintroduce BCH coupling). Free function so the
+/// composition is testable without constructing a `Demo`.
+pub(crate) fn compose_active_rotor(base_angles: &[f32; 6], active: &[bool; 6], t: f32) -> Rotor4 {
+    let mut r = Rotor4::IDENTITY;
+    for i in 0..6 {
+        let angle = active_plane_angle(base_angles[i], active[i], t);
+        if angle != 0.0 {
+            let bivec = Plane4::ALL[i].unit_bivector() * angle;
+            r = bivec.exp() * r;
+        }
+    }
+    r.normalize()
+}
+
+/// True when `row` contains a 120-cell or 600-cell, the two polychora whose
+/// SDFs overrun the browser WebGPU shader budget (120 / 600 face hyperplanes
+/// each, against the per-pixel Wolfe-greedy projection) and crash the tab.
+/// Free function so the gate is unit-testable without a GPU-backed `Demo`;
+/// [`Demo::sdf_blocked_by_heavy_polychora`] is the `self.row` specialization.
+pub(crate) fn row_blocks_sdf(row: &[ShapeEntry]) -> bool {
+    row.iter().any(|e| {
+        matches!(
+            e.shape,
+            RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
+        )
+    })
+}
+
 pub(crate) fn angular_velocity_from_seq(seq: &[RotorTerm], rate_scale: f32) -> Bivector4 {
     let mut omega = Bivector4::ZERO;
     for term in seq {
@@ -535,10 +575,22 @@ pub(crate) struct Demo {
 
     pub(crate) rotate: bool,
     pub(crate) rot_state: Rotor4,
-    /// Toggle bitmap for the six rotation planes; sum of active planes' unit bivectors
-    /// becomes the per-frame angular velocity. See [`Plane4::ALL`] for the index ->
-    /// plane mapping.
+    /// Toggle bitmap for the six rotation planes; an active plane participates in the
+    /// spin (`rot_time` advances its displayed angle). See [`Plane4::ALL`] for the
+    /// index -> plane mapping.
     pub(crate) active: [bool; 6],
+    /// User-set baseline angle per plane in radians. Active mode treats the displayed
+    /// angle of plane i as `base_angles[i] + rot_time * RATE * active[i]` and composes
+    /// `rot_state` as the ORDERED PRODUCT `∏ᵢ exp(planeᵢ · displayed_angle[i])`. This
+    /// is the "comprehensive set of rotors" parameterization: each plane is its own
+    /// simple-rotation factor in a product instead of a term in a single summed
+    /// bivector. The sliders read/write `base_angles` directly, so changing one
+    /// slider only mutates that plane's factor; the others stay put. The math
+    /// underneath is still BCH-coupled (the product of exps of non-commuting plane
+    /// bivectors isn't itself an exp of a sum), but the UI commits to "what the user
+    /// set is what we use" instead of trying to read back from `log(rot_state)`,
+    /// which has no faithful decomposition into 6 plane angles.
+    pub(crate) base_angles: [f32; 6],
     pub(crate) rate_scale: f32,
     /// Accumulated time spent rotating (advances only while `rotate == true`; resets on
     /// **R**). Useful for spotting periodicities in compound-bivector animations.
@@ -575,11 +627,6 @@ pub(crate) struct Demo {
     /// overlays in the playground will instantiate additional `CalloutState`s
     /// the same way.
     pub(crate) example_callout: rye_egui::CalloutState,
-
-    /// Cached natural overlay width on first frame. Used as the fixed width of the
-    /// overlay regardless of the current window size, so resizing the demo window
-    /// doesn't stretch the controls. Set lazily on first render.
-    pub(crate) overlay_pinned_width: Option<f32>,
 
     /// Whether the top-right rotation-formula popup is rendered. Off by default; the
     /// formula is dense for newcomers; the expanded section has a checkbox to turn it on
@@ -665,6 +712,11 @@ impl Demo {
     /// Per-animation-second angular velocity (the bivector that, integrated over
     /// animation time, produces `rot_state`). Independent of `rate_scale`. Active mode
     /// sums the toggled basis bivectors; Composer mode delegates to the seq walker.
+    ///
+    /// Note: Active mode composes its rotor as a *product* (see [`Self::active_rotor`]), so
+    /// the returned bivector is only meaningful in the BCH-trivial direction (single
+    /// active plane) or as a coarse "this is the direction the rotation is going."
+    /// Composer mode uses the sum semantics throughout, so its omega is exact.
     pub(crate) fn omega_animation(&self) -> Bivector4 {
         match self.rotation_mode {
             RotationMode::Active => {
@@ -677,6 +729,63 @@ impl Demo {
                 omega * BASE_ROTATION_RATE
             }
             RotationMode::Composer => angular_velocity_from_seq(&self.seq, 1.0),
+        }
+    }
+
+    /// Angle for plane `i` in Active mode at animation time `t`: the user's
+    /// stored baseline plus, if the plane is active, the spin's accumulated
+    /// contribution `t * BASE_ROTATION_RATE`. Parameterized over `t` so the
+    /// filmstrip can sample future times; [`Self::active_displayed_angle`]
+    /// is the `t = rot_time` specialization the sliders read.
+    pub(crate) fn active_angle_at(&self, plane_idx: usize, t: f32) -> f32 {
+        active_plane_angle(self.base_angles[plane_idx], self.active[plane_idx], t)
+    }
+
+    /// Displayed angle for plane `i` in Active mode at the current `rot_time`.
+    /// The slider reads this; writing the slider sets `base_angles[i]` so the
+    /// new displayed value matches where the user dropped the handle (dragging
+    /// a spinning slider doesn't snap back to the pre-drag baseline).
+    pub(crate) fn active_displayed_angle(&self, plane_idx: usize) -> f32 {
+        self.active_angle_at(plane_idx, self.rot_time)
+    }
+
+    /// Active-mode rotor at animation time `t`: ORDERED PRODUCT of per-plane
+    /// simple rotations in `Plane4::ALL` order. Sliders are independent because
+    /// each `base_angles[i]` contributes to exactly one factor; changing one
+    /// slider only mutates one factor in the product. The product across
+    /// non-commuting planes is still BCH-coupled in the rotor itself (so
+    /// `log(rot_state).component(plane)` won't give back the user-set angles),
+    /// but we don't read back through `log` in Active mode -- the sliders are
+    /// the source of truth.
+    pub(crate) fn active_rotor_at(&self, t: f32) -> Rotor4 {
+        compose_active_rotor(&self.base_angles, &self.active, t)
+    }
+
+    /// Active-mode rotor at the current `rot_time`. The `t = rot_time`
+    /// specialization of [`Self::active_rotor_at`].
+    pub(crate) fn active_rotor(&self) -> Rotor4 {
+        self.active_rotor_at(self.rot_time)
+    }
+
+    /// Orientation rotor at animation time `t`, dispatched on the active
+    /// rotation mode. This is the single source of truth for "what does the
+    /// orientation look like at animation time `t`" and MUST be used by every
+    /// t-scrub and filmstrip-offset site so they agree with the spin path:
+    ///
+    /// - **Active**: product-of-exp via [`Self::active_rotor_at`]. The 6 plane
+    ///   sliders are independent factors; summing them (the Composer model)
+    ///   would reintroduce the BCH coupling the Active rework removed.
+    /// - **Composer**: `exp(omega_animation * t)`, the sum-of-bivectors model
+    ///   the Composer UI is built around.
+    ///
+    /// For a single active plane the two modes coincide (no BCH coupling); the
+    /// distinction only bites with two or more non-commuting active planes,
+    /// which is exactly where a naive sum-everywhere t-scrub diverged from the
+    /// product-based spin.
+    pub(crate) fn rotor_at_time(&self, t: f32) -> Rotor4 {
+        match self.rotation_mode {
+            RotationMode::Active => self.active_rotor_at(t),
+            RotationMode::Composer => (self.omega_animation() * t).exp().normalize(),
         }
     }
 
@@ -710,6 +819,17 @@ impl Demo {
     /// cross-section caps.
     pub(crate) fn effective_body_size(&self) -> f32 {
         BODY_SIZE * self.surface_scale
+    }
+
+    /// True when entering `SurfaceMode::Sdf` would put a 120-cell or
+    /// 600-cell into the live SDF kernel. The 120-cell carries 120 face
+    /// hyperplanes and the 600-cell carries 600; combined with the
+    /// per-pixel Wolfe-greedy projection they exhaust the browser
+    /// WebGPU shader budget (Chrome crashed the tab on first attempt).
+    /// The console `surface sdf` command and the UI radio gate on this
+    /// to keep the demo crash-free.
+    pub(crate) fn sdf_blocked_by_heavy_polychora(&self) -> bool {
+        row_blocks_sdf(&self.row)
     }
 
     /// Effective `w` slider half-range after [`Self::surface_scale`]. The
@@ -780,10 +900,134 @@ impl Demo {
         // Restore the xw-only default active set so a first-time
         // user resetting and then hitting Spin sees motion.
         self.active = [false, false, true, false, false, false];
+        self.base_angles = [0.0; 6];
         self.rot_state = Rotor4::IDENTITY;
         self.rot_time = 0.0;
         self.t_slider_max = T_SLIDER_INITIAL;
         self.draft.clear();
         self.write_all(Rotor4::IDENTITY);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{active_plane_angle, compose_active_rotor, row_blocks_sdf, BASE_ROTATION_RATE};
+    use crate::catalog::ShapeEntry;
+    use rye_math::{Bivector, Plane4, Rotor4};
+    use rye_physics::polytope::Polytope4;
+    use rye_render::raymarch::RaymarchShape;
+
+    fn entry(shape: RaymarchShape) -> ShapeEntry {
+        ShapeEntry {
+            shape,
+            body_color: [0.5, 0.5, 0.5],
+            label: "test",
+            long_name: "test shape",
+        }
+    }
+
+    const NONE: [bool; 6] = [false; 6];
+
+    fn rotor_close(a: Rotor4, b: Rotor4, eps: f32) -> bool {
+        (a.s - b.s).abs() < eps
+            && (a.xy - b.xy).abs() < eps
+            && (a.xz - b.xz).abs() < eps
+            && (a.xw - b.xw).abs() < eps
+            && (a.yz - b.yz).abs() < eps
+            && (a.yw - b.yw).abs() < eps
+            && (a.zw - b.zw).abs() < eps
+            && (a.xyzw - b.xyzw).abs() < eps
+    }
+
+    #[test]
+    fn active_plane_angle_adds_spin_only_when_active() {
+        // Inactive plane: angle is the baseline regardless of t.
+        assert_eq!(active_plane_angle(0.5, false, 3.0), 0.5);
+        // Active plane: baseline plus t * rate.
+        assert_eq!(
+            active_plane_angle(0.5, true, 2.0),
+            0.5 + 2.0 * BASE_ROTATION_RATE
+        );
+        // t = 0 collapses to the baseline even when active.
+        assert_eq!(active_plane_angle(0.5, true, 0.0), 0.5);
+    }
+
+    #[test]
+    fn compose_all_zero_is_identity() {
+        let r = compose_active_rotor(&[0.0; 6], &NONE, 0.0);
+        assert!(rotor_close(r, Rotor4::IDENTITY, 1e-6), "got {r:?}");
+    }
+
+    #[test]
+    fn compose_is_always_unit_norm() {
+        // A messy multi-plane configuration must still produce a unit rotor
+        // (the function normalizes). Norm-squared within 1e-5 of 1.
+        let base = [0.3, -1.1, 2.0, 0.7, -0.4, 1.6];
+        let active = [true, false, true, true, false, true];
+        for &t in &[0.0_f32, 0.5, 3.0, 50.0] {
+            let n2 = compose_active_rotor(&base, &active, t).norm_squared();
+            assert!((n2 - 1.0).abs() < 1e-5, "t={t} norm_squared={n2}");
+        }
+    }
+
+    #[test]
+    fn compose_single_plane_equals_direct_exp() {
+        // One plane (xw = index 2) at a baseline angle, no spin: the product
+        // collapses to a single factor, which must equal exp(plane * angle)
+        // directly. This is the BCH-trivial case where product == the obvious
+        // single rotation.
+        let theta = 0.8_f32;
+        let mut base = [0.0; 6];
+        base[2] = theta; // Plane4::Xw
+        let composed = compose_active_rotor(&base, &NONE, 0.0);
+        let direct = (Plane4::Xw.unit_bivector() * theta).exp().normalize();
+        assert!(
+            rotor_close(composed, direct, 1e-6),
+            "{composed:?} vs {direct:?}"
+        );
+    }
+
+    #[test]
+    fn compose_orthogonal_pair_is_order_independent() {
+        // xy (index 0) and zw (index 5) are absolutely orthogonal: their
+        // bivectors commute, so exp(a*xy) * exp(b*zw) == exp(b*zw) * exp(a*xy).
+        // `compose_active_rotor` walks Plane4::ALL order (xy before zw); build
+        // the reverse by hand and confirm they match. (This is the case where
+        // the product genuinely equals exp(sum); the non-commuting case is
+        // exactly why Active mode uses the product, tested implicitly by the
+        // unit-norm + single-plane invariants above.)
+        let (a, b) = (0.6_f32, -0.9_f32);
+        let mut base = [0.0; 6];
+        base[0] = a; // xy
+        base[5] = b; // zw
+        let composed = compose_active_rotor(&base, &NONE, 0.0);
+        let xy = (Plane4::Xy.unit_bivector() * a).exp();
+        let zw = (Plane4::Zw.unit_bivector() * b).exp();
+        let reverse = (xy * zw).normalize();
+        assert!(
+            rotor_close(composed, reverse, 1e-6),
+            "{composed:?} vs {reverse:?}"
+        );
+    }
+
+    #[test]
+    fn row_blocks_sdf_only_for_heavy_polychora() {
+        // Empty row: nothing to block.
+        assert!(!row_blocks_sdf(&[]));
+        // Lighter shapes (default-row members): SDF stays available.
+        let light = [
+            entry(RaymarchShape::Polytope(Polytope4::Tesseract)),
+            entry(RaymarchShape::Polytope(Polytope4::Cell24)),
+        ];
+        assert!(!row_blocks_sdf(&light));
+        // A 120-cell anywhere in the row blocks SDF.
+        let with_120 = [
+            entry(RaymarchShape::Polytope(Polytope4::Tesseract)),
+            entry(RaymarchShape::Polytope(Polytope4::Cell120)),
+        ];
+        assert!(row_blocks_sdf(&with_120));
+        // A 600-cell does too.
+        let with_600 = [entry(RaymarchShape::Polytope(Polytope4::Cell600))];
+        assert!(row_blocks_sdf(&with_600));
     }
 }

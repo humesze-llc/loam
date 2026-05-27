@@ -11,7 +11,19 @@
 //! Detection helpers ([`is_worker_context`], plus the heap sampler that
 //! `rye-time::frame_trace` registers) live at the module root so the
 //! `rye_app::wasm::*` import path stays flat for the common cases.
+//!
+//! ## Browser support
+//!
+//! Verified on Chrome and Firefox (desktop). The hard requirements are
+//! WebGPU (`navigator.gpu`), `OffscreenCanvas` + `transferControlToOffscreen`,
+//! and ES-module workers (`new Worker(url, { type: "module" })`). Safari is
+//! UNVERIFIED: WebGPU shipped in Safari 18 but the OffscreenCanvas-in-worker
+//! + module-worker combination this path depends on has not been tested here,
+//! and older Safari lacks WebGPU entirely. Demos that need a Safari fallback
+//! should feature-detect `navigator.gpu` and surface a "WebGPU required"
+//! message rather than spawning the worker into a hard failure.
 
+pub mod host_action;
 pub mod launch;
 pub mod main_launcher;
 pub mod messages;

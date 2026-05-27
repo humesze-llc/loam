@@ -38,5 +38,7 @@ scripts/
 *.gif
 /out.*
 
-# Trunk wasm build output (per-demo bundles emit into ./dist; rebuild any time)
+# Trunk wasm build output (workspace root + per-demo bundles emit into dist/;
+# rebuild any time)
 /dist/
+crates/*/dist/

@@ -1,0 +1,72 @@
+<!-- Static page-load progress bar. Engine-owned, inlined by demos via:
+       <link data-trunk rel="inline" href="../rye-app/static/page_loader.html" />
+     placed inside the `#rye-canvas-host` div.
+
+     Renders on first paint (before the wasm bundle has finished
+     downloading and `inject_launch_overlay` runs), so the user sees
+     "something's happening" immediately on page load instead of a
+     blank canvas. The bar advances in discrete steps as the worker
+     emits `preview_progress` messages (see the CSS comment below for
+     why a bar, not a spinner).
+
+     Removed by the wasm runtime (`install_preview_ready_handler` in
+     `rye_app::wasm::main_launcher`) when the worker posts
+     `preview_ready`, at which point the engine-injected
+     `#rye-launch` overlay takes over the visual layer with the
+     click-to-start affordance.
+
+     The progress track carries `role="progressbar"` + aria-value*;
+     `install_preview_progress_handler` updates `aria-valuenow`
+     alongside the fill width so a screen reader announces the
+     loading percentage rather than silence during the multi-second
+     warmup. -->
+<style>
+    /* Why a progress bar instead of a spinner: WebGPU pipeline
+       compilation happens in the browser's GPU process, which is
+       shared with the compositor. While shaders compile, the GPU
+       process is blocked and EVERY animation on the page stalls --
+       CSS, SVG SMIL, even animated GIFs all freeze because they
+       depend on the compositor producing frames. A progress bar
+       sidesteps this: it doesn't pretend to animate smoothly, it
+       jumps to discrete positions as the worker emits
+       `preview_progress` messages. The gaps between jumps tell the
+       viewer "compilation in progress" without the false-confidence
+       of a frozen spinner. */
+    #rye-page-loader {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #0e0e12;
+        z-index: 1;
+        pointer-events: none;
+    }
+    #rye-page-loader .rye-progress-track {
+        width: 240px;
+        height: 4px;
+        background: rgba(200, 200, 220, 0.15);
+        border-radius: 2px;
+        overflow: hidden;
+    }
+    #rye-page-loader .rye-progress-fill {
+        height: 100%;
+        background: rgba(230, 230, 245, 0.9);
+        border-radius: 2px;
+        width: 0%;
+        transition: width 200ms ease-out;
+    }
+    /* The fill's width tween is the only motion here. Honor a
+       reduced-motion preference by snapping to each step instead. */
+    @media (prefers-reduced-motion: reduce) {
+        #rye-page-loader .rye-progress-fill {
+            transition: none;
+        }
+    }
+</style>
+<div id="rye-page-loader" aria-busy="true">
+    <div class="rye-progress-track" role="progressbar" aria-label="Loading demo"
+         aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="rye-progress-fill" id="rye-page-loader-fill"></div>
+    </div>
+</div>

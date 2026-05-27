@@ -33,12 +33,16 @@ use std::time::Duration;
 // `std::time::Instant::now` panics on wasm32, so the swap is mandatory.
 use web_time::Instant;
 
-/// 60 fps in nanoseconds (≈16.667 ms). Initial value the runner uses unless a
-/// console command changes it. Picked because it matches the typical display
-/// refresh rate the browser RAF and most native vsync settings already
-/// enforce. i.e., the cap is mostly a no-op until the user explicitly raises
-/// or lowers it.
-const DEFAULT_PERIOD_NS: u64 = 16_666_667;
+/// Initial value the runner uses unless a console command changes it. `0`
+/// means "uncapped": native uses the surface's PresentMode (typically vsync
+/// at the display refresh rate) and wasm uses the browser RAF cadence. We
+/// previously defaulted to 60 fps (~16.667 ms) on the assumption that "most
+/// displays are 60 Hz so the cap is a no-op," but that assumption breaks on
+/// 120/144/240 Hz displays where the cap actively suppresses the native
+/// rate AND introduces RAF-jitter alternating-skip in the worker. Defaulting
+/// to uncapped means `fps <N>` is the only way to introduce a cap, which
+/// matches the principle of least surprise.
+const DEFAULT_PERIOD_NS: u64 = 0;
 
 /// Target frame period in nanoseconds. `0` means "uncapped"; the runner will
 /// not sleep / skip and lets the display refresh rate or browser RAF be the
@@ -125,6 +129,10 @@ pub fn take_pending_vsync() -> Option<bool> {
 /// than Windows' default 15.625 ms timer tick is *imprecise*, not wider than
 /// the *whole* tick: `std::thread::sleep` rounds DOWN sometimes and UP others,
 /// and 2 ms of spin covers the worst-case overshoot we've seen on Win11.
+///
+/// Native-only: the sole consumer is [`sleep_until`], which is cfg'd out on
+/// wasm32 (the worker takes the skip-and-rerequest path instead of sleeping).
+#[cfg(not(target_arch = "wasm32"))]
 const SPIN_TAIL: Duration = Duration::from_millis(2);
 
 /// Sleep until `deadline`, hybrid coarse-sleep + spin-wait for sub-millisecond

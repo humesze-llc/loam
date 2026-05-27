@@ -1,5 +1,13 @@
 # Trunk: wasm packager for the rye engine demos.
 #
+# Tested with Trunk 0.21.x. Trunk is a local-dev tool only: it is NOT in the
+# CI build path (the `wasm-build` job in .github/workflows/ci.yml runs raw
+# `cargo build --target wasm32-unknown-unknown`, which is what gates wasm
+# regressions). Install with `cargo install --locked trunk` to pin the
+# transitive dep tree. If a future Trunk release changes the `[serve]` or
+# `data-trunk rel="inline"` semantics this file relies on, pin explicitly via
+# `cargo install --locked --version 0.21 trunk`.
+#
 # Each demo lives in its own workspace member crate under `crates/<name>/`, with a
 # `Cargo.toml` registering an implicit `[[bin]]` (from `src/main.rs`) and an
 # `index.html` next to the Cargo.toml that points Trunk at it. The dev loop is:

@@ -37,8 +37,19 @@ pub enum InputMessage {
 
     /// Pointer moved to (x, y) in canvas-local CSS pixels. `buttons` is
     /// the standard `MouseEvent.buttons` bitmask (1=primary, 2=secondary,
-    /// 4=middle).
-    MouseMove { x: f32, y: f32, buttons: u8 },
+    /// 4=middle). `dx`/`dy` are the raw motion delta this event carries
+    /// (`MouseEvent.movementX/Y`), used for FPS mouse-look so the camera
+    /// receives correct deltas both before Pointer Lock engages (against
+    /// arbitrary positions) and while it's engaged (against the locked
+    /// center). When the main thread coalesces moves to one per RAF the
+    /// deltas of the dropped intermediate events are summed in.
+    MouseMove {
+        x: f32,
+        y: f32,
+        buttons: u8,
+        dx: f32,
+        dy: f32,
+    },
 
     /// Pointer button transitioned. `button` is the standard
     /// `MouseEvent.button` (0=primary, 1=middle, 2=secondary).
@@ -82,6 +93,14 @@ pub enum InputMessage {
     /// of a gradient placeholder); the RAF loop only starts once
     /// `Start` lands.
     Start,
+
+    /// Pointer Lock state mirror from the main thread. Fired whenever
+    /// the main thread's `pointerlockchange` event observes the lock
+    /// either engaging or releasing (user pressed Esc, switched tabs,
+    /// etc.). The worker updates [`crate::cursor::mark_applied`] so
+    /// `current_state()` stays in sync with what the browser actually
+    /// has and demos that read the cursor flag see the truth.
+    PointerLockChanged(bool),
 }
 
 thread_local! {
@@ -135,6 +154,8 @@ pub fn parse_non_init(data: &JsValue) -> Result<Option<InputMessage>> {
             x: read_f32_field(data, "x").unwrap_or(0.0),
             y: read_f32_field(data, "y").unwrap_or(0.0),
             buttons: read_u32_field(data, "buttons").unwrap_or(0) as u8,
+            dx: read_f32_field(data, "dx").unwrap_or(0.0),
+            dy: read_f32_field(data, "dy").unwrap_or(0.0),
         },
         "mouse_button" => InputMessage::MouseButton {
             x: read_f32_field(data, "x").unwrap_or(0.0),
@@ -159,6 +180,9 @@ pub fn parse_non_init(data: &JsValue) -> Result<Option<InputMessage>> {
         "focus" => InputMessage::Focus(read_bool_field(data, "focused").unwrap_or(false)),
         "visibility" => InputMessage::Visibility(read_bool_field(data, "visible").unwrap_or(false)),
         "start" => InputMessage::Start,
+        "pointer_lock_changed" => {
+            InputMessage::PointerLockChanged(read_bool_field(data, "locked").unwrap_or(false))
+        }
         _ => return Ok(None), // unknown kind; caller decides to warn or ignore
     };
 

@@ -13,7 +13,7 @@ use rye_egui::{
     media::{chevron_button, play_pause_button, rate_toggle, refresh_button},
     slider_with_edit,
 };
-use rye_math::{Bivector, Rotor4};
+use rye_math::Rotor4;
 
 use crate::consts::{CONTROL_H, CONTROL_W, PLAY_PAUSE_W};
 use crate::state::{
@@ -146,6 +146,9 @@ impl Demo {
         // inside the closure would need `&mut self` while `&mut self.show_render_panel`
         // is still active.
         let prev_surface = self.surface_mode;
+        // Computed BEFORE the destructure so the closure can read it as a captured value
+        // (the destructure exclusively borrows `self.row`).
+        let sdf_disabled = self.sdf_blocked_by_heavy_polychora();
         // Destructure-borrow the fields the panel writes so the closure doesn't capture
         // a whole `&mut self`. This sidesteps the borrow conflict with `show_render_panel`
         // and lets the closure remain a plain `FnOnce(&mut Ui)`.
@@ -171,7 +174,20 @@ impl Demo {
             |ui| {
                 ui.label(egui::RichText::new("Surface").strong());
                 ui.radio_value(surface_mode, SurfaceMode::Raster, "Raster (default)");
-                ui.radio_value(surface_mode, SurfaceMode::Sdf, "SDF raymarch");
+                // SDF disabled when the row contains a 120-cell or 600-cell. Those
+                // SDF kernels overrun the browser's WebGPU shader budget and crash
+                // the tab; the user has to remove the heavy polychora first. The
+                // disabled radio surfaces the reason via tooltip so they're not
+                // wondering why the option grayed out.
+                ui.add_enabled_ui(!sdf_disabled, |ui| {
+                    let resp = ui.radio_value(surface_mode, SurfaceMode::Sdf, "SDF raymarch");
+                    if sdf_disabled {
+                        resp.on_disabled_hover_text(
+                            "Disabled: 120-cell/600-cell SDFs crash the browser tab. \
+                             Remove the heavy polychora to re-enable.",
+                        );
+                    }
+                });
                 ui.radio_value(surface_mode, SurfaceMode::Off, "Off");
                 ui.separator();
 
@@ -334,9 +350,14 @@ impl Demo {
     pub(crate) fn render_overlay(&mut self, ctx: &egui::Context) {
         let screen = ctx.content_rect();
         let pad = 16.0;
-        let natural_w = (screen.width() - 2.0 * pad).max(280.0);
-        let pinned = *self.overlay_pinned_width.get_or_insert(natural_w);
-        let area_w = pinned.min(natural_w).max(280.0);
+        // Cap the overlay width to roughly the 800x600 layout (the
+        // shape the demo was designed against; full-screen widths
+        // stretched the slider strip into a usability problem).
+        // Falls back to the window width if the window is narrower.
+        const OVERLAY_MAX_WIDTH: f32 = 768.0;
+        const OVERLAY_MIN_WIDTH: f32 = 280.0;
+        let natural_w = screen.width() - 2.0 * pad;
+        let area_w = natural_w.clamp(OVERLAY_MIN_WIDTH, OVERLAY_MAX_WIDTH);
 
         let visuals = &ctx.style().visuals;
         let frame = egui::Frame::default()
@@ -450,13 +471,11 @@ impl Demo {
             t_dragged = interaction.dragged;
         });
         if t_dragged {
-            // Scrub uses the rate-independent `omega_animation`;
-            // `rot_time` is animation time (already rate-scaled at
-            // integration), so `exp(omega_animation * rot_time)`
-            // equals what the continuous-spin path would have
-            // integrated.
-            let omega = self.omega_animation();
-            self.rot_state = (omega * self.rot_time).exp().normalize();
+            // `rotor_at_time` dispatches Active (product-of-exp) vs
+            // Composer (sum-of-bivectors), so scrubbing the t slider
+            // reproduces exactly what the continuous-spin path would
+            // have integrated to at this `rot_time` in either mode.
+            self.rot_state = self.rotor_at_time(self.rot_time);
             self.write_all(self.rot_state);
         }
     }

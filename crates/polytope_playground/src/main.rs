@@ -494,6 +494,7 @@ impl Demo {
             // characteristic 4D rotation, pulling the visible x-axis
             // through the hidden w-axis.
             active: [false, false, true, false, false, false],
+            base_angles: [0.0; 6],
             rate_scale: 1.0,
             rot_time: 0.0,
             t_slider_max: T_SLIDER_INITIAL,
@@ -504,7 +505,6 @@ impl Demo {
                 window_pos: egui::Pos2::new(220.0, 120.0),
                 open: false,
             },
-            overlay_pinned_width: None,
             show_formula: false,
             show_controls: true,
             view_mode: ViewMode::Shapes,
@@ -547,8 +547,9 @@ impl Demo {
         }
 
         // Time scrub (t axis, left/right arrow keys). Mirrors the
-        // t-slider drag: rebuild `rot_state` from the new
-        // `rot_time` via `exp(omega_animation * rot_time)`.
+        // t-slider drag: rebuild `rot_state` from the new `rot_time`
+        // via `rotor_at_time`, which dispatches Active (product) vs
+        // Composer (sum) so the scrub matches the spin path's math.
         // Right = forward in time, left = back. Floors `rot_time`
         // at zero (the t slider's lower bound).
         let t_dir = (self.slider_right_held as i32 - self.slider_left_held as i32) as f32;
@@ -564,8 +565,7 @@ impl Demo {
                     self.rot_time = T_SLIDER_CAP;
                 }
             }
-            let omega = self.omega_animation();
-            self.rot_state = (omega * self.rot_time).exp().normalize();
+            self.rot_state = self.rotor_at_time(self.rot_time);
         }
 
         // 4D rotation animation. Both bodies share the same rotor
@@ -578,13 +578,7 @@ impl Demo {
         if self.rotate {
             // Animation time advances by `dt_real * rate_scale`
             // so the rate buttons make `t` count faster/slower
-            // (per-real-second). The integrated rotation is
-            // `exp(omega_animation * dt_animation)` per frame,
-            // which = `exp(omega_animation * rate_scale * dt_real)`.
-            // This way `rot_state` and `rot_time` stay in sync:
-            // dragging `t` to N reproduces what the spin would
-            // have integrated to at animation time N, regardless
-            // of how the rate varied along the way.
+            // (per-real-second).
             let dt_animation = dt_secs * self.rate_scale;
             self.rot_time += dt_animation;
             // Grow the t-slider's max range when the spin has
@@ -601,10 +595,24 @@ impl Demo {
                     self.rot_time = T_SLIDER_CAP;
                 }
             }
-            let omega = self.omega_animation() * dt_animation;
-            if omega.magnitude_squared() > 0.0 {
-                let delta = omega.exp();
-                self.rot_state = (delta * self.rot_state).normalize();
+        }
+        // Recompose `rot_state` each frame so spin advances (Active mode
+        // reads `rot_time` through `active_displayed_angle`; Composer
+        // integrates the omega-bivector into rot_state directly via the
+        // legacy path below).
+        match self.rotation_mode {
+            RotationMode::Active => {
+                self.rot_state = self.active_rotor();
+            }
+            RotationMode::Composer => {
+                if self.rotate {
+                    let dt_animation = dt_secs * self.rate_scale;
+                    let omega = self.omega_animation() * dt_animation;
+                    if omega.magnitude_squared() > 0.0 {
+                        let delta = omega.exp();
+                        self.rot_state = (delta * self.rot_state).normalize();
+                    }
+                }
             }
         }
         self.write_all(self.rot_state);
@@ -849,16 +857,15 @@ impl Demo {
         );
     }
 
-    pub(crate) fn on_event(&mut self, ev: &winit::event::WindowEvent, _ctx: &mut FrameCtx<'_>) {
-        use winit::event::{ElementState, WindowEvent};
-        use winit::keyboard::{KeyCode, PhysicalKey};
-        let WindowEvent::KeyboardInput { event, .. } = ev else {
-            return;
-        };
-        let PhysicalKey::Code(kc) = event.physical_key else {
-            return;
-        };
-        let pressed = event.state == ElementState::Pressed;
+    pub(crate) fn on_key(
+        &mut self,
+        kc: winit::keyboard::KeyCode,
+        state: winit::event::ElementState,
+        _ctx: &mut FrameCtx<'_>,
+    ) {
+        use winit::event::ElementState;
+        use winit::keyboard::KeyCode;
+        let pressed = state == ElementState::Pressed;
         match kc {
             KeyCode::ArrowUp => self.slider_up_held = pressed,
             KeyCode::ArrowDown => self.slider_down_held = pressed,
@@ -947,7 +954,6 @@ impl Demo {
                 (false, false) => (1, 1, true),
             };
             let col_vps = viewport.split_horizontal(cols as u32);
-            let omega = self.omega_animation();
             let mut grid_cells: Vec<(Viewport, f32, BodyUniform)> = Vec::with_capacity(cols * rows);
             for (col_idx, col_vp) in col_vps.into_iter().enumerate() {
                 let row_vps = col_vp.split_vertical(rows as u32);
@@ -977,12 +983,17 @@ impl Demo {
                         let t_norm = t_idx as f32 / (t_n - 1) as f32;
                         t_norm * self.strip_t_extent
                     };
-                    // Cell's rotor: spin from `rot_state` by
-                    // `omega * t_offset` (animation-time offset).
+                    // Cell's rotor: the orientation at animation time
+                    // `rot_time + t_offset`, via the same `rotor_at_time`
+                    // dispatch the spin + t-scrub use. For Composer this
+                    // equals the old `exp(omega * t_offset) * rot_state`
+                    // (omega commutes with itself); for Active it's the
+                    // product-of-exp sampled at the future time, which the
+                    // old sum-based offset got wrong with 2+ active planes.
                     let cell_rotor = if t_offset == 0.0 {
                         self.rot_state
                     } else {
-                        ((omega * t_offset).exp() * self.rot_state).normalize()
+                        self.rotor_at_time(self.rot_time + t_offset)
                     };
                     let body = BodyUniform::polytope_with_rotor(
                         [0.0, BODY_Y, 0.0, 0.0],
@@ -2014,6 +2025,13 @@ impl RotatePolytopesApp {
                         })?,
                         None => SurfaceMode::Off,
                     };
+                    if next == SurfaceMode::Sdf && demo.sdf_blocked_by_heavy_polychora() {
+                        return Err(anyhow!(
+                            "surface sdf disabled while 120-cell or 600-cell is in the row \
+                             (the SDF kernel crashes the browser tab on those); remove the \
+                             heavy polychora first, or use `surface raster`"
+                        ));
+                    }
                     if next != demo.surface_mode {
                         demo.surface_mode = next;
                         // Re-emit the SDF body list: switching INTO Sdf mode makes the
@@ -2275,16 +2293,21 @@ impl App for RotatePolytopesApp {
         self.last_egui_keyboard = ctx.wants_keyboard_input();
     }
 
-    fn on_event(&mut self, ev: &winit::event::WindowEvent, ctx: &mut FrameCtx<'_>) {
+    fn on_key(
+        &mut self,
+        code: winit::keyboard::KeyCode,
+        state: winit::event::ElementState,
+        ctx: &mut FrameCtx<'_>,
+    ) {
         // Suppress demo keybinds when egui is actively capturing
         // keyboard input (any TextEdit focused: console, formula
         // bar, etc.) so typing `reset` into the console doesn't
         // also fire the R hotkey, etc. When the user clicks
         // outside the egui widget that had focus, egui releases
-        // keyboard focus and the next frame's `on_event` routes
+        // keyboard focus and the next frame's `on_key` routes
         // hotkeys back to the demo as normal.
         if !self.last_egui_keyboard {
-            self.demo.on_event(ev, ctx);
+            self.demo.on_key(code, state, ctx);
         }
     }
 

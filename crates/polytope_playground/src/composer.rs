@@ -375,20 +375,35 @@ impl Demo {
                                     ui.horizontal(|ui| {
                                         let term = &self.seq[term_idx];
                                         if let Some(phi) = term.scalar {
+                                            // Inline editor: a DragValue
+                                            // sized + colored to match the
+                                            // previous read-only label. Drag
+                                            // the value to adjust; click to
+                                            // enter text-edit mode. The old
+                                            // right-click->menu->menu->DragValue
+                                            // chain stayed defocused on click
+                                            // so the value never committed.
                                             let phi_color = egui::Color32::from_rgb(255, 150, 150);
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(format!(
-                                                        "{:.2}°",
-                                                        phi.to_degrees()
-                                                    ))
-                                                    .monospace()
-                                                    .color(phi_color),
-                                                )
-                                                .selectable(false),
-                                            )
-                                            .on_hover_text(
-                                                "Right-click the term to edit or remove",
+                                            let mut deg = phi.to_degrees();
+                                            let drag_resp = ui
+                                                .scope(|ui| {
+                                                    ui.visuals_mut().override_text_color =
+                                                        Some(phi_color);
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut deg)
+                                                            .suffix("°")
+                                                            .speed(1.0)
+                                                            .fixed_decimals(2)
+                                                            .range(-720.0..=720.0),
+                                                    )
+                                                })
+                                                .inner;
+                                            if drag_resp.changed() {
+                                                edit_scalar = Some((term_idx, deg.to_radians()));
+                                            }
+                                            drag_resp.on_hover_text(
+                                                "Drag to adjust; click to type. \
+                                                     Right-click the term to remove the scalar.",
                                             );
                                             ui.monospace("·");
                                         }
@@ -443,23 +458,11 @@ impl Demo {
                     let scalar_now = self.seq[term_idx].scalar;
                     let menu_resp = card_resp.interact(egui::Sense::click());
                     menu_resp.context_menu(|ui| {
-                        if let Some(phi) = scalar_now {
-                            let current_deg = phi.to_degrees();
-                            ui.menu_button(format!("Edit scalar ({current_deg:.2}°)"), |ui| {
-                                let mut deg = current_deg;
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut deg)
-                                            .suffix("°")
-                                            .speed(1.0)
-                                            .fixed_decimals(2)
-                                            .range(-720.0..=720.0),
-                                    )
-                                    .changed()
-                                {
-                                    edit_scalar = Some((term_idx, deg.to_radians()));
-                                }
-                            });
+                        // Editing the scalar is now inline on the card itself
+                        // (the colored DragValue above), so the context menu
+                        // only owns the irreversible actions: add/remove the
+                        // scalar field, delete the whole term.
+                        if scalar_now.is_some() {
                             if ui.button("Remove scalar (φ)").clicked() {
                                 remove_scalar = Some(term_idx);
                                 ui.close_kind(egui::UiKind::Menu);

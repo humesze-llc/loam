@@ -179,7 +179,35 @@ pub trait App: Sized + 'static {
     /// Custom `WindowEvent` handling beyond the input routing the framework runs first.
     /// Most apps don't need this; useful for keyboard-driven mode toggles,
     /// drag-and-drop, etc.
+    ///
+    /// **Wasm worker context: not called for keyboard events.** The worker can't
+    /// construct a `WindowEvent::KeyboardInput` (winit's `KeyEvent` has a
+    /// `pub(crate)` field) so hotkey handlers placed here fire on native only.
+    /// Use [`App::on_key`] for keyboard hotkeys instead; it fires on both paths.
     fn on_event(&mut self, _ev: &WindowEvent, _ctx: &mut FrameCtx<'_>) {}
+
+    /// Keyboard hotkey hook, fired for every key press AND release after
+    /// the framework's input routing. Use this for mode toggles, hotkeys,
+    /// and other key-driven UI flips. Default impl is empty; demos with no
+    /// hotkeys ignore it.
+    ///
+    /// Why a separate hook from [`App::on_event`]: the wasm worker has no
+    /// way to construct a `winit::event::KeyEvent` (one of its fields is
+    /// `pub(crate)`), so the worker can't route keyboard events through
+    /// `on_event` like the native runner does. `on_key` takes `KeyCode +
+    /// ElementState`, which both runners can produce, so demos that use
+    /// `on_key` see hotkeys on both native and wasm.
+    ///
+    /// Continuous WASD-style integration belongs in [`App::update`] reading
+    /// [`rye_input::FrameInput`] (held-key axes); use `on_key`
+    /// for edge-triggered toggles (Space, Tab, T, R, digits, etc.).
+    fn on_key(
+        &mut self,
+        _code: winit::keyboard::KeyCode,
+        _state: ElementState,
+        _ctx: &mut FrameCtx<'_>,
+    ) {
+    }
 
     /// Hot-reload notification: the framework polled `AssetWatcher`, applied events to
     /// `ShaderDb` against `self.space()`, and any consumer pipelines you built may be
@@ -1124,6 +1152,14 @@ impl<A: App> ApplicationHandler for Runner<A> {
                     _non_exhaustive: PhantomData,
                 };
                 app.on_event(&ev, &mut ctx);
+                // Mirror the wasm worker's contract: route keyboard events
+                // through `on_key` too, so demos with a single hotkey impl
+                // (in `on_key`) work the same on both runners.
+                if let WindowEvent::KeyboardInput { event, .. } = &ev {
+                    if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                        app.on_key(code, event.state, &mut ctx);
+                    }
+                }
             }
         }
     }
@@ -1257,22 +1293,30 @@ impl<A: App> Runner<A> {
         // if individual frames overshoot. If we ran long (work + present took
         // longer than the period), we set `last_redraw_at = now` to "catch
         // up" instead of falling further behind on every subsequent frame.
-        let mut frame_anchor = Instant::now();
-        if let (Some(period), Some(last)) = (frame_pacing::target_period(), self.last_redraw_at) {
+        let now = Instant::now();
+        let frame_anchor = if let (Some(period), Some(last)) =
+            (frame_pacing::target_period(), self.last_redraw_at)
+        {
             let deadline = last + period;
-            if frame_anchor < deadline {
+            if now < deadline {
                 #[cfg(target_arch = "wasm32")]
                 {
                     win.request_redraw();
                     return;
                 }
+                // Native: sleep out the remainder and anchor on the
+                // ideal deadline, not the wake-up time.
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     frame_pacing::precise_sleep_until(deadline);
-                    frame_anchor = deadline;
+                    deadline
                 }
+            } else {
+                now
             }
-        }
+        } else {
+            now
+        };
         self.last_redraw_at = Some(frame_anchor);
 
         // Mark frame start for `idle` measurement. `end_frame` subtracts this from

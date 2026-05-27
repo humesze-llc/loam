@@ -184,17 +184,15 @@ impl Demo {
                     );
                 });
         });
-        let mut removed = false;
-        drag_resp
+        let resp = drag_resp
             .on_hover_cursor(egui::CursorIcon::Grab)
             .on_hover_text(entry.long_name)
-            .interact(egui::Sense::click())
-            .context_menu(|ui| {
-                if row_len > 1 && ui.button("Remove from row").clicked() {
-                    removed = true;
-                    ui.close_kind(egui::UiKind::Menu);
-                }
-            });
-        removed
+            .interact(egui::Sense::click());
+        // Right-click directly removes the card when more than one is in
+        // the row (matches the keep-at-least-one invariant the rest of
+        // the shape-row code enforces). When per-shape configuration
+        // lands (color, label override), this is where a context menu
+        // would replace the bare right-click.
+        row_len > 1 && resp.clicked_by(egui::PointerButton::Secondary)
     }
 }

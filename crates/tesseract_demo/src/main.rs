@@ -355,9 +355,14 @@ impl App for TesseractApp {
         }
     }
 
-    fn on_event(&mut self, ev: &winit::event::WindowEvent, ctx: &mut FrameCtx<'_>) {
-        use winit::event::{ElementState, KeyEvent, WindowEvent};
-        use winit::keyboard::{KeyCode, PhysicalKey};
+    fn on_key(
+        &mut self,
+        code: winit::keyboard::KeyCode,
+        state: winit::event::ElementState,
+        ctx: &mut FrameCtx<'_>,
+    ) {
+        use winit::event::ElementState;
+        use winit::keyboard::KeyCode;
         // Gate app-level hotkeys on egui NOT having keyboard focus. Without this,
         // typing `trace` in the console fires our `KeyT` handler and toggles
         // pause; silently freezing the animation while the user just wanted to
@@ -366,63 +371,52 @@ impl App for TesseractApp {
         if ctx.ui_has_focus {
             return;
         }
-        if let WindowEvent::KeyboardInput {
-            event:
-                KeyEvent {
-                    state,
-                    physical_key: PhysicalKey::Code(code),
-                    ..
-                },
-            ..
-        } = ev
+        // Alt is the only key that needs BOTH edges: the freecam preset's
+        // `on_alt(pressed)` interprets press + release according to its
+        // `cursor_mode` (Hold by default, MMO-style: cursor released while
+        // held, re-grabbed on release). Toggle mode ignores release
+        // internally.
+        if matches!(code, KeyCode::AltLeft | KeyCode::AltRight)
+            && matches!(self.mode, CameraMode::FreeRoam)
         {
-            // Alt is the only key that needs BOTH edges: the freecam
-            // preset's `on_alt(pressed)` interprets press + release
-            // according to its `cursor_mode` (Hold by default, MMO-style:
-            // cursor released while held, re-grabbed on release). Toggle
-            // mode ignores release internally.
-            if matches!(code, KeyCode::AltLeft | KeyCode::AltRight)
-                && matches!(self.mode, CameraMode::FreeRoam)
-            {
-                self.freecam.on_alt(matches!(state, ElementState::Pressed));
-                return;
+            self.freecam.on_alt(matches!(state, ElementState::Pressed));
+            return;
+        }
+        if !matches!(state, ElementState::Pressed) {
+            return;
+        }
+        match code {
+            KeyCode::KeyF => {
+                // Toggle camera mode. Freecam preset grabs the cursor +
+                // seeds its position from the current camera pose on
+                // activation, releases on deactivation; the toggle
+                // feels continuous rather than teleporting.
+                self.mode = match self.mode {
+                    CameraMode::Orbit => {
+                        self.freecam.set_active(true, self.camera.position);
+                        CameraMode::FreeRoam
+                    }
+                    CameraMode::FreeRoam => {
+                        self.freecam.set_active(false, self.camera.position);
+                        CameraMode::Orbit
+                    }
+                };
             }
-            if !matches!(state, ElementState::Pressed) {
-                return;
+            // T always toggles pause; Space ALSO toggles pause, but only
+            // outside FreeRoam (where Space is the jump-up axis and would
+            // be a double-bind).
+            KeyCode::KeyT => {
+                self.paused = !self.paused;
             }
-            match code {
-                KeyCode::KeyF => {
-                    // Toggle camera mode. Freecam preset grabs the cursor +
-                    // seeds its position from the current camera pose on
-                    // activation, releases on deactivation; the toggle
-                    // feels continuous rather than teleporting.
-                    self.mode = match self.mode {
-                        CameraMode::Orbit => {
-                            self.freecam.set_active(true, self.camera.position);
-                            CameraMode::FreeRoam
-                        }
-                        CameraMode::FreeRoam => {
-                            self.freecam.set_active(false, self.camera.position);
-                            CameraMode::Orbit
-                        }
-                    };
-                }
-                // T always toggles pause; Space ALSO toggles pause, but only
-                // outside FreeRoam (where Space is the jump-up axis and would
-                // be a double-bind).
-                KeyCode::KeyT => {
-                    self.paused = !self.paused;
-                }
-                KeyCode::Space if !matches!(self.mode, CameraMode::FreeRoam) => {
-                    self.paused = !self.paused;
-                }
-                KeyCode::KeyR => {
-                    // Reset orientation to identity. omega is preserved so
-                    // unpausing keeps the chosen spin direction.
-                    self.rotor = Rotor4::IDENTITY;
-                }
-                _ => {}
+            KeyCode::Space if !matches!(self.mode, CameraMode::FreeRoam) => {
+                self.paused = !self.paused;
             }
+            KeyCode::KeyR => {
+                // Reset orientation to identity. omega is preserved so
+                // unpausing keeps the chosen spin direction.
+                self.rotor = Rotor4::IDENTITY;
+            }
+            _ => {}
         }
     }
 

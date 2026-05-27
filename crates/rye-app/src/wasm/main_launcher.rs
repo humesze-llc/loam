@@ -10,9 +10,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{
-    HtmlButtonElement, HtmlCanvasElement, MessageEvent, Worker, WorkerOptions, WorkerType,
-};
+use web_sys::{HtmlCanvasElement, MessageEvent, Worker, WorkerOptions, WorkerType};
 
 /// Main-thread entry point for worker mode. Wires the launch button so a
 /// click transfers the page's canvas to a freshly-spawned worker, which
@@ -74,7 +72,7 @@ fn read_wasm_bundle_url() -> Result<String> {
 /// wire the launch-overlay click handler that posts the `Start`
 /// message + removes the overlay on click. Called once at page load
 /// from `launch_on_click`.
-fn spawn_worker_for_preview(canvas_id: &str, _host_id: &str, button_id: &str) -> Result<()> {
+fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> Result<()> {
     let document = web_sys::window()
         .and_then(|w| w.document())
         .ok_or_else(|| anyhow!("no document on global window"))?;
@@ -83,11 +81,12 @@ fn spawn_worker_for_preview(canvas_id: &str, _host_id: &str, button_id: &str) ->
         .ok_or_else(|| anyhow!("no element with id '{canvas_id}'"))?
         .dyn_into::<HtmlCanvasElement>()
         .map_err(|_| anyhow!("element '{canvas_id}' is not a canvas"))?;
-    let launch_overlay = document
-        .get_element_by_id(button_id)
-        .ok_or_else(|| anyhow!("no element with id '{button_id}'"))?
-        .dyn_into::<HtmlButtonElement>()
-        .map_err(|_| anyhow!("element '{button_id}' is not a button"))?;
+    // Engine owns the overlay markup + CSS. `inject_launch_overlay` is
+    // idempotent: returns an existing button with `button_id` if the
+    // demo's `index.html` shipped one (legacy demos), otherwise creates
+    // it as a child of `host_id` and injects the default CSS into
+    // `<head>` exactly once per page.
+    let launch_overlay = super::launch::inject_launch_overlay(host_id, button_id)?;
 
     // Size the canvas's pixel backing-store to match its DISPLAYED size
     // × device pixel ratio. The HTML's `width`/`height` attributes are a
@@ -233,6 +232,18 @@ fn spawn_worker_for_preview(canvas_id: &str, _host_id: &str, button_id: &str) ->
     // (or via the worker's handle_message queue) and applied on first frame.
     install_dom_input_forwarders(&worker, &canvas).context("install_dom_input_forwarders")?;
 
+    // Worker -> main DOM-action channel + pointerlockchange forwarder +
+    // canvas click-to-re-engage. This is the standard OffscreenCanvas-
+    // in-Worker pattern for letting the worker drive DOM APIs that can
+    // only be called from main thread.
+    install_host_action_handler(&worker, &canvas).context("install_host_action_handler")?;
+
+    // Listen for the worker's incremental "preview_progress" updates
+    // (one per warmup frame) to drive the static page-loader bar, and
+    // for the terminal "preview_ready" that removes the bar entirely.
+    install_preview_progress_handler(&worker)?;
+    install_preview_ready_handler(&worker, button_id)?;
+
     // Launch-overlay click handler. Spam-click defensive:
     // - FnMut closure (not `Closure::once`) so repeat invocations are
     //   guaranteed to be safe no-ops via the `fired` Cell guard. The
@@ -255,6 +266,19 @@ fn spawn_worker_for_preview(canvas_id: &str, _host_id: &str, button_id: &str) ->
         let on_click = Closure::wrap(Box::new(move || {
             if fired.get() {
                 tracing::debug!("rye_app::wasm::worker: launch click ignored (already fired)");
+                return;
+            }
+            // Gate on the overlay being in `.ready` state. Before
+            // `preview_ready` lands (worker still spawning + preview
+            // frame not rendered) the overlay has no `.ready` class, so
+            // clicks are absorbed silently and the user can spam-click
+            // without queueing a Start that fires before the worker is
+            // actually ready to handle it.
+            if !overlay_for_click.class_name().contains("ready") {
+                tracing::debug!(
+                    "rye_app::wasm::worker: launch click ignored (not yet ready, overlay state = {})",
+                    overlay_for_click.class_name()
+                );
                 return;
             }
             fired.set(true);
@@ -285,28 +309,10 @@ fn spawn_worker_for_preview(canvas_id: &str, _host_id: &str, button_id: &str) ->
                 }
             }
 
-            // Hide via pointer-events first (in case any queued clicks
-            // are still in-flight after our handler runs), THEN remove
-            // from the DOM on the next microtask. The
-            // pointer-events-none style alone would be sufficient to
-            // ignore subsequent clicks; the .remove() is cosmetic
-            // (the canvas underneath is what the viewer should see).
-            let style = overlay_for_click.style();
-            let _ = style.set_property("pointer-events", "none");
-            let _ = style.set_property("opacity", "0");
-            // Defer the actual DOM removal so the opacity transition
-            // (configured in CSS) can play out. 200ms matches the CSS
-            // `transition: opacity 200ms ease`.
-            let overlay_for_remove = overlay_for_click.clone();
-            let remove_cb = Closure::once_into_js(Box::new(move || {
-                overlay_for_remove.remove();
-            }) as Box<dyn FnOnce()>);
-            if let Some(window) = web_sys::window() {
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                    remove_cb.unchecked_ref(),
-                    200,
-                );
-            }
+            // Worker pre-warmed pipelines before posting preview_ready,
+            // so the demo is genuinely ready right now. Just remove the
+            // overlay; click -> demo is one transition, no second wait.
+            overlay_for_click.remove();
         }) as Box<dyn FnMut()>);
         launch_overlay
             .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())
@@ -441,13 +447,26 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
     // latest position. Result: at most 60 mouse-move postMessages per
     // second regardless of input device frequency.
     {
-        let pending: Rc<RefCell<Option<(f32, f32, u32)>>> = Rc::new(RefCell::new(None));
+        // Pending state carries: latest (x, y, buttons) plus the *summed*
+        // `movementX/Y` across all coalesced events since the last RAF
+        // tick. Latest absolute position is what the worker uses for the
+        // egui cursor; summed deltas are what the worker uses for FPS
+        // mouse-look (`mouse_raw_delta`) so intermediate sub-frame motion
+        // isn't lost when we coalesce.
+        let pending: Rc<RefCell<Option<(f32, f32, u32, f32, f32)>>> = Rc::new(RefCell::new(None));
         let pending_for_listener = pending.clone();
         let cb = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
-            *pending_for_listener.borrow_mut() = Some((
+            let mut p = pending_for_listener.borrow_mut();
+            let (sum_dx, sum_dy) = match *p {
+                Some((_, _, _, dx, dy)) => (dx, dy),
+                None => (0.0, 0.0),
+            };
+            *p = Some((
                 ev.offset_x() as f32,
                 ev.offset_y() as f32,
                 ev.buttons() as u32,
+                sum_dx + ev.movement_x() as f32,
+                sum_dy + ev.movement_y() as f32,
             ));
         }) as Box<dyn FnMut(web_sys::MouseEvent)>);
         canvas
@@ -461,11 +480,13 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
         let raf_cb: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
         let raf_cb_for_closure = raf_cb.clone();
         *raf_cb.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-            if let Some((x, y, buttons)) = pending_for_raf.borrow_mut().take() {
+            if let Some((x, y, buttons, dx, dy)) = pending_for_raf.borrow_mut().take() {
                 let msg = build_msg("mouse_move");
                 set_msg_f32(&msg, "x", x);
                 set_msg_f32(&msg, "y", y);
                 set_msg_u32(&msg, "buttons", buttons);
+                set_msg_f32(&msg, "dx", dx);
+                set_msg_f32(&msg, "dy", dy);
                 let _ = worker_for_raf.post_message(&msg);
             }
             let cb_ref = raf_cb_for_closure.borrow();
@@ -489,6 +510,14 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
     for (event_name, pressed) in [("mousedown", true), ("mouseup", false)] {
         let worker = worker.clone();
         let cb = Closure::wrap(Box::new(move |ev: web_sys::MouseEvent| {
+            // Suppress browser default for right (2) + middle (1) button
+            // so right-click context menu and middle-click autoscroll
+            // don't fire ahead of the app receiving the press. Left
+            // button (0) is left alone; demos that pointer-lock will
+            // request the lock on left-click themselves.
+            if ev.button() != 0 {
+                ev.prevent_default();
+            }
             let msg = build_msg("mouse_button");
             set_msg_f32(&msg, "x", ev.offset_x() as f32);
             set_msg_f32(&msg, "y", ev.offset_y() as f32);
@@ -499,6 +528,20 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
         canvas
             .add_event_listener_with_callback(event_name, cb.as_ref().unchecked_ref())
             .map_err(|e| anyhow!("{event_name} listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    // Block the browser context menu so right-click reaches the app.
+    // Separate from `mousedown`'s suppression because `contextmenu` also
+    // fires for keyboard triggers (Shift+F10, the dedicated context-menu
+    // key) which `mousedown` never sees.
+    {
+        let cb = Closure::wrap(Box::new(move |ev: web_sys::Event| {
+            ev.prevent_default();
+        }) as Box<dyn FnMut(web_sys::Event)>);
+        canvas
+            .add_event_listener_with_callback("contextmenu", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("contextmenu listener: {e:?}"))?;
         cb.forget();
     }
 
@@ -525,11 +568,45 @@ fn install_dom_input_forwarders(worker: &Worker, canvas: &HtmlCanvasElement) -> 
 
     // Keyboard: listen on document so keys reach us regardless of which
     // element has focus (game convention).
+    //
+    // `preventDefault()` is selective. The browser owns reload (F5,
+    // Ctrl+R), devtools (F12), tab/window management (Ctrl+T / Ctrl+W /
+    // Ctrl+Tab), fullscreen (F11), and most modifier combos; we leave
+    // those alone so the user retains an escape hatch. The demo owns
+    // Tab (otherwise focus walks to off-canvas DOM elements and
+    // subsequent keys never reach us), Space + arrows (otherwise the
+    // browser scrolls or activates a focused button), slash + quote
+    // (Firefox quick-find), and Alt (Chrome/Firefox treat lone-Alt taps
+    // as menu-bar activation on the keyup edge; preventDefault on both
+    // edges suppresses). Letter keys never trigger a browser default
+    // action at the page level, so WASD / T / etc. need no handling.
     for (event_name, pressed) in [("keydown", true), ("keyup", false)] {
         let worker = worker.clone();
         let cb = Closure::wrap(Box::new(move |ev: web_sys::KeyboardEvent| {
+            let code = ev.code();
+            let no_modifier = !ev.ctrl_key() && !ev.alt_key() && !ev.meta_key();
+            // Alt as the key itself: the `no_modifier` check excludes
+            // this case (ev.alt_key is true while Alt is the down key),
+            // so it gets its own check. Skip when Ctrl/Cmd is held so
+            // Ctrl+Alt / Cmd+Alt combos still work as intended.
+            let is_alt_self = matches!(code.as_str(), "AltLeft" | "AltRight");
+            let suppress_alt = is_alt_self && !ev.ctrl_key() && !ev.meta_key();
+            let owned_unmodified = matches!(
+                code.as_str(),
+                "Tab"
+                    | "Space"
+                    | "ArrowLeft"
+                    | "ArrowRight"
+                    | "ArrowUp"
+                    | "ArrowDown"
+                    | "Slash"
+                    | "Quote",
+            );
+            if suppress_alt || (owned_unmodified && no_modifier) {
+                ev.prevent_default();
+            }
             let msg = build_msg("key");
-            set_msg_string(&msg, "code", &ev.code());
+            set_msg_string(&msg, "code", &code);
             set_msg_string(&msg, "key", &ev.key());
             set_msg_bool(&msg, "pressed", pressed);
             set_msg_bool(&msg, "repeat", ev.repeat());
@@ -604,4 +681,250 @@ fn set_msg_bool(obj: &js_sys::Object, key: &str, v: bool) {
 
 fn set_msg_string(obj: &js_sys::Object, key: &str, v: &str) {
     let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), &JsValue::from_str(v));
+}
+
+/// Listen for `{kind: "preview_progress", pct: f64}` updates from the
+/// worker and drive the static `#rye-page-loader-fill` element's width
+/// plus the progress track's `aria-valuenow` (so a screen reader
+/// announces the loading percentage instead of silence). The bar is in
+/// `crates/rye-app/static/page_loader.html` (engine-owned, inlined into
+/// the demo's `index.html` via `data-trunk rel="inline"`).
+fn install_preview_progress_handler(worker: &Worker) -> Result<()> {
+    let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data: JsValue = event.data();
+        let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|v| v.as_string());
+        if kind.as_deref() != Some("preview_progress") {
+            return;
+        }
+        let pct = js_sys::Reflect::get(&data, &JsValue::from_str("pct"))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let percent = pct * 100.0;
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        if let Some(fill) = document.get_element_by_id("rye-page-loader-fill") {
+            let _ = fill.dyn_into::<web_sys::HtmlElement>().map(|el| {
+                let _ = el.style().set_property("width", &format!("{percent}%"));
+            });
+        }
+        // Mirror the width into the progressbar's announced value.
+        if let Some(track) = document
+            .query_selector("#rye-page-loader .rye-progress-track")
+            .ok()
+            .flatten()
+        {
+            let _ = track.set_attribute("aria-valuenow", &format!("{}", percent.round() as i32));
+        }
+    }) as Box<dyn FnMut(MessageEvent)>);
+    worker
+        .add_event_listener_with_callback("message", cb.as_ref().unchecked_ref())
+        .map_err(|e| anyhow!("worker.addEventListener('message') for preview_progress: {e:?}"))?;
+    cb.forget();
+    Ok(())
+}
+
+/// Listen for the worker's once-only `{kind: "preview_ready"}` message,
+/// remove the static `#rye-page-loader` progress bar, and add the
+/// `.ready` class to the launch overlay so the "Click to launch"
+/// affordance becomes visible only after the blurred preview frame has
+/// actually rendered. Before this, the page-loader bar is the visible
+/// state and the click handler short-circuits so spam clicks are absorbed.
+fn install_preview_ready_handler(worker: &Worker, button_id: &str) -> Result<()> {
+    let button_id_owned: String = button_id.to_string();
+    let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
+        let data: JsValue = event.data();
+        let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
+            .ok()
+            .and_then(|v| v.as_string());
+        if kind.as_deref() != Some("preview_ready") {
+            return;
+        }
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        // Remove the static page-load spinner from `index.html`. The
+        // wasm overlay (below) takes over the visual layer from here.
+        if let Some(loader) = document.get_element_by_id("rye-page-loader") {
+            loader.remove();
+        }
+        if let Some(overlay) = document.get_element_by_id(&button_id_owned) {
+            overlay.set_class_name("rye-demo-launch ready");
+        }
+    }) as Box<dyn FnMut(MessageEvent)>);
+    worker
+        .add_event_listener_with_callback("message", cb.as_ref().unchecked_ref())
+        .map_err(|e| anyhow!("worker.addEventListener('message') for preview_ready: {e:?}"))?;
+    cb.forget();
+    Ok(())
+}
+
+/// Install the worker -> main DOM-action handler, the
+/// `pointerlockchange` -> worker forwarder, and the canvas
+/// click-to-re-engage Pointer Lock helper.
+///
+/// ## Architecture
+///
+/// The worker (in `wasm::worker`) posts
+/// `{kind: "host_action", actions: [{kind: "pointer_lock_request"}, ...]}`
+/// messages whenever an engine module (`rye_app::cursor`, future
+/// `fullscreen` / `clipboard` / ...) queues a DOM-touching action. Every
+/// browser API that needs DOM access has to round-trip through here
+/// because the worker has no `document` / `window` / canvas-element
+/// handle of its own; it owns only the `OffscreenCanvas` bitmap surface.
+///
+/// ## Pointer Lock specifically
+///
+/// `canvas.requestPointerLock()` succeeds when called inside the
+/// transient-activation window (~5 sec) opened by the user's last
+/// key/click. The worker can't see the activation token, but the main
+/// thread can: a console-driven freecam toggle starts as an `Enter`
+/// keydown on `document`, the worker processes it on the next frame,
+/// queues a `PointerLockRequest`, and the round-trip from key-event to
+/// `requestPointerLock` call is comfortably under that 5 sec window.
+///
+/// `document.exitPointerLock()` is always allowed (no activation
+/// needed); the browser also auto-releases on Esc, on tab switch, on
+/// visibility change. Each of those produces a `pointerlockchange`
+/// event we forward back to the worker as
+/// `InputMessage::PointerLockChanged(false)` so the engine cursor state
+/// stays accurate.
+///
+/// ## Click-to-re-engage
+///
+/// When the browser auto-releases lock (e.g., Esc) but the demo still
+/// wants it (the worker last requested grab; `want_locked = true`),
+/// clicking the canvas re-requests the lock. This is the standard
+/// WebGL-game pattern.
+fn install_host_action_handler(worker: &Worker, canvas: &HtmlCanvasElement) -> Result<()> {
+    let window = web_sys::window().ok_or_else(|| anyhow!("no global window"))?;
+    let document = window
+        .document()
+        .ok_or_else(|| anyhow!("no document on window"))?;
+
+    // Demo's desired lock state, as last requested by the worker. Lives
+    // here on the main thread (the worker's mirror via
+    // `cursor::current_state` updates from `pointerlockchange` events
+    // we forward back). Drives the canvas-click re-engagement decision:
+    // if want_locked is true but the actual lock dropped (Esc, tab
+    // switch), the next click re-requests. If want_locked is false (the
+    // demo voluntarily released), the click does nothing.
+    let want_locked: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+    // Worker -> main: drain a `host_action` message into DOM calls.
+    {
+        let canvas_for_dispatch = canvas.clone();
+        let document_for_dispatch = document.clone();
+        let want_locked_for_dispatch = want_locked.clone();
+        let cb = Closure::wrap(Box::new(move |event: MessageEvent| {
+            let data: JsValue = event.data();
+            let kind = js_sys::Reflect::get(&data, &JsValue::from_str("kind"))
+                .ok()
+                .and_then(|v| v.as_string());
+            if kind.as_deref() != Some("host_action") {
+                return;
+            }
+            let actions = match js_sys::Reflect::get(&data, &JsValue::from_str("actions")) {
+                Ok(arr) => arr,
+                Err(_) => return,
+            };
+            let arr = match actions.dyn_into::<js_sys::Array>() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            for i in 0..arr.length() {
+                let item = arr.get(i);
+                let action_kind = js_sys::Reflect::get(&item, &JsValue::from_str("kind"))
+                    .ok()
+                    .and_then(|v| v.as_string());
+                match action_kind.as_deref() {
+                    Some("pointer_lock_request") => {
+                        *want_locked_for_dispatch.borrow_mut() = true;
+                        // `requestPointerLock` resolves async; the
+                        // `pointerlockchange` listener below relays
+                        // success/failure back to the worker. Failure
+                        // can mean "no transient activation" or "another
+                        // tab already has lock"; in either case the
+                        // demo learns via the relay and can act on it
+                        // (e.g., the user clicks again and we retry).
+                        canvas_for_dispatch.request_pointer_lock();
+                    }
+                    Some("pointer_lock_release") => {
+                        *want_locked_for_dispatch.borrow_mut() = false;
+                        document_for_dispatch.exit_pointer_lock();
+                    }
+                    Some(other) => {
+                        tracing::warn!(
+                            "rye_app::wasm: unknown host_action kind '{other}'; dropping"
+                        );
+                    }
+                    None => {
+                        tracing::warn!("rye_app::wasm: host_action item missing 'kind'");
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(MessageEvent)>);
+        worker
+            .add_event_listener_with_callback("message", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("worker.addEventListener('message') for host_action: {e:?}"))?;
+        cb.forget();
+    }
+
+    // `pointerlockchange` on document: tells us the truth about the
+    // browser's current lock state, whether we triggered it (requestPointerLock
+    // / exitPointerLock) or the user did (Esc, tab switch). Forward to
+    // the worker so `cursor::mark_applied` reflects reality.
+    {
+        let worker_for_change = worker.clone();
+        let document_for_change = document.clone();
+        let canvas_for_change = canvas.clone();
+        let cb = Closure::wrap(Box::new(move || {
+            let locked = document_for_change
+                .pointer_lock_element()
+                .as_ref()
+                .map(|el| el == canvas_for_change.as_ref())
+                .unwrap_or(false);
+            let msg = build_msg("pointer_lock_changed");
+            set_msg_bool(&msg, "locked", locked);
+            let _ = worker_for_change.post_message(&msg);
+        }) as Box<dyn FnMut()>);
+        document
+            .add_event_listener_with_callback("pointerlockchange", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("pointerlockchange listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    // Canvas click: re-engage Pointer Lock if the demo last requested
+    // grab but the browser dropped it (Esc). No-op if want_locked is
+    // false (release was voluntary) or if the browser already has lock
+    // (the click landed during normal interaction, no work to do).
+    {
+        let canvas_for_click = canvas.clone();
+        let document_for_click = document.clone();
+        let want_locked_for_click = want_locked.clone();
+        let cb = Closure::wrap(Box::new(move |_ev: web_sys::MouseEvent| {
+            if !*want_locked_for_click.borrow() {
+                return;
+            }
+            let already_locked = document_for_click
+                .pointer_lock_element()
+                .as_ref()
+                .map(|el| el == canvas_for_click.as_ref())
+                .unwrap_or(false);
+            if already_locked {
+                return;
+            }
+            canvas_for_click.request_pointer_lock();
+        }) as Box<dyn FnMut(web_sys::MouseEvent)>);
+        canvas
+            .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
+            .map_err(|e| anyhow!("canvas click listener: {e:?}"))?;
+        cb.forget();
+    }
+
+    Ok(())
 }

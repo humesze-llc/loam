@@ -35,11 +35,12 @@ use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, OffscreenCanvas};
 
 use super::messages::{self, InputMessage};
 use super::worker_ui::WorkerUi;
-use crate::{App, FrameCtx, RenderCtx, SetupCtx};
+use crate::{App, FrameCtx, RenderCtx, SetupCtx, TickCtx};
 use rye_asset::AssetWatcher;
 use rye_input::InputState;
 use rye_render::device::RenderDevice;
 use rye_shader::ShaderDb;
+use rye_time::FixedTimestep;
 use winit::event::{ElementState, MouseScrollDelta};
 use winit::keyboard::PhysicalKey;
 
@@ -278,10 +279,70 @@ where
     // would render on the very first RAF tick if it had started, just
     // displayed via the placeholder canvas instead of through a live
     // RAF loop.
+    // Pre-Start warmup: render the preview frame plus extra frames so
+    // wgpu's lazy shader compilation (browser WebGPU defers
+    // `create_render_pipeline` work until first use) happens BEFORE
+    // the user clicks. Without this the user sees a second hitch right
+    // after clicking; with it the click -> demo-running transition is
+    // immediate. Safe because the default `rotate` state is false, so
+    // warmup frames don't advance any simulation state (rot_time only
+    // ticks when self.rotate is true, which it isn't until the user
+    // toggles it).
+    //
+    // 11 total frames (1 preview + 10 warmup) is empirically enough to
+    // cover the first-frame compilation of the polytope_playground
+    // pipelines on Chrome and Firefox WebGPU; more is harmless but
+    // lengthens the perceived initialization wait. Reassess if a demo
+    // lands that builds several new render pipelines not exercised by
+    // the default scene.
+    //
+    // Each frame fires a `preview_progress` message so the main
+    // thread's static `#rye-page-loader` bar can advance. During the
+    // first frame (when pipeline compilation actually happens) the GPU
+    // process is blocked and the bar can't visually update -- but the
+    // discrete progress steps before and after the freeze frame the
+    // wait so it doesn't read as a hang.
+    const WARMUP_FRAMES: usize = 10;
+    const TOTAL_FRAMES: usize = 1 + WARMUP_FRAMES;
+    let post_progress = |step: usize| {
+        let msg = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("kind"),
+            &JsValue::from_str("preview_progress"),
+        );
+        let _ = js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("pct"),
+            &JsValue::from_f64(step as f64 / TOTAL_FRAMES as f64),
+        );
+        let _ = scope.post_message(&msg);
+    };
     runner.frame().context("preview frame")?;
+    post_progress(1);
+    for i in 0..WARMUP_FRAMES {
+        runner.frame().context("warmup frame")?;
+        post_progress(2 + i);
+    }
     tracing::info!(
-        "rye_app::wasm::worker: preview frame rendered; awaiting Start to begin RAF loop"
+        "rye_app::wasm::worker: preview + {WARMUP_FRAMES} warmup frames rendered; \
+         awaiting Start to begin RAF loop"
     );
+    // Tell main thread the worker is fully ready: preview frame is on
+    // the canvas AND pipelines are warmed. Main thread promotes the
+    // launch overlay to `.ready` so the click affordance becomes
+    // visible; click then triggers an instant Start (no loading state).
+    {
+        let msg = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("kind"),
+            &JsValue::from_str("preview_ready"),
+        );
+        if let Err(e) = scope.post_message(&msg) {
+            tracing::warn!("rye_app::wasm::worker: post preview_ready failed: {e:?}");
+        }
+    }
 
     // Self-referential RAF closure. Captures the runner via Rc<RefCell>
     // and re-schedules itself each frame. Standard wasm-bindgen pattern.
@@ -403,7 +464,26 @@ where
     pixels_per_point: f32,
     start: web_time::Instant,
     last_update_at: Option<web_time::Instant>,
+    /// Anchor for the fps cap. Set to the previous frame's IDEAL deadline
+    /// (not its wake-up time), so RAF jitter doesn't compound into
+    /// alternating-skip behavior at the boundary between the target
+    /// period and the display refresh rate. Mirrors the native runner's
+    /// `last_redraw_at` invariant. `None` when uncapped (so the next
+    /// frame's first-cap-tick anchors against `now`).
+    last_redraw_anchor: Option<web_time::Instant>,
     tick_index: u64,
+    /// Fixed-timestep accumulator. Matches the windowed runner so demos
+    /// that read `FrameCtx::n_ticks` (e.g. `dt_secs = n_ticks / 60.0`)
+    /// see ticks fire on the same cadence in browser as on native.
+    /// Hardcoded to 60Hz to match `RunConfig::default()`; if any demo
+    /// ever wants a different rate, RunConfig will need to be wired
+    /// through to the worker (currently set up via postMessage with no
+    /// config payload).
+    timestep: FixedTimestep,
+    /// Mirror of the windowed runner's `max_ticks_per_frame` cap, kept
+    /// at the windowed default (4) so a slow-rendering frame doesn't
+    /// catch up by running 60 ticks in a row and spiraling further.
+    max_ticks_per_frame: usize,
     _marker: PhantomData<A::Space>,
 }
 
@@ -468,7 +548,10 @@ where
             pixels_per_point,
             start: web_time::Instant::now(),
             last_update_at: None,
+            last_redraw_anchor: None,
             tick_index: 0,
+            timestep: FixedTimestep::new(60),
+            max_ticks_per_frame: 4,
             _marker: PhantomData,
         })
     }
@@ -510,18 +593,35 @@ where
         match msg {
             InputMessage::Resize { width, height } => {
                 self.resize(width, height);
-                // Render one frame at the new size so the preview
-                // refreshes (no CSS-stretched display). When the RAF
-                // loop is already running this is just one extra frame
-                // before the next RAF tick; harmless. When we're in
-                // pre-Start preview mode, this is the only frame that
-                // happens, and it's what the launch overlay's
-                // backdrop-filter blurs.
-                if let Err(e) = self.frame() {
-                    tracing::error!("rye_app::wasm::worker: post-resize frame failed: {e:#}");
+                // Render one frame at the new size ONLY when we're in
+                // pre-Start preview mode. After Start kicks the RAF
+                // loop, the next RAF tick naturally renders at the
+                // new size. The recursive frame() call was crashing
+                // the demo on rapid resize because each Resize event
+                // re-enters the frame loop, which drains MORE Resize
+                // events from the queue, each triggering another
+                // frame(); under sustained drag the recursion either
+                // overflows wgpu's command queue or trips a
+                // surface-reconfigure race. Pre-Start there's no RAF
+                // loop yet, so we have to render once to refresh the
+                // backdrop-blur thumbnail.
+                if self.last_update_at.is_none() {
+                    if let Err(e) = self.frame() {
+                        tracing::error!(
+                            "rye_app::wasm::worker: pre-Start resize frame failed: {e:#}"
+                        );
+                    }
                 }
             }
-            InputMessage::MouseMove { x, y, .. } => {
+            InputMessage::MouseMove { x, y, dx, dy, .. } => {
+                // `dx`/`dy` are `MouseEvent.movementX/Y` summed across any
+                // RAF-coalesced intermediate events. This is the correct
+                // raw-motion source whether Pointer Lock is engaged (where
+                // `offsetX/Y` is pinned to the locked center and absolute-
+                // position diffing would always read zero) or not. Browser
+                // movementX/Y has been universal since ~2013, so we don't
+                // bother with a fallback path.
+                self.input.accumulate_raw_motion(dx as f64, dy as f64);
                 self.input.cursor_moved(x as f64, y as f64);
             }
             InputMessage::MouseButton {
@@ -548,8 +648,25 @@ where
                         ElementState::Released
                     };
                     self.input.key_input(PhysicalKey::Code(code), state);
+                    // Route to `App::on_key` so hotkeys (spin toggle, R, T,
+                    // digit plane toggles, etc.) work the same on wasm as on
+                    // native. The framework can't dispatch to `App::on_event`
+                    // here because winit's `KeyEvent` has a `pub(crate)`
+                    // field we can't construct from outside the crate.
+                    let ui_has_focus = self.ui.wants_input;
+                    let mut fctx = FrameCtx {
+                        rd: &self.rd,
+                        input: rye_input::FrameInput::default(),
+                        time: self.start.elapsed().as_secs_f32(),
+                        fps: 0.0,
+                        n_ticks: 0,
+                        tick: self.tick_index,
+                        dt: 0.0,
+                        ui_has_focus,
+                        _non_exhaustive: PhantomData,
+                    };
+                    self.app.on_key(code, state, &mut fctx);
                 }
-                // Hotkey routing via App::on_event deferred (see fn doc).
             }
             InputMessage::Focus(focused) => {
                 if !focused {
@@ -571,14 +688,89 @@ where
                 // inside that loop, so routing through it would
                 // deadlock.
             }
+            InputMessage::PointerLockChanged(locked) => {
+                // The main thread's `pointerlockchange` listener tells us
+                // when the browser actually engaged/released the lock
+                // (user pressed Esc, switched tabs, our request was
+                // denied for lack of activation, etc.). Mirror the truth
+                // into the cursor module so `current_state()` reads what
+                // the browser actually has. Demos can observe a release
+                // they didn't request and switch back to a "click to
+                // re-engage" prompt (the main thread also wires a
+                // canvas-click handler to re-request the lock when our
+                // last-requested state was Locked but the browser dropped
+                // it; this update is the worker-side signal it succeeded).
+                let grab = if locked {
+                    crate::cursor::GrabMode::Locked
+                } else {
+                    crate::cursor::GrabMode::None
+                };
+                // Visibility on wasm is implied by lock state: Pointer
+                // Lock auto-hides; release auto-shows.
+                crate::cursor::mark_applied(grab, !locked);
+            }
         }
     }
 
-    /// One frame: drain input queue, dt, App::update, begin_frame,
-    /// App::record, composite, submit, present. Wraps
-    /// `rye_time::frame_trace::scope` so the same telemetry the windowed
-    /// runner emits is available here.
+    /// One frame of the worker's RAF loop. Phases, in order:
+    ///
+    /// 1. **FPS cap** -- drop this callback if it fired before the next
+    ///    deadline (deadline-anchored, see below).
+    /// 2. **Input drain** -- apply every queued `InputMessage` (resize,
+    ///    mouse, key, focus, pointer-lock-state).
+    /// 3. **Fixed-timestep ticks** -- advance the accumulator, run
+    ///    `App::tick` per tick, count them into `FrameCtx::n_ticks`.
+    /// 4. **App::update + App::ui** -- per-frame update with drained input,
+    ///    then the egui pass.
+    /// 5. **Render** -- `begin_frame`, `App::record`, composite, submit,
+    ///    present.
+    /// 6. **End-of-frame host actions** -- drain `cursor::take_pending`,
+    ///    translate to `host_action`s, post the batched message to the
+    ///    main thread; emit the per-frame `preview_progress` during warmup.
+    ///
+    /// Wraps `rye_time::frame_trace::scope` so the same telemetry the
+    /// windowed runner emits is available here.
     fn frame(&mut self) -> Result<()> {
+        // FPS cap: drop RAF callbacks that fire before the next ideal
+        // deadline (= previous anchor + target period). Anchoring on
+        // the IDEAL deadline (not the actual wake-up time) absorbs RAF
+        // jitter -- without this, a target that matches the display
+        // refresh rate suffers alternating-skip (callbacks fire ~0.5ms
+        // early due to jitter, get skipped, the next one fires ~3.7ms
+        // later, half-rate). Mirrors the native runner's pattern at
+        // `lib.rs:1297-1311`. Can only lower the rate below the browser
+        // RAF cadence (typically display refresh); raising above that
+        // isn't possible without changing the surface PresentMode,
+        // which browsers don't expose anyway.
+        let now_raf = web_time::Instant::now();
+        match crate::frame_pacing::target_period() {
+            Some(target) => {
+                if let Some(last) = self.last_redraw_anchor {
+                    let deadline = last + target;
+                    if now_raf < deadline {
+                        return Ok(());
+                    }
+                    // Clamp catch-up: if we drifted multiple periods
+                    // behind (tab backgrounded, etc.), don't queue all
+                    // the missed frames at once -- snap forward to at
+                    // most one period behind `now_raf` so pacing
+                    // resumes cleanly when the tab returns to focus.
+                    let catch_up_floor = now_raf.checked_sub(target).unwrap_or(now_raf);
+                    self.last_redraw_anchor = Some(deadline.max(catch_up_floor));
+                } else {
+                    // First frame under an active cap: start the
+                    // schedule from `now` so the first inter-frame
+                    // interval respects the target period.
+                    self.last_redraw_anchor = Some(now_raf);
+                }
+            }
+            None => {
+                // Uncapped: clear the anchor so a later `fps <N>`
+                // command starts a fresh schedule from that moment.
+                self.last_redraw_anchor = None;
+            }
+        }
+
         rye_time::frame_trace::begin_frame();
         let _frame_scope = rye_time::frame_trace::scope("frame");
 
@@ -597,7 +789,27 @@ where
             None => 1.0 / 60.0,
         };
         self.last_update_at = Some(now);
-        self.tick_index = self.tick_index.wrapping_add(1);
+
+        // Fixed-timestep ticks. Mirrors the windowed runner's structure
+        // so demos that read `FrameCtx::n_ticks` (or compute `dt_secs =
+        // n_ticks / 60.0` to integrate spin / freecam translation /
+        // similar) behave the same in browser as on native.
+        let n_capped;
+        {
+            let _scope = rye_time::frame_trace::scope("sim-ticks");
+            let ticks = self.timestep.advance(now);
+            let n_ticks = ticks.count();
+            n_capped = n_ticks.min(self.max_ticks_per_frame);
+            let tick_dt = 1.0 / 60.0;
+            for _ in 0..n_capped {
+                let mut tctx = TickCtx {
+                    time: self.start.elapsed().as_secs_f32(),
+                    tick: self.tick_index,
+                };
+                self.app.tick(tick_dt, &mut tctx);
+                self.tick_index = self.tick_index.wrapping_add(1);
+            }
+        }
 
         // App::update with the FrameInput accumulated from this frame's
         // InputMessage events. `take_frame` returns the drained snapshot
@@ -611,7 +823,7 @@ where
                 input,
                 time: self.start.elapsed().as_secs_f32(),
                 fps: 0.0, // worker-side FPS bookkeeping not yet wired; reads as 0.0.
-                n_ticks: 0,
+                n_ticks: n_capped,
                 tick: self.tick_index,
                 dt,
                 ui_has_focus,
@@ -677,6 +889,35 @@ where
             let _scope = rye_time::frame_trace::scope("present");
             self.rd.queue.submit(Some(encoder.finish()));
             frame.present();
+        }
+
+        // Drain pending cursor / DOM-action requests produced during this
+        // frame (`freecam.set_active` calls `cursor::request_grab`, etc.)
+        // and post them to the main thread as one batched `host_action`
+        // message. Doing it after `present()` keeps the GPU submission
+        // critical path free of postMessage latency and matches the
+        // native runner's pattern (which applies cursor changes at the
+        // end of redraw, after the surface present).
+        let (pending_grab, _pending_visible) = crate::cursor::take_pending();
+        if let Some(grab) = pending_grab {
+            let action = match grab {
+                crate::cursor::GrabMode::Locked | crate::cursor::GrabMode::Confined => {
+                    super::host_action::HostAction::PointerLockRequest
+                }
+                crate::cursor::GrabMode::None => super::host_action::HostAction::PointerLockRelease,
+            };
+            super::host_action::queue(action);
+        }
+        // `take_pending_warp_center` is drained to clear the flag even
+        // though warp-to-center is a no-op on wasm (browsers don't
+        // expose a cursor-position write). Without the drain the flag
+        // would stick and a later native build (or different wasm
+        // implementation) would observe it.
+        let _ = crate::cursor::take_pending_warp_center();
+        if let Ok(scope) = worker_scope() {
+            if let Err(e) = super::host_action::post_pending_actions(&scope) {
+                tracing::warn!("rye_app::wasm::worker: post host_action failed: {e:#}");
+            }
         }
 
         rye_time::frame_trace::end_frame();
