@@ -129,6 +129,10 @@ pub fn take_pending_vsync() -> Option<bool> {
 /// than Windows' default 15.625 ms timer tick is *imprecise*, not wider than
 /// the *whole* tick: `std::thread::sleep` rounds DOWN sometimes and UP others,
 /// and 2 ms of spin covers the worst-case overshoot we've seen on Win11.
+///
+/// Native-only: the sole consumer is [`sleep_until`], which is cfg'd out on
+/// wasm32 (the worker takes the skip-and-rerequest path instead of sleeping).
+#[cfg(not(target_arch = "wasm32"))]
 const SPIN_TAIL: Duration = Duration::from_millis(2);
 
 /// Sleep until `deadline`, hybrid coarse-sleep + spin-wait for sub-millisecond
