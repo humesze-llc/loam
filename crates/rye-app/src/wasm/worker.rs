@@ -594,6 +594,23 @@ where
     /// `rye_time::frame_trace::scope` so the same telemetry the windowed
     /// runner emits is available here.
     fn frame(&mut self) -> Result<()> {
+        // FPS cap: if the user has set a target frame period via the
+        // `fps` console command, drop RAF ticks that fired sooner than
+        // that period. The RAF callback re-schedules unconditionally,
+        // so dropping a tick just means the next callback fires and
+        // re-checks. Note this can only lower the rate below the
+        // browser RAF cadence (typically display refresh); raising fps
+        // above that isn't possible without changing the surface
+        // PresentMode, which browsers don't expose anyway.
+        if let Some(target) = crate::frame_pacing::target_period() {
+            if let Some(prev) = self.last_update_at {
+                let elapsed = web_time::Instant::now().duration_since(prev);
+                if elapsed < target {
+                    return Ok(());
+                }
+            }
+        }
+
         rye_time::frame_trace::begin_frame();
         let _frame_scope = rye_time::frame_trace::scope("frame");
 
