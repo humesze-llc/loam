@@ -95,14 +95,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      # Regression gate for the wasm32 target. M5/M6/M7 work touches
-      # rye-app / rye-render / rye-egui, any of which can silently break
-      # the wasm bundle (cfg-shims, web-time, OffscreenCanvas worker
-      # plumbing). `--no-default-features` drops polytope_playground's
-      # native-only `capture` feature so the native encoder crates stay
-      # out of the wasm dep tree, matching `index.html`'s
-      # `data-cargo-no-default-features` directive.
+      # Add the wasm target to the toolchain `rust-toolchain.toml` pins
+      # (currently 1.95.0). The `targets:` input on the action above would
+      # add it to `stable` instead, which the toml override then bypasses
+      # at `cargo build` time, leaving the pinned toolchain without a
+      # wasm32 std (the "can't find crate for `std`" failure). Running
+      # `rustup target add` inside the checked-out repo respects the
+      # override, so the target lands on the toolchain cargo actually uses.
+      - run: rustup target add wasm32-unknown-unknown
+      # Regression gate for the wasm32 target. Engine work on rye-app /
+      # rye-render / rye-egui can silently break the wasm bundle (cfg-shims,
+      # web-time, OffscreenCanvas worker plumbing). `--no-default-features`
+      # drops polytope_playground's native-only `capture` feature so the
+      # native encoder crates stay out of the wasm dep tree, matching
+      # `index.html`'s `data-cargo-no-default-features` directive.
       - run: cargo build --target wasm32-unknown-unknown -p polytope_playground --no-default-features
