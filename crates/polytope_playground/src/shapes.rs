@@ -184,17 +184,23 @@ impl Demo {
                     );
                 });
         });
-        let mut removed = false;
-        drag_resp
+        let resp = drag_resp
             .on_hover_cursor(egui::CursorIcon::Grab)
             .on_hover_text(entry.long_name)
-            .interact(egui::Sense::click())
-            .context_menu(|ui| {
-                if row_len > 1 && ui.button("Remove from row").clicked() {
-                    removed = true;
-                    ui.close_kind(egui::UiKind::Menu);
-                }
-            });
+            .interact(egui::Sense::click());
+        // Right-click directly removes the card when more than one is in
+        // the row (matches the keep-at-least-one invariant the rest of
+        // the shape-row code enforces). The previous behavior popped a
+        // single-item "Remove from row" context menu; left commented out
+        // below because the popup primitive is still wanted when we add
+        // per-shape configuration later (color, label override, etc.).
+        let removed = row_len > 1 && resp.clicked_by(egui::PointerButton::Secondary);
+        // resp.context_menu(|ui| {
+        //     if row_len > 1 && ui.button("Remove from row").clicked() {
+        //         removed = true;
+        //         ui.close_kind(egui::UiKind::Menu);
+        //     }
+        // });
         removed
     }
 }
