@@ -132,6 +132,46 @@ impl Demo {
         }
     }
 
+    /// Single-view body: just the subject picker. Single mode renders exactly
+    /// one shape (`strip_subject`, shared with the filmstrip) with the full
+    /// surface / wireframe / projection / points stack, so this body needs no
+    /// w/t-axis fan controls. The subject is chosen from the same catalog menu
+    /// the filmstrip and shape-row `+` button use, so a user who picks a
+    /// 120/600-cell here gets the same heavy-SDF hint they would in those views.
+    ///
+    /// The Schlegel boundary-cell stepper (in the Render modal) reads this
+    /// subject's `cell_count()` for its upper bound, which is the whole reason
+    /// Single mode exists: the cell index is well-defined only against one
+    /// unambiguous polytope.
+    pub(crate) fn render_single_body(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        let heavy = matches!(
+            self.strip_subject.shape,
+            RaymarchShape::Polytope(Polytope4::Cell120 | Polytope4::Cell600)
+        );
+        if heavy && self.surface_mode.uses_sdf_for_polychora() {
+            ui.colored_label(
+                egui::Color32::from_rgb(242, 130, 70),
+                "120/600-cell SDFs are heavy; expect <60 fps. Try `surface raster`.",
+            );
+        }
+        ui.horizontal(|ui| {
+            // Same catalog menu as the filmstrip subject picker + the shape-row
+            // `+` button, so the visuals (nested category submenus, hover names)
+            // stay identical across every shape-selection surface.
+            let subject_button = ui
+                .button(format!("subject: {}", self.strip_subject.label))
+                .on_hover_text("Pick the single polytope to inspect");
+            egui::Popup::menu(&subject_button).show(|ui| {
+                ui.set_min_width(140.0);
+                render_shape_catalog_menu(ui, |entry| {
+                    self.strip_subject = entry;
+                });
+            });
+            ui.label("Projection + boundary cell live in the Render settings (gear).");
+        });
+    }
+
     /// Filmstrip body: subject combo (over the catalog, so the
     /// user can pick any of the shipped polytopes independent of
     /// `self.row`) plus per-axis count DragValues. Heavy-shape

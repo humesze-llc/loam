@@ -365,57 +365,11 @@ impl LineRasterNode {
         S: RasterizableSpace<N>,
     {
         let samples = samples_per_segment.max(1);
-        // `tess_buf` stays local because it's generic over `S::Point` and the
-        // node-level scratch field can't pick a single type. For flat spaces
-        // (the common case) `samples = 1` so this Vec stays at capacity 2; the
-        // allocation cost is tiny (~64 bytes) and short-lived. Once a curved-
-        // space user shows real cost here, lift it into a type-erased scratch
-        // (`Vec<u8>` with `bytemuck::cast_slice_mut`) on the node.
-        let mut tess_buf: Vec<S::Point> = Vec::with_capacity(samples + 1);
-
-        // `instances_scratch` is the node-owned scratch: `clear()` preserves
-        // the heap capacity allocated in previous calls, so the steady-state
-        // hot path does zero allocations after the first frame's growth.
-        // Avoids the ~80-bytes-per-segment Vec allocation that the previous
-        // call-local `Vec::with_capacity` did per upload.
-        self.instances_scratch.clear();
-        self.instances_scratch
-            .reserve(mesh.segments.len() * samples);
-
-        for ((seg, (color_a, color_b)), &width) in mesh
-            .segments
-            .iter()
-            .zip(mesh.colors.iter())
-            .zip(mesh.widths.iter())
-        {
-            tess_buf.clear();
-            let p0 = S::array_to_point(seg.0);
-            let p1 = S::array_to_point(seg.1);
-            S::tessellate_segment(p0, p1, samples, &mut tess_buf);
-
-            // tess_buf now holds samples+1 points. Pair consecutive points into rendered
-            // sub-segments. Per-endpoint color is linearly interpolated along the original
-            // segment so multi-sample tessellation preserves the gradient.
-            let n_sub = tess_buf.len().saturating_sub(1);
-            for i in 0..n_sub {
-                let t0 = i as f32 / samples as f32;
-                let t1 = (i + 1) as f32 / samples as f32;
-                let c0 = lerp_color(*color_a, *color_b, t0);
-                let c1 = lerp_color(*color_a, *color_b, t1);
-                let q0 = S::project_point(tess_buf[i], projection);
-                let q1 = S::project_point(tess_buf[i + 1], projection);
-                self.instances_scratch.push(LineInstance {
-                    start_pos: q0.to_array(),
-                    _pad0: 0.0,
-                    end_pos: q1.to_array(),
-                    _pad1: 0.0,
-                    start_color: c0,
-                    end_color: c1,
-                    width_px: width,
-                    _pad2: [0.0; 3],
-                });
-            }
-        }
+        // Build into the node-owned scratch (capacity reused across frames),
+        // then ship it to the GPU below. Factored out so the CPU-side
+        // tessellation + projection + non-finite drop is unit-testable without
+        // a GPU device (see `build_line_instances`).
+        build_line_instances::<S, N>(&mut self.instances_scratch, mesh, projection, samples);
 
         let needed_capacity = self.instances_scratch.len() as u32;
         if needed_capacity > self.instance_capacity {
@@ -533,6 +487,84 @@ impl LineRasterNode {
     }
 }
 
+/// Tessellate, project, and pack a [`LineMesh`] into `out` (one [`LineInstance`]
+/// per rendered sub-segment). `out` is caller-owned scratch; it is `clear()`-ed
+/// here (preserving heap capacity, so a reused buffer does zero allocations in
+/// the steady state) and `reserve`-d for the worst-case segment count, so the
+/// only allocation is the first-call growth or a growth past the prior high
+/// watermark.
+///
+/// Each input segment is tessellated via [`RasterizableSpace::tessellate_segment`]
+/// (for flat spaces with `samples == 1` this is just the two endpoints) and the
+/// resulting consecutive points are paired into rendered sub-segments with a
+/// linear color gradient along the original segment.
+///
+/// Sub-segments with a non-finite projected endpoint are dropped: a central
+/// projection (Schlegel, Stereographic, Perspective4D) can map a vertex on the
+/// projection center / pole to a NaN or infinity, and a single non-finite point
+/// poisons the GPU view-projection divide into a full-screen garbage quad rather
+/// than a missing line. `is_finite` rejects every quiet-NaN bit pattern AND both
+/// infinities (an `== NAN` sentinel test would miss infinities and signaling
+/// NaNs); the `continue` drops the offending sub-segment without pushing, so the
+/// scratch capacity is untouched (no `filter().collect()` reallocation).
+fn build_line_instances<S, const N: usize>(
+    out: &mut Vec<LineInstance>,
+    mesh: &LineMesh<N>,
+    projection: &Projection<N>,
+    samples: usize,
+) where
+    S: RasterizableSpace<N>,
+{
+    // `tess_buf` stays local because it's generic over `S::Point` and the
+    // node-level scratch field can't pick a single type. For flat spaces
+    // (the common case) `samples = 1` so this Vec stays at capacity 2; the
+    // allocation cost is tiny (~64 bytes) and short-lived. Once a curved-
+    // space user shows real cost here, lift it into a type-erased scratch
+    // (`Vec<u8>` with `bytemuck::cast_slice_mut`) on the node.
+    let mut tess_buf: Vec<S::Point> = Vec::with_capacity(samples + 1);
+
+    out.clear();
+    out.reserve(mesh.segments.len() * samples);
+
+    for ((seg, (color_a, color_b)), &width) in mesh
+        .segments
+        .iter()
+        .zip(mesh.colors.iter())
+        .zip(mesh.widths.iter())
+    {
+        tess_buf.clear();
+        let p0 = S::array_to_point(seg.0);
+        let p1 = S::array_to_point(seg.1);
+        S::tessellate_segment(p0, p1, samples, &mut tess_buf);
+
+        // tess_buf now holds samples+1 points. Pair consecutive points into rendered
+        // sub-segments. Per-endpoint color is linearly interpolated along the original
+        // segment so multi-sample tessellation preserves the gradient.
+        let n_sub = tess_buf.len().saturating_sub(1);
+        for i in 0..n_sub {
+            let t0 = i as f32 / samples as f32;
+            let t1 = (i + 1) as f32 / samples as f32;
+            let c0 = lerp_color(*color_a, *color_b, t0);
+            let c1 = lerp_color(*color_a, *color_b, t1);
+            let q0 = S::project_point(tess_buf[i], projection);
+            let q1 = S::project_point(tess_buf[i + 1], projection);
+            if !q0.is_finite() || !q1.is_finite() {
+                continue;
+            }
+            out.push(LineInstance {
+                start_pos: q0.to_array(),
+                _pad0: 0.0,
+                end_pos: q1.to_array(),
+                _pad1: 0.0,
+                start_color: c0,
+                end_color: c1,
+                width_px: width,
+                _pad2: [0.0; 3],
+            });
+        }
+    }
+}
+
 fn lerp_color(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     [
         a[0] + (b[0] - a[0]) * t,
@@ -586,5 +618,93 @@ mod tests {
         assert_eq!(start_color_off, 32);
         assert_eq!(end_color_off, 48);
         assert_eq!(width_off, 64);
+    }
+
+    // ---- non-finite drop backstop ---------------------------------------
+    //
+    // These exercise the CPU-side instance builder directly (no GPU device):
+    // `build_line_instances` is the part of `upload` that tessellates,
+    // projects, and packs, including the `is_finite` drop guard. `EuclideanR3`
+    // + `Projection::Identity` is a bitwise pass-through, so a non-finite
+    // coordinate in the input mesh flows straight to the projected endpoint and
+    // exercises the guard without needing a projection that manufactures one.
+
+    use rye_math::EuclideanR3;
+    use rye_shape::LineMesh;
+
+    /// Build a single-segment R³ mesh with the given endpoints, uniform white
+    /// color, and unit width.
+    fn one_segment_mesh(a: [f32; 3], b: [f32; 3]) -> LineMesh<3> {
+        LineMesh {
+            segments: vec![(a, b)],
+            colors: vec![([1.0; 4], [1.0; 4])],
+            widths: vec![1.0],
+        }
+    }
+
+    /// A segment with all-finite endpoints survives; a segment carrying a NaN
+    /// endpoint is dropped, so the built instance count excludes it. Pins the
+    /// invariant that a non-finite endpoint contributes ZERO instances rather
+    /// than a poisoned one.
+    #[test]
+    fn upload_drops_non_finite_segments() {
+        let mut scratch: Vec<LineInstance> = Vec::new();
+
+        let finite = one_segment_mesh([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        build_line_instances::<EuclideanR3, 3>(&mut scratch, &finite, &Projection::Identity, 1);
+        assert_eq!(scratch.len(), 1, "finite segment must produce one instance");
+
+        let nan = one_segment_mesh([0.0, 0.0, 0.0], [f32::NAN, 1.0, 1.0]);
+        build_line_instances::<EuclideanR3, 3>(&mut scratch, &nan, &Projection::Identity, 1);
+        assert_eq!(scratch.len(), 0, "NaN-endpoint segment must be dropped");
+    }
+
+    /// Re-running the builder over a NaN-bearing mesh leaves the scratch Vec's
+    /// heap capacity unchanged from the prior (finite) build: the drop is a
+    /// `continue`, not a `filter().collect()`, so the zero-per-frame-allocation
+    /// contract holds even when segments are culled.
+    #[test]
+    fn upload_drops_non_finite_without_reallocating() {
+        let mut scratch: Vec<LineInstance> = Vec::new();
+
+        // Prime the scratch with several finite segments so it grows once.
+        let mut many = LineMesh::<3>::default();
+        for k in 0..8 {
+            let f = k as f32;
+            many.segments.push(([f, 0.0, 0.0], [f, 1.0, 0.0]));
+            many.colors.push(([1.0; 4], [1.0; 4]));
+            many.widths.push(1.0);
+        }
+        build_line_instances::<EuclideanR3, 3>(&mut scratch, &many, &Projection::Identity, 1);
+        assert_eq!(scratch.len(), 8);
+        let cap_after_growth = scratch.capacity();
+
+        // Now feed a mesh whose only segment is non-finite. The builder
+        // `clear()`s then `reserve()`s for one segment (<= current cap, so no
+        // growth) and drops the segment, leaving capacity untouched.
+        let nan = one_segment_mesh([f32::NAN, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        build_line_instances::<EuclideanR3, 3>(&mut scratch, &nan, &Projection::Identity, 1);
+        assert_eq!(scratch.len(), 0);
+        assert_eq!(
+            scratch.capacity(),
+            cap_after_growth,
+            "dropping a segment must not change the scratch heap capacity"
+        );
+    }
+
+    /// The drop predicate is `!is_finite()`, not an `== NAN` sentinel: a segment
+    /// with a `+inf` (or `-inf`) endpoint is ALSO dropped. An equality-to-NaN
+    /// test would let infinities through to poison the GPU divide.
+    #[test]
+    fn upload_drop_predicate_catches_infinity_not_just_nan() {
+        let mut scratch: Vec<LineInstance> = Vec::new();
+
+        let pos_inf = one_segment_mesh([0.0, 0.0, 0.0], [f32::INFINITY, 1.0, 1.0]);
+        build_line_instances::<EuclideanR3, 3>(&mut scratch, &pos_inf, &Projection::Identity, 1);
+        assert_eq!(scratch.len(), 0, "+inf endpoint must be dropped");
+
+        let neg_inf = one_segment_mesh([f32::NEG_INFINITY, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        build_line_instances::<EuclideanR3, 3>(&mut scratch, &neg_inf, &Projection::Identity, 1);
+        assert_eq!(scratch.len(), 0, "-inf endpoint must be dropped");
     }
 }

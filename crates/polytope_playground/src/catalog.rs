@@ -20,7 +20,7 @@ use rye_render::raymarch::RaymarchShape;
 /// `hexadecachoron` family; the `*-plex` aliases (pentaplex, dodecaplex, ...) are
 /// deliberately avoided since "plex" is dimension-generalized rather than being the
 /// actual 4D name.
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub(crate) struct ShapeEntry {
     pub(crate) shape: RaymarchShape,
     pub(crate) body_color: [f32; 3],

@@ -152,6 +152,11 @@ impl Demo {
         value_w: f32,
     ) {
         let plane = Plane4::ALL[plane_idx];
+        // Displayed angle BEFORE any widget in this cell mutates state this
+        // frame. The checkbox below flips `active[plane_idx]`, which changes
+        // whether the spin contribution counts toward the displayed angle, so
+        // we capture the pre-toggle displayed angle here to absorb that step.
+        let displayed_before = self.active_displayed_angle(plane_idx);
         // Slider value is the *displayed* angle (base + spin contribution),
         // wrapped into (-720°, 720°]. The wrap is purely for the slider
         // handle: during continuous spin the raw displayed angle grows
@@ -162,12 +167,30 @@ impl Demo {
         // regardless of how this value is normalized for display --
         // `exp(plane * (x + 2π·k))` is the same rotor for any integer k
         // when the plane is a simple unit bivector.
-        let raw_deg = self.active_displayed_angle(plane_idx).to_degrees();
-        let mut deg = wrap_slider_deg(raw_deg);
-        ui.add_sized(
+        let mut deg = wrap_slider_deg(displayed_before.to_degrees());
+        let checkbox_resp = ui.add_sized(
             [checkbox_w, 18.0],
             egui::Checkbox::new(&mut self.active[plane_idx], ""),
         );
+        if checkbox_resp.changed() {
+            // Toggling a plane must not teleport the body: the displayed angle
+            // is `base + spin_contribution(active)`, and flipping `active`
+            // adds or removes the `rot_time * RATE` spin term in one step.
+            // Re-solve `base` so the displayed angle is continuous across the
+            // toggle (freeze the accumulated spin into `base` when switching
+            // off, subtract it back out when switching on):
+            //     base = displayed_before - spin_contribution(active_after)
+            // This keeps the checkbox decoupled from the live orientation, the
+            // same invariant the slider write-back below preserves for drags.
+            let spin_contribution = if self.active[plane_idx] {
+                self.rot_time * crate::consts::BASE_ROTATION_RATE
+            } else {
+                0.0
+            };
+            self.base_angles[plane_idx] = displayed_before - spin_contribution;
+            self.rot_state = self.active_rotor();
+            self.write_all(self.rot_state);
+        }
         ui.add_sized(
             [label_w, 18.0],
             egui::Label::new(egui::RichText::new(plane.label()).monospace()),

@@ -17,17 +17,57 @@ use rye_math::Rotor4;
 
 use crate::consts::{CONTROL_H, CONTROL_W, PLAY_PAUSE_W};
 use crate::state::{
-    DeferredAction, Demo, RotationMode, RotorTerm, SurfaceMode, ViewMode, WireframeColorMode,
-    WireframeProjection,
+    hyperslice_cull_active, DeferredAction, Demo, RotationMode, RotorTerm, SectionLayer,
+    SurfaceMode, ViewMode, WireframeColorMode, WireframeProjection,
 };
+
+/// Render one [`SectionLayer`]'s controls: a perimeter-outline checkbox and a
+/// fill-alpha slider whose `0` end is the layer's off state. `title` names the
+/// layer; `tooltip` explains what it shows. The perimeter outline only draws in
+/// the wireframe overlay, so its checkbox tooltip says so and notes that the
+/// overlay must be on (the fill draws in Raster mode regardless).
+///
+/// Free function (not an `impl Demo` method) so it can take a `&mut SectionLayer`
+/// destructured out of `Demo` in the render-panel closure without re-borrowing
+/// the whole `Demo`.
+fn section_layer_controls(
+    ui: &mut egui::Ui,
+    title: &str,
+    tooltip: &str,
+    layer: &mut SectionLayer,
+    wireframe_enabled: bool,
+) {
+    ui.label(egui::RichText::new(title).italics())
+        .on_hover_text(tooltip);
+    let perimeter_resp = ui
+        .checkbox(&mut layer.perimeter, "Perimeter outline")
+        .on_hover_text(
+            "Cap-boundary outline. Draws in the wireframe overlay, so enable Wireframe to see it.",
+        );
+    if layer.perimeter && !wireframe_enabled {
+        perimeter_resp
+            .on_hover_text("Wireframe overlay is off, so the outline is not currently drawn.");
+    }
+    ui.horizontal(|ui| {
+        ui.label("Fill alpha");
+        // 0 is the off state; the slider spans the full [0, 1] so the user can
+        // drag a layer off or to any visible opacity. The fill draws in Raster
+        // surface mode; below 1.0 it composites through the no-depth-write
+        // pipeline so layers behind show through.
+        ui.add(egui::Slider::new(&mut layer.surface_alpha, 0.0..=1.0).fixed_decimals(2))
+            .on_hover_text("0 = off; below 1.0 composites translucently over the layers behind");
+    });
+}
 
 impl Demo {
     /// Expanded section of the bottom overlay. Two tab rows
     /// stacked vertically:
     ///
-    /// 1. **View tabs** (Shapes / Filmstrip): top-level visual
-    ///    demo. Shapes shows the multi-shape row; Filmstrip
-    ///    shows one shape across N w-slices.
+    /// 1. **View tabs** (Shapes / Single / Filmstrip): top-level
+    ///    visual demo. Shapes shows the multi-shape row; Single
+    ///    shows one subject with the full projection stack (the
+    ///    mode Schlegel's cell-index needs); Filmstrip shows one
+    ///    shape across N w-slices.
     /// 2. **Rotation tabs** (Active set / Composer): how the
     ///    rotor evolves. Independent of view mode.
     ///
@@ -37,6 +77,7 @@ impl Demo {
         self.render_view_tab_row(ui);
         match self.view_mode {
             ViewMode::Shapes => self.render_shapes_section(ui),
+            ViewMode::Single => self.render_single_body(ui),
             ViewMode::Filmstrip => self.render_filmstrip_body(ui),
         }
         ui.separator();
@@ -49,15 +90,22 @@ impl Demo {
     }
 
     /// Top tab row of the expanded body: visual demo selector.
-    /// Shapes (multi-shape side-by-side row) vs Filmstrip (one
-    /// shape across multiple w-slices). Tab change is staged
-    /// into `pending_view_mode` for the same `BottomOverlay`
-    /// two-pass reason as `pending_mode`.
+    /// Shapes (multi-shape side-by-side row), Single (one subject
+    /// with the full projection stack), Filmstrip (one shape
+    /// across multiple w-slices). Tab change is staged into
+    /// `pending_view_mode` for the same `BottomOverlay` two-pass
+    /// reason as `pending_mode`.
     pub(crate) fn render_view_tab_row(&mut self, ui: &mut egui::Ui) {
         let mut staged = self.view_mode;
         ui.horizontal(|ui| {
             ui.selectable_value(&mut staged, ViewMode::Shapes, "Shapes")
                 .on_hover_text("Side-by-side row of shapes at one w-slice");
+            ui.selectable_value(&mut staged, ViewMode::Single, "Single")
+                .on_hover_text(
+                    "One subject (the picker below) at one w-slice with the full \
+                     surface / wireframe / projection stack. Schlegel's boundary-cell \
+                     selection needs this unambiguous single shape.",
+                );
             ui.selectable_value(&mut staged, ViewMode::Filmstrip, "Filmstrip")
                 .on_hover_text(
                     "One shape rendered N times across w-slices fanning out by \
@@ -118,6 +166,12 @@ impl Demo {
                     ui.checkbox(&mut self.show_controls, "Rotation controls (H)");
                     ui.checkbox(&mut self.show_formula, "Formula popup");
                     ui.checkbox(&mut self.example_callout.open, "Example callout");
+                    ui.checkbox(&mut self.mode_annotation_open.open, "Mode annotation")
+                        .on_hover_text(
+                            "Floating note explaining the active projection / space \
+                             mode. Appears only for a non-default projection or with \
+                             Curvature turned up.",
+                        );
                     ui.separator();
                     // One-shot action: opens the About window and the menu should fold
                     // away. `Popup::close_all(ctx)` cooperates with the sticky-popup
@@ -146,20 +200,32 @@ impl Demo {
         // inside the closure would need `&mut self` while `&mut self.show_render_panel`
         // is still active.
         let prev_surface = self.surface_mode;
+        // Snapshot the projection so we can detect a Schlegel select / cell-index
+        // change after the panel's borrow ends and re-resolve the cache (the same
+        // deferred-mutation shape `prev_surface` uses for `rebuild_bodies`).
+        let prev_projection = self.wireframe_projection;
         // Computed BEFORE the destructure so the closure can read it as a captured value
         // (the destructure exclusively borrows `self.row`).
         let sdf_disabled = self.sdf_blocked_by_heavy_polychora();
+        // Cell count of the polytope a Schlegel cell index refers to (the leading
+        // polychoron). Captured for the cell-index DragValue's clamp. `None` when
+        // the row has no polychoron, in which case the stepper is disabled.
+        let schlegel_cell_count = self.schlegel_subject().map(|p| p.cell_count() as u32);
         // Destructure-borrow the fields the panel writes so the closure doesn't capture
         // a whole `&mut self`. This sidesteps the borrow conflict with `show_render_panel`
         // and lets the closure remain a plain `FnOnce(&mut Ui)`.
         let Self {
             show_render_panel,
             surface_mode,
+            cross_section,
+            projected_cap,
             wireframe_enabled,
-            wireframe_perimeter,
             wireframe_nearest_active,
             wireframe_color_mode,
             wireframe_projection,
+            wireframe_hyperslice,
+            wireframe_hyperslice_thickness,
+            space_blend,
             points_enabled,
             points_show_vertices,
             points_show_cell_centers,
@@ -191,10 +257,37 @@ impl Demo {
                 ui.radio_value(surface_mode, SurfaceMode::Off, "Off");
                 ui.separator();
 
+                // Cross-section layers. The slice renders as two overlaid layers
+                // in one viewport: the HONEST cross-section (drop-w, never
+                // reprojected; what the SDF shows) and the PROJECTED cap (the
+                // slice reprojected through the active wireframe projection). Each
+                // has its own perimeter outline + fill alpha. Fills draw in Raster
+                // mode; perimeter outlines draw in the wireframe overlay, so they
+                // gate on `wireframe_enabled` and the tooltips say so.
+                ui.label(egui::RichText::new("Cross-section").strong());
+                section_layer_controls(
+                    ui,
+                    "Honest (drop-w)",
+                    "The drop-w slice, never reprojected: the geometry the SDF \
+                     shows. On by default so a projection change never distorts \
+                     the slice.",
+                    cross_section,
+                    *wireframe_enabled,
+                );
+                section_layer_controls(
+                    ui,
+                    "Projected cap",
+                    "The same slice reprojected through the active wireframe \
+                     projection, so it can sit on a Schlegel / stereographic \
+                     wireframe. Off by default.",
+                    projected_cap,
+                    *wireframe_enabled,
+                );
+                ui.separator();
+
                 ui.label(egui::RichText::new("Wireframe").strong());
                 ui.checkbox(wireframe_enabled, "Enabled");
                 ui.add_enabled_ui(*wireframe_enabled, |ui| {
-                    ui.checkbox(wireframe_perimeter, "Section perimeter (cyan)");
                     ui.checkbox(wireframe_nearest_active, "Nearest-active gradient");
                     ui.horizontal(|ui| {
                         ui.label("Color");
@@ -204,13 +297,102 @@ impl Demo {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Projection");
-                        ui.radio_value(wireframe_projection, WireframeProjection::DropW, "Drop-w");
-                        ui.radio_value(
-                            wireframe_projection,
-                            WireframeProjection::WDepth,
-                            "W-depth",
-                        );
+                        for mode in WireframeProjection::ALL {
+                            // Compare by VARIANT, not full `PartialEq`: a Schlegel
+                            // cell-index change must keep the Schlegel button
+                            // selected. Selecting Schlegel preserves the current
+                            // cell index (the contextual stepper below owns it).
+                            let selected = wireframe_projection.same_variant(mode);
+                            if ui.radio(selected, mode.label()).clicked() && !selected {
+                                *wireframe_projection = match (mode, *wireframe_projection) {
+                                    (
+                                        WireframeProjection::Schlegel { .. },
+                                        WireframeProjection::Schlegel { cell_index },
+                                    ) => WireframeProjection::Schlegel { cell_index },
+                                    (m, _) => m,
+                                };
+                            }
+                        }
                     });
+                    // Contextual parameter row: only the active mode's knob shows.
+                    // Schlegel -> cell-index stepper (clamped to the leading
+                    // polytope's cell count). Other modes need no contextual
+                    // param; Hyperslice's slab width lives with the cull toggle
+                    // below, so it is not duplicated here.
+                    if let WireframeProjection::Schlegel { cell_index } = wireframe_projection {
+                        ui.horizontal(|ui| {
+                            ui.label("Boundary cell");
+                            match schlegel_cell_count {
+                                Some(count) => {
+                                    ui.add(
+                                        egui::DragValue::new(cell_index)
+                                            .range(0..=count - 1)
+                                            .speed(0.25),
+                                    );
+                                    ui.label(format!("of {count}"));
+                                }
+                                None => {
+                                    ui.add_enabled(false, egui::DragValue::new(cell_index))
+                                        .on_disabled_hover_text(
+                                            "No polychoron in the row to project",
+                                        );
+                                }
+                            }
+                        });
+                    }
+                    // Hyperslice cull: thin the edge graph to a w-slab around the
+                    // current slice. The thickness stepper is enabled whenever the
+                    // cull is running, which includes the Hyperslice PROJECTION
+                    // mode (it resolves to drop-w and turns the cull on without the
+                    // standalone toggle). Gating on the toggle alone left the slab
+                    // width greyed out under that projection even though the cull
+                    // was active.
+                    ui.checkbox(wireframe_hyperslice, "Hyperslice cull (w-slab)");
+                    let cull_active =
+                        hyperslice_cull_active(*wireframe_hyperslice, *wireframe_projection);
+                    ui.add_enabled_ui(cull_active, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Slab width");
+                            ui.add(
+                                egui::DragValue::new(wireframe_hyperslice_thickness)
+                                    .range(
+                                        crate::consts::HYPERSLICE_MIN_THICKNESS
+                                            ..=2.0 * crate::consts::W_RANGE,
+                                    )
+                                    .speed(0.01),
+                            );
+                        });
+                    });
+                });
+                // Curvature is a DIFFERENT axis from Projection above. The
+                // Projection radio picks the 4D->R³ map (where a vertex lands
+                // on screen); Curvature morphs the EDGE GEOMETRY between a flat
+                // R⁴ chord and an S³ great-circle arc (whether the line between
+                // two landed vertices is straight or bowed). They compose, but
+                // conflating them confuses, so the slider sits in its own
+                // separator-delimited group below the projection knob. Writes
+                // the same `space_blend` field the `wireframe space` /
+                // top-level `space` console command drives, clamped to [0, 1].
+                //
+                // Deliberately OUTSIDE the `wireframe_enabled` enable-gate the
+                // other wireframe controls sit in: the morph is only visible in
+                // the wireframe layer, but gating the slider behind that toggle
+                // is the same dead-end the bare `space spherical` command had
+                // (mutate a field nothing draws). A user reaching for the
+                // Curvature slider IS asking to see curved edges, so dragging it
+                // above zero auto-enables the wireframe, mirroring the console
+                // handler. Holding it at zero never flips the overlay on.
+                ui.separator();
+                ui.label(egui::RichText::new("Curvature (flat <-> spherical)").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Blend");
+                    if ui
+                        .add(egui::Slider::new(space_blend, 0.0..=1.0).fixed_decimals(2))
+                        .changed()
+                        && *space_blend > 0.0
+                    {
+                        *wireframe_enabled = true;
+                    }
                 });
                 ui.separator();
 
@@ -236,6 +418,14 @@ impl Demo {
         // stays in sync with the new mode (`BodyKind::Invalid` for inert polychora).
         if self.surface_mode != prev_surface {
             self.rebuild_bodies();
+        }
+        // Re-resolve the cached Schlegel face-plane params if the user changed the
+        // projection mode or dragged the cell-index stepper through the panel.
+        // Deferred to here (same shape as the surface-mode rebuild) because the
+        // resolve runs the LazyLock cell-table fit on first access and must not be
+        // called inside the destructure-borrowed closure (it needs `&mut self`).
+        if self.wireframe_projection != prev_projection {
+            self.resolve_schlegel_cache();
         }
     }
 
@@ -368,6 +558,13 @@ impl Demo {
 
         let default_bottom_centre = egui::pos2(screen.center().x, screen.bottom() - pad);
 
+        // Snapshot the single-view subject so a change made through the Single
+        // body's picker this frame can trigger the same body-rebuild + Schlegel
+        // re-resolve a row edit does (the subject IS the rendered row in Single
+        // mode, so changing it changes which polychoron the diagram projects
+        // through and its cell count). Compared after the deferred-apply block.
+        let prev_strip_subject = self.strip_subject;
+
         egui::Window::new("polytope-playground-overlay")
             .id(egui::Id::new("polytope-playground-overlay"))
             .title_bar(false)
@@ -397,6 +594,15 @@ impl Demo {
         }
         if let Some(new_view) = self.pending_view_mode.take() {
             self.view_mode = new_view;
+            // The rendered row changes with the view mode (full row in Shapes,
+            // the lone `strip_subject` in Single), so re-emit the SDF body slots
+            // and re-resolve the Schlegel cache: the leading polychoron (and its
+            // cell count) the diagram projects through can differ between the row
+            // and the single subject. Filmstrip re-uploads its own per-cell
+            // bodies during render and restores the row after, so this rebuild is
+            // harmless there too.
+            self.rebuild_bodies();
+            self.resolve_schlegel_cache();
         }
         for action in std::mem::take(&mut self.pending_actions) {
             match action {
@@ -413,6 +619,14 @@ impl Demo {
                 DeferredAction::DraftClear => self.draft.clear(),
                 DeferredAction::SeqPushTerm(term) => self.seq.push(term),
             }
+        }
+        // A Single-view subject change is a render-row change: re-emit the SDF
+        // body slots and re-resolve the Schlegel cache against the new subject's
+        // topology. Gated on `Single` so picking a filmstrip subject (which does
+        // not change the Schlegel-relevant row) skips the work.
+        if self.view_mode == ViewMode::Single && self.strip_subject != prev_strip_subject {
+            self.rebuild_bodies();
+            self.resolve_schlegel_cache();
         }
     }
 
