@@ -311,6 +311,11 @@ fn cap_vertex_projected_and_world(
 /// already folds the w-dependent scale into the projection, so no extra scale
 /// factor is applied here (unlike [`local_r3_to_world`], which the cross-section
 /// path needs because it drops w before this stage).
+///
+/// Test-only: the render paths inline this (they also need the pre-translate
+/// projected point for the stereographic clip, which this discards), so it
+/// survives solely as a tessellation/projection oracle for the wireframe tests.
+#[cfg(test)]
 fn project_to_world(p: Vec4, projection: &rye_math::Projection<4>, body_pos_r3: Vec3) -> Vec3 {
     <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(p, projection)
         + body_pos_r3
