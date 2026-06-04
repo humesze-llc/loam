@@ -86,36 +86,72 @@ const SECTION_FACES_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Dep
 /// large-but-finite rather than dividing by zero.
 const PERSPECTIVE_SCALE_DENOM_EPSILON: f32 = 1e-4;
 
-/// Body-local projected radius past which a stereographic sample is treated as
-/// the conformal point at infinity and cut from the rendered polyline (the arc
-/// runs out to this radius; samples beyond it are the near-pole blow-up).
+/// Fraction of the live camera-to-body distance used as the stereographic arc
+/// clip radius (see [`stereographic_view_radius`]).
 ///
-/// **The cap must sit below the camera distance.** A stereographic near-pole edge
-/// images to an arc that runs off toward infinity; the cap bounds it at this
-/// world radius. The wireframe is centered near the orbit target, and the camera
-/// orbits it at [`OrbitController`]'s distance (the demo's default is `9.5`, the
-/// minimum `1.5`). If the cap exceeds the camera distance, an arc endpoint at
-/// radius `R` in the camera's direction lands AT or BEHIND the eye, and the
+/// **The clip must sit below the camera distance.** A stereographic near-pole
+/// edge images to an arc that runs off toward infinity; the clip bounds it at a
+/// world radius. If that radius exceeds the camera's distance to the figure, an
+/// arc endpoint in the camera's direction lands AT or BEHIND the eye, and the
 /// perspective projection of a point grazing the eye plane is hyper-sensitive: a
 /// small rotation step swings its screen image from the far edge (a "long" arc)
 /// to a finite on-screen point (a "short" arc), the long/short rubberband. The
 /// engine's near-plane line clip (`line_raster.wgsl`) removes the sign-flip
-/// *width* artifact of a behind-eye endpoint, but it cannot remove this
-/// *length* discontinuity, which is inherent to an extended arc reaching past a
-/// close camera. Keeping `R` comfortably below the orbit distance keeps every arc
-/// endpoint well in front of the eye, so the projection stays smooth and bounded
-/// and the arc has no way to graze the camera plane.
+/// *width* artifact of a behind-eye endpoint, but it cannot remove this *length*
+/// discontinuity, which is inherent to an extended arc reaching past a close
+/// camera. Tying the radius to a fraction `< 1` of the live camera distance keeps
+/// every arc endpoint in front of the eye at ANY zoom (the zoom-robust property)
+/// when zooming in (the zoom-robust property). On zoom-OUT the radius is held at
+/// [`STEREOGRAPHIC_VIEW_RADIUS_MAX`] rather than growing without bound, which also
+/// brings the arcs on-screen (their NDC shrinks) so a pulled-back camera frames a
+/// larger shape's full arc halo.
 ///
-/// `6.0` sits below the default `9.5` orbit (nearest approach to the eye `~3.5`,
-/// a gentle off-axis sweep) and far above the legitimate image extent of a
-/// unit-circumradius polytope (a `w = 0.5` vertex maps to radius `~1.7`), so real
-/// geometry is never clipped while the near-pole arcs read as an extended halo
-/// rather than offscreen-bouncing infinities. It is also well under the
-/// pole-clamp ceiling `sqrt(2 / eps)` (~141), so the near-pole blow-up still
-/// reliably exceeds it. NOTE: not yet adaptive to zoom; a zoom-in past `R` would
-/// reintroduce the grazing sweep (the near-plane clip still prevents the width
-/// artifact). Pinned by `stereographic_view_radius_below_camera_distance`.
-const STEREOGRAPHIC_VIEW_RADIUS: f32 = 6.0;
+/// `0.75` leaves a nearest-approach margin of `0.25 ×` the camera distance (a
+/// gentle off-axis sweep, never a graze); at an 8-unit camera distance it yields
+/// ~6.0, the eyes-on-confirmed extent (the test reference `STEREOGRAPHIC_VIEW_RADIUS`).
+const STEREOGRAPHIC_VIEW_RADIUS_FRACTION: f32 = 0.75;
+
+/// Floor on the stereographic clip radius, so a close zoom never clips the figure
+/// itself: a unit-circumradius polytope's legitimate image reaches radius `~1.7`
+/// (a `w = 0.5` vertex), so the clip is held at least this far out. When the
+/// camera is nearer than `~3.3` units the floor can exceed the camera distance
+/// (the user is essentially inside the figure); the near-plane line clip is the
+/// backstop there.
+const STEREOGRAPHIC_VIEW_RADIUS_FLOOR: f32 = 2.5;
+
+/// Ceiling on the stereographic clip radius. Beyond this the arc would be drawn
+/// deep into the steep near-pole region, where the fixed-count
+/// [`SPACE_TESSELLATION_SAMPLES`] arc sampling (uniform in 4D arc-angle) is far
+/// too coarse for the nonlinear projection: consecutive samples jump several-fold
+/// in image magnitude, so the rendered arc facets into long straight chords
+/// (jagged) and those chords twitch as rotation shifts which sample brackets the
+/// boundary (the bounce). Capping at `6.0` keeps the arc in the gentle region
+/// where the 16 samples read as a smooth curve, and matches the eyes-on-confirmed
+/// extent. To let arcs extend further AND stay smooth, raise this together with
+/// the arc sample count (or subdivide adaptively by projected segment length).
+const STEREOGRAPHIC_VIEW_RADIUS_MAX: f32 = 6.0;
+
+/// Reference clip radius for tests (which have no live camera): the value
+/// [`stereographic_view_radius`] yields at an 8-unit camera distance and beyond
+/// (where it saturates at [`STEREOGRAPHIC_VIEW_RADIUS_MAX`]). Eyes-on-confirmed to
+/// kill the rubberband while keeping the near-pole arcs a smooth extended halo.
+/// The live render path uses the camera-adaptive [`stereographic_view_radius`]
+/// instead, so this is compiled only for tests.
+#[cfg(test)]
+const STEREOGRAPHIC_VIEW_RADIUS: f32 = STEREOGRAPHIC_VIEW_RADIUS_MAX;
+
+/// Camera-adaptive stereographic clip radius: a fraction of the live distance
+/// from the eye to the figure, clamped to `[FLOOR, MAX]`. The fraction keeps it
+/// below the camera distance so zoom-in never rubberbands; the MAX ceiling keeps
+/// it out of the under-tessellated steep near-pole region so zoom-out never
+/// jaggeds or bounces (see [`STEREOGRAPHIC_VIEW_RADIUS_MAX`]); the floor keeps the
+/// figure itself from being clipped at close range.
+fn stereographic_view_radius(camera_distance: f32) -> f32 {
+    (camera_distance * STEREOGRAPHIC_VIEW_RADIUS_FRACTION).clamp(
+        STEREOGRAPHIC_VIEW_RADIUS_FLOOR,
+        STEREOGRAPHIC_VIEW_RADIUS_MAX,
+    )
+}
 
 /// Cap on the reconstructed near-pole image magnitude (see `near_pole_view_point`).
 /// A point within the pole-denominator clamp band is a point-at-infinity; the
@@ -123,23 +159,26 @@ const STEREOGRAPHIC_VIEW_RADIUS: f32 = 6.0;
 /// origin, so the wireframe builder substitutes the true magnitude
 /// `sqrt((1 + dot) / (1 - dot))` in the same projected direction. That true
 /// magnitude diverges at the pole, so it is capped here purely for f32 safety:
-/// `1e4` is far above `STEREOGRAPHIC_VIEW_RADIUS` (so the sample reliably clips
-/// out) and far below any value that would lose precision in the segment/sphere
-/// boundary solve (`1e4^2 = 1e8`, comfortably inside f32's exact-integer range).
+/// `1e4` is far above any camera-adaptive view radius (so the sample reliably
+/// clips out) and far below any value that would lose precision in the
+/// segment/sphere boundary solve (`1e4^2 = 1e8`, inside f32's exact-integer range).
 const STEREOGRAPHIC_POLE_FAR_CAP: f32 = 1.0e4;
 
-/// Body-local projected-radius clip for a `projection`, or `None` when the
-/// projection needs no clip. Only [`rye_math::Projection::Stereographic`] has a
-/// genuine point-at-infinity in its image (a vertex on the pole), so it is the
-/// only projection whose near-singularity samples are dropped; the affine
-/// projections and Schlegel's bounded-finite clamp keep every sample. The test
-/// compares the magnitude of the *pre-translate* projected point (the conformal
-/// image about the body's own center), which is invariant to the body's R³
-/// position and the camera, so the same 4D edge clips identically at every row
-/// slot and zoom.
-fn stereographic_clip_radius(projection: &rye_math::Projection<4>) -> Option<f32> {
+/// Body-local projected-radius clip for a `projection` at the given per-frame
+/// `view_radius`, or `None` when the projection needs no clip. Only
+/// [`rye_math::Projection::Stereographic`] has a genuine point-at-infinity in its
+/// image (a vertex on the pole), so it is the only projection whose
+/// near-singularity samples are clipped; the affine projections and Schlegel's
+/// bounded-finite clamp keep every sample. `view_radius` is the camera-adaptive
+/// [`stereographic_view_radius`] in the live render path (tests pass the fixed
+/// [`STEREOGRAPHIC_VIEW_RADIUS`]); it is a body-local radius, so the same 4D edge
+/// clips identically at every row slot regardless of the body's R³ position.
+fn stereographic_clip_radius(
+    projection: &rye_math::Projection<4>,
+    view_radius: f32,
+) -> Option<f32> {
     match *projection {
-        rye_math::Projection::Stereographic { .. } => Some(STEREOGRAPHIC_VIEW_RADIUS),
+        rye_math::Projection::Stereographic { .. } => Some(view_radius),
         rye_math::Projection::Identity
         | rye_math::Projection::Orthographic { .. }
         | rye_math::Projection::Perspective4D { .. }
@@ -359,9 +398,10 @@ fn push_projected_chord(
     width: f32,
     projection: &rye_math::Projection<4>,
     body_pos_r3: Vec3,
+    view_radius: f32,
 ) {
     let samples = SPACE_TESSELLATION_SAMPLES;
-    let clip_radius = stereographic_clip_radius(projection);
+    let clip_radius = stereographic_clip_radius(projection, view_radius);
     // Seed from sample 0 (`a` exactly). `sample_at` returns the pre-translate
     // projected point (for the clip test) and the world point (for the mesh).
     let sample_at = |p4: Vec4| {
@@ -650,12 +690,13 @@ fn push_blended_edge(
     projection: &rye_math::Projection<4>,
     body_pos_r3: Vec3,
     slerp_scratch: &mut Vec<Vec4>,
+    view_radius: f32,
 ) {
     // Flat edge: one straight R3 chord per polytope edge. For stereographic this
     // is a comparison overlay, not the S3 great-circle image.
     if blend <= 0.0 {
         if flat_edge_uses_endpoint_chord(projection) {
-            let clip_radius = stereographic_clip_radius(projection);
+            let clip_radius = stereographic_clip_radius(projection, view_radius);
             let a3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
                 a, projection,
             );
@@ -673,7 +714,17 @@ fn push_blended_edge(
             return;
         }
         // Future non-line-preserving flat projection: sample the R⁴ chord.
-        push_projected_chord(mesh, a, b, color_a, color_b, width, projection, body_pos_r3);
+        push_projected_chord(
+            mesh,
+            a,
+            b,
+            color_a,
+            color_b,
+            width,
+            projection,
+            body_pos_r3,
+            view_radius,
+        );
         return;
     }
 
@@ -686,7 +737,7 @@ fn push_blended_edge(
         // circumradius `body_size`), but route through the same flat-edge chord
         // policy so degenerate inputs don't invent spherical samples.
         if flat_edge_uses_endpoint_chord(projection) {
-            let clip_radius = stereographic_clip_radius(projection);
+            let clip_radius = stereographic_clip_radius(projection, view_radius);
             let a3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
                 a, projection,
             );
@@ -703,12 +754,22 @@ fn push_blended_edge(
             }
             return;
         }
-        push_projected_chord(mesh, a, b, color_a, color_b, width, projection, body_pos_r3);
+        push_projected_chord(
+            mesh,
+            a,
+            b,
+            color_a,
+            color_b,
+            width,
+            projection,
+            body_pos_r3,
+            view_radius,
+        );
         return;
     }
 
     let samples = SPACE_TESSELLATION_SAMPLES;
-    let clip_radius = stereographic_clip_radius(projection);
+    let clip_radius = stereographic_clip_radius(projection, view_radius);
     // Unit endpoints on S³ for the great-circle arc; the per-sample radius lerp
     // below restores the body's scale and keeps the endpoints exactly on `a`/`b`.
     let p0u = a / radius_a;
@@ -1093,11 +1154,12 @@ impl Demo {
         );
 
         let mut camera = Camera::<EuclideanR3>::at_origin();
-        camera.position = Vec3::new(0.0, 3.0, 9.0);
+        camera.position = Vec3::new(0.0, 4.0, 13.0);
         let mut orbit: OrbitController<EuclideanR3> = OrbitController::default();
-        // Wider orbit so all four bodies in the row are visible at
-        // default zoom; user can scroll-zoom in.
-        orbit.set_orbit(9.5, -0.25);
+        // Wider orbit so all four bodies in the row are visible at default zoom,
+        // with extra room for larger shapes' stereographic arcs; the user can
+        // scroll-zoom in toward MIN_DISTANCE or out toward the raised MAX_DISTANCE.
+        orbit.set_orbit(13.0, -0.25);
 
         // Freecam preset; inactive at startup. The `camera freecam` console
         // command calls `freecam.set_active(true, camera.position)` which
@@ -1894,7 +1956,10 @@ impl Demo {
         // the touching edges are dropped. Gating the point push on the same
         // predicate keeps the points overlay consistent with the wireframe.
         // `None` for every other projection, so nothing is dropped there.
-        let points_clip_radius = stereographic_clip_radius(&wireframe_projection);
+        let points_clip_radius = stereographic_clip_radius(
+            &wireframe_projection,
+            stereographic_view_radius(self.camera_distance_to_focus()),
+        );
         // Active-mode palette: bright green for vertices that belong to a
         // currently-intersected cell, dim gray otherwise. Same hues the
         // wireframe overlay uses so the visual identity stays consistent.
@@ -2152,8 +2217,9 @@ impl Demo {
         // cap outline. The cross layer is drop-w (Identity), so its radius is
         // `None` and every triangle is kept, bit-identical to before this clip.
         // The cap layer is `None` unless the active projection is Stereographic.
-        let cross_clip = stereographic_clip_radius(&cross_projection);
-        let cap_clip = stereographic_clip_radius(&cap_projection);
+        let view_radius = stereographic_view_radius(self.camera_distance_to_focus());
+        let cross_clip = stereographic_clip_radius(&cross_projection, view_radius);
+        let cap_clip = stereographic_clip_radius(&cap_projection, view_radius);
 
         // Reused per-vertex projected-point buffer for the triangle-granularity
         // fill clip, taken out so the `append_layer` closure can hold it `&mut`
@@ -2313,6 +2379,14 @@ impl Demo {
     /// wireframe) from the current row + rotor + w_slice, upload them, clear the overlay
     /// depth buffer, and execute the three raster passes on top of the existing SDF render.
     ///
+    /// Distance from the camera eye to the scene focus (the orbit target), used to
+    /// scale the stereographic clip radius (see [`stereographic_view_radius`]).
+    /// Reads the live eye position rather than `orbit.distance` so it is correct in
+    /// FreeRoam too, where the orbit controller is not driving the camera.
+    fn camera_distance_to_focus(&self) -> f32 {
+        (self.camera.position - self.orbit.target).length()
+    }
+
     /// Per-body transform: each canonical Polytope4 vertex `v` becomes the world Vec4
     /// `body.position + effective_body_size() * rot_state.apply(v)`. The section algorithm
     /// then runs on these world vertices against the demo's `w_slice`, producing geometry
@@ -2359,6 +2433,11 @@ impl Demo {
         // Resolve once per frame; same projection applied to every body's wireframe so all
         // bodies share a consistent R³ embedding.
         let wireframe_projection = self.resolved_wireframe_projection();
+        // Camera-adaptive stereographic clip radius for this frame, captured once
+        // (Copy f32) so the perimeter closure and the per-edge `push_blended_edge`
+        // calls below share it without re-borrowing `self`. See
+        // `stereographic_view_radius` for why it tracks the camera distance.
+        let view_radius = stereographic_view_radius(self.camera_distance_to_focus());
         // Per-layer perimeter toggles + the honest layer's always-drop-w
         // projection (the active projection is forced to `Identity` for the
         // cross-section so its outline can never follow a distorting projection).
@@ -2439,7 +2518,7 @@ impl Demo {
                 let w_slice = self.w_slice;
                 let mut push_perimeter = |projection: &rye_math::Projection<4>| {
                     let section_scale = perspective_scale_at_w(w_slice, projection);
-                    let clip_radius = stereographic_clip_radius(projection);
+                    let clip_radius = stereographic_clip_radius(projection, view_radius);
                     for ((a, b), (color, width)) in perim
                         .segments
                         .iter()
@@ -2647,6 +2726,7 @@ impl Demo {
                     &wireframe_projection,
                     body_pos_r3,
                     &mut slerp_scratch,
+                    view_radius,
                 );
             }
         }
@@ -3903,6 +3983,7 @@ mod blended_edge_tests {
             &flat_drop_w(),
             Vec3::ZERO,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
         assert_eq!(mesh.segments.len(), 1);
         let chord = (Vec3::new(0.0, 0.7, 0.0) - Vec3::new(0.7, 0.0, 0.0)).length();
@@ -3928,6 +4009,7 @@ mod blended_edge_tests {
             &flat_drop_w(),
             Vec3::ZERO,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
         assert_eq!(mesh.segments.len(), SPACE_TESSELLATION_SAMPLES);
     }
@@ -3955,6 +4037,7 @@ mod blended_edge_tests {
             &flat_drop_w(),
             Vec3::ZERO,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
         let arc_len = polyline_length(&arc);
         // Quarter circle of radius 0.7 has arc length 0.7·π/2 ≈ 1.0996 vs chord
@@ -3989,6 +4072,7 @@ mod blended_edge_tests {
                 &flat_drop_w(),
                 Vec3::ZERO,
                 &mut scratch,
+                STEREOGRAPHIC_VIEW_RADIUS,
             );
             polyline_length(&mesh)
         };
@@ -4045,6 +4129,7 @@ mod blended_edge_tests {
             &proj,
             body_pos,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
 
         assert_eq!(mesh.segments.len(), 1, "affine flat chord is one segment");
@@ -4087,6 +4172,7 @@ mod blended_edge_tests {
                 &proj,
                 body_pos,
                 &mut scratch,
+                STEREOGRAPHIC_VIEW_RADIUS,
             );
             assert!(!mesh.segments.is_empty(), "blend {blend}: emitted nothing");
             let first = mesh.segments.first().unwrap().0;
@@ -5157,6 +5243,7 @@ mod section_cap_projection_tests {
             &proj,
             body_pos,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
         assert_eq!(
             mesh.segments.len(),
@@ -5197,6 +5284,7 @@ mod section_cap_projection_tests {
             &proj,
             Vec3::ZERO,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
         assert_eq!(mesh.segments.len(), 1, "Schlegel edge is one chord");
         assert_eq!(
@@ -5236,6 +5324,7 @@ mod section_cap_projection_tests {
             &proj,
             body_pos,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
         assert_eq!(
             mesh.segments.len(),
@@ -5366,47 +5455,68 @@ mod section_cap_projection_tests {
     // temporal behavior is a visual property and needs human eyes-on (see the
     // wireframe overlay note); a test named "flicker_free" would be a doc lie.
 
-    /// `STEREOGRAPHIC_VIEW_RADIUS` sits below the camera orbit distance (so a
-    /// near-pole arc can never reach the camera plane and rubberband), above the
-    /// legitimate stereographic image of a unit-circumradius polytope (so real
-    /// geometry is never clipped), and below the pole-clamp magnitude ceiling
-    /// `sqrt(2 / eps)` (so the near-pole blow-up still reliably exceeds it). The
-    /// camera-distance bound is the load-bearing one: it is what removes the
-    /// long/short length jump the near-plane line clip alone cannot.
+    /// The camera-adaptive clip radius stays below the camera distance at every
+    /// reasonable zoom (so a near-pole arc can never reach the camera plane and
+    /// rubberband, the zoom-robust property), clears the legitimate image of a
+    /// unit-circumradius polytope (so real geometry is never clipped), stays below
+    /// the pole-clamp magnitude ceiling (so the near-pole blow-up still reliably
+    /// exceeds it), and saturates at [`STEREOGRAPHIC_VIEW_RADIUS_MAX`] on zoom-out
+    /// (so the arc never reaches the under-tessellated steep region, which would
+    /// jag and bounce). The below-camera-distance and saturation properties are
+    /// the load-bearing ones.
     #[test]
-    fn stereographic_view_radius_below_camera_distance() {
-        // The demo's default orbit distance (see `Demo::new`, `set_orbit(9.5, ..)`).
-        // The wireframe sits near the orbit target, so this is the eye's distance
-        // from the stereographic image; an arc capped below it stays in front of
-        // the eye at every orientation.
-        const DEFAULT_ORBIT_DISTANCE: f32 = 9.5;
-        assert!(
-            STEREOGRAPHIC_VIEW_RADIUS < DEFAULT_ORBIT_DISTANCE,
-            "radius {STEREOGRAPHIC_VIEW_RADIUS} must stay below the camera distance \
-             {DEFAULT_ORBIT_DISTANCE} so arcs never reach the camera plane"
-        );
-
-        // Below the pole-clamp ceiling, so a clamp-band sample reliably exceeds R.
-        let clamp_ceiling = (2.0 / rye_math::STEREOGRAPHIC_POLE_EPSILON).sqrt();
-        assert!(
-            STEREOGRAPHIC_VIEW_RADIUS < clamp_ceiling,
-            "radius {STEREOGRAPHIC_VIEW_RADIUS} must sit below the clamp ceiling {clamp_ceiling}"
-        );
-
-        // Above the legit image: project an actual unit tesseract vertex (the
-        // `+w`-cell corner, the worst non-pole case at w = 0.5, image magnitude
-        // sqrt(3) ~ 1.73) and require the cap to clear it with margin, so real
-        // geometry is never clipped. Pins the radius against a genuine sample
-        // rather than a const-vs-const tautology.
+    fn stereographic_view_radius_tracks_camera_distance() {
+        // The legit image of the worst non-pole vertex (the `+w`-cell corner at
+        // w = 0.5, image magnitude sqrt(3) ~ 1.73): the radius must always clear
+        // it so real geometry is never clipped. Pinned against a genuine sample.
         let legit = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
             Vec4::new(0.5, 0.5, 0.5, 0.5),
             &rye_math::Projection::Stereographic { pole: Vec4::W },
+        )
+        .length();
+        let clamp_ceiling = (2.0 / rye_math::STEREOGRAPHIC_POLE_EPSILON).sqrt();
+
+        // Across the orbit's zoom range and beyond, the radius stays a fixed
+        // fraction below the camera distance, clears the figure, and sits under
+        // the clamp ceiling. At very close range the figure floor can exceed the
+        // distance (the eye is inside the figure); above the floor's reach the
+        // strict-below-distance property holds, which is the rubberband fix.
+        for distance in [2.0_f32, 4.0, 8.0, 16.0, 40.0] {
+            let r = stereographic_view_radius(distance);
+            assert!(
+                r > legit,
+                "radius {r} at distance {distance} must clear the figure {legit}"
+            );
+            assert!(
+                r < clamp_ceiling,
+                "radius {r} must stay below the clamp ceiling"
+            );
+            // Above where the floor dominates, the radius is strictly below the
+            // camera distance (arcs stay in front of the eye).
+            if distance * STEREOGRAPHIC_VIEW_RADIUS_FRACTION >= STEREOGRAPHIC_VIEW_RADIUS_FLOOR {
+                assert!(
+                    r < distance,
+                    "radius {r} must stay below camera distance {distance} (no plane crossing)"
+                );
+            }
+            // Never past the gentle-region ceiling, at any distance.
+            assert!(
+                r <= STEREOGRAPHIC_VIEW_RADIUS_MAX,
+                "radius {r} must never exceed the cap {STEREOGRAPHIC_VIEW_RADIUS_MAX}"
+            );
+        }
+
+        // On zoom-out the radius saturates at the cap (does not grow into the
+        // under-tessellated steep region), which is what keeps far-zoom arcs
+        // smooth and bounce-free.
+        assert_eq!(
+            stereographic_view_radius(40.0),
+            STEREOGRAPHIC_VIEW_RADIUS_MAX
         );
-        assert!(
-            STEREOGRAPHIC_VIEW_RADIUS > 2.0 * legit.length(),
-            "radius {STEREOGRAPHIC_VIEW_RADIUS} must clear the legit image ({})",
-            legit.length()
-        );
+        // The test reference equals the live value at an 8-unit camera distance
+        // (and beyond), so fixtures using the constant exercise a representative
+        // radius.
+        assert!((stereographic_view_radius(8.0) - STEREOGRAPHIC_VIEW_RADIUS).abs() < 1e-5);
     }
 
     /// `stereographic_clip_radius` returns `Some(R)` exactly for Stereographic and
@@ -5418,7 +5528,10 @@ mod section_cap_projection_tests {
     #[test]
     fn stereographic_clip_radius_only_for_stereographic() {
         assert_eq!(
-            stereographic_clip_radius(&rye_math::Projection::Stereographic { pole: Vec4::W }),
+            stereographic_clip_radius(
+                &rye_math::Projection::Stereographic { pole: Vec4::W },
+                STEREOGRAPHIC_VIEW_RADIUS
+            ),
             Some(STEREOGRAPHIC_VIEW_RADIUS)
         );
         for proj in [
@@ -5430,7 +5543,7 @@ mod section_cap_projection_tests {
             rye_math::Projection::schlegel(Vec4::W, 0.5, 0.75),
         ] {
             assert_eq!(
-                stereographic_clip_radius(&proj),
+                stereographic_clip_radius(&proj, STEREOGRAPHIC_VIEW_RADIUS),
                 None,
                 "non-stereographic projection {proj:?} must carry no clip"
             );
@@ -5460,6 +5573,7 @@ mod section_cap_projection_tests {
             &proj,
             Vec3::ZERO,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
         mesh.segments
     }
@@ -5714,6 +5828,7 @@ mod section_cap_projection_tests {
             &proj,
             Vec3::ZERO,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
         let cap_after_first = scratch.capacity();
         // The slerp buffer holds `samples + 1` points, so its capacity must be
@@ -5732,6 +5847,7 @@ mod section_cap_projection_tests {
             &proj,
             Vec3::ZERO,
             &mut scratch,
+            STEREOGRAPHIC_VIEW_RADIUS,
         );
         assert_eq!(
             scratch.capacity(),
@@ -5825,7 +5941,7 @@ mod section_cap_projection_tests {
     #[test]
     fn cap_fill_matches_perimeter_clip() {
         let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
-        let clip = stereographic_clip_radius(&proj);
+        let clip = stereographic_clip_radius(&proj, STEREOGRAPHIC_VIEW_RADIUS);
         // A near-pole cap vertex (w-slice close to +w, off-axis so it projects to
         // a large finite point) and a far one on the equatorial slice.
         let near = cap_projected([0.05, 0.02, 0.01], 0.999, &proj);
@@ -5861,7 +5977,7 @@ mod section_cap_projection_tests {
     #[test]
     fn points_overlay_drops_near_pole_vertex() {
         let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
-        let clip = stereographic_clip_radius(&proj);
+        let clip = stereographic_clip_radius(&proj, STEREOGRAPHIC_VIEW_RADIUS);
         // Body-local vertex within the angular epsilon of +w: project it the same
         // way render_points does, then apply the gate.
         let v_near = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
@@ -5884,7 +6000,8 @@ mod section_cap_projection_tests {
         );
         // Affine projection carries no clip: even the near-pole image is kept
         // (Identity has no point-at-infinity, so the magnitude is bounded anyway).
-        let affine_clip = stereographic_clip_radius(&rye_math::Projection::Identity);
+        let affine_clip =
+            stereographic_clip_radius(&rye_math::Projection::Identity, STEREOGRAPHIC_VIEW_RADIUS);
         assert!(
             sample_in_radius(v_near, affine_clip),
             "affine projection must keep every point (no clip)"
@@ -5900,7 +6017,7 @@ mod section_cap_projection_tests {
     #[test]
     fn cap_fill_uses_default_plus_w_pole() {
         let proj = default_stereographic();
-        let clip = stereographic_clip_radius(&proj);
+        let clip = stereographic_clip_radius(&proj, STEREOGRAPHIC_VIEW_RADIUS);
         // A 4D point in the +w pole's near neighborhood: `(0.05, 0, 0, 1.0)`
         // normalizes to dot ~ 0.99875 with +w, image magnitude ~40, past the
         // ~35 radius, so it drops.
