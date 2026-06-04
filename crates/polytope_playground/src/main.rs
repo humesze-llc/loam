@@ -87,36 +87,35 @@ const SECTION_FACES_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Dep
 const PERSPECTIVE_SCALE_DENOM_EPSILON: f32 = 1e-4;
 
 /// Body-local projected radius past which a stereographic sample is treated as
-/// the conformal point at infinity and DROPPED from the rendered polyline,
-/// rather than drawn as the large-but-finite point the pole-denominator clamp
-/// produces.
+/// the conformal point at infinity and cut from the rendered polyline (the arc
+/// runs out to this radius; samples beyond it are the near-pole blow-up).
 ///
-/// Why a drop, not a magnitude clamp: as a vertex sweeps through the pole under
-/// rotation, the pole-perpendicular numerator `p - dot*pole` passes through zero
-/// and reverses direction, so the projected point's direction flips 180 degrees
-/// across the crossing. Rescaling that point back to a fixed radius (a clamp)
-/// keeps the flip: the clamped point still jumps from `R*(+u)` to `R*(-u)`, a
-/// `2R` screen pop. Dropping the over-radius sub-segment instead lets the edge
-/// run out toward the view boundary and culls the offscreen blow-up; the
-/// remaining on-screen polyline is the true conformal image, untouched. This
-/// bounds and de-NaNs the artifact but does NOT make the at-pole instant
-/// continuous (a vertex crossing the pole is a genuine discontinuity of the
-/// projection); see the eyes-on caveat in the wireframe overlay.
+/// **The cap must sit below the camera distance.** A stereographic near-pole edge
+/// images to an arc that runs off toward infinity; the cap bounds it at this
+/// world radius. The wireframe is centered near the orbit target, and the camera
+/// orbits it at [`OrbitController`]'s distance (the demo's default is `9.5`, the
+/// minimum `1.5`). If the cap exceeds the camera distance, an arc endpoint at
+/// radius `R` in the camera's direction lands AT or BEHIND the eye, and the
+/// perspective projection of a point grazing the eye plane is hyper-sensitive: a
+/// small rotation step swings its screen image from the far edge (a "long" arc)
+/// to a finite on-screen point (a "short" arc), the long/short rubberband. The
+/// engine's near-plane line clip (`line_raster.wgsl`) removes the sign-flip
+/// *width* artifact of a behind-eye endpoint, but it cannot remove this
+/// *length* discontinuity, which is inherent to an extended arc reaching past a
+/// close camera. Keeping `R` comfortably below the orbit distance keeps every arc
+/// endpoint well in front of the eye, so the projection stays smooth and bounded
+/// and the arc has no way to graze the camera plane.
 ///
-/// Interdependent with [`rye_math::STEREOGRAPHIC_POLE_EPSILON`]: a sample inside
-/// the clamp band maps to magnitude at most `sqrt(2 / eps)` (~141 at the default
-/// `eps = 1e-4`), so this radius must sit strictly below that ceiling for the
-/// near-pole blow-up to reliably exceed it and be dropped, yet well above the
-/// legitimate on-screen extent of a unit-circumradius polytope's stereographic
-/// image (a `body_size`-scaled vertex with `w = 0.5` maps to radius ~1.7, and
-/// near-pole edge interiors reach a few units) so real geometry is never
-/// clipped. The value is a quarter of the clamp ceiling `sqrt(2 / eps)`, i.e.
-/// ~35: a quarter keeps the clip well clear of both the legitimate image (far
-/// below `R`) and the clamp-saturated near-pole blow-up (far above `R`), so the
-/// drop is unambiguous on both sides. Pinned against its formula by
-/// `stereographic_view_radius_sits_below_clamp_ceiling` (the literal is the f32
-/// value of `0.25 * sqrt(2 / eps)`, recorded because `f32::sqrt` is not `const`).
-const STEREOGRAPHIC_VIEW_RADIUS: f32 = 35.355_34;
+/// `6.0` sits below the default `9.5` orbit (nearest approach to the eye `~3.5`,
+/// a gentle off-axis sweep) and far above the legitimate image extent of a
+/// unit-circumradius polytope (a `w = 0.5` vertex maps to radius `~1.7`), so real
+/// geometry is never clipped while the near-pole arcs read as an extended halo
+/// rather than offscreen-bouncing infinities. It is also well under the
+/// pole-clamp ceiling `sqrt(2 / eps)` (~141), so the near-pole blow-up still
+/// reliably exceeds it. NOTE: not yet adaptive to zoom; a zoom-in past `R` would
+/// reintroduce the grazing sweep (the near-plane clip still prevents the width
+/// artifact). Pinned by `stereographic_view_radius_below_camera_distance`.
+const STEREOGRAPHIC_VIEW_RADIUS: f32 = 6.0;
 
 /// Cap on the reconstructed near-pole image magnitude (see `near_pole_view_point`).
 /// A point within the pole-denominator clamp band is a point-at-infinity; the
@@ -5367,44 +5366,45 @@ mod section_cap_projection_tests {
     // temporal behavior is a visual property and needs human eyes-on (see the
     // wireframe overlay note); a test named "flicker_free" would be a doc lie.
 
-    /// `STEREOGRAPHIC_VIEW_RADIUS` equals its documented formula
-    /// `0.25 * sqrt(2 / eps)` and sits strictly below the pole-clamp magnitude
-    /// ceiling `sqrt(2 / eps)` yet well above the legitimate stereographic image
-    /// of a unit-circumradius polytope. Pins the recorded literal against its
-    /// derivation (it is a literal only because `f32::sqrt` is not `const`) and
-    /// the interdependence with the pole clamp: if `STEREOGRAPHIC_POLE_EPSILON`
-    /// changed without re-deriving the radius, the clip could fall above the
-    /// clamp ceiling and never engage, or below the real image and clip true
-    /// geometry.
+    /// `STEREOGRAPHIC_VIEW_RADIUS` sits below the camera orbit distance (so a
+    /// near-pole arc can never reach the camera plane and rubberband), above the
+    /// legitimate stereographic image of a unit-circumradius polytope (so real
+    /// geometry is never clipped), and below the pole-clamp magnitude ceiling
+    /// `sqrt(2 / eps)` (so the near-pole blow-up still reliably exceeds it). The
+    /// camera-distance bound is the load-bearing one: it is what removes the
+    /// long/short length jump the near-plane line clip alone cannot.
     #[test]
-    fn stereographic_view_radius_sits_below_clamp_ceiling() {
-        let eps = rye_math::STEREOGRAPHIC_POLE_EPSILON;
-        let clamp_ceiling = (2.0 / eps).sqrt();
-        // A quarter of the clamp ceiling: see STEREOGRAPHIC_VIEW_RADIUS.
-        let derived = 0.25 * clamp_ceiling;
+    fn stereographic_view_radius_below_camera_distance() {
+        // The demo's default orbit distance (see `Demo::new`, `set_orbit(9.5, ..)`).
+        // The wireframe sits near the orbit target, so this is the eye's distance
+        // from the stereographic image; an arc capped below it stays in front of
+        // the eye at every orientation.
+        const DEFAULT_ORBIT_DISTANCE: f32 = 9.5;
         assert!(
-            (STEREOGRAPHIC_VIEW_RADIUS - derived).abs() < 1e-2,
-            "recorded radius {STEREOGRAPHIC_VIEW_RADIUS} must match formula {derived}"
+            STEREOGRAPHIC_VIEW_RADIUS < DEFAULT_ORBIT_DISTANCE,
+            "radius {STEREOGRAPHIC_VIEW_RADIUS} must stay below the camera distance \
+             {DEFAULT_ORBIT_DISTANCE} so arcs never reach the camera plane"
         );
-        // Strictly below the clamp-saturated near-pole magnitude, so a sample in
-        // the clamp band reliably exceeds R and is dropped.
+
+        // Below the pole-clamp ceiling, so a clamp-band sample reliably exceeds R.
+        let clamp_ceiling = (2.0 / rye_math::STEREOGRAPHIC_POLE_EPSILON).sqrt();
         assert!(
             STEREOGRAPHIC_VIEW_RADIUS < clamp_ceiling,
             "radius {STEREOGRAPHIC_VIEW_RADIUS} must sit below the clamp ceiling {clamp_ceiling}"
         );
-        // Well above the legit image: project an actual unit tesseract vertex
-        // (the `+w`-cell corner, the worst non-pole case at w = 0.5) and require
-        // the clip radius to clear its image magnitude by more than 10x, so real
-        // geometry is never dropped. A bare `R > literal` would be a const-vs-const
-        // tautology; this pins the radius against a genuine projected sample.
+
+        // Above the legit image: project an actual unit tesseract vertex (the
+        // `+w`-cell corner, the worst non-pole case at w = 0.5, image magnitude
+        // sqrt(3) ~ 1.73) and require the cap to clear it with margin, so real
+        // geometry is never clipped. Pins the radius against a genuine sample
+        // rather than a const-vs-const tautology.
         let legit = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
             Vec4::new(0.5, 0.5, 0.5, 0.5),
             &rye_math::Projection::Stereographic { pole: Vec4::W },
         );
         assert!(
-            STEREOGRAPHIC_VIEW_RADIUS > 10.0 * legit.length(),
-            "radius {STEREOGRAPHIC_VIEW_RADIUS} must clear the legit image \
-             ({}) by a wide margin",
+            STEREOGRAPHIC_VIEW_RADIUS > 2.0 * legit.length(),
+            "radius {STEREOGRAPHIC_VIEW_RADIUS} must clear the legit image ({})",
             legit.length()
         );
     }
@@ -5525,7 +5525,7 @@ mod section_cap_projection_tests {
     /// The clip cuts a straddling sub-segment AT the view boundary and DROPS a
     /// sub-segment whose interior runs deep through the pole; it is neither a
     /// whole-segment drop nor a magnitude rescale. The fixture is an edge whose
-    /// great-circle interior passes straight through the `+w` pole (endpoints 5
+    /// great-circle interior passes straight through the `+w` pole (endpoints 30
     /// degrees off the pole on opposite sides), so the deep-pole samples blow up
     /// while both endpoints stay well inside `R`. Three guarantees:
     ///
@@ -5544,11 +5544,11 @@ mod section_cap_projection_tests {
     #[test]
     fn stereographic_clip_cuts_to_boundary_and_drops_deep_pole() {
         let r = STEREOGRAPHIC_VIEW_RADIUS;
-        // Endpoints 5 degrees off the pole on opposite sides of the w-x plane;
+        // Endpoints 30 degrees off the pole on opposite sides of the w-x plane;
         // their connecting great circle passes through the +w pole at its
-        // midpoint. The endpoints' image magnitude is cot(2.5 deg) ~ 22.9 < R, so
+        // midpoint. The endpoints' image magnitude is cot(15 deg) ~ 3.73 < R, so
         // they are kept, while the midpoint samples blow up past R.
-        let off = 5.0_f32.to_radians();
+        let off = 30.0_f32.to_radians();
         let a = Vec4::new(off.sin(), 0.0, 0.0, off.cos());
         let b = Vec4::new(-off.sin(), 0.0, 0.0, off.cos());
         let segs = build_spherical_stereographic_edge(a, b);
