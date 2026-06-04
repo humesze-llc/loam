@@ -78,17 +78,38 @@ fn vs_main(
     let s_3d = project_perspective_4d(s_4d, transform.focal_distance);
     let e_3d = project_perspective_4d(e_4d, transform.focal_distance);
     // Stage 3: standard R3 -> clip via view*proj.
-    let s_clip = transform.view_projection * vec4<f32>(s_3d, 1.0);
-    let e_clip = transform.view_projection * vec4<f32>(e_3d, 1.0);
-    let s_ndc  = s_clip.xyz / s_clip.w;
-    let e_ndc  = e_clip.xyz / e_clip.w;
+    var a = transform.view_projection * vec4<f32>(s_3d, 1.0);
+    var b = transform.view_projection * vec4<f32>(e_3d, 1.0);
+
+    // Near-plane clip before the perspective divide (see `line_raster.wgsl` for
+    // the full rationale): glam's `perspective_rh` puts the near plane at
+    // `clip.z == 0` and `clip.z < 0` for anything nearer, including behind the
+    // eye (`w <= 0`), where the divide would flip the NDC across the screen.
+    // Both endpoints in front (the common case here, since a unit-circumradius
+    // polytope never reaches the camera) take no clip. The depth-cue color is a
+    // single value for the whole segment, so a clipped endpoint keeps it.
+    if (a.z < 0.0 && b.z < 0.0) {
+        var culled: VsOut;
+        culled.clip       = vec4<f32>(0.0, 0.0, -1.0, 1.0);
+        culled.coverage_t = 0.0;
+        culled.width_px   = width_px;
+        culled.color      = vec4<f32>(0.0);
+        return culled;
+    }
+    if (a.z < 0.0) {
+        a = mix(a, b, a.z / (a.z - b.z));
+    } else if (b.z < 0.0) {
+        b = mix(b, a, b.z / (b.z - a.z));
+    }
+    let s_ndc  = a.xyz / a.w;
+    let e_ndc  = b.xyz / b.w;
 
     // Corners 0, 2 belong to the start endpoint; 1, 3 to the end. (Mirrors
     // the same convention as the R³ variant; the quad-expansion + AA logic
     // below is bit-identical to `line_raster.wgsl`.)
     let pick_start = (corner == 0u || corner == 2u);
     let base_ndc   = select(e_ndc, s_ndc, pick_start);
-    let base_w     = select(e_clip.w, s_clip.w, pick_start);
+    let base_w     = select(b.w, a.w, pick_start);
 
     // Depth-cue color: average the segment's rotated w-coordinates, normalize,
     // and lerp between a cool "back" tint and a warm "front" tint. Identical

@@ -118,6 +118,17 @@ const PERSPECTIVE_SCALE_DENOM_EPSILON: f32 = 1e-4;
 /// value of `0.25 * sqrt(2 / eps)`, recorded because `f32::sqrt` is not `const`).
 const STEREOGRAPHIC_VIEW_RADIUS: f32 = 35.355_34;
 
+/// Cap on the reconstructed near-pole image magnitude (see `near_pole_view_point`).
+/// A point within the pole-denominator clamp band is a point-at-infinity; the
+/// conformal map's denominator clamp deflates its rendered magnitude toward the
+/// origin, so the wireframe builder substitutes the true magnitude
+/// `sqrt((1 + dot) / (1 - dot))` in the same projected direction. That true
+/// magnitude diverges at the pole, so it is capped here purely for f32 safety:
+/// `1e4` is far above `STEREOGRAPHIC_VIEW_RADIUS` (so the sample reliably clips
+/// out) and far below any value that would lose precision in the segment/sphere
+/// boundary solve (`1e4^2 = 1e8`, comfortably inside f32's exact-integer range).
+const STEREOGRAPHIC_POLE_FAR_CAP: f32 = 1.0e4;
+
 /// Body-local projected-radius clip for a `projection`, or `None` when the
 /// projection needs no clip. Only [`rye_math::Projection::Stereographic`] has a
 /// genuine point-at-infinity in its image (a vertex on the pole), so it is the
@@ -165,32 +176,34 @@ fn perspective_scale_at_w(w_slice: f32, projection: &rye_math::Projection<4>) ->
     }
 }
 
-/// Whether `projection` maps a straight R⁴ chord to a straight R³ segment, so a
+/// Whether `projection` maps a straight R4 chord to a straight R3 segment, so a
 /// polytope edge can be rendered as a single line between its projected endpoints.
 ///
 /// `Identity` / `Orthographic` are linear and `Perspective4D` is a central
 /// projection (the bodies sit at `w = 0`, so the perspective divide is a
-/// line-preserving map onto R³): all three send a 4D segment to an R³ segment,
-/// the affine fast path. `Schlegel` and `Stereographic` are non-affine -- their
-/// R³ image of a point depends nonlinearly on all four coordinates, so the image
-/// of an edge is a *curve*, not the chord through its projected endpoints. An edge
-/// drawn as a single straight chord under those projections drifts off its own
-/// projected midpoint (measured ~0.17 R³ units for a unit-circumradius tesseract
-/// edge under the `+w`-pole stereographic map), and the per-vertex-projected
-/// cross-section cap, which lands on the true projected edge, then floats off the
-/// wireframe. The wireframe builder subdivides the edge under these projections so
-/// the rendered polyline follows the projected curve and the cap rejoins it.
-///
-/// This is the same affine/non-affine split [`perspective_scale_at_w`] reports as
-/// `Some`/`None`; kept as a distinct boolean so the wireframe edge path reads as a
-/// shape question ("is the projected edge straight?") rather than borrowing the
-/// section cap's scalar-shim return.
-fn projection_is_affine(projection: &rye_math::Projection<4>) -> bool {
+/// line-preserving map onto R3). Schlegel is central projection onto the chosen
+/// cell's hyperplane, so it is line-preserving too even though it is not affine
+/// and cannot use the section-cap scalar shim. Stereographic is the odd one out:
+/// sampling a chord through its S3-normalizing projection generally curves in
+/// R3. The flat stereographic wireframe path is a separate endpoint-chord
+/// overlay, not this projected chord interior.
+fn projection_maps_chords_to_lines(projection: &rye_math::Projection<4>) -> bool {
     match *projection {
         rye_math::Projection::Identity
         | rye_math::Projection::Orthographic { .. }
-        | rye_math::Projection::Perspective4D { .. } => true,
-        rye_math::Projection::Schlegel { .. } | rye_math::Projection::Stereographic { .. } => false,
+        | rye_math::Projection::Perspective4D { .. }
+        | rye_math::Projection::Schlegel { .. } => true,
+        rye_math::Projection::Stereographic { .. } => false,
+    }
+}
+
+/// Whether a flat wireframe edge (`blend == 0`) should render as the R3 chord
+/// between projected endpoints. Stereographic edges are always drawn as S3 arcs
+/// (`blend == 1`), so this chord path is the affine projections' geometry.
+fn flat_edge_uses_endpoint_chord(projection: &rye_math::Projection<4>) -> bool {
+    match *projection {
+        rye_math::Projection::Stereographic { .. } => true,
+        _ => projection_maps_chords_to_lines(projection),
     }
 }
 
@@ -333,11 +346,10 @@ fn cell_w_range(cell: &[u32], local_vertices: &[Vec4]) -> (f32, f32) {
 /// blow-up is culled. No clip is applied for other projections
 /// ([`stereographic_clip_radius`] returns `None`).
 ///
-/// Used by [`push_blended_edge`] for the flat-space (`blend == 0`) case under a
-/// non-affine projection (Stereographic / Schlegel), where a single straight
-/// segment would drift off the projected edge and the per-vertex-projected
-/// cross-section cap would float off the wireframe. Affine projections never reach
-/// here; they keep the single-segment fast path.
+/// Kept as the future escape hatch for a projection that genuinely maps flat R4
+/// chords to curved R3 images. Current built-in modes do not use it for
+/// `blend == 0`: line-preserving projections and the stereographic comparison
+/// overlay both use endpoint chords.
 #[allow(clippy::too_many_arguments)]
 fn push_projected_chord(
     mesh: &mut LineMesh<3>,
@@ -401,6 +413,156 @@ fn sample_in_radius(projected: Vec3, radius: Option<f32>) -> bool {
     }
 }
 
+/// Parameter `t in [0, 1]` at which the straight segment `inside -> outside`
+/// (`p_in` within the clip sphere, `p_out` beyond it) crosses the clip sphere of
+/// radius `r`, both points in the body-local projected frame. Solving
+/// `|p_in + t*(p_out - p_in)|^2 = r^2` for `t` is the standard segment/sphere
+/// intersection (do Carmo, *Differential Geometry of Curves and Surfaces*, §1.5,
+/// the line/quadric form): with `d = p_out - p_in`,
+///   `|d|^2 t^2 + 2(p_in·d) t + (|p_in|^2 - r^2) = 0`.
+/// Because `|p_in| <= r < |p_out|` the constant term is non-positive and the
+/// leading term positive, so the two roots straddle zero and the unique crossing
+/// in `[0, 1]` is the larger root `(-b + sqrt(b^2 - a*c)) / a`. The discriminant
+/// is non-negative for a genuine straddle; it is floored at 0 against f32
+/// roundoff on a sample sitting essentially on the boundary, and the result is
+/// clamped to `[0, 1]` so a hair-past-unit root from the same roundoff cannot
+/// push the clip point off the segment.
+///
+/// This is the smooth-clip primitive: a near-pole arc sub-segment that leaves
+/// the view radius is cut AT the boundary rather than dropped whole, so the
+/// visible arc end rides the clip sphere continuously as a vertex sweeps the
+/// pole under rotation, instead of popping between discrete tessellation samples
+/// (the 16-cell "bounce"). The cut point lies on the real polyline chord, so it
+/// preserves the arc's path and the genuine pole-crossing inversion; it is NOT a
+/// radial rescale of an off-arc sample.
+fn radius_crossing_t(p_in: Vec3, p_out: Vec3, r: f32) -> f32 {
+    let d = p_out - p_in;
+    let a = d.length_squared();
+    // Coincident projected samples have no crossing direction; clip at the far
+    // end (degenerate, effectively never hit for a real straddle).
+    if a <= f32::MIN_POSITIVE {
+        return 1.0;
+    }
+    let b = p_in.dot(d);
+    let c = p_in.length_squared() - r * r;
+    let disc = (b * b - a * c).max(0.0);
+    ((-b + disc.sqrt()) / a).clamp(0.0, 1.0)
+}
+
+/// The clip-sphere boundary point at parameter `t` along the projected segment
+/// `p_in -> p_out`, returned as `(world_point, color)`: the body-local projected
+/// crossing `lerp(p_in, p_out, t)` translated by `body_pos`, paired with the
+/// endpoint colors linearly interpolated by the same `t` so the cut inherits the
+/// edge's gradient. `t` comes from [`radius_crossing_t`].
+fn clip_point(
+    p_in: Vec3,
+    p_out: Vec3,
+    c_in: [f32; 4],
+    c_out: [f32; 4],
+    t: f32,
+    body_pos: Vec3,
+) -> ([f32; 3], [f32; 4]) {
+    let boundary = (p_in.lerp(p_out, t) + body_pos).to_array();
+    let color = [
+        c_in[0] + (c_out[0] - c_in[0]) * t,
+        c_in[1] + (c_out[1] - c_in[1]) * t,
+        c_in[2] + (c_out[2] - c_in[2]) * t,
+        c_in[3] + (c_out[3] - c_in[3]) * t,
+    ];
+    (boundary, color)
+}
+
+/// Emit one tessellation sub-segment into `mesh` under the stereographic radius
+/// clip. Each end is `(projected, world, color, in_radius)`: the body-local
+/// projected point (what the clip tests), its world point (what the mesh draws),
+/// the endpoint color, and whether the projected point is within the clip radius.
+///
+/// With no clip (`clip_radius == None`) both ends are always in-radius and the
+/// whole sub-segment is emitted, bit-identical to the unclipped path. Under the
+/// clip a fully-inside sub-segment is emitted whole; a sub-segment that STRADDLES
+/// the boundary is cut AT the clip sphere via [`radius_crossing_t`] /
+/// [`clip_point`], so the visible arc end rides the boundary smoothly as a vertex
+/// sweeps the pole (this is what removes the near-pole "bounce": the tip tracks
+/// the boundary continuously instead of popping between discrete tessellation
+/// samples); a fully-outside sub-segment is dropped, breaking the polyline so the
+/// next in-bounds pair starts fresh rather than bridging the gap through the pole
+/// region.
+fn push_clipped_subsegment(
+    mesh: &mut LineMesh<3>,
+    clip_radius: Option<f32>,
+    width: f32,
+    body_pos_r3: Vec3,
+    prev: (Vec3, [f32; 3], [f32; 4], bool),
+    cur: (Vec3, [f32; 3], [f32; 4], bool),
+) {
+    let (prev_proj, prev_world, prev_c, prev_in) = prev;
+    let (cur_proj, cur_world, cur_c, cur_in) = cur;
+    let mut push = |a_world, b_world, a_c, b_c| {
+        mesh.segments.push((a_world, b_world));
+        mesh.colors.push((a_c, b_c));
+        mesh.widths.push(width);
+    };
+    match (clip_radius, prev_in, cur_in) {
+        // No clip, or both samples inside: emit the whole sub-segment.
+        (None, _, _) | (Some(_), true, true) => push(prev_world, cur_world, prev_c, cur_c),
+        // Both outside: drop, so the polyline breaks across the pole region.
+        (Some(_), false, false) => {}
+        // Inside -> outside: cut the far end to the clip sphere.
+        (Some(r), true, false) => {
+            let t = radius_crossing_t(prev_proj, cur_proj, r);
+            let (bw, bc) = clip_point(prev_proj, cur_proj, prev_c, cur_c, t, body_pos_r3);
+            push(prev_world, bw, prev_c, bc);
+        }
+        // Outside -> inside: cut the near end (measured from the inside sample).
+        (Some(r), false, true) => {
+            let t = radius_crossing_t(cur_proj, prev_proj, r);
+            let (bw, bc) = clip_point(cur_proj, prev_proj, cur_c, prev_c, t, body_pos_r3);
+            push(bw, cur_world, bc, cur_c);
+        }
+    }
+}
+
+/// Body-local projected point of a wireframe sample `p` for the stereographic
+/// CLIP, correcting the conformal map's near-pole denominator clamp.
+///
+/// The map floors the denominator `1 - dot(p, pole)` at `STEREOGRAPHIC_POLE_EPSILON`
+/// so a vertex at the pole stays finite, but the numerator `p - dot*pole` vanishes
+/// at the pole too. So WITHIN the clamp band the rendered magnitude
+/// `|perp| / eps` DEFLATES toward the origin as the sample nears the pole, instead
+/// of diverging. A vertex sweeping the pole under rotation would then drag its
+/// incident edges in through the screen center and back out (the gradient visibly
+/// sliding along a line that should read as a static axis), rather than the edges
+/// running off to the clip boundary and the figure inverting cleanly.
+///
+/// For a sample genuinely inside the clamp band this returns the TRUE conformal
+/// magnitude `sqrt((1 + dot) / (1 - dot))` (capped by [`STEREOGRAPHIC_POLE_FAR_CAP`]
+/// for f32 safety) in the SAME projected direction, so the magnitude clip treats
+/// it as the point-at-infinity it is and the boundary cut runs the edge out toward
+/// it. The projected direction is taken from the deflated point, which is correct:
+/// the clamp scales `perp` uniformly, so only the magnitude is wrong, not the
+/// direction. Outside the band, and for every non-stereographic projection, this
+/// is exactly `project_point` (no perturbation, bit-identical to the unclamped
+/// path). The exact pole (`perp ~ 0`, projected point at the origin) has no
+/// direction to send outward, so it is left at the origin (the map's documented
+/// pole-to-origin value); a rotating vertex effectively never lands on it exactly.
+fn stereographic_view_point(p: Vec4, projection: &rye_math::Projection<4>) -> Vec3 {
+    let proj =
+        <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(p, projection);
+    let rye_math::Projection::Stereographic { pole } = projection else {
+        return proj;
+    };
+    let dot = p.normalize().dot(*pole).clamp(-1.0, 1.0);
+    let raw = 1.0 - dot;
+    if raw < rye_math::STEREOGRAPHIC_POLE_EPSILON && proj.length() > MIN_EDGE_RADIUS {
+        let true_mag = ((1.0 + dot) / raw.max(f32::MIN_POSITIVE))
+            .sqrt()
+            .min(STEREOGRAPHIC_POLE_FAR_CAP);
+        proj.normalize() * true_mag
+    } else {
+        proj
+    }
+}
+
 /// In-place near-pole clip for the section-cap FILL, at TRIANGLE granularity: a
 /// just-appended triangle in `indices[start_i..]` survives only when all three of
 /// its vertices' body-local projected points are within `radius`, mirroring the
@@ -443,19 +605,19 @@ fn retain_in_radius_triangles(
 }
 
 /// Append one polytope edge to `mesh`, morphed between a flat R⁴ chord and an
-/// S³ great-circle arc by `blend` (0 = chord, 1 = arc; see [`Demo::space_blend`]).
+/// S³ great-circle arc by `blend` (0 = chord, 1 = arc). The caller derives
+/// `blend` from the projection ([`state::default_edge_blend`]): Stereographic
+/// passes 1, the affine projections pass 0.
 ///
 /// `a` / `b` are the body-local 4D endpoints (rotor-rotated and `body_size`-scaled).
 /// Both interpolation curves share these endpoints because the polytope's
 /// vertices sit on the body's circumsphere, so the morph only bows the edge
-/// interior outward onto the sphere. The edge is emitted as a single straight R³
-/// chord only when it is flat (`blend == 0`) AND the projection maps a chord to a
-/// chord ([`projection_is_affine`]); a non-affine projection subdivides even the
-/// flat chord (via [`push_projected_chord`]) so the screen polyline follows the
-/// projected curve and the section cap lands on it. The blended (`blend > 0`) path
-/// always subdivides into [`SPACE_TESSELLATION_SAMPLES`] sub-segments with a
-/// per-sample chord/arc blend and a linear color gradient between the endpoint
-/// colors.
+/// interior outward onto the sphere. Flat edges (`blend == 0`) render as the R3
+/// chord between projected endpoints. Under stereographic that flat chord is a
+/// comparison overlay; the faithful S3 great-circle edge is the `blend == 1`
+/// path. The blended (`blend > 0`) path subdivides into
+/// [`SPACE_TESSELLATION_SAMPLES`] sub-segments with a per-sample chord/arc blend
+/// and a linear color gradient between the endpoint colors.
 ///
 /// `slerp_scratch` is a caller-owned buffer reused across edges to keep the
 /// great-circle sampling off the per-edge allocation path; it is cleared on
@@ -475,7 +637,7 @@ fn retain_in_radius_triangles(
 /// runs over every edge of the 600-cell wireframe each frame (the documented
 /// dominant per-frame cost). The endpoints are shared by both curves, so no
 /// metric fidelity is lost where it would be visible; only the interior path
-/// differs, and the arc sample already carries the S³ curvature the morph is
+/// differs, and the arc sample already carries the S3 bow the morph is
 /// meant to show.
 #[allow(clippy::too_many_arguments)]
 fn push_blended_edge(
@@ -490,30 +652,28 @@ fn push_blended_edge(
     body_pos_r3: Vec3,
     slerp_scratch: &mut Vec<Vec4>,
 ) {
-    // Single-segment fast path: one straight R³ chord per edge, bit-identical to
-    // the pre-blend behavior. Valid only when the edge is a flat chord (`blend <=
-    // 0`) AND the projection sends a straight R⁴ chord to a straight R³ segment
-    // (`projection_is_affine`). Under a non-affine projection (Stereographic /
-    // Schlegel) the projected edge is a CURVE, so a single chord drifts off its own
-    // projected midpoint and the per-vertex-projected section cap floats off the
-    // wireframe; those fall through to the subdivided path below, which samples the
-    // flat chord and projects each sample so the polyline follows the projected
-    // curve. Kept ahead of any extra work so steady-state perf in the default mode
-    // (flat space, affine projection) is unaffected.
+    // Flat edge: one straight R3 chord per polytope edge. For stereographic this
+    // is a comparison overlay, not the S3 great-circle image.
     if blend <= 0.0 {
-        if projection_is_affine(projection) {
-            let a3 = project_to_world(a, projection, body_pos_r3);
-            let b3 = project_to_world(b, projection, body_pos_r3);
-            mesh.segments.push((a3.to_array(), b3.to_array()));
-            mesh.colors.push((color_a, color_b));
-            mesh.widths.push(width);
+        if flat_edge_uses_endpoint_chord(projection) {
+            let clip_radius = stereographic_clip_radius(projection);
+            let a3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                a, projection,
+            );
+            let b3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                b, projection,
+            );
+            if sample_in_radius(a3_local, clip_radius) && sample_in_radius(b3_local, clip_radius) {
+                mesh.segments.push((
+                    (a3_local + body_pos_r3).to_array(),
+                    (b3_local + body_pos_r3).to_array(),
+                ));
+                mesh.colors.push((color_a, color_b));
+                mesh.widths.push(width);
+            }
             return;
         }
-        // Flat chord, non-affine projection: the edge is still geometrically the
-        // straight R⁴ chord (no sphere bow), but its R³ image is a curve, so
-        // subdivide the chord and project each sample. This is what lets the
-        // per-vertex-projected section cap rejoin the wireframe. No slerp buffer
-        // needed; the chord has no radial arc.
+        // Future non-line-preserving flat projection: sample the R⁴ chord.
         push_projected_chord(mesh, a, b, color_a, color_b, width, projection, body_pos_r3);
         return;
     }
@@ -523,15 +683,25 @@ fn push_blended_edge(
     if radius_a < MIN_EDGE_RADIUS || radius_b < MIN_EDGE_RADIUS {
         // Vertex effectively at the body center: no radial direction for slerp, so
         // the sphere arc is undefined and the edge degrades to the flat chord.
-        // Affine projections render it as a single straight segment; non-affine
-        // ones subdivide so the projected chord still curves. Never reached in
-        // practice (regular polytope vertices are at circumradius `body_size`).
-        if projection_is_affine(projection) {
-            let a3 = project_to_world(a, projection, body_pos_r3);
-            let b3 = project_to_world(b, projection, body_pos_r3);
-            mesh.segments.push((a3.to_array(), b3.to_array()));
-            mesh.colors.push((color_a, color_b));
-            mesh.widths.push(width);
+        // Never reached in practice (regular polytope vertices are at
+        // circumradius `body_size`), but route through the same flat-edge chord
+        // policy so degenerate inputs don't invent spherical samples.
+        if flat_edge_uses_endpoint_chord(projection) {
+            let clip_radius = stereographic_clip_radius(projection);
+            let a3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                a, projection,
+            );
+            let b3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                b, projection,
+            );
+            if sample_in_radius(a3_local, clip_radius) && sample_in_radius(b3_local, clip_radius) {
+                mesh.segments.push((
+                    (a3_local + body_pos_r3).to_array(),
+                    (b3_local + body_pos_r3).to_array(),
+                ));
+                mesh.colors.push((color_a, color_b));
+                mesh.widths.push(width);
+            }
             return;
         }
         push_projected_chord(mesh, a, b, color_a, color_b, width, projection, body_pos_r3);
@@ -555,11 +725,18 @@ fn push_blended_edge(
     // Sample 0 is `a` exactly (flat == sphere == a), so seed `prev` from it and
     // emit consecutive sub-segments from sample 1. `slerp_scratch` holds exactly
     // `samples + 1` points, so skipping the first walks indices 1..=samples.
-    // Same stereographic clip as `push_projected_chord`: drop a sub-segment whose
-    // endpoint leaves the clip radius (a near-pole blended sample), resuming the
-    // polyline when it re-enters; `clip_radius == None` keeps every sample.
-    let proj0 =
-        <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(a, projection);
+    // Stereographic clip: a sub-segment straddling the view radius is cut AT the
+    // boundary (`push_clipped_subsegment`), so a near-pole arc end rides the
+    // clip sphere smoothly under rotation instead of popping between samples; a
+    // fully-outside sub-segment is dropped, breaking the polyline across the pole
+    // region. `clip_radius == None` keeps every sample whole.
+    // `stereographic_view_point` corrects the near-pole denominator-clamp
+    // deflation so a sample inside the pole band reads as the point-at-infinity it
+    // is (large magnitude, correct direction) rather than collapsing toward the
+    // origin; outside the band, and for every other projection, it is exactly
+    // `project_point`.
+    let proj0 = stereographic_view_point(a, projection);
+    let mut prev_proj = proj0;
     let mut prev_world = (proj0 + body_pos_r3).to_array();
     let mut prev_c = color_a;
     let mut prev_in = sample_in_radius(proj0, clip_radius);
@@ -568,10 +745,7 @@ fn push_blended_edge(
         let flat = a.lerp(b, s);
         let radius = radius_a + (radius_b - radius_a) * s;
         let sphere = radius * arc_pt;
-        let proj = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
-            flat.lerp(sphere, blend),
-            projection,
-        );
+        let proj = stereographic_view_point(flat.lerp(sphere, blend), projection);
         let world = (proj + body_pos_r3).to_array();
         let c = [
             color_a[0] + (color_b[0] - color_a[0]) * s,
@@ -580,11 +754,15 @@ fn push_blended_edge(
             color_a[3] + (color_b[3] - color_a[3]) * s,
         ];
         let cur_in = sample_in_radius(proj, clip_radius);
-        if prev_in && cur_in {
-            mesh.segments.push((prev_world, world));
-            mesh.colors.push((prev_c, c));
-            mesh.widths.push(width);
-        }
+        push_clipped_subsegment(
+            mesh,
+            clip_radius,
+            width,
+            body_pos_r3,
+            (prev_proj, prev_world, prev_c, prev_in),
+            (proj, world, c, cur_in),
+        );
+        prev_proj = proj;
         prev_world = world;
         prev_c = c;
         prev_in = cur_in;
@@ -955,7 +1133,6 @@ impl Demo {
             stereographic_pole: state::STEREOGRAPHIC_DEFAULT_POLE,
             wireframe_hyperslice: false,
             wireframe_hyperslice_thickness: consts::HYPERSLICE_DEFAULT_THICKNESS,
-            space_blend: 0.0,
             wireframe_width_px: 1.8,
             wireframe_alpha: 1.0,
             unique_edge_palette_cache: std::collections::HashMap::new(),
@@ -1002,12 +1179,12 @@ impl Demo {
                 window_pos: egui::Pos2::new(220.0, 120.0),
                 open: false,
             },
-            // On by default: the moment a user picks a non-default projection or
-            // turns up Curvature, the annotation explains the mode without their
-            // having to read the source. `render_mode_annotation` no-ops while the
-            // scene is in its plain drop-w + flat-space default, so an open flag
-            // costs nothing until a non-default mode is selected. Default position
-            // sits below the example callout's default slot so the two don't stack.
+            // On by default: the moment a user picks a non-default projection the
+            // annotation explains the mode without their having to read the
+            // source. `render_mode_annotation` no-ops while the scene is in its
+            // plain drop-w default, so an open flag costs nothing until a
+            // non-default projection is selected. Default position sits below the
+            // example callout's default slot so the two don't stack.
             mode_annotation_open: rye_egui::CalloutState {
                 window_pos: egui::Pos2::new(220.0, 300.0),
                 open: true,
@@ -1289,46 +1466,27 @@ impl Demo {
         self.render_example_callout(ctx, frame);
         // Per-mode educational annotation (on by default; toggle via View > Mode
         // annotation). No-ops in the default drop-w + flat-space scene; otherwise
-        // explains the active projection / curvature combination.
+        // explains the active projection / edge-geometry combination.
         self.render_mode_annotation(ctx, frame);
     }
 
     /// Surface the per-projection / per-space-mode educational annotation via the
     /// `rye_egui::callout` primitive, anchored to the leading polychoron's body
     /// center. The text is the pure [`state::mode_annotation`] mapping of the
-    /// active `(wireframe_projection, effective_blend, raster-cap)` state,
-    /// reprojected per frame so the leader line tracks the shape as the camera
-    /// orbits. `effective_blend` is `space_blend` only while the wireframe overlay
-    /// is enabled (the bowed edges live there and nowhere else), so a curvature
-    /// value set while the overlay is off does not produce a spherical annotation
-    /// for geometry that is not on screen. No-op when the toggle is off, the row
-    /// has no polychoron, or the scene is in its plain default state (drop-w
-    /// projection AND no visible curvature), where the mapping returns `None` and
-    /// there is nothing non-obvious to explain.
+    /// active `wireframe_projection`, reprojected per frame so the leader line
+    /// tracks the shape as the camera orbits. No-op when the toggle is off, the
+    /// row has no polychoron, or the projection is the plain default (drop-w),
+    /// where the mapping returns `None` and there is nothing to explain.
     ///
     /// Anchoring to the body center (not a single vertex like
     /// [`Self::render_example_callout`]) is deliberate: the annotation is about the
-    /// whole shape's projection / curvature, not one vertex, so the body center is
-    /// the honest anchor.
+    /// whole shape's projection, not one vertex, so the body center is the honest
+    /// anchor.
     fn render_mode_annotation(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
         if !self.mode_annotation_open.open {
             return;
         }
-        // The flat cross-section cap is drawn only in Raster surface mode; this
-        // gates the three-way-overlap note inside `mode_annotation`.
-        let flat_cap_drawn = matches!(self.surface_mode, SurfaceMode::Raster);
-        // The spherical-curvature morph is wireframe-only: `space_blend` bows the
-        // edges in `push_blended_edge`, reached only from `render_wireframe_overlay`,
-        // and that path is skipped while the overlay is off. The caps and the
-        // projection stay visible without the wireframe, but the bowed edges do
-        // not, so report the blend as flat when the overlay is off (see
-        // `annotation_effective_blend`) and the annotation never claims curvature
-        // the user cannot see.
-        let effective_blend =
-            state::annotation_effective_blend(self.space_blend, self.wireframe_enabled);
-        let Some(annotation) =
-            state::mode_annotation(self.wireframe_projection, effective_blend, flat_cap_drawn)
-        else {
+        let Some(annotation) = state::mode_annotation(self.wireframe_projection) else {
             return;
         };
 
@@ -2210,7 +2368,10 @@ impl Demo {
         let cross_section_projection = state::section_layer_projection(true, wireframe_projection);
         // Flat-chord vs S³-arc morph for every edge (0 = chord). Captured once so
         // the per-edge helper stays free of `&self`.
-        let space_blend = self.space_blend;
+        // Edge geometry is derived from the projection, not a control:
+        // Stereographic draws S3 great-circle arcs, every affine projection draws
+        // flat R4 chords (see `state::default_edge_blend`).
+        let space_blend = state::default_edge_blend(self.wireframe_projection);
         // Wireframe Hyperslice cull: when on, only edges whose body-local
         // w-interval intersects the slab around `w_slice` survive. Captured
         // once per frame. This is a third, independent slicing affordance
@@ -2471,11 +2632,11 @@ impl Demo {
                 };
                 color_a[3] = alpha;
                 color_b[3] = alpha;
-                // Emit the edge in body-local 4D, projected to world R³. At
-                // `space_blend == 0` this is one chord per edge (the historical
-                // behavior); above 0 the edge bows toward its S³ great-circle arc.
-                // Projection is shared with the flat path: DropW is identity-on-
-                // (x, y, z), Perspective4D scales each component by focal/(focal-w).
+                // Emit the edge in body-local 4D, projected to world R³. `blend`
+                // is projection-derived (Stereographic -> 1 = S³ arc, affine -> 0
+                // = one chord per edge). Projection is shared with the flat path:
+                // Shadow is identity-on-(x, y, z), Perspective4D scales each
+                // component by focal/(focal-w).
                 push_blended_edge(
                     &mut parent_lines,
                     a,
@@ -2584,85 +2745,6 @@ struct RotatePolytopesApp {
     perf: rye_app::trace::PerfOverlay,
 }
 
-/// Shared handler for the `wireframe space` subcommand and the top-level
-/// `space` alias. Both write the same `space_blend` field (the flat<->spherical
-/// edge morph; see [`Demo::space_blend`]): `flat` -> 0.0 (R⁴ chords),
-/// `spherical` -> 1.0 (S³ great-circle arcs), `blend <t>` -> a `t` accepted only
-/// inside `[0, 1]`. A bare invocation reports the current value. Factored out so
-/// the canonical control (`wireframe space`, since the morph IS a
-/// wireframe-geometry property) and the one-keypress thesis alias (`space
-/// spherical`) cannot drift apart.
-///
-/// `space_blend` is read ONLY by [`Demo::render_wireframe_overlay`], which the
-/// frame loop skips entirely while `wireframe_enabled` is `false` (the default).
-/// So a verb that turns the morph ON has to enable the wireframe too, or the
-/// headline `space spherical` keypress mutates a field nothing draws and the
-/// user sees no change. This handler therefore takes `wireframe_enabled` and
-/// flips it on whenever it sets a NON-ZERO blend (`spherical`, or `blend <t>`
-/// with `t > 0`): the great-circle arcs only exist in the wireframe layer, so
-/// asking to see them is implicitly asking for that layer. `flat` and `blend 0`
-/// leave `wireframe_enabled` untouched, never force it off: zero blend is the
-/// default flat geometry and a user may have the wireframe up for unrelated
-/// reasons (color mode, projection, hyperslice). Bare query and rejected input
-/// touch neither field.
-///
-/// Both fields are `&mut` primitives rather than `&mut Demo` so the two
-/// registrations still share one body (they cannot diverge) AND the handler
-/// stays unit-testable without a GPU-backed `Demo`.
-fn run_space_command(
-    space_blend: &mut f32,
-    wireframe_enabled: &mut bool,
-    args: &[&str],
-    out: &mut rye_egui::console::ConsoleWriter,
-) -> anyhow::Result<()> {
-    // Turning the morph on without the wireframe layer drawn is a silent no-op;
-    // surface that the layer was auto-enabled so the user knows where the arcs
-    // came from and can toggle it off again if they only wanted the SDF view.
-    let mut enable_wireframe = |out: &mut rye_egui::console::ConsoleWriter| {
-        if !*wireframe_enabled {
-            *wireframe_enabled = true;
-            out.line("wireframe overlay auto-enabled (the morph draws there)");
-        }
-    };
-    match args.first().copied() {
-        None => {
-            out.line(format!(
-                "wireframe space blend: {space_blend:.3} (0 = flat, 1 = spherical)"
-            ));
-        }
-        Some("flat") => {
-            *space_blend = 0.0;
-            out.line("wireframe space: flat (R⁴ chords)");
-        }
-        Some("spherical") => {
-            *space_blend = 1.0;
-            out.line("wireframe space: spherical (S³ great-circle arcs)");
-            enable_wireframe(out);
-        }
-        Some("blend") => match args.get(1) {
-            None => out.line(format!("wireframe space blend: {space_blend:.3}")),
-            Some(s) => match s.parse::<f32>() {
-                Ok(t) if (0.0..=1.0).contains(&t) => {
-                    *space_blend = t;
-                    out.line(format!("wireframe space blend: set to {t:.3}"));
-                    // Only a positive blend bows the edges; `blend 0` is flat
-                    // geometry and must not silently flip the overlay on.
-                    if t > 0.0 {
-                        enable_wireframe(out);
-                    }
-                }
-                _ => out.line(format!(
-                    "wireframe space blend: invalid `{s}` (need a float in [0, 1])"
-                )),
-            },
-        },
-        Some(other) => out.line(format!(
-            "wireframe space: unknown `{other}` (try flat|spherical|blend)"
-        )),
-    }
-    Ok(())
-}
-
 /// Lower bound on a VISIBLE section-layer fill alpha. Mirrors the old `surface
 /// alpha` floor: below this the cap is so faint it reads as off, so the grammar
 /// rejects it and steers the user to `0` (the explicit off state) instead, the
@@ -2756,27 +2838,6 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
-        // Top-level alias for `wireframe space`. The canonical control lives under
-        // `wireframe space` because the morph IS a wireframe-geometry property,
-        // but the spec's thesis demo is the one-keypress `space spherical`, so we
-        // also surface a thin top-level verb dispatching the SAME
-        // [`run_space_command`] handler. `cmd` passes `(args, ctx, out)` whereas
-        // the subcommand passes `(ctx, args, out)`; the closure just reorders.
-        c.register(
-            rye_egui::cmd(
-                "space",
-                "edge geometry: flat (R⁴ chords) | spherical (S³ arcs) | blend <t in [0,1]>",
-                |args: &[&str], demo: &mut Demo, out| {
-                    run_space_command(
-                        &mut demo.space_blend,
-                        &mut demo.wireframe_enabled,
-                        args,
-                        out,
-                    )
-                },
-            )
-            .with_args(&[&["flat", "spherical", "blend"]]),
-        );
         // Cross-section + parent-wireframe overlay. Tab-completion is context-aware
         // via [`SubcommandSet`]: each subcommand's value slot lists only that
         // subcommand's choices. Bare invocations flip:
@@ -2889,8 +2950,8 @@ impl RotatePolytopesApp {
                 )
                 .custom(
                     "perspective",
-                    "wireframe 4D->R³ projection (bare cycles): drop-w | w-depth | schlegel <cell> | stereographic | hyperslice",
-                    &[&["drop-w", "w-depth", "schlegel", "stereographic", "hyperslice"]],
+                    "wireframe 4D->R³ projection (bare cycles): shadow | w-pinhole | schlegel <cell> | stereographic | hyperslice",
+                    &[&["shadow", "w-pinhole", "schlegel", "stereographic", "hyperslice"]],
                     &[],
                     |d, args, out| {
                         let next = match args.first().copied() {
@@ -2944,11 +3005,15 @@ impl RotatePolytopesApp {
                             }
                             Some(token) => WireframeProjection::from_token(token).ok_or_else(|| {
                                 anyhow!(
-                                    "unknown projection `{token}` (try drop-w|w-depth|schlegel|stereographic|hyperslice)"
+                                    "unknown projection `{token}` (try shadow|w-pinhole|schlegel|stereographic|hyperslice)"
                                 )
                             })?,
                         };
                         d.wireframe_projection = next;
+                        state::apply_projection_selection_defaults(
+                            d.wireframe_projection,
+                            &mut d.wireframe_enabled,
+                        );
                         // Resolve + cache the Schlegel face-plane params now (at
                         // select time) so the per-frame upload never re-runs the
                         // LazyLock cell-table fit. No-op (clears the cache) for the
@@ -3025,20 +3090,6 @@ impl RotatePolytopesApp {
                             }
                         }
                         Ok(())
-                    },
-                )
-                .custom(
-                    "space",
-                    "edge geometry: flat (R⁴ chords) | spherical (S³ arcs) | blend <t in [0,1]>",
-                    &[&["flat", "spherical", "blend"]],
-                    &[],
-                    |d, args, out| {
-                        run_space_command(
-                            &mut d.space_blend,
-                            &mut d.wireframe_enabled,
-                            args,
-                            out,
-                        )
                     },
                 )
                 .custom(
@@ -4010,15 +4061,14 @@ mod blended_edge_tests {
     /// edge interior; the endpoints are shared by the flat chord and the S³ arc
     /// (the vertices already lie on the body's circumsphere), so the glue must be
     /// bit-exact at every t or the section cap would detach from the wireframe.
-    /// Walks a non-affine projection (Stereographic) so the subdivided path is
-    /// taken even at blend == 0, plus the blended path at several interior t.
+    /// Walks a stereographic projection: `blend == 0` takes the flat endpoint
+    /// chord path, while `blend > 0` takes the sampled spherical path.
     #[test]
     fn blend_endpoints_exact_at_all_t() {
         let a = Vec4::new(0.5, 0.5, 0.5, 0.5);
         let b = Vec4::new(-0.5, 0.5, 0.5, -0.5);
-        // Stereographic from the +w pole: non-affine, so even blend == 0 takes
-        // the subdivided `push_projected_chord` branch, and blend > 0 takes the
-        // slerp branch. Both must still glue the endpoints exactly.
+        // Stereographic from the +w pole: zero blend is one endpoint chord, and
+        // blend > 0 takes the sampled path. Both must still glue the endpoints.
         let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
         let body_pos = Vec3::new(-0.25, 1.5, 0.0);
         let expected_a = project_to_world(a, &proj, body_pos).to_array();
@@ -4052,154 +4102,11 @@ mod blended_edge_tests {
 }
 
 #[cfg(test)]
-mod space_command_tests {
-    //! Tests for the flat<->spherical morph control surfaced two ways: the
-    //! Render-modal Curvature slider and the `wireframe space` / top-level
-    //! `space` console verbs. Both write the same `space_blend` field; these
-    //! pin that the field is written and clamped identically across surfaces.
+mod section_command_tests {
+    //! Tests for shared console handlers unit-testable without a GPU-backed
+    //! `Demo` by exercising the handler body directly.
     use super::*;
-    use rye_app::egui;
     use rye_egui::console::ConsoleWriter;
-    use std::cell::Cell;
-
-    /// Render the modal's Curvature slider headless against `seed` and return the
-    /// value it leaves behind. `__run_test_ui` hands the closure a `Fn` context
-    /// (no `&mut` captures), so the bound value lives in a `Cell` driven through
-    /// `Slider::from_get_set`; this is behaviorally the same widget the modal
-    /// builds via `Slider::new(&mut space_blend, 0.0..=1.0)` (which itself
-    /// desugars to `from_get_set` over the field) with the same range and the
-    /// default `SliderClamping::Always`.
-    fn slider_clamped(seed: f32) -> f32 {
-        let cell = Cell::new(seed as f64);
-        egui::__run_test_ui(|ui| {
-            ui.add(egui::Slider::from_get_set(0.0..=1.0, |v: Option<f64>| {
-                if let Some(v) = v {
-                    cell.set(v);
-                }
-                cell.get()
-            }));
-        });
-        cell.get() as f32
-    }
-
-    /// The modal Curvature slider writes `space_blend` and clamps it to [0, 1].
-    /// The default `SliderClamping::Always` re-clamps the bound value to the
-    /// range on every render (egui 0.33, `Slider::add_contents` calls
-    /// `set_value(old_value)` when clamping is `Always`), so rendering the widget
-    /// once against an out-of-range seed must pull the field back into [0, 1].
-    #[test]
-    fn space_blend_slider_writes_field() {
-        assert_eq!(slider_clamped(5.0), 1.0, "above-range value clamps to 1.0");
-        assert_eq!(slider_clamped(-3.0), 0.0, "below-range value clamps to 0.0");
-        assert_eq!(
-            slider_clamped(0.375),
-            0.375,
-            "in-range value is preserved exactly"
-        );
-    }
-
-    /// `space spherical` (top-level alias) and `wireframe space spherical`
-    /// (canonical subcommand) move `space_blend` to the same value, because both
-    /// registrations dispatch the single shared `run_space_command` handler.
-    /// Driving the registered console for each path needs a GPU-backed `Demo`
-    /// ctx, which a unit test cannot build; instead this exercises the shared
-    /// handler directly (the exact `&mut space_blend` both call sites pass),
-    /// which IS the aliasing guarantee: the two verbs cannot diverge while they
-    /// share this function. Covers every verb plus the clamp rejection.
-    #[test]
-    fn space_toplevel_aliases_wireframe_space() {
-        // Seed the wireframe ON so this test isolates the blend mutation from the
-        // auto-enable behavior (covered separately by
-        // `space_command_enables_wireframe_for_visible_morph`).
-        let run = |start: f32, args: &[&str]| -> f32 {
-            let mut blend = start;
-            let mut wireframe = true;
-            let mut out = ConsoleWriter::new();
-            run_space_command(&mut blend, &mut wireframe, args, &mut out)
-                .expect("handler is infallible");
-            blend
-        };
-
-        assert_eq!(run(0.4, &["spherical"]), 1.0, "spherical -> 1.0");
-        assert_eq!(run(0.4, &["flat"]), 0.0, "flat -> 0.0");
-        assert_eq!(run(0.4, &["blend", "0.625"]), 0.625, "blend t -> t");
-
-        // Bare query and unknown/invalid args must NOT mutate the field.
-        assert_eq!(run(0.4, &[]), 0.4, "bare query leaves blend untouched");
-        assert_eq!(run(0.4, &["nonsense"]), 0.4, "unknown verb is inert");
-        assert_eq!(
-            run(0.4, &["blend", "9.0"]),
-            0.4,
-            "out-of-range blend is rejected, not clamped silently"
-        );
-        assert_eq!(
-            run(0.4, &["blend", "notafloat"]),
-            0.4,
-            "unparseable blend is rejected"
-        );
-    }
-
-    /// The morph is read ONLY by the wireframe overlay, which the frame loop
-    /// skips while `wireframe_enabled` is false (the default). So a verb that
-    /// sets a NON-ZERO blend must also turn the wireframe on, or the headline
-    /// `space spherical` keypress mutates a field nothing draws. This pins that
-    /// invariant per verb, and the inverse: verbs that leave the geometry flat
-    /// (`flat`, `blend 0`, bare query, rejected input) never flip the overlay,
-    /// since zero blend is the default geometry and the user may have the
-    /// wireframe up (or deliberately down) for unrelated reasons.
-    #[test]
-    fn space_command_enables_wireframe_for_visible_morph() {
-        // Returns the wireframe-enabled flag after running `args` against a
-        // wireframe that started OFF (the demo default).
-        let wireframe_after = |args: &[&str]| -> bool {
-            let mut blend = 0.0_f32;
-            let mut wireframe = false;
-            let mut out = ConsoleWriter::new();
-            run_space_command(&mut blend, &mut wireframe, args, &mut out)
-                .expect("handler is infallible");
-            wireframe
-        };
-
-        // Non-zero blend is invisible without the overlay: auto-enable it.
-        assert!(
-            wireframe_after(&["spherical"]),
-            "`space spherical` must enable the wireframe so the arcs show"
-        );
-        assert!(
-            wireframe_after(&["blend", "0.5"]),
-            "`space blend 0.5` (positive) must enable the wireframe"
-        );
-
-        // Flat geometry must not silently flip the overlay on.
-        assert!(
-            !wireframe_after(&["flat"]),
-            "`space flat` is the default geometry; it must not enable the wireframe"
-        );
-        assert!(
-            !wireframe_after(&["blend", "0"]),
-            "`space blend 0` is flat; it must not enable the wireframe"
-        );
-        assert!(
-            !wireframe_after(&[]),
-            "bare query must not touch the overlay"
-        );
-        assert!(
-            !wireframe_after(&["blend", "9.0"]),
-            "rejected (out-of-range) blend must not touch the overlay"
-        );
-
-        // A wireframe the user already turned ON stays on through `flat`: the
-        // morph control must never force the overlay OFF.
-        let mut blend = 1.0_f32;
-        let mut wireframe = true;
-        let mut out = ConsoleWriter::new();
-        run_space_command(&mut blend, &mut wireframe, &["flat"], &mut out)
-            .expect("handler is infallible");
-        assert!(
-            wireframe,
-            "`space flat` must not force an enabled wireframe off"
-        );
-    }
 
     /// `run_section_alpha` is the shared handler behind both `section cross-alpha`
     /// and `section cap-alpha`. It must: set a visible alpha in range, accept `0`
@@ -5110,14 +5017,7 @@ mod section_cap_projection_tests {
             None
         );
         assert_eq!(
-            perspective_scale_at_w(
-                0.0,
-                &rye_math::Projection::Schlegel {
-                    cell_normal: Vec4::W,
-                    cell_offset: 0.5,
-                    viewpoint_distance: 0.75,
-                }
-            ),
+            perspective_scale_at_w(0.0, &rye_math::Projection::schlegel(Vec4::W, 0.5, 0.75)),
             None
         );
     }
@@ -5196,82 +5096,54 @@ mod section_cap_projection_tests {
         }
     }
 
-    /// `projection_is_affine` is true exactly for the chord-to-chord projections
-    /// (Identity / Orthographic / Perspective4D) and false for the curving ones
-    /// (Schlegel / Stereographic). This is the predicate the wireframe edge builder
-    /// branches on to decide between a single straight segment and a subdivided
-    /// polyline; it must agree with `perspective_scale_at_w`'s `Some`/`None` split,
-    /// since both encode the same affine/non-affine distinction.
+    /// Edge-line preservation, flat endpoint chords, and section-cap scalar
+    /// shortcuts are separate questions. Schlegel preserves straight edges but
+    /// still needs per-vertex cap projection. Stereographic does not preserve a
+    /// sampled chord interior, but its flat wireframe mode is an endpoint-chord
+    /// comparison overlay.
     #[test]
-    fn projection_affine_classification_matches_scale_shim() {
-        let cases = [
-            rye_math::Projection::Identity,
-            rye_math::Projection::Orthographic { drop_axis: 3 },
-            rye_math::Projection::Perspective4D {
-                focal_distance: 2.0,
-            },
-            rye_math::Projection::Schlegel {
-                cell_normal: Vec4::W,
-                cell_offset: 0.5,
-                viewpoint_distance: 0.75,
-            },
-            rye_math::Projection::Stereographic { pole: Vec4::W },
-        ];
-        for proj in cases {
-            assert_eq!(
-                projection_is_affine(&proj),
-                perspective_scale_at_w(0.0, &proj).is_some(),
-                "affine flag must match the scale-shim Some/None split for {proj:?}"
-            );
-        }
-        assert!(projection_is_affine(&rye_math::Projection::Identity));
-        assert!(!projection_is_affine(
-            &rye_math::Projection::Stereographic { pole: Vec4::W }
-        ));
+    fn flat_edge_chord_policy_splits_from_cap_scale_policy() {
+        let schlegel = rye_math::Projection::schlegel(Vec4::W, 0.5, 0.75);
+        assert_eq!(
+            perspective_scale_at_w(0.0, &schlegel),
+            None,
+            "Schlegel cap vertices need per-vertex projection"
+        );
+        assert!(
+            projection_maps_chords_to_lines(&schlegel),
+            "Schlegel central projection preserves straight edges"
+        );
+        assert!(
+            flat_edge_uses_endpoint_chord(&schlegel),
+            "flat Schlegel wireframe edges render as one chord"
+        );
+
+        let stereo = rye_math::Projection::Stereographic { pole: Vec4::W };
+        assert_eq!(
+            perspective_scale_at_w(0.0, &stereo),
+            None,
+            "stereographic cap vertices need per-vertex projection"
+        );
+        assert!(
+            !projection_maps_chords_to_lines(&stereo),
+            "stereographic does not preserve a sampled chord interior"
+        );
+        assert!(
+            flat_edge_uses_endpoint_chord(&stereo),
+            "flat stereographic wireframe edges render as comparison chords"
+        );
     }
 
-    /// The repair invariant: under a non-affine projection (Stereographic), the
-    /// parent wireframe edge built by `push_blended_edge` is subdivided so the
-    /// screen polyline follows the projected curve, and a section-cap vertex (the
-    /// edge's slice intersection, projected per-vertex through
-    /// `cap_vertex_projected_and_world`)
-    /// lands ON that polyline. The pre-repair single straight chord between the two
-    /// projected endpoints missed the cap by a measurable margin (~0.17 R³ units for
-    /// a unit-circumradius tesseract w-edge under the `+w`-pole map); the test
-    /// asserts the subdivided polyline closes that gap to well under the chord error.
-    ///
-    /// Uses a generic polytope edge whose endpoints differ in the spatial axes too
-    /// (not a pure radial w-edge, whose projected endpoints stay collinear with the
-    /// cap and would hide the defect), so the stereographic image genuinely bows off
-    /// the chord. `body_pos = ZERO` so the comparison is in the projection's own
-    /// frame.
+    /// Zero-blend stereographic is the comparison overlay: project endpoints,
+    /// then draw the R3 chord between them. The faithful S3 edge is sampled at
+    /// blend one.
     #[test]
-    fn stereographic_wireframe_polyline_tracks_section_cap() {
+    fn stereographic_zero_blend_is_endpoint_chord_overlay() {
         let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
         let body_pos = Vec3::ZERO;
-        let w_slice = 0.0;
-        // Endpoints straddling `w = 0` with distinct spatial coords; the slice cuts
-        // the edge at a non-midpoint, away from any radial special case.
         let a = Vec4::new(0.30, 0.60, 0.20, 0.50);
         let b = Vec4::new(0.70, 0.10, 0.40, -0.30);
-        // Section cap vertex: the edge's true intersection with `w = w_slice`.
-        // `edge_section` returns its drop-w R³; `cap_vertex_projected_and_world`
-        // reconstructs it at `w_slice` and projects per-vertex (the non-affine path).
-        let t_cut = (w_slice - a.w) / (b.w - a.w);
-        let cut = a.lerp(b, t_cut);
-        let cap_r3 = [cut.x, cut.y, cut.z];
-        let scale = perspective_scale_at_w(w_slice, &proj);
-        assert_eq!(
-            scale, None,
-            "Stereographic must take the per-vertex cap path"
-        );
-        let cap = Vec3::from_array(
-            cap_vertex_projected_and_world(cap_r3, w_slice, scale, &proj, body_pos).1,
-        );
 
-        // Build the parent wireframe edge through the real code path (flat space:
-        // blend = 0). Under Stereographic this routes to `push_projected_chord`, so
-        // `mesh` holds SPACE_TESSELLATION_SAMPLES sub-segments, not one chord.
         let mut mesh = LineMesh::<3>::default();
         let mut scratch = Vec::new();
         let white = [1.0, 1.0, 1.0, 1.0];
@@ -5287,36 +5159,54 @@ mod section_cap_projection_tests {
             body_pos,
             &mut scratch,
         );
-        assert!(
-            mesh.segments.len() > 1,
-            "non-affine flat edge must subdivide, got {} segment(s)",
-            mesh.segments.len()
+        assert_eq!(
+            mesh.segments.len(),
+            1,
+            "zero-blend stereographic should be one endpoint chord"
         );
-
-        // Min distance from the cap vertex to the polyline (any sub-segment).
-        let poly_gap = mesh
-            .segments
-            .iter()
-            .map(|(s, e)| {
-                point_to_segment_distance(cap, Vec3::from_array(*s), Vec3::from_array(*e))
-            })
-            .fold(f32::INFINITY, f32::min);
-
-        // The pre-repair single chord between the two projected endpoints.
-        let pa = project_to_world(a, &proj, body_pos);
-        let pb = project_to_world(b, &proj, body_pos);
-        let chord_gap = point_to_segment_distance(cap, pa, pb);
-
-        // The defect (single chord) misses the cap by a real margin; the repaired
-        // polyline tracks it. The chord error for this edge is ~0.16; require the
-        // polyline to beat it by more than 10x and sit near the sampling floor.
-        assert!(
-            chord_gap > 0.05,
-            "expected the single-chord defect to miss the cap, gap {chord_gap}"
+        assert_eq!(
+            scratch.len(),
+            0,
+            "zero-blend stereographic should not use the slerp scratch"
         );
-        assert!(
-            poly_gap < chord_gap * 0.1,
-            "subdivided polyline must track the cap: poly_gap {poly_gap} vs chord_gap {chord_gap}"
+        let expected_a = project_to_world(a, &proj, body_pos).to_array();
+        let expected_b = project_to_world(b, &proj, body_pos).to_array();
+        assert_eq!(mesh.segments[0].0, expected_a);
+        assert_eq!(mesh.segments[0].1, expected_b);
+    }
+
+    /// Schlegel is not affine for cap scaling, but it is a central projection:
+    /// flat R⁴ edges map to straight R³ chords. This catches the old
+    /// "non-affine == must subdivide" mistake.
+    #[test]
+    fn schlegel_flat_wireframe_edge_is_endpoint_chord() {
+        let proj = rye_math::Projection::schlegel(Vec4::W, 0.5, 1.0);
+        assert_eq!(perspective_scale_at_w(0.0, &proj), None);
+        let a = Vec4::new(0.25, 0.50, -0.25, 0.50);
+        let b = Vec4::new(-0.25, 0.50, -0.25, -0.50);
+        let mut mesh = LineMesh::<3>::default();
+        let mut scratch = Vec::new();
+        let white = [1.0, 1.0, 1.0, 1.0];
+        push_blended_edge(
+            &mut mesh,
+            a,
+            b,
+            white,
+            white,
+            1.0,
+            0.0,
+            &proj,
+            Vec3::ZERO,
+            &mut scratch,
+        );
+        assert_eq!(mesh.segments.len(), 1, "Schlegel edge is one chord");
+        assert_eq!(
+            mesh.segments[0].0,
+            project_to_world(a, &proj, Vec3::ZERO).to_array()
+        );
+        assert_eq!(
+            mesh.segments[0].1,
+            project_to_world(b, &proj, Vec3::ZERO).to_array()
         );
     }
 
@@ -5389,11 +5279,7 @@ mod section_cap_projection_tests {
                 focal_distance: 2.0,
             },
             rye_math::Projection::Stereographic { pole: Vec4::W },
-            rye_math::Projection::Schlegel {
-                cell_normal: Vec4::W,
-                cell_offset: 0.5,
-                viewpoint_distance: 0.9,
-            },
+            rye_math::Projection::schlegel(Vec4::W, 0.5, 0.9),
         ];
 
         // Honest layer (drop-w): the world cap is the body-local cap scaled by 1
@@ -5541,11 +5427,7 @@ mod section_cap_projection_tests {
             rye_math::Projection::Perspective4D {
                 focal_distance: 2.0,
             },
-            rye_math::Projection::Schlegel {
-                cell_normal: Vec4::W,
-                cell_offset: 0.5,
-                viewpoint_distance: 0.75,
-            },
+            rye_math::Projection::schlegel(Vec4::W, 0.5, 0.75),
         ] {
             assert_eq!(
                 stereographic_clip_radius(&proj),
@@ -5558,7 +5440,11 @@ mod section_cap_projection_tests {
     /// Build the parent wireframe edge `a -> b` under the `+w`-pole stereographic
     /// projection with `body_pos = ZERO`, so each emitted endpoint's world coord
     /// equals its body-local projected point. Returns the segment endpoints.
-    fn build_stereographic_edge(a: Vec4, b: Vec4) -> Vec<([f32; 3], [f32; 3])> {
+    fn build_stereographic_edge_with_blend(
+        a: Vec4,
+        b: Vec4,
+        blend: f32,
+    ) -> Vec<([f32; 3], [f32; 3])> {
         let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
         let mut mesh = LineMesh::<3>::default();
         let mut scratch = Vec::new();
@@ -5570,12 +5456,20 @@ mod section_cap_projection_tests {
             white,
             white,
             1.0,
-            0.0,
+            blend,
             &proj,
             Vec3::ZERO,
             &mut scratch,
         );
         mesh.segments
+    }
+
+    fn build_stereographic_edge(a: Vec4, b: Vec4) -> Vec<([f32; 3], [f32; 3])> {
+        build_stereographic_edge_with_blend(a, b, 0.0)
+    }
+
+    fn build_spherical_stereographic_edge(a: Vec4, b: Vec4) -> Vec<([f32; 3], [f32; 3])> {
+        build_stereographic_edge_with_blend(a, b, 1.0)
     }
 
     /// A unit point at angular distance `theta_deg` from the `+w` pole, in the
@@ -5585,6 +5479,24 @@ mod section_cap_projection_tests {
         Vec4::new(t.sin(), 0.0, 0.0, t.cos())
     }
 
+    /// Zero-blend stereographic is an endpoint chord overlay. If either endpoint
+    /// clips out near the pole, the flat chord drops; the sampled S3 path can
+    /// still resume after its clipped samples.
+    #[test]
+    fn stereographic_zero_blend_near_pole_uses_endpoint_clip() {
+        let zero = build_stereographic_edge(near_pole(1.0), Vec4::new(1.0, 0.0, 0.0, 0.0));
+        let spherical =
+            build_spherical_stereographic_edge(near_pole(1.0), Vec4::new(1.0, 0.0, 0.0, 0.0));
+        assert!(
+            zero.is_empty(),
+            "flat near-pole chord should drop when an endpoint clips out"
+        );
+        assert!(
+            !spherical.is_empty(),
+            "sampled S3 edge should resume after clipped near-pole samples"
+        );
+    }
+
     /// Boundedness: every emitted endpoint of a stereographic wireframe edge has
     /// body-local projected magnitude <= `STEREOGRAPHIC_VIEW_RADIUS`, even for an
     /// edge that grazes the pole. The edge runs from 1 degree off the pole (well
@@ -5592,7 +5504,8 @@ mod section_cap_projection_tests {
     /// drops the near-pole samples, so no emitted endpoint carries the blow-up.
     #[test]
     fn stereographic_clip_output_bounded_by_radius() {
-        let segs = build_stereographic_edge(near_pole(1.0), Vec4::new(1.0, 0.0, 0.0, 0.0));
+        let segs =
+            build_spherical_stereographic_edge(near_pole(1.0), Vec4::new(1.0, 0.0, 0.0, 0.0));
         assert!(
             !segs.is_empty(),
             "edge must emit at least one in-bounds segment"
@@ -5609,36 +5522,111 @@ mod section_cap_projection_tests {
         }
     }
 
-    /// The discriminating test the radius-clamp alternative fails: the clip is a
-    /// DROP, not a magnitude rescale. A pole-grazing edge tessellated into
-    /// `SPACE_TESSELLATION_SAMPLES` sub-segments must emit FEWER than that many
-    /// segments (the near-pole ones are dropped). A radius clamp would rescale the
-    /// offending samples back onto a sphere of radius `R` and keep every segment,
-    /// preserving the 180-degree direction flip across a pole crossing; this
-    /// asserts segments genuinely vanish, so the implementation cannot quietly be
-    /// a clamp. Also asserts no retained endpoint sits at the clamp ring (no
-    /// emitted endpoint within a hair of `R`), which a clamp would manufacture.
+    /// The clip cuts a straddling sub-segment AT the view boundary and DROPS a
+    /// sub-segment whose interior runs deep through the pole; it is neither a
+    /// whole-segment drop nor a magnitude rescale. The fixture is an edge whose
+    /// great-circle interior passes straight through the `+w` pole (endpoints 5
+    /// degrees off the pole on opposite sides), so the deep-pole samples blow up
+    /// while both endpoints stay well inside `R`. Three guarantees:
+    ///
+    /// 1. **Boundary cut, not stop-short.** Some emitted endpoint sits within a
+    ///    hair of `R`: the straddling sub-segment is cut to the clip sphere, so
+    ///    the arc reaches the boundary instead of stopping at the last in-radius
+    ///    tessellation sample (the old whole-segment drop left the tip at a random
+    ///    interior sample, the source of the near-pole "bounce").
+    /// 2. **Deep-pole drop, not rescale.** The polyline still has a GAP (fewer
+    ///    than `SPACE_TESSELLATION_SAMPLES` segments): the both-outside samples
+    ///    straddling the pole are dropped, never bridged. A radius rescale-clamp
+    ///    would instead keep every sub-segment (pinned onto the sphere of radius
+    ///    `R`), preserving the 180-degree direction flip across the pole as a
+    ///    spurious segment sweeping the view; the gap proves we drop them.
+    /// 3. **Bounded.** Every emitted endpoint stays within `R`.
     #[test]
-    fn stereographic_clip_drops_segments_not_rescales() {
-        // Edge from 1 degree off the pole to the equator: the first samples sit
-        // inside the ~3.24-degree clip band (image magnitude > R) and are dropped.
-        let segs = build_stereographic_edge(near_pole(1.0), Vec4::new(1.0, 0.0, 0.0, 0.0));
+    fn stereographic_clip_cuts_to_boundary_and_drops_deep_pole() {
+        let r = STEREOGRAPHIC_VIEW_RADIUS;
+        // Endpoints 5 degrees off the pole on opposite sides of the w-x plane;
+        // their connecting great circle passes through the +w pole at its
+        // midpoint. The endpoints' image magnitude is cot(2.5 deg) ~ 22.9 < R, so
+        // they are kept, while the midpoint samples blow up past R.
+        let off = 5.0_f32.to_radians();
+        let a = Vec4::new(off.sin(), 0.0, 0.0, off.cos());
+        let b = Vec4::new(-off.sin(), 0.0, 0.0, off.cos());
+        let segs = build_spherical_stereographic_edge(a, b);
+        assert!(!segs.is_empty(), "kept endpoints must emit segments");
+
+        // (1) Boundary cut: an endpoint sits within a hair of R.
+        let max_extent = segs
+            .iter()
+            .flat_map(|(s, e)| [Vec3::from_array(*s).length(), Vec3::from_array(*e).length()])
+            .fold(0.0_f32, f32::max);
+        assert!(
+            (max_extent - r).abs() < 1e-2,
+            "straddling sub-segment must be cut to the boundary (max extent {max_extent}, R {r})"
+        );
+
+        // (2) Deep-pole drop: the through-pole samples vanish, leaving a gap.
         assert!(
             segs.len() < SPACE_TESSELLATION_SAMPLES,
-            "near-pole edge must drop sub-segments (got {} of {})",
+            "deep-pole samples must drop (got {} of {}); a rescale-clamp would keep them all",
             segs.len(),
             SPACE_TESSELLATION_SAMPLES
         );
-        // No retained endpoint sits on the clamp ring at radius ~R: a rescale
-        // clamp would pin the dropped samples there, a drop never does.
-        let r = STEREOGRAPHIC_VIEW_RADIUS;
+
+        // (3) Bounded.
         for (s, e) in &segs {
             for end in [Vec3::from_array(*s), Vec3::from_array(*e)] {
                 assert!(
-                    (end.length() - r).abs() > 0.5,
-                    "endpoint {end:?} sits on the clamp ring at radius {r}; clip must drop, not rescale"
+                    end.length() <= r + 1e-3,
+                    "endpoint {end:?} (|.| = {}) exceeds the bound {r}",
+                    end.length()
                 );
             }
+        }
+    }
+
+    /// The regression test for the 16-cell near-pole artifacts under `xw`
+    /// rotation: once a vertex is near the `+w` pole, the visible arc tip must sit
+    /// at the clip boundary and STAY there as the vertex sweeps closer, with no
+    /// popping (sample-granularity drop) and no diving toward the center (the
+    /// conformal map's denominator-clamp deflation). The fixture is the genuine
+    /// 16-cell edge `+e_w -> +e_y`: `+e_y` is FIXED by an `xw` rotation while
+    /// `+e_w` rotates toward the pole, so the arc tip is purely the near-pole end.
+    ///
+    /// The sweep walks `phi` from 3 deg (just past the view-radius crossing,
+    /// `cot(phi/2) = R` at `phi ~ 3.24 deg`, so `+e_w` is already beyond `R`) down
+    /// to 0.05 deg, deep inside the pole-denominator clamp band (`phi < ~0.8 deg`).
+    /// Across this whole regime the tip must hold the boundary `R` to within a
+    /// unit. Two prior defects each break this: the whole-segment drop left the tip
+    /// at the last in-radius sample (well below `R`), and the clamp-band deflation
+    /// dove the tip from `R` toward the origin below `phi ~ 0.2 deg` (a >30-unit
+    /// collapse). Both manifest as a tip far below `R` somewhere in the sweep.
+    #[test]
+    fn stereographic_clip_arc_tip_holds_boundary_near_pole() {
+        let r = STEREOGRAPHIC_VIEW_RADIUS;
+        // `xw` rotation of the +e_w -- +e_y edge by `phi`: e_w -> (-sin phi, 0, 0,
+        // cos phi) sweeps toward the pole; e_y = (0, 1, 0, 0) is fixed.
+        let tip_extent = |phi_deg: f32| -> f32 {
+            let phi = phi_deg.to_radians();
+            let a = Vec4::new(-phi.sin(), 0.0, 0.0, phi.cos());
+            let b = Vec4::new(0.0, 1.0, 0.0, 0.0);
+            build_spherical_stereographic_edge(a, b)
+                .iter()
+                .flat_map(|(s, e)| [Vec3::from_array(*s).length(), Vec3::from_array(*e).length()])
+                .fold(0.0_f32, f32::max)
+        };
+        // Geometric sweep so steps cluster near the pole, where the deflation dive
+        // strikes; every sample is in the beyond-R regime.
+        let samples = 60;
+        let hi = 3.0_f32.ln();
+        let lo = 0.05_f32.ln();
+        for step in 0..=samples {
+            let frac = step as f32 / samples as f32;
+            let phi = (hi + (lo - hi) * frac).exp();
+            let tip = tip_extent(phi);
+            assert!(
+                tip > r - 1.0 && tip <= r + 1e-2,
+                "near-pole arc tip must hold the boundary R={r} at phi={phi} deg, got {tip}"
+            );
         }
     }
 
@@ -5650,7 +5638,7 @@ mod section_cap_projection_tests {
     /// stereographic case.
     #[test]
     fn stereographic_pole_endpoint_edge_is_finite_and_bounded() {
-        let segs = build_stereographic_edge(Vec4::W, Vec4::new(1.0, 0.0, 0.0, 0.0));
+        let segs = build_spherical_stereographic_edge(Vec4::W, Vec4::new(1.0, 0.0, 0.0, 0.0));
         let r = STEREOGRAPHIC_VIEW_RADIUS;
         for (s, e) in &segs {
             for end in [Vec3::from_array(*s), Vec3::from_array(*e)] {
@@ -5666,19 +5654,19 @@ mod section_cap_projection_tests {
         }
     }
 
-    /// Non-perturbation off the pole: an edge well clear of the pole keeps every
-    /// sub-segment (nothing dropped) and each emitted endpoint equals the raw
-    /// `project_to_world` of the corresponding chord sample bit-for-bit. The clip
-    /// is a pure post-filter on already-projected samples; it must not move a
-    /// retained sample. This guards the conformal interior: the clip changes
-    /// nothing where the projection is well-behaved.
+    /// Non-perturbation off the pole: a spherical edge well clear of the pole
+    /// keeps every sub-segment (nothing dropped) and each emitted endpoint equals
+    /// the raw `project_to_world` of the corresponding great-circle sample
+    /// bit-for-bit. The clip is a pure post-filter on already-projected samples;
+    /// it must not move a retained sample. This guards the conformal interior:
+    /// the clip changes nothing where the projection is well-behaved.
     #[test]
     fn stereographic_clip_does_not_perturb_off_pole_edge() {
         let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
-        // An edge straddling w = 0, far from the +w pole on both ends.
-        let a = Vec4::new(0.30, 0.60, 0.20, 0.10);
-        let b = Vec4::new(0.70, 0.10, 0.40, -0.30);
-        let segs = build_stereographic_edge(a, b);
+        // A unit edge straddling w = 0, far from the +w pole on both ends.
+        let a = Vec4::new(0.30, 0.60, 0.20, 0.10).normalize();
+        let b = Vec4::new(0.70, 0.10, 0.40, -0.30).normalize();
+        let segs = build_spherical_stereographic_edge(a, b);
         assert_eq!(
             segs.len(),
             SPACE_TESSELLATION_SAMPLES,
@@ -5686,10 +5674,13 @@ mod section_cap_projection_tests {
         );
         // Reconstruct the un-clipped projected polyline directly and compare.
         let samples = SPACE_TESSELLATION_SAMPLES;
+        let mut arc = Vec::new();
+        <rye_math::SphericalS3Embedded as rye_math::RasterizableSpace<4>>::tessellate_segment(
+            a, b, samples, &mut arc,
+        );
         let mut prev = project_to_world(a, &proj, Vec3::ZERO).to_array();
-        for (k, seg) in segs.iter().enumerate() {
-            let s = (k + 1) as f32 / samples as f32;
-            let cur = project_to_world(a.lerp(b, s), &proj, Vec3::ZERO).to_array();
+        for (k, (seg, &sample)) in segs.iter().zip(arc.iter().skip(1)).enumerate() {
+            let cur = project_to_world(sample, &proj, Vec3::ZERO).to_array();
             assert_eq!(seg.0, prev, "segment {k} start must match raw projection");
             assert_eq!(seg.1, cur, "segment {k} end must match raw projection");
             prev = cur;
@@ -5779,8 +5770,9 @@ mod section_cap_projection_tests {
     /// The cap FILL drops a triangle touching a near-pole vertex and keeps a
     /// triangle whose vertices are all far from the pole, at TRIANGLE granularity:
     /// a fan triangle with one near-pole vertex vanishes entirely (its index
-    /// triple is removed), while a far fan keeps every triangle. Mirrors
-    /// `stereographic_clip_drops_segments_not_rescales` for the fill path.
+    /// triple is removed), while a far fan keeps every triangle. The fill clip is
+    /// a whole-triangle drop (no boundary cut), mirroring the deep-pole drop in
+    /// `stereographic_clip_cuts_to_boundary_and_drops_deep_pole` for the fill path.
     #[test]
     fn cap_fill_triangle_dropped_near_pole() {
         let r = STEREOGRAPHIC_VIEW_RADIUS;
@@ -5899,30 +5891,27 @@ mod section_cap_projection_tests {
         );
     }
 
-    /// The default-pole render path actually projects through the cell-center pole
-    /// (not `+w`), and the cap clip applies to it: a cap vertex near the cell
-    /// center is dropped, one far from it kept. Pins that
-    /// `resolved_wireframe_projection`'s pole substitution flows into the cap fill
-    /// without re-deriving the projection. Also a demo-level guard that the
-    /// conformal map is the pure rye-math primitive (an equatorial-ish cap vertex
-    /// far from any pole projects to a bounded, finite, kept point).
+    /// The default-pole render path projects through the `+w` pole, and the cap
+    /// clip applies to it: a cap vertex near `+w` is dropped, one far from it
+    /// kept. Pins that `resolved_wireframe_projection`'s pole substitution flows
+    /// into the cap fill without re-deriving the projection. Also a demo-level
+    /// guard that the conformal map is the pure rye-math primitive (a cap vertex
+    /// far from the pole projects to a bounded, finite, kept point).
     #[test]
-    fn cap_fill_uses_default_cell_center_pole() {
+    fn cap_fill_uses_default_plus_w_pole() {
         let proj = default_stereographic();
         let clip = stereographic_clip_radius(&proj);
-        // A 4D point in the cell-center pole's near neighborhood (NOT exactly on
-        // it: the pole itself maps to a small point because the perpendicular
-        // numerator vanishes there; the blow-up is in the punctured neighborhood).
-        // `(0.5, 0.5, 0.5, 0.49)` normalizes to dot ~ 0.99996 with the pole, image
-        // magnitude ~87, well past the ~35 radius, so it drops.
-        let near = cap_projected([0.5, 0.5, 0.5], 0.49, &proj);
+        // A 4D point in the +w pole's near neighborhood: `(0.05, 0, 0, 1.0)`
+        // normalizes to dot ~ 0.99875 with +w, image magnitude ~40, past the
+        // ~35 radius, so it drops.
+        let near = cap_projected([0.05, 0.0, 0.0], 1.0, &proj);
         assert!(
             !sample_in_radius(near, clip),
-            "cap vertex near the cell-center pole (|.| = {}) must drop",
+            "cap vertex near the +w pole (|.| = {}) must drop",
             near.length()
         );
-        // A point far from the cell-center direction (negative lanes) stays
-        // bounded and finite, the pure conformal image, and is kept.
+        // A point far from +w (w = 0) stays bounded and finite, the pure
+        // conformal image, and is kept.
         let far = cap_projected([-0.4, -0.3, 0.2], 0.0, &proj);
         assert!(
             far.is_finite() && sample_in_radius(far, clip),

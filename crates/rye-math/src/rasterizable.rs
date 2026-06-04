@@ -249,19 +249,11 @@ pub enum Projection<const N: usize> {
     /// `result = E + t * (p - E)`.
     ///
     /// `result` lands in the 3-flat perpendicular to `cell_normal`; the readout expresses it
-    /// in an orthonormal basis of that 3-flat (Gram-Schmidt against `n`), not by dropping the
-    /// w-coordinate. A naive w-drop is exact only for a w-aligned `n`; for any other cell
-    /// normal it is an oblique projection that flattens the chosen boundary cell (its `+n`
-    /// vertex collapses toward the origin) and breaks the nesting, so the 5-cell, 16-cell,
-    /// 24-cell, 120-cell, and 600-cell would all render as degenerate diagrams. The frame is a
-    /// function of `n` alone, so it is identical across the polytope's vertices within one
-    /// Schlegel projection, but [`RasterizableSpace::project_point`] rebuilds it on every call,
-    /// which is once per vertex (per tessellation sample) in the upload path. The rebuild is a
-    /// few f32 ops with no allocation; it is left in the per-vertex path until Schlegel is
-    /// wired into the demo and the redundancy is measured, at which point the frame should be
-    /// resolved once per projection (see `perp_frame`). The frame's in-3-flat orientation
-    /// (which way is "up" in the diagram) is arbitrary but deterministic in `n`, which is all a
-    /// wireframe needs.
+    /// in the supplied orthonormal `basis` for that 3-flat, not by dropping the w-coordinate.
+    /// A naive w-drop is exact only for a w-aligned `n`; for any other cell normal it is an
+    /// oblique projection that flattens the chosen boundary cell. The basis is part of the
+    /// projection because its in-flat gauge is visible: a basis rebuilt from the live normal
+    /// can snap during rotation when a "drop one axis" construction crosses a tie.
     ///
     /// **Precondition: `cell_normal` is the *outward* unit normal and
     /// `viewpoint_distance > cell_offset`.** With the inward normal the diagram fails to nest
@@ -283,6 +275,8 @@ pub enum Projection<const N: usize> {
         /// Eye distance along `cell_normal` from the origin; must exceed `cell_offset` so the
         /// viewpoint sits just outside the chosen cell.
         viewpoint_distance: f32,
+        /// Orthonormal readout basis spanning the chosen cell's 3-flat.
+        basis: [Vec4; 3],
     },
 
     /// Stereographic projection of the unit 3-sphere S³ onto R³ from a chosen `pole` (a unit
@@ -335,6 +329,29 @@ pub enum Projection<const N: usize> {
         /// actually selects lives in the demo layer (this map stays pole-agnostic).
         pole: Vec4,
     },
+}
+
+impl Projection<4> {
+    /// Build a Schlegel projection with the deterministic normal-only basis.
+    pub fn schlegel(cell_normal: Vec4, cell_offset: f32, viewpoint_distance: f32) -> Projection<4> {
+        let (e1, e2, e3) = perp_frame(cell_normal);
+        Self::schlegel_with_basis(cell_normal, cell_offset, viewpoint_distance, [e1, e2, e3])
+    }
+
+    /// Build a Schlegel projection with an explicit 3-flat readout basis.
+    pub fn schlegel_with_basis(
+        cell_normal: Vec4,
+        cell_offset: f32,
+        viewpoint_distance: f32,
+        basis: [Vec4; 3],
+    ) -> Projection<4> {
+        Projection::Schlegel {
+            cell_normal,
+            cell_offset,
+            viewpoint_distance,
+            basis,
+        }
+    }
 }
 
 /// A flat or curved space that can drive the rasterizer pipeline: provides projection from its
@@ -447,6 +464,7 @@ impl RasterizableSpace<4> for EuclideanR4 {
                 cell_normal,
                 cell_offset,
                 viewpoint_distance,
+                basis,
             } => {
                 // Central projection from the eye `E = viewpoint_distance * n` through the
                 // vertex `point` onto the chosen cell's 3-flat `{x : dot(n, x) = cell_offset}`
@@ -470,20 +488,15 @@ impl RasterizableSpace<4> for EuclideanR4 {
                 };
                 let t = (*cell_offset - n_dot_eye) / denom;
                 let result = eye + t * (point - eye);
-                // Read `result` out in an orthonormal frame of the cell's 3-flat (perpendicular
-                // to `n`), not by dropping the w-coordinate. The drop-w shortcut is exact only
-                // for a w-aligned `n`; for any other cell normal it obliquely flattens the
-                // chosen boundary cell (its `+n` vertex collapses toward the origin) and the
-                // diagram stops nesting. The frame depends on `n` alone and is rebuilt per call
-                // (per vertex); see `perp_frame` for why that recompute is left un-hoisted.
-                let (e1, e2, e3) = perp_frame(n);
+                // Read in the caller-supplied frame so interactive Schlegel diagrams keep a
+                // stable in-flat orientation while the body rotates.
+                let [e1, e2, e3] = *basis;
                 Vec3::new(result.dot(e1), result.dot(e2), result.dot(e3))
             }
             Projection::Stereographic { pole } => {
-                // Stereographic is only defined on the unit sphere, but vertices fed through the
-                // demo are `body_size`-scaled rather than unit, so normalize onto S³ first; the
-                // normalize is the precondition guard. `stereographic_to_r3` then applies the
-                // conformal map with the pole-denominator clamp.
+                // Stereographic is only defined on the unit sphere, but demo
+                // vertices are body-scaled. Normalize onto S3 first, then apply
+                // the conformal map with the pole-denominator clamp.
                 stereographic_to_r3(point.normalize(), *pole)
             }
         }
@@ -505,13 +518,13 @@ mod tests {
     use crate::SphericalS3Embedded;
     use approx::assert_relative_eq;
 
-    /// Golden Vec3 for `stereographic_frame_is_deterministic_under_tie`. Hand-derived from the
-    /// deterministic `perp_frame` construction for the pole `(0,0,1,1)/√2` and the unit input
-    /// `(0.5, 0.5, -0.5, 0.5)`: the z/w max-magnitude tie resolves to dropping z (the earlier
-    /// index in the `==` ladder), giving the frame `(X, Y, (0,0,-1,1)/√2)`; with `dot(p, pole)
-    /// = 0` the readout is `(0.5, 0.5, 1/√2)`. A future change to the tie-break or Gram-Schmidt
-    /// order that flips the gauge changes this value and the test catches it.
-    /// `1/√2` is the `FRAC_1_SQRT_2` constant, not a bare literal.
+    /// Golden Vec3 for `stereographic_frame_is_deterministic_under_tie`.
+    /// Hand-derived from `perp_frame` for pole `(0,0,1,1)/sqrt(2)` and input
+    /// `(0.5, 0.5, -0.5, 0.5)`: the z/w tie drops z, giving the frame
+    /// `(X, Y, (0,0,-1,1)/sqrt(2))`. With `dot(p, pole) = 0`, the readout is
+    /// `(0.5, 0.5, 1/sqrt(2))`. A future tie-break or Gram-Schmidt change that
+    /// flips the gauge changes this value and the test catches it.
+    /// `1/sqrt(2)` is `FRAC_1_SQRT_2`, not a bare literal.
     const GOLDEN_TIE_FRAME: Vec3 = Vec3::new(0.5, 0.5, std::f32::consts::FRAC_1_SQRT_2);
 
     /// `point_to_array` is the inverse of `array_to_point` on `EuclideanR3` for any input.
@@ -696,8 +709,9 @@ mod tests {
         let far = Vec4::new(0.5, 0.5, 0.5, -0.5);
         let pn = <EuclideanR4 as RasterizableSpace<4>>::project_point(near, &proj);
         let pf = <EuclideanR4 as RasterizableSpace<4>>::project_point(far, &proj);
-        // Scale at w=+0.5 is `2 / (2 - 0.5) = 4/3`; at w=-0.5 is `2 / 2.5 = 4/5`. Each R³
-        // component scales by the same factor, so the ratio of magnitudes is `(4/3)/(4/5) = 5/3`.
+        // Scale at w=+0.5 is `2 / (2 - 0.5) = 4/3`; at w=-0.5 it is
+        // `2 / 2.5 = 4/5`. Each R3 component scales by the same factor, so
+        // the magnitude ratio is `(4/3)/(4/5) = 5/3`.
         let r_near = (pn.length() / 0.5_f32.mul_add(3.0_f32.sqrt(), 0.0)).abs(); // |near|/|input|
         let r_far = (pf.length() / 0.5_f32.mul_add(3.0_f32.sqrt(), 0.0)).abs();
         assert!((r_near - 4.0 / 3.0).abs() < 1e-5, "near scale {r_near}");
@@ -770,11 +784,7 @@ mod tests {
     #[test]
     fn schlegel_chosen_cell_renders_undistorted() {
         let cell_offset = 0.5;
-        let proj = Projection::Schlegel {
-            cell_normal: Vec4::W,
-            cell_offset,
-            viewpoint_distance: 1.5 * cell_offset,
-        };
+        let proj = Projection::schlegel(Vec4::W, cell_offset, 1.5 * cell_offset);
         // The eight vertices of the `w = +0.5` cell (the first half of TESSERACT_VERTS).
         let cell: Vec<Vec4> = TESSERACT_VERTS.iter().take(8).copied().collect();
         let projected: Vec<Vec3> = cell
@@ -819,11 +829,7 @@ mod tests {
         let centroid = (Vec4::X + Vec4::Y + Vec4::Z + Vec4::W) / 4.0;
         let cell_offset = centroid.length();
         let cell_normal = centroid / cell_offset;
-        let proj = Projection::Schlegel {
-            cell_normal,
-            cell_offset,
-            viewpoint_distance: 1.5 * cell_offset,
-        };
+        let proj = Projection::schlegel(cell_normal, cell_offset, 1.5 * cell_offset);
         // The four chosen-cell vertices (the +axes) are the boundary; the four -axes nest.
         let boundary = [Vec4::X, Vec4::Y, Vec4::Z, Vec4::W];
         let inner = [-Vec4::X, -Vec4::Y, -Vec4::Z, -Vec4::W];
@@ -847,10 +853,10 @@ mod tests {
                 "every nested vertex must sit inside the boundary, inner {inner_r:?} vs {r0}"
             );
         }
-        // Directly pin the oblique-normal isometry (the case this divergence from spec exists
-        // to fix): the four boundary +axes are mutually equidistant at `sqrt(2)`, and each lies
-        // on the cell hyperplane (`t = 1`, projects to itself), so the orthonormal-frame readout
-        // must preserve every pairwise distance. A naive oblique drop-w would not.
+        // Directly pin the oblique-normal isometry. The four boundary +axes are
+        // mutually equidistant at `sqrt(2)`, and each lies on the cell hyperplane
+        // (`t = 1`, projects to itself), so the orthonormal-frame readout must
+        // preserve every pairwise distance. A naive oblique drop-w would not.
         let proj_boundary: Vec<Vec3> = boundary.iter().map(|&v| proj_pt(v)).collect();
         let edge_len = 2.0_f32.sqrt();
         for i in 0..proj_boundary.len() {
@@ -882,6 +888,22 @@ mod tests {
         }
     }
 
+    /// Schlegel readout uses the supplied basis, not a rebuilt normal-only frame.
+    /// The point lies on the chosen boundary cell, so central projection returns
+    /// it unchanged and only the basis ordering can affect the R3 coordinates.
+    #[test]
+    fn schlegel_uses_supplied_basis_for_readout() {
+        let p = Vec4::new(0.5, -0.25, 0.125, 0.5);
+        let xyz = Projection::schlegel_with_basis(Vec4::W, 0.5, 0.75, [Vec4::X, Vec4::Y, Vec4::Z]);
+        let yxz = Projection::schlegel_with_basis(Vec4::W, 0.5, 0.75, [Vec4::Y, Vec4::X, Vec4::Z]);
+
+        let a = <EuclideanR4 as RasterizableSpace<4>>::project_point(p, &xyz);
+        let b = <EuclideanR4 as RasterizableSpace<4>>::project_point(p, &yxz);
+
+        assert_eq!(a, Vec3::new(0.5, -0.25, 0.125));
+        assert_eq!(b, Vec3::new(-0.25, 0.5, 0.125));
+    }
+
     /// Every tesseract vertex projects to an all-finite R³ point under the default viewpoint
     /// (`viewpoint_distance = 1.5 * cell_offset`). The viewpoint clears the chosen cell, so no
     /// vertex sits on the viewer 3-flat and the denominator clamp never engages on this input;
@@ -890,11 +912,7 @@ mod tests {
     #[test]
     fn schlegel_projection_is_always_finite() {
         let cell_offset = 0.5;
-        let proj = Projection::Schlegel {
-            cell_normal: Vec4::W,
-            cell_offset,
-            viewpoint_distance: 1.5 * cell_offset,
-        };
+        let proj = Projection::schlegel(Vec4::W, cell_offset, 1.5 * cell_offset);
         for v in TESSERACT_VERTS {
             let got = <EuclideanR4 as RasterizableSpace<4>>::project_point(v, &proj);
             for c in [got.x, got.y, got.z] {
@@ -913,11 +931,7 @@ mod tests {
     #[test]
     fn schlegel_zero_denominator_clamps_finite() {
         let viewpoint_distance = 0.75;
-        let proj = Projection::Schlegel {
-            cell_normal: Vec4::W,
-            cell_offset: 0.5,
-            viewpoint_distance,
-        };
+        let proj = Projection::schlegel(Vec4::W, 0.5, viewpoint_distance);
         // `w = viewpoint_distance` puts the vertex exactly on the eye's 3-flat.
         let p = Vec4::new(0.3, -0.2, 0.1, viewpoint_distance);
         let got = <EuclideanR4 as RasterizableSpace<4>>::project_point(p, &proj);
@@ -939,18 +953,10 @@ mod tests {
     fn schlegel_outward_normal_sign_required() {
         let cell_offset = 0.5;
         let viewpoint_distance = 1.5 * cell_offset;
-        let outward = Projection::Schlegel {
-            cell_normal: Vec4::W,
-            cell_offset,
-            viewpoint_distance,
-        };
+        let outward = Projection::schlegel(Vec4::W, cell_offset, viewpoint_distance);
         // Same physical `w = +0.5` cell described with the inward normal `-W`: its offset
         // flips sign, and the eye lands on the far side of the polytope.
-        let inward = Projection::Schlegel {
-            cell_normal: -Vec4::W,
-            cell_offset: -cell_offset,
-            viewpoint_distance,
-        };
+        let inward = Projection::schlegel(-Vec4::W, -cell_offset, viewpoint_distance);
         // A vertex of the opposite (`w = -0.5`) cell.
         let opposite = Vec4::new(0.5, 0.5, 0.5, -0.5);
         // The boundary cube's corners sit at radius `sqrt(3)/2` from the diagram center.
@@ -1004,10 +1010,11 @@ mod tests {
     #[test]
     fn schlegel_unsupported_on_r3_returns_zero() {
         let p = Vec3::new(1.0, 2.0, 3.0);
-        let proj = Projection::Schlegel {
+        let proj = Projection::<3>::Schlegel {
             cell_normal: Vec4::W,
             cell_offset: 0.5,
             viewpoint_distance: 0.75,
+            basis: [Vec4::X, Vec4::Y, Vec4::Z],
         };
         let got = <EuclideanR3 as RasterizableSpace<3>>::project_point(p, &proj);
         assert_eq!(got, Vec3::ZERO);
@@ -1080,8 +1087,9 @@ mod tests {
         );
     }
 
-    /// `stereo_inverse(stereo(p)) ≈ p` for unit `p` clear of the pole, for the default pole and
-    /// an off-axis pole. Written against the TRUNCATED image (the inverse re-embeds the
+    /// `stereo_inverse(stereo(p)) ~= p` for unit `p` clear of the pole, for the
+    /// default pole and an off-axis pole. Written against the TRUNCATED image
+    /// (the inverse re-embeds the
     /// in-3-flat readout), so the `n`-perpendicular truncation is pinned as load-bearing: a
     /// leaked pole-component would break this round-trip.
     #[test]
@@ -1266,8 +1274,8 @@ mod tests {
         let intrinsic = (ta.dot(tb) / (ta.length() * tb.length()))
             .clamp(-1.0, 1.0)
             .acos();
-        // Angle between the projected edges in R³. Step a small distance along each geodesic so
-        // the projected secant approximates the projected tangent direction.
+        // Angle between the projected edges in R3. Step a small distance along
+        // each geodesic so the secant approximates the projected tangent.
         let step = 1e-3;
         let pv = <EuclideanR4 as RasterizableSpace<4>>::project_point(v, &proj);
         let pa = <EuclideanR4 as RasterizableSpace<4>>::project_point(
@@ -1286,8 +1294,8 @@ mod tests {
         assert_relative_eq!(projected, intrinsic, epsilon = 1e-2);
     }
 
-    /// `Projection::Stereographic` on R³ falls back to `Vec3::ZERO` per the enum's "unsupported
-    /// variant returns zero" contract (R³ has no 3-sphere to project from).
+    /// `Projection::Stereographic` on R3 falls back to `Vec3::ZERO` per the
+    /// enum's "unsupported variant returns zero" contract.
     #[test]
     fn stereographic_unsupported_on_r3_returns_zero() {
         let p = Vec3::new(1.0, 2.0, 3.0);

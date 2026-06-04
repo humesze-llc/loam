@@ -4,6 +4,7 @@
 Cargo.lock
 
 # IDE / editor / tooling
+CLAUDE.md
 .claude/
 .idea/
 .vscode/
@@ -26,7 +27,7 @@ desktop.ini
 *.orig
 *.rej
 
-# Personal devlog — backed up separately (Obsidian)
+# Personal devlog
 docs/devlog/
 
 # Personal audit / dev scripts (not shipped; rerun locally)

@@ -183,13 +183,12 @@ impl RasterizableSpace<4> for SphericalS3Embedded {
             Projection::Stereographic { pole } => {
                 crate::rasterizable::stereographic_to_r3(point, *pole)
             }
-            // The remaining variants project the ambient unit 4-vector exactly as
-            // flat R⁴ does. The polytope playground views S³ great-circle arcs
-            // through the same Perspective4D pinhole (or Schlegel diagram) it uses
-            // for flat wireframes, so a flat edge and its curved counterpart share
-            // one screen embedding and the lerp↔slerp morph reads as the edges
-            // bowing out, not as a projection change. Delegating keeps the two
-            // impls bit-identical on those projection steps.
+            // The remaining variants project the ambient unit 4-vector exactly
+            // as flat R4 does. The playground views S3 great-circle arcs through
+            // the same Perspective4D pinhole or Schlegel diagram it uses for
+            // flat wireframes. The flat edge and curved counterpart share one
+            // screen embedding, so the lerp to slerp morph reads as the edge
+            // bowing out, not as a projection change.
             Projection::Identity
             | Projection::Orthographic { .. }
             | Projection::Perspective4D { .. }
@@ -654,29 +653,23 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// Schlegel delegates to the flat R⁴ projection too: the central-projection math is on the
-    /// ambient R⁴ embedding, so an S³ vertex and its flat counterpart share one screen point.
+    /// Schlegel delegates to the flat R4 projection too: central projection is
+    /// on the ambient R4 embedding, so an S3 vertex and its flat counterpart
+    /// share one screen point.
     /// Pins that the blanket delegation covers the Schlegel variant, not just Perspective4D.
     #[test]
     fn project_point_schlegel_matches_flat_r4() {
         let p = Vec4::new(0.5, 0.5, 0.5, 0.5);
-        let proj = Projection::Schlegel {
-            cell_normal: Vec4::W,
-            cell_offset: 0.5,
-            viewpoint_distance: 0.75,
-        };
+        let proj = Projection::schlegel(Vec4::W, 0.5, 0.75);
         let got = <SphericalS3Embedded as RasterizableSpace<4>>::project_point(p, &proj);
         let want = <EuclideanR4 as RasterizableSpace<4>>::project_point(p, &proj);
         assert_eq!(got, want);
     }
 
-    /// Stereographic does NOT blanket-delegate: the embedded S³ type computes the conformal map
-    /// directly (no normalize, since the input is already unit by invariant), so it returns the
-    /// stereographic image, not the flat R⁴ drop-w. Pins the design decision that a true
-    /// spherical view uses the stereographic projection. For a unit input the direct map and
-    /// the flat arm (which normalizes a unit vector to itself) coincide, so the discriminating
-    /// check is against the closed-form `(x, y, z) / (1 - w)`, which differs from the drop-w
-    /// that `Projection::Identity` would produce.
+    /// Stereographic does NOT blanket-delegate: the embedded S3 type computes
+    /// the conformal map directly, with no normalize because the input is unit.
+    /// It returns the stereographic image, not the flat R4 drop-w. Pins that a
+    /// true spherical view uses stereographic projection.
     #[test]
     fn project_point_stereographic_is_conformal_map_not_drop_w() {
         let p = Vec4::new(0.5, 0.5, 0.5, 0.5); // unit by construction

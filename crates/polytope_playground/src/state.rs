@@ -153,16 +153,14 @@ impl SectionLayer {
     }
 }
 
-/// Default surface-fill alpha for the honest cross-section layer: visible but
-/// slightly translucent so the parent wireframe (when enabled) reads through the
-/// cap without a separate `surface alpha` command. "Full-ish" rather than fully
-/// opaque per the layer's default-on role as the always-honest slice.
-const CROSS_SECTION_DEFAULT_ALPHA: f32 = 0.85;
+/// Default surface-fill alpha for the honest cross-section layer: fully opaque
+/// by default so the always-honest slice reads as solid surface geometry.
+const CROSS_SECTION_DEFAULT_ALPHA: f32 = 1.0;
 
 impl SectionLayer {
-    /// The honest cross-section's default: perimeter + fill on at a full-ish
-    /// alpha, so selecting a distorting wireframe projection never silently
-    /// reshapes the slice the user reads as "the cross-section."
+    /// The honest cross-section's default: perimeter + opaque fill on, so
+    /// selecting a distorting wireframe projection never silently reshapes the
+    /// slice the user reads as "the cross-section."
     pub(crate) const CROSS_SECTION_DEFAULT: SectionLayer = SectionLayer {
         perimeter: true,
         surface_alpha: CROSS_SECTION_DEFAULT_ALPHA,
@@ -202,19 +200,23 @@ pub(crate) fn section_layer_projection(
 /// slice IS a 3-flat and drop-w is the inhabitant's natural view of it).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum WireframeProjection {
-    /// Axis-aligned drop-w: `(x, y, z, w) -> (x, y, z)`. The default. Collapses every
-    /// pair of w-opposite vertices to the same R³ point, so axis-aligned polytopes
-    /// (especially the tesseract) render as visually degenerate "flat" shapes; the
-    /// 5-cell and 24-cell read more naturally because their cells aren't w-aligned.
+    /// Shadow: the orthographic drop-w projection `(x, y, z, w) -> (x, y, z)`, the
+    /// 4D object's shadow cast by parallel light down the w-axis. The default.
+    /// Collapses every pair of w-opposite vertices to the same R³ point, so
+    /// axis-aligned polytopes (especially the tesseract) render as visually
+    /// degenerate "flat" shapes; the 5-cell and 24-cell read more naturally
+    /// because their cells aren't w-aligned.
     #[default]
-    DropW,
-    /// 4D pinhole perspective from a viewer at `(0, 0, 0, focal_distance)` looking
-    /// in -w. Produces the classical "cube within a cube" tesseract view: +w face
-    /// renders as the outer (larger) shape, -w face as the inner (smaller) shape,
-    /// connecting edges as the frustum lines. Brings axis-aligned polytopes to life
-    /// at the cost of slight distortion on the polytopes that already read well
-    /// under drop-w.
-    WDepth,
+    Shadow,
+    /// W-pinhole: a 4D pinhole camera with its eye at `(0, 0, 0, focal_distance)`
+    /// on the w-axis, projecting the polytope onto the `w = 0` image 3-flat
+    /// (rays through one center, foreshortening by `focal / (focal - w)`).
+    /// Produces the classical "cube within a cube" tesseract view: the +w face
+    /// renders as the outer (larger) shape, the -w face as the inner (smaller)
+    /// shape, connecting edges as the frustum lines. Brings axis-aligned polytopes
+    /// to life at the cost of slight distortion on the polytopes that already read
+    /// well under Shadow.
+    WPinhole,
     /// 4D Schlegel diagram: central projection from a viewpoint just outside the
     /// chosen boundary cell onto that cell's bounding 3-flat (Coxeter, *Regular
     /// Polytopes*, ch. 13). The chosen cell becomes the diagram's outer boundary;
@@ -222,9 +224,9 @@ pub(crate) enum WireframeProjection {
     /// polytope's cells is the boundary, in the canonical [`Polytope4::topology`]
     /// cell order; it is clamped to the polytope's cell count at resolve time.
     ///
-    /// The variant carries only the index. The `cell_normal` / `cell_offset` /
-    /// `viewpoint_distance` scalars that [`rye_math::Projection::Schlegel`] needs
-    /// are resolved from the *selected polytope's* topology (cell centroids via
+    /// The variant carries only the index. The `cell_normal`, cell basis, and
+    /// distance scalars that [`rye_math::Projection::Schlegel`] needs are
+    /// resolved from the *selected polytope's* topology (cell centroids via
     /// [`Polytope4::face_planes`], the CORRECT path, NOT the buggy dual-vertex
     /// `cell{120,600}_face_planes`) and cached on [`Demo::schlegel_params`] at
     /// cell-select time, never inside the per-frame upload. See
@@ -235,16 +237,17 @@ pub(crate) enum WireframeProjection {
     },
     /// Conformal stereographic projection of the polytope from S³ (where its
     /// unit-circumradius vertices live) to R³, casting away from a configurable
-    /// pole (default [`STEREOGRAPHIC_DEFAULT_POLE`], a cell-center direction; live
-    /// value is [`Demo::stereographic_pole`]). Angle-preserving, distance-
-    /// distorting: the cell facing the pole balloons to the outer boundary and the
-    /// opposite cell shrinks to the interior, the same nesting Schlegel shows but
-    /// with the round, angle-faithful look that pairs with spherical-space mode.
+    /// pole (default [`STEREOGRAPHIC_DEFAULT_POLE`], the `+w` axis aligned with
+    /// the w-slice; live value is [`Demo::stereographic_pole`]). Edges always
+    /// render as S³ great-circle arcs (see [`default_edge_blend`]). Angle-
+    /// preserving, distance-distorting: the cell facing the pole balloons to the
+    /// outer boundary and the opposite cell shrinks to the interior, the same
+    /// nesting Schlegel shows but with the round, angle-faithful conformal look.
     /// The `EuclideanR4` projection normalizes each vertex onto S³ first, so this
     /// reads correctly for the demo's `BODY_SIZE`-scaled vertices.
     Stereographic,
-    /// Drop-w projection paired with a demo-side CELL-level w-range cull (the
-    /// `wireframe_hyperslice` filter): the wireframe thins to the edges that
+    /// Shadow (drop-w) projection paired with a demo-side CELL-level w-range cull
+    /// (the `wireframe_hyperslice` filter): the wireframe thins to the edges that
     /// belong to a cell whose body-local w-range overlaps a slab around
     /// `w_slice`. The cull is cell-level (not edge-level) so a kept edge agrees
     /// with the cell-level active-edge coloring and the cross-section: a far-side
@@ -266,9 +269,9 @@ pub(crate) enum WireframeProjection {
 /// Stored in CANONICAL coordinates (the polytope's unit-circumradius topology):
 /// the per-frame [`Demo::resolved_wireframe_projection`] scales `cell_offset` and
 /// `viewpoint_distance` by the live [`Demo::effective_body_size`] and rotates
-/// `cell_normal` by the live `rot_state`. Caching canonical (not body-scaled)
-/// params keeps the cache valid across `surface scale` changes and is what lets
-/// the chosen cell stay the outer boundary as the polytope spins.
+/// `cell_normal` / `cell_basis` by the live `rot_state`. Caching canonical (not
+/// body-scaled) params keeps the cache valid across `surface scale` changes and
+/// lets the chosen cell stay the outer boundary as the polytope spins.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SchlegelParams {
     /// The polytope these params were resolved against. The cache is invalid if
@@ -279,6 +282,9 @@ pub(crate) struct SchlegelParams {
     /// Outward unit normal of the chosen cell's hyperplane, in CANONICAL coords.
     /// Per-frame rotated by `rot_state`; rotation preserves unit length.
     pub(crate) cell_normal: glam::Vec4,
+    /// Orthonormal readout basis spanning the chosen cell, in CANONICAL coords.
+    /// Per-frame rotated by `rot_state` so its gauge cannot snap while spinning.
+    pub(crate) cell_basis: [glam::Vec4; 3],
     /// Signed plane offset in CANONICAL coords (the cell's inradius): the chosen
     /// cell lies in `{x : dot(cell_normal, x) = cell_offset}`. Per-frame scaled by
     /// `effective_body_size`.
@@ -289,6 +295,61 @@ pub(crate) struct SchlegelParams {
     /// cell_offset` crowds the eye against the small-inradius 5-cell). Per-frame
     /// scaled by `effective_body_size`.
     pub(crate) viewpoint_distance: f32,
+}
+
+const SCHLEGEL_BASIS_EPSILON: f32 = 1e-6;
+
+fn push_schlegel_basis_vector(
+    candidate: glam::Vec4,
+    cell_normal: glam::Vec4,
+    basis: &mut [glam::Vec4; 3],
+    count: &mut usize,
+) {
+    if *count == basis.len() {
+        return;
+    }
+    let mut v = candidate - candidate.dot(cell_normal) * cell_normal;
+    for b in basis.iter().take(*count) {
+        v -= v.dot(*b) * *b;
+    }
+    let len = v.length();
+    if len > SCHLEGEL_BASIS_EPSILON {
+        basis[*count] = v / len;
+        *count += 1;
+    }
+}
+
+fn resolve_schlegel_cell_basis(
+    polytope: Polytope4,
+    cell_index: usize,
+    cell_normal: glam::Vec4,
+) -> [glam::Vec4; 3] {
+    let topo = polytope.topology();
+    let cell = topo.cells[cell_index];
+    let anchor = topo.vertices[cell[0] as usize];
+    let mut basis = [glam::Vec4::ZERO; 3];
+    let mut count = 0usize;
+
+    for &vi in cell.iter().skip(1) {
+        push_schlegel_basis_vector(
+            topo.vertices[vi as usize] - anchor,
+            cell_normal,
+            &mut basis,
+            &mut count,
+        );
+        if count == 3 {
+            return basis;
+        }
+    }
+
+    debug_assert_eq!(count, 3, "Schlegel boundary cell must span a 3-flat");
+    for seed in [glam::Vec4::X, glam::Vec4::Y, glam::Vec4::Z, glam::Vec4::W] {
+        push_schlegel_basis_vector(seed, cell_normal, &mut basis, &mut count);
+        if count == 3 {
+            break;
+        }
+    }
+    basis
 }
 
 /// Additive eye clearance beyond the chosen cell's far edge, in canonical
@@ -322,6 +383,7 @@ pub(crate) fn resolve_schlegel_params(polytope: Polytope4, cell_index: u32) -> S
     let clamped = cell_index.min(cell_count - 1);
     let (normals, cell_offset) = polytope.face_planes();
     let cell_normal = normals[clamped as usize];
+    let cell_basis = resolve_schlegel_cell_basis(polytope, clamped as usize, cell_normal);
     // Farthest vertex-projection along the outward normal. For the chosen cell
     // this is its own boundary plane (`= cell_offset`), but compute it over all
     // vertices so the eye clearance is robust to any topology quirk rather than
@@ -336,6 +398,7 @@ pub(crate) fn resolve_schlegel_params(polytope: Polytope4, cell_index: u32) -> S
         polytope,
         cell_index: clamped,
         cell_normal,
+        cell_basis,
         cell_offset,
         viewpoint_distance: max_dot + SCHLEGEL_EYE_MARGIN,
     }
@@ -375,6 +438,34 @@ pub(crate) fn synced_schlegel_projection(
     }
 }
 
+/// The edge geometry an honest render of `projection` uses: the S3 great-circle
+/// arc (`blend == 1`) for Stereographic, flat R4 chords (`blend == 0`) for every
+/// other projection. Under the conformal map a polytope edge is a circular arc,
+/// not a straight chord, so Stereographic always draws arcs; the affine
+/// projections draw chords. Read per frame by the wireframe builder
+/// ([`Demo::render_wireframe_overlay`]); edge geometry is derived from the
+/// projection, not a separate control, so it can never disagree with the map.
+pub(crate) fn default_edge_blend(projection: WireframeProjection) -> f32 {
+    match projection {
+        WireframeProjection::Stereographic => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// Apply secondary state changes implied by selecting a wireframe projection.
+///
+/// Stereographic only shows anything in the wireframe overlay (its S3 arcs are
+/// drawn there), so selecting it turns the overlay on. Edge geometry itself is
+/// derived from the projection ([`default_edge_blend`]), not set here.
+pub(crate) fn apply_projection_selection_defaults(
+    projection: WireframeProjection,
+    wireframe_enabled: &mut bool,
+) {
+    if matches!(projection, WireframeProjection::Stereographic) {
+        *wireframe_enabled = true;
+    }
+}
+
 /// A short educational annotation for the active projection / space-mode
 /// combination: a `title` for the callout window plus a `body` of one to three
 /// sentences explaining what the user is looking at. Surfaced via the
@@ -384,35 +475,13 @@ pub(crate) fn synced_schlegel_projection(
 pub(crate) struct ModeAnnotation {
     /// Callout window title: the mode's short name.
     pub(crate) title: &'static str,
-    /// One to three sentences. Composed from the projection's own explanation
-    /// plus, when spherical curvature is active, a curvature sentence and (for
-    /// the flat-cap overlap) a disambiguating note.
+    /// One to three sentences explaining the active projection.
     pub(crate) body: String,
 }
 
-/// The `space_blend` argument above this counts as "spherical curvature is on"
-/// for the annotation: any visible bow of the edges toward S³ warrants the
-/// curvature sentence. Matches the wireframe builder's own `blend <= 0.0` flat
-/// fast-path cutoff (the per-edge morph in the demo's `push_blended_edge`), so
-/// the curvature sentence appears for exactly the blend values that bow the
-/// edges. The wireframe-overlay-enabled gate is the caller's responsibility:
-/// `Demo::render_mode_annotation` passes `0.0` here while the overlay is off,
-/// since the bowed edges render only in that overlay, so this threshold is the
-/// last condition rather than the only one.
-const SPHERICAL_ANNOTATION_THRESHOLD: f32 = 0.0;
-
-/// Educational annotation for the active `(projection, space curvature, flat-cap)`
-/// combination, or `None` when the scene is in its plain default state (drop-w
-/// projection AND flat space): there is nothing non-obvious to explain, so no
-/// callout is shown. Every other combination returns `Some` with distinct,
-/// non-empty copy.
-///
-/// `flat_cap_drawn` is `true` when the rasterized cross-section caps are being
-/// drawn (`SurfaceMode::Raster`). It only affects the body text in the THREE-WAY
-/// overlap case (spherical curvature on, with a flat cap and/or Stereographic),
-/// where the cap stays a flat 3-flat slice while the edges bow onto S³; the note
-/// tells the user the flat cap is expected (a curved cross-section is future
-/// work) so a flat cap under curved edges does not read as a bug.
+/// Educational annotation for the active `projection`, or `None` for the plain
+/// default (drop-w): there is nothing non-obvious to explain, so no callout is
+/// shown. Every other projection returns `Some` with distinct, non-empty copy.
 ///
 /// Pure (no `&Demo`) so the `(mode) -> copy` mapping is unit-testable without a
 /// GPU-backed [`Demo`]; [`Demo::render_mode_annotation`] is the one caller.
@@ -420,21 +489,15 @@ const SPHERICAL_ANNOTATION_THRESHOLD: f32 = 0.0;
 /// Projection explanations follow Coxeter, *Regular Polytopes*, ch. 13
 /// (Schlegel diagrams) and the standard conformal stereographic map
 /// `(x, y, z) / (1 - w)` (Wikipedia, "Stereographic projection").
-pub(crate) fn mode_annotation(
-    projection: WireframeProjection,
-    space_blend: f32,
-    flat_cap_drawn: bool,
-) -> Option<ModeAnnotation> {
-    let spherical = space_blend > SPHERICAL_ANNOTATION_THRESHOLD;
-
-    // Per-projection lead sentence. `None` for drop-w, the default projection:
-    // it has no distortion to explain, so a drop-w + flat scene shows nothing.
+pub(crate) fn mode_annotation(projection: WireframeProjection) -> Option<ModeAnnotation> {
+    // `None` for drop-w, the default projection: it has no distortion to
+    // explain, so a drop-w scene shows nothing.
     let (title, projection_body): (&'static str, Option<&str>) = match projection {
-        WireframeProjection::DropW => ("Drop-w", None),
-        WireframeProjection::WDepth => (
-            "W-depth perspective",
+        WireframeProjection::Shadow => ("Shadow", None),
+        WireframeProjection::WPinhole => (
+            "W-pinhole",
             Some(
-                "4D pinhole perspective from a viewer down the w-axis: the +w face \
+                "4D pinhole camera with its eye down the w-axis: the +w face \
                  projects to the outer shape and the -w face to the inner one, the \
                  classic cube-within-a-cube view of the tesseract.",
             ),
@@ -451,10 +514,10 @@ pub(crate) fn mode_annotation(
         WireframeProjection::Stereographic => (
             "Stereographic projection",
             Some(
-                "Conformal S^3 -> R^3 map, (x, y, z) / (1 - w): angles are preserved \
-                 but distances are not, so the polytope distorts globally and the \
-                 cell facing the +w pole balloons outward as its vertices approach \
-                 the pole.",
+                "Conformal S^3 -> R^3 map, (x, y, z) / (1 - w): the polytope is \
+                 cast onto S^3 and its edges render as great-circle arcs. Angles \
+                 are preserved but distances are not, so the cell facing the +w \
+                 pole balloons outward as its vertices approach the pole.",
             ),
         ),
         WireframeProjection::Hyperslice => (
@@ -468,98 +531,43 @@ pub(crate) fn mode_annotation(
         ),
     };
 
-    // The default scene (drop-w, flat space) has nothing to annotate.
-    let Some(projection_lead) = projection_body else {
-        if !spherical {
-            return None;
-        }
-        // Spherical curvature on but the projection is plain drop-w: the
-        // curvature is the only thing to explain, so the callout is titled for
-        // the space mode rather than the projection.
-        return Some(ModeAnnotation {
-            title: "Spherical space",
-            body: spherical_sentence(flat_cap_drawn, projection).to_string(),
-        });
-    };
-
-    let mut body = projection_lead.to_string();
-    if spherical {
-        body.push(' ');
-        body.push_str(spherical_sentence(flat_cap_drawn, projection));
-    }
-    Some(ModeAnnotation { title, body })
+    let projection_lead = projection_body?;
+    Some(ModeAnnotation {
+        title,
+        body: projection_lead.to_string(),
+    })
 }
 
-/// The `space_blend` value the annotation should describe, given the raw blend
-/// and whether the wireframe overlay is on. The flat-to-spherical edge morph
-/// lives entirely in the wireframe builder (`push_blended_edge`, reached only
-/// from `Demo::render_wireframe_overlay`), which the frame loop skips while the
-/// overlay is disabled. With the overlay off there is no bowed edge on screen,
-/// so the annotation must not claim curvature: report the blend as `0.0` so
-/// [`mode_annotation`] drops the spherical sentence (or the whole "Spherical
-/// space" callout, for plain drop-w). The projection annotation is unaffected
-/// because the rasterized section caps reproject through the same projection
-/// whether or not the wireframe overlay draws.
+/// Default pole for the Stereographic wireframe projection: the `+w` axis
+/// `(0, 0, 0, 1)`, casting away from `+w` toward the `-w` antipode at the R^3
+/// origin. The pole is deliberately aligned with the w-slice axis: the
+/// cross-section selects cells by their w-coordinate, and under a `+w` pole the
+/// conformal scale `1 / (1 - dot(p, pole)) = 1 / (1 - p.w)` depends only on `w`,
+/// so every cell sharing the slice's w maps to one CENTERED radial shell. An
+/// off-axis pole (e.g. a cell center `(½,½,½,½)`) makes the scale depend on
+/// `x + y + z + w`, which spreads a single w-slice asymmetrically and pulls the
+/// active cells off-center.
 ///
-/// Split out so the "no curvature claim without a visible bow" invariant is
-/// unit-testable without a GPU-backed [`Demo`]; [`Demo::render_mode_annotation`]
-/// is the one caller.
-pub(crate) fn annotation_effective_blend(space_blend: f32, wireframe_enabled: bool) -> f32 {
-    if wireframe_enabled {
-        space_blend
-    } else {
-        0.0
-    }
-}
-
-/// The spherical-curvature sentence appended when `space_blend > 0`, plus the
-/// three-way-overlap note when a flat cross-section cap and/or Stereographic is
-/// also in play. The flat cap stays a flat 3-flat slice while the edges bow onto
-/// S^3; the note flags that as expected (curved cross-sections are future work)
-/// so the user does not read the flat cap under curved edges as a bug.
-fn spherical_sentence(flat_cap_drawn: bool, projection: WireframeProjection) -> &'static str {
-    let stereographic = matches!(projection, WireframeProjection::Stereographic);
-    if flat_cap_drawn || stereographic {
-        "Spherical space bows the edges onto S^3 great-circle arcs, so the \
-         polytope curves; the filled cross-section cap stays flat (a flat 3-flat \
-         slice), which is expected here -- a curved cross-section is not yet \
-         implemented."
-    } else {
-        "Spherical space bows the edges onto S^3 great-circle arcs, so the \
-         polytope curves rather than rendering as straight chords."
-    }
-}
-
-/// Default pole for the Stereographic wireframe projection: the unit
-/// direction `(1, 1, 1, 1)/2`, a cell-center direction of the 16-cell (and of
-/// the tesseract and 24-cell). Casting away from a cell center, rather than the
-/// `+w` axis, keeps an *axis-aligned* polytope's vertices off the pole: the
-/// 16-cell's vertices are the `±e_i` axes (Coxeter, *Regular Polytopes*, §8.2),
-/// and a cell centroid lies along the outward face normal between four such
-/// axes, so no 16-cell vertex sits on this pole and a pure `xw` rotation (which
-/// fixes `y, z`) can never sweep one onto it. That removes the common-case
-/// 16-cell pole flicker the `+w` pole exhibits.
-///
-/// Tradeoff, by 16-cell / tesseract duality: this direction *is* a tesseract
-/// vertex direction (the tesseract vertex `(½,½,½,½)`), so under this pole a
-/// tesseract presents a vertex toward the pole at rest, where the `+w` pole
-/// presented a cell. A single pole cannot avoid every polytope's vertices in a
-/// mixed row; this constant trades the tesseract's static look for the
-/// 16-cell's continuous-rotation robustness, and the pole stays configurable
-/// (see [`Demo::stereographic_pole`]). Written as the exact, exactly-unit f32
-/// literal `0.5` per lane so no runtime `normalize` is needed and the constant
-/// is bit-reproducible.
-pub(crate) const STEREOGRAPHIC_DEFAULT_POLE: glam::Vec4 = glam::Vec4::new(0.5, 0.5, 0.5, 0.5);
+/// Tradeoff: `+w` is a vertex direction of the axis-aligned polytopes (the
+/// 16-cell vertex `+e_w`, Coxeter, *Regular Polytopes*, §8.2), so a vertex can
+/// sweep through the pole under an `xw` rotation and flick to infinity at the
+/// crossing instant. This is the standard stereographic point-at-infinity
+/// singularity, accepted here in exchange for the centered, slice-aligned image
+/// (a pole that dodges the vertices instead skews every slice). The pole stays
+/// configurable (see [`Demo::stereographic_pole`]). `(0, 0, 0, 1)` is exactly
+/// unit, so no runtime `normalize` is needed and the constant is
+/// bit-reproducible.
+pub(crate) const STEREOGRAPHIC_DEFAULT_POLE: glam::Vec4 = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
 
 impl WireframeProjection {
     /// Parse the console-arg spelling. Hyphens because the console grammar lexes on
-    /// whitespace and `drop-w` / `w-depth` read as single tokens. `schlegel` parses
+    /// whitespace and `w-pinhole` reads as a single token. `schlegel` parses
     /// to `cell_index = 0`; the console handler reads the trailing `<cell-index>`
     /// token separately (the grammar carries it as its own positional arg).
     pub(crate) fn from_token(token: &str) -> Option<Self> {
         match token {
-            "drop-w" => Some(WireframeProjection::DropW),
-            "w-depth" => Some(WireframeProjection::WDepth),
+            "shadow" => Some(WireframeProjection::Shadow),
+            "w-pinhole" => Some(WireframeProjection::WPinhole),
             "schlegel" => Some(WireframeProjection::Schlegel { cell_index: 0 }),
             "stereographic" => Some(WireframeProjection::Stereographic),
             "hyperslice" => Some(WireframeProjection::Hyperslice),
@@ -568,12 +576,12 @@ impl WireframeProjection {
     }
 
     /// Cycle order for the bare `wireframe perspective` console command and the
-    /// UI radio: drop-w -> w-depth -> schlegel -> stereographic -> hyperslice ->
-    /// drop-w. Schlegel cycles in at `cell_index = 0`; the cell-index stepper then
+    /// UI radio: shadow -> w-pinhole -> schlegel -> stereographic -> hyperslice ->
+    /// shadow. Schlegel cycles in at `cell_index = 0`; the cell-index stepper then
     /// picks the boundary cell.
     pub(crate) const ALL: [Self; 5] = [
-        WireframeProjection::DropW,
-        WireframeProjection::WDepth,
+        WireframeProjection::Shadow,
+        WireframeProjection::WPinhole,
         WireframeProjection::Schlegel { cell_index: 0 },
         WireframeProjection::Stereographic,
         WireframeProjection::Hyperslice,
@@ -582,8 +590,8 @@ impl WireframeProjection {
     /// Display label for the egui projection radio.
     pub(crate) fn label(self) -> &'static str {
         match self {
-            WireframeProjection::DropW => "Drop-w",
-            WireframeProjection::WDepth => "W-depth",
+            WireframeProjection::Shadow => "Shadow",
+            WireframeProjection::WPinhole => "W-pinhole",
             WireframeProjection::Schlegel { .. } => "Schlegel",
             WireframeProjection::Stereographic => "Stereographic",
             WireframeProjection::Hyperslice => "Hyperslice",
@@ -601,12 +609,12 @@ impl WireframeProjection {
 
     /// Context-free resolution to a [`rye_math::Projection<4>`]. Handles the modes
     /// that need no polytope or rotor context:
-    /// - `DropW` -> `Identity` (drop-w),
-    /// - `WDepth` -> `Perspective4D { focal_distance: 2.0 }` (focal sized to clear
+    /// - `Shadow` -> `Identity` (orthographic drop-w),
+    /// - `WPinhole` -> `Perspective4D { focal_distance: 2.0 }` (focal sized to clear
     ///   the unit-circumradius polytope's `BODY_SIZE`-scaled w-extent so the
     ///   denominator never nears zero),
     /// - `Stereographic` -> `Stereographic { pole: STEREOGRAPHIC_DEFAULT_POLE }`
-    ///   (a cell-center pole, off every 16-cell vertex; see the constant). The
+    ///   (the `+w` pole aligned with the w-slice; see the constant). The
     ///   live pole is [`Demo::stereographic_pole`], which
     ///   [`Demo::resolved_wireframe_projection`] substitutes; this context-free
     ///   resolution returns the default so a non-render caller still gets the
@@ -622,14 +630,14 @@ impl WireframeProjection {
     /// sites call it, not this.
     pub(crate) fn to_projection(self) -> rye_math::Projection<4> {
         match self {
-            WireframeProjection::DropW | WireframeProjection::Hyperslice => {
+            WireframeProjection::Shadow | WireframeProjection::Hyperslice => {
                 rye_math::Projection::Identity
             }
-            WireframeProjection::WDepth => rye_math::Projection::Perspective4D {
+            WireframeProjection::WPinhole => rye_math::Projection::Perspective4D {
                 focal_distance: 2.0,
             },
             // Schlegel needs cached params + rotor (see doc above); fall back to
-            // drop-w until `Demo::resolved_wireframe_projection` resolves it.
+            // Shadow (drop-w) until `Demo::resolved_wireframe_projection` resolves it.
             WireframeProjection::Schlegel { .. } => rye_math::Projection::Identity,
             WireframeProjection::Stereographic => rye_math::Projection::Stereographic {
                 pole: STEREOGRAPHIC_DEFAULT_POLE,
@@ -1001,8 +1009,8 @@ pub(crate) struct Demo {
     pub(crate) schlegel_params: Option<SchlegelParams>,
     /// Live pole for the Stereographic wireframe projection, the unit `Vec4` the
     /// conformal map casts away from. Defaults to [`STEREOGRAPHIC_DEFAULT_POLE`]
-    /// (a cell-center direction, off every 16-cell vertex; see the constant for
-    /// why and the tesseract tradeoff). Kept as a field rather than baked into the
+    /// (the `+w` axis, aligned with the w-slice; see the constant for why and the
+    /// 16-cell flicker tradeoff). Kept as a field rather than baked into the
     /// payload-free [`WireframeProjection::Stereographic`] variant so the enum
     /// stays a plain marker across `ALL` / `from_token` / `same_variant` / the UI
     /// radio; [`Self::resolved_wireframe_projection`] substitutes it per frame.
@@ -1027,14 +1035,6 @@ pub(crate) struct Demo {
     /// survive" rather than an exact-equality test that never fires. Default
     /// [`crate::consts::HYPERSLICE_DEFAULT_THICKNESS`].
     pub(crate) wireframe_hyperslice_thickness: f32,
-    /// Wireframe-edge geometry morph in `[0, 1]`: `0.0` draws straight chords
-    /// in R⁴ (flat, `EuclideanR4` lerp); `1.0` draws great-circle arcs on S³
-    /// (`SphericalS3Embedded` slerp); values between linearly blend the two
-    /// per tessellation sample. The polytope's unit-circumradius vertices
-    /// already lie on S³, so only the edge interiors move; endpoints are
-    /// shared. Set via the `space` console command. At exactly `0.0` the
-    /// wireframe takes a one-segment-per-edge fast path (no tessellation).
-    pub(crate) space_blend: f32,
     /// Pixel width of parent-wireframe edges. Tuneable via `wireframe width <N>`
     /// for thicker lines on screenshots. Default bumped from 1.2 px to 1.8 px
     /// after side-by-side comparison: 1.2 px was too fine to read clearly
@@ -1145,7 +1145,7 @@ pub(crate) struct Demo {
     pub(crate) body_uniform_scratch: Vec<BodyUniform>,
     /// Reused great-circle sampling buffer for `push_blended_edge`; taken via
     /// `mem::take` during the wireframe-overlay build and put back after, so the
-    /// curved-mode (`space_blend > 0`) path does not allocate per frame.
+    /// arc-edge (Stereographic) path does not allocate per frame.
     pub(crate) slerp_scratch: Vec<glam::Vec4>,
     /// Selects how the six regular convex 4-polytopes are rendered. Smooth-surface shapes
     /// (Clifford torus, duocylinder, etc.) ignore this and always render via the SDF since
@@ -1217,13 +1217,12 @@ pub(crate) struct Demo {
     pub(crate) example_callout: rye_egui::CalloutState,
 
     /// Persistent state for the per-mode educational annotation callout: a short
-    /// floating explanation of the active projection / space mode, anchored to
-    /// the leading polychoron. Its text is the pure [`mode_annotation`] mapping
-    /// reprojected each frame; the callout only draws when that mapping returns
-    /// `Some` (a non-default projection or spherical curvature is active) AND
-    /// this flag is on. On by default so a first-time user who switches to
-    /// Schlegel / Stereographic / Hyperslice or turns up Curvature immediately
-    /// sees what the mode does; toggle via `View > Mode annotation`.
+    /// floating explanation of the active projection, anchored to the leading
+    /// polychoron. Its text is the pure [`mode_annotation`] mapping reprojected
+    /// each frame; the callout only draws when that mapping returns `Some` (a
+    /// non-default projection is active) AND this flag is on. On by default so a
+    /// first-time user who switches to Schlegel / Stereographic / Hyperslice
+    /// immediately sees what the mode does; toggle via `View > Mode annotation`.
     pub(crate) mode_annotation_open: rye_egui::CalloutState,
 
     /// Whether the top-right rotation-formula popup is rendered. Off by default; the
@@ -1507,9 +1506,9 @@ impl Demo {
 
     /// The live [`rye_math::Projection<4>`] for the wireframe overlay this frame.
     /// For Schlegel it builds the engine projection from the cached canonical
-    /// [`SchlegelParams`]: the canonical normal is rotated by the current
-    /// `rot_state` (one rotor apply; rotation preserves unit length) so the chosen
-    /// cell stays the outer boundary as the body spins, and the canonical offset +
+    /// [`SchlegelParams`]: the canonical normal and basis rotate by the current
+    /// `rot_state` so the chosen cell stays the outer boundary as the body spins,
+    /// and its in-flat orientation stays continuous. The canonical offset and
     /// viewpoint distance are scaled by [`Self::effective_body_size`] to match the
     /// body-scaled vertices the wireframe feeds the projection. No allocation, no
     /// `face_planes` call: this is the hot-path-safe counterpart to
@@ -1520,11 +1519,14 @@ impl Demo {
             WireframeProjection::Schlegel { .. } => match self.schlegel_params {
                 Some(p) => {
                     let body_size = self.effective_body_size();
-                    Projection::Schlegel {
-                        cell_normal: self.rot_state.apply(p.cell_normal),
-                        cell_offset: p.cell_offset * body_size,
-                        viewpoint_distance: p.viewpoint_distance * body_size,
-                    }
+                    let cell_normal = self.rot_state.apply(p.cell_normal);
+                    let basis = p.cell_basis.map(|axis| self.rot_state.apply(axis));
+                    Projection::schlegel_with_basis(
+                        cell_normal,
+                        p.cell_offset * body_size,
+                        p.viewpoint_distance * body_size,
+                        basis,
+                    )
                 }
                 // Unresolved (no polychoron in row): drop-w fallback. The cache is
                 // resolved at every select point, so this only fires for a row with
@@ -1627,7 +1629,6 @@ impl Demo {
         self.rot_state = Rotor4::IDENTITY;
         self.rot_time = 0.0;
         self.t_slider_max = T_SLIDER_INITIAL;
-        self.space_blend = 0.0;
         // Restore the honest-slice default: the drop-w cross-section visible,
         // the reprojected cap off, so a reset always returns to the "slice that
         // never distorts under a projection change" baseline.
@@ -1641,10 +1642,11 @@ impl Demo {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_plane_angle, annotation_effective_blend, compose_active_rotor,
-        hyperslice_cull_active, mode_annotation, render_row_entries, resolve_schlegel_params,
-        row_blocks_sdf, section_layer_projection, synced_schlegel_projection, SectionLayer,
-        ViewMode, WireframeProjection, BASE_ROTATION_RATE, STEREOGRAPHIC_DEFAULT_POLE,
+        active_plane_angle, apply_projection_selection_defaults, compose_active_rotor,
+        default_edge_blend, hyperslice_cull_active, mode_annotation, render_row_entries,
+        resolve_schlegel_params, row_blocks_sdf, section_layer_projection,
+        synced_schlegel_projection, SectionLayer, ViewMode, WireframeProjection,
+        BASE_ROTATION_RATE, STEREOGRAPHIC_DEFAULT_POLE,
     };
     use crate::catalog::ShapeEntry;
     use glam::Vec4;
@@ -1803,136 +1805,42 @@ mod tests {
         assert!(row_blocks_sdf(&with_600));
     }
 
-    /// A curvature value set while the wireframe overlay is OFF must not produce a
-    /// spherical annotation: the flat-to-spherical edge bow renders only in the
-    /// wireframe overlay, so with the overlay off there is no curved geometry on
-    /// screen and the callout would describe something the user cannot see. The
-    /// caller routes `space_blend` through [`annotation_effective_blend`], which
-    /// reports flat (`0.0`) while the overlay is off, so:
-    ///  - drop-w + curvature-but-overlay-off collapses to the default no-op
-    ///    (`None`), exactly as plain flat drop-w does; and
-    ///  - a non-default projection keeps its projection annotation (the caps
-    ///    reproject without the wireframe) but drops the spherical sentence.
-    ///
-    /// With the overlay on, the raw blend passes through unchanged.
-    #[test]
-    fn curvature_annotation_requires_visible_wireframe() {
-        // Overlay off: the gate reports flat regardless of the raw blend.
-        assert_eq!(annotation_effective_blend(1.0, false), 0.0);
-        assert_eq!(annotation_effective_blend(0.5, false), 0.0);
-        // Overlay on: the raw blend passes through untouched.
-        assert_eq!(annotation_effective_blend(1.0, true), 1.0);
-        assert_eq!(annotation_effective_blend(0.0, true), 0.0);
-
-        // Drop-w with curvature set but the overlay off is indistinguishable from
-        // the plain flat default scene: no annotation.
-        let blend_off = annotation_effective_blend(1.0, false);
-        assert!(
-            mode_annotation(WireframeProjection::DropW, blend_off, false).is_none(),
-            "spherical-over-drop-w must not annotate while the wireframe is off"
-        );
-        // Turning the overlay on resurrects the spherical-space callout.
-        let blend_on = annotation_effective_blend(1.0, true);
-        assert!(
-            mode_annotation(WireframeProjection::DropW, blend_on, false).is_some(),
-            "spherical-over-drop-w must annotate once the wireframe is on"
-        );
-
-        // A non-default projection keeps its projection annotation with the
-        // overlay off, but the body must NOT mention the S^3 edge bow, since no
-        // bowed edge is drawn. The projection lead (caps reproject regardless) is
-        // still present.
-        let stereo_off = mode_annotation(WireframeProjection::Stereographic, blend_off, false)
-            .expect("stereographic still annotates its projection with the overlay off");
-        assert!(
-            !stereo_off.body.contains("S^3 great-circle arcs"),
-            "no spherical sentence without a visible wireframe bow: {}",
-            stereo_off.body
-        );
-        assert!(
-            stereo_off.body.contains("Conformal S^3 -> R^3"),
-            "the stereographic projection lead must still be present: {}",
-            stereo_off.body
-        );
-    }
-
     /// The educational-annotation mapping pins three invariants the UI relies on:
-    /// (1) the plain default scene (drop-w projection, flat space) yields no
-    /// annotation, so nothing floats over an undistorted view; (2) every
-    /// non-default projection and the spherical-space-over-drop-w case yields a
-    /// non-empty body; and (3) the bodies are pairwise DISTINCT across the
-    /// non-default modes, so each mode reads as its own explanation rather than a
-    /// shared placeholder. Pins the `(mode) -> copy` mapping, not the egui render.
+    /// (1) the plain default (drop-w) projection yields no annotation, so nothing
+    /// floats over the undistorted default view; (2) every non-default projection
+    /// yields a non-empty title and body; and (3) the bodies are pairwise DISTINCT,
+    /// so each mode reads as its own explanation rather than a shared placeholder.
+    /// Pins the `(projection) -> copy` mapping, not the egui render.
     #[test]
     fn annotation_text_present_per_mode() {
-        // Default scene: drop-w + flat space + (cap state irrelevant) -> nothing.
         assert!(
-            mode_annotation(WireframeProjection::DropW, 0.0, true).is_none(),
-            "drop-w + flat space must not annotate the default view"
-        );
-        assert!(
-            mode_annotation(WireframeProjection::DropW, 0.0, false).is_none(),
-            "cap state must not resurrect the default-scene annotation"
+            mode_annotation(WireframeProjection::Shadow).is_none(),
+            "drop-w must not annotate the default view"
         );
 
-        // Each distinct mode case the UI can surface. `space_blend` and the
-        // flat-cap flag are chosen to exercise both the plain projection body and
-        // the spherical/overlap branches.
-        let cases: &[(WireframeProjection, f32, bool)] = &[
-            (WireframeProjection::WDepth, 0.0, true),
-            (WireframeProjection::Schlegel { cell_index: 0 }, 0.0, true),
-            (WireframeProjection::Stereographic, 0.0, true),
-            (WireframeProjection::Hyperslice, 0.0, true),
-            // Spherical curvature over plain drop-w: the space mode is the only
-            // thing to explain, so this is its own distinct annotation.
-            (WireframeProjection::DropW, 1.0, true),
+        let cases = [
+            WireframeProjection::WPinhole,
+            WireframeProjection::Schlegel { cell_index: 0 },
+            WireframeProjection::Stereographic,
+            WireframeProjection::Hyperslice,
         ];
-
         let mut bodies = HashSet::new();
-        for &(projection, blend, flat_cap) in cases {
-            let annotation = mode_annotation(projection, blend, flat_cap)
-                .unwrap_or_else(|| panic!("{projection:?} blend={blend} must annotate"));
+        for projection in cases {
+            let annotation = mode_annotation(projection)
+                .unwrap_or_else(|| panic!("{projection:?} must annotate"));
             assert!(
                 !annotation.title.is_empty(),
-                "{projection:?} blend={blend}: title must be non-empty"
+                "{projection:?}: title must be non-empty"
             );
             assert!(
                 !annotation.body.is_empty(),
-                "{projection:?} blend={blend}: body must be non-empty"
+                "{projection:?}: body must be non-empty"
             );
             assert!(
                 bodies.insert(annotation.body.clone()),
-                "{projection:?} blend={blend}: body duplicates another mode's copy"
+                "{projection:?}: body duplicates another mode's copy"
             );
         }
-
-        // The three-way overlap note is conditional: spherical curvature with a
-        // flat cap (or Stereographic) must mention the flat cross-section, and the
-        // no-flat-cap / non-stereographic case must NOT, so the user is only warned
-        // about the flat cap when one is actually drawn under curved edges.
-        let with_cap = mode_annotation(WireframeProjection::WDepth, 1.0, true)
-            .expect("wdepth + spherical annotates");
-        assert!(
-            with_cap.body.contains("cross-section cap stays flat"),
-            "spherical + flat cap must flag the flat cross-section: {}",
-            with_cap.body
-        );
-        let no_cap = mode_annotation(WireframeProjection::WDepth, 1.0, false)
-            .expect("wdepth + spherical annotates");
-        assert!(
-            !no_cap.body.contains("cross-section cap stays flat"),
-            "spherical without a flat cap must not mention the cap: {}",
-            no_cap.body
-        );
-        // Stereographic forces the overlap note even with no raster cap, because
-        // its own R^3 image is a flat conformal map under the curved edges.
-        let stereo_no_cap = mode_annotation(WireframeProjection::Stereographic, 1.0, false)
-            .expect("stereographic + spherical annotates");
-        assert!(
-            stereo_no_cap.body.contains("cross-section cap stays flat"),
-            "stereographic + spherical must flag the flat slice even without a cap: {}",
-            stereo_no_cap.body
-        );
     }
 
     /// The SDF crash-safety gate keys off the RENDERED row, not the stored
@@ -1991,8 +1899,8 @@ mod tests {
         );
         for mode in WireframeProjection::ALL {
             let token = match mode {
-                WireframeProjection::DropW => "drop-w",
-                WireframeProjection::WDepth => "w-depth",
+                WireframeProjection::Shadow => "shadow",
+                WireframeProjection::WPinhole => "w-pinhole",
                 WireframeProjection::Schlegel { .. } => "schlegel",
                 WireframeProjection::Stereographic => "stereographic",
                 WireframeProjection::Hyperslice => "hyperslice",
@@ -2005,11 +1913,11 @@ mod tests {
         }
         // Context-free engine projections per the documented contract.
         assert_eq!(
-            WireframeProjection::DropW.to_projection(),
+            WireframeProjection::Shadow.to_projection(),
             Projection::Identity
         );
         assert_eq!(
-            WireframeProjection::WDepth.to_projection(),
+            WireframeProjection::WPinhole.to_projection(),
             Projection::Perspective4D {
                 focal_distance: 2.0
             }
@@ -2033,64 +1941,103 @@ mod tests {
         );
     }
 
-    /// The default Stereographic pole is the unit direction `(1, 1, 1, 1)/2` and
-    /// equals (to f32 epsilon) the normalized centroid of a 16-cell cell, tying
-    /// the literal constant to the polytope's topology rather than a bare number.
-    /// If the cell-centroid derivation ever drifts from the recorded literal this
-    /// fails loudly.
+    /// Edge geometry is derived from the projection, not a control: Stereographic
+    /// always renders S3 great-circle arcs (`blend == 1`), every affine projection
+    /// renders flat R4 chords (`blend == 0`). Because the wireframe builder reads
+    /// `default_edge_blend` per frame, this can never disagree with the map, and a
+    /// reset (which touches no edge-geometry state) cannot flatten the arcs.
     #[test]
-    fn stereographic_default_pole_is_unit_cell_center() {
-        // Exactly unit by construction: 4 * 0.5^2 = 1.
+    fn edge_geometry_is_derived_from_projection() {
+        assert_eq!(default_edge_blend(WireframeProjection::Stereographic), 1.0);
+        for p in [
+            WireframeProjection::Shadow,
+            WireframeProjection::WPinhole,
+            WireframeProjection::Hyperslice,
+        ] {
+            assert_eq!(default_edge_blend(p), 0.0, "{p:?} should draw chords");
+        }
+    }
+
+    /// Selecting Stereographic turns the wireframe overlay on (its arcs are drawn
+    /// only there); every other projection leaves the toggle alone.
+    #[test]
+    fn stereographic_selection_enables_wireframe() {
+        let mut wireframe = false;
+        apply_projection_selection_defaults(WireframeProjection::Stereographic, &mut wireframe);
+        assert!(
+            wireframe,
+            "stereographic arcs require the wireframe overlay"
+        );
+
+        let mut wireframe = false;
+        apply_projection_selection_defaults(WireframeProjection::WPinhole, &mut wireframe);
+        assert!(
+            !wireframe,
+            "non-stereographic selection must not force the overlay"
+        );
+    }
+
+    /// The default Stereographic pole is the `+w` axis `(0, 0, 0, 1)`, exactly
+    /// unit. Aligning the pole with the w-slice axis is what centers the active
+    /// cells (see [`stereographic_plus_w_pole_scale_depends_only_on_w`]).
+    #[test]
+    fn stereographic_default_pole_is_plus_w() {
+        assert_eq!(STEREOGRAPHIC_DEFAULT_POLE, Vec4::W);
         assert_eq!(
             STEREOGRAPHIC_DEFAULT_POLE.length_squared(),
             1.0,
             "default pole must be exactly unit"
         );
-        // The 16-cell cell centroids are the (±½, ±½, ±½, ±½) directions; the
-        // all-positive one, normalized, is the default pole. `cell_centers`
-        // returns centroids at the inradius, so normalize before comparing.
-        let centers = Polytope4::Cell16.cell_centers();
-        let matches_a_centroid = centers
-            .iter()
-            .any(|c| (c.normalize() - STEREOGRAPHIC_DEFAULT_POLE).length() < 1e-6);
+    }
+
+    /// The centering property the `+w` pole is chosen for: the conformal scale
+    /// `1 / (1 - dot(p, pole))` reduces to `1 / (1 - p.w)`, so it depends ONLY on
+    /// `w`. Every cell sharing the cross-section's w-coordinate therefore maps to
+    /// one centered radial shell, instead of the asymmetric spread an off-w pole
+    /// (whose scale depends on `x + y + z + w`) produces. Pins that two points at
+    /// equal `w` but different `x, y, z` share an identical stereographic
+    /// denominator under the default pole, and that an off-w pole does NOT.
+    #[test]
+    fn stereographic_plus_w_pole_scale_depends_only_on_w() {
+        let pole = STEREOGRAPHIC_DEFAULT_POLE;
+        // Two unit directions at the same w = 0.6 but different x + y + z
+        // (0.8 vs 1.12), so an off-w pole can tell them apart while +w cannot.
+        // Both are exactly unit: 0.8^2 + 0.6^2 = 1 and 0.48^2 + 0.64^2 + 0.6^2 = 1.
+        let p = Vec4::new(0.8, 0.0, 0.0, 0.6);
+        let q = Vec4::new(0.0, 0.48, 0.64, 0.6);
+        assert!((p.w - q.w).abs() < 1e-6, "fixture points must share w");
+        let denom_p = 1.0 - p.dot(pole);
+        let denom_q = 1.0 - q.dot(pole);
         assert!(
-            matches_a_centroid,
-            "default pole must be a normalized 16-cell cell centroid"
+            (denom_p - denom_q).abs() < 1e-6,
+            "+w pole must give equal scale at equal w ({denom_p} vs {denom_q})"
+        );
+        // An off-w pole (a cell center) breaks the equal-w invariant, which is
+        // exactly the off-center pull the +w pole was reverted to avoid.
+        let off_w = Vec4::splat(0.5);
+        assert!(
+            (1.0 - p.dot(off_w) - (1.0 - q.dot(off_w))).abs() > 1e-3,
+            "off-w pole must spread a single w-slice (the skew we reverted)"
         );
     }
 
-    /// No 16-cell vertex sits on the default pole: every vertex direction is
-    /// strictly outside the pole-clamp band (`dot(v, pole) < 1 - eps`), so the
-    /// stereographic denominator never reaches the clamp for an axis-aligned
-    /// 16-cell at rest. Also pins the common-case sweep: a pure `xw` rotation
-    /// leaves each vertex's `y, z` fixed, and the pole has `y = z = ½`, so no
-    /// 16-cell vertex (whose `y, z` are each `0` or `±1`) can ever rotate onto it.
+    /// The accepted tradeoff: `+w` IS a 16-cell vertex (`+e_w`), so under an `xw`
+    /// rotation a vertex sweeps through the pole and flicks to infinity. Pinned
+    /// so the streak is a documented, deliberate consequence of the slice-aligned
+    /// pole, not a regression: a future "dodge the vertices" pole change would
+    /// reintroduce the off-center pull and must fail here.
     #[test]
-    fn stereographic_default_pole_is_never_a_16cell_vertex() {
-        let eps = rye_math::STEREOGRAPHIC_POLE_EPSILON;
+    fn stereographic_default_pole_is_a_16cell_vertex_by_design() {
         let pole = STEREOGRAPHIC_DEFAULT_POLE;
-        for v in Polytope4::Cell16.topology().vertices {
-            // Vertices are unit `±e_i`; dot with the pole is exactly ±½.
-            let d = v.normalize().dot(pole);
-            assert!(
-                d < 1.0 - eps,
-                "16-cell vertex {v:?} has dot {d} with the default pole, inside \
-                 the pole-clamp band"
-            );
-        }
-        // The common-case xw sweep: rotate +x through the xw plane and confirm
-        // the pole's fixed y = z = ½ keeps dot bounded away from 1 the whole way.
-        for step in 0..360 {
-            let theta = (step as f32).to_radians();
-            // xw rotation of +x: (cos, 0, 0, sin). y and z stay 0.
-            let rotated = Vec4::new(theta.cos(), 0.0, 0.0, theta.sin());
-            let d = rotated.dot(pole);
-            // Max over the sweep is cos*½ + sin*½ <= sqrt(2)/2 ~ 0.707 < 1 - eps.
-            assert!(
-                d < 1.0 - eps,
-                "xw-rotated +x at {step} deg has dot {d}, inside the clamp band"
-            );
-        }
+        let on_a_vertex = Polytope4::Cell16
+            .topology()
+            .vertices
+            .iter()
+            .any(|v| (v.normalize() - pole).length() < 1e-6);
+        assert!(
+            on_a_vertex,
+            "the slice-aligned +w pole sits on a 16-cell vertex by design"
+        );
     }
 
     /// The Hyperslice cull runs when EITHER the standalone toggle is on OR the
@@ -2242,11 +2189,58 @@ mod tests {
             let a = resolve_schlegel_params(polytope, cell_index);
             let b = resolve_schlegel_params(polytope, cell_index);
             assert_eq!(a.cell_normal, b.cell_normal, "{polytope:?} normal");
+            assert_eq!(a.cell_basis, b.cell_basis, "{polytope:?} basis");
             assert_eq!(a.cell_offset, b.cell_offset, "{polytope:?} offset");
             assert_eq!(
                 a.viewpoint_distance, b.viewpoint_distance,
                 "{polytope:?} viewpoint"
             );
+        }
+    }
+
+    /// The cached Schlegel basis is an orthonormal frame of the selected cell's
+    /// own 3-flat. This is the no-snap invariant: the frame is derived once in
+    /// canonical cell coordinates, not guessed later from a live rotated normal.
+    #[test]
+    fn schlegel_cell_basis_spans_chosen_cell() {
+        for polytope in Polytope4::ALL {
+            let cell_index = (polytope.cell_count() / 2) as u32;
+            let params = resolve_schlegel_params(polytope, cell_index);
+
+            for (i, axis) in params.cell_basis.iter().enumerate() {
+                assert!(
+                    (axis.length() - 1.0).abs() < 1e-5,
+                    "{polytope:?} basis axis {i} must be unit"
+                );
+                assert!(
+                    axis.dot(params.cell_normal).abs() < 1e-5,
+                    "{polytope:?} basis axis {i} must be in the cell plane"
+                );
+            }
+            for i in 0..3 {
+                for j in (i + 1)..3 {
+                    assert!(
+                        params.cell_basis[i].dot(params.cell_basis[j]).abs() < 1e-5,
+                        "{polytope:?} basis axes {i}/{j} must be orthogonal"
+                    );
+                }
+            }
+
+            let topo = polytope.topology();
+            let cell = topo.cells[params.cell_index as usize];
+            let anchor = topo.vertices[cell[0] as usize];
+            for &vi in cell {
+                let delta = topo.vertices[vi as usize] - anchor;
+                let reconstructed = params
+                    .cell_basis
+                    .iter()
+                    .fold(Vec4::ZERO, |acc, &axis| acc + delta.dot(axis) * axis);
+                let residual = delta - reconstructed;
+                assert!(
+                    residual.length() < 5e-4,
+                    "{polytope:?} cell vertex {vi} must reconstruct in the basis"
+                );
+            }
         }
     }
 
@@ -2258,7 +2252,7 @@ mod tests {
     /// if its normal rotates with the body. Verified at the math level (the rotor
     /// apply) since `Demo::resolved_wireframe_projection` needs a GPU-backed `Demo`.
     #[test]
-    fn schlegel_normal_rotates_with_body() {
+    fn schlegel_frame_rotates_with_body() {
         let polytope = Polytope4::Tesseract;
         let cell_index = 0;
         let params = resolve_schlegel_params(polytope, cell_index);
@@ -2273,12 +2267,22 @@ mod tests {
         // Rotation preserves unit length, so the rotated normal is still a valid
         // outward unit normal for the engine `Projection::Schlegel`.
         assert!((rotated.length() - 1.0).abs() < 1e-5);
+        let rotated_basis = params.cell_basis.map(|axis| rot.apply(axis));
+        for (i, axis) in rotated_basis.iter().enumerate() {
+            assert!((axis.length() - 1.0).abs() < 1e-5, "axis {i} unit");
+            assert!(
+                axis.dot(rotated).abs() < 1e-5,
+                "axis {i} remains perpendicular to the rotated normal"
+            );
+        }
         // And it equals the body's own rotation of every chosen-cell vertex's
         // direction: a chosen-cell vertex `v` has `dot(canonical_normal, v) =
         // cell_offset`; after rotating both, `dot(rotated_normal, rot.apply(v))`
         // must still equal `cell_offset` (the cell stays on its hyperplane).
         let topo = polytope.topology();
         let cell = topo.cells[cell_index as usize];
+        let anchor = topo.vertices[cell[0] as usize];
+        let rotated_anchor = rot.apply(anchor);
         for &vi in cell {
             let v = topo.vertices[vi as usize];
             let lhs = rotated.dot(rot.apply(v));
@@ -2287,6 +2291,16 @@ mod tests {
                 "rotated cell vertex must stay on the rotated boundary hyperplane: {lhs} vs {}",
                 params.cell_offset
             );
+            let delta = v - anchor;
+            let rotated_delta = rot.apply(v) - rotated_anchor;
+            for (axis, rotated_axis) in params.cell_basis.iter().zip(rotated_basis) {
+                let want = delta.dot(*axis);
+                let got = rotated_delta.dot(rotated_axis);
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "rotated basis coordinates must match canonical coordinates"
+                );
+            }
         }
     }
 
@@ -2424,11 +2438,7 @@ mod tests {
                 focal_distance: 2.0,
             },
             Projection::Stereographic { pole: Vec4::W },
-            Projection::Schlegel {
-                cell_normal: Vec4::W,
-                cell_offset: 0.5,
-                viewpoint_distance: 0.75,
-            },
+            Projection::schlegel(Vec4::W, 0.5, 0.75),
         ];
         for active in actives {
             // Honest layer: drop-w no matter what the active projection is.

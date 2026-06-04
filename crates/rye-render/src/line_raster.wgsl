@@ -29,16 +29,50 @@ fn vs_main(
     @location(4) end_color:   vec4<f32>,
     @location(5) width_px:    f32,
 ) -> VsOut {
-    let s_clip = camera.view_projection * vec4<f32>(start_pos, 1.0);
-    let e_clip = camera.view_projection * vec4<f32>(end_pos,   1.0);
-    let s_ndc  = s_clip.xyz / s_clip.w;
-    let e_ndc  = e_clip.xyz / e_clip.w;
+    var a  = camera.view_projection * vec4<f32>(start_pos, 1.0);
+    var b  = camera.view_projection * vec4<f32>(end_pos,   1.0);
+    var ca = start_color;
+    var cb = end_color;
+
+    // Near-plane clip in homogeneous clip space, BEFORE the perspective divide.
+    // glam's `perspective_rh` puts the near plane at `clip.z == 0` (wgpu's [0, w]
+    // depth range), and `clip.z < 0` for everything nearer than the near plane,
+    // INCLUDING points behind the eye (`w <= 0`). Without this clip a behind-eye
+    // endpoint divides by a non-positive `w`, flipping its NDC across the screen
+    // and rubber-banding the whole segment (a long stereographic arc swinging
+    // through the camera's near hemisphere is the trigger). Both endpoints in
+    // front of the near plane (the overwhelmingly common case) take no clip and
+    // are bit-identical to the unclipped path.
+    if (a.z < 0.0 && b.z < 0.0) {
+        // Whole segment is behind the near plane: emit a degenerate vertex
+        // outside the clip volume (z < 0) so the hardware discards the quad.
+        var culled: VsOut;
+        culled.clip       = vec4<f32>(0.0, 0.0, -1.0, 1.0);
+        culled.coverage_t = 0.0;
+        culled.width_px   = width_px;
+        culled.color      = vec4<f32>(0.0);
+        return culled;
+    }
+    // At most one endpoint is behind the near plane now; move it along the
+    // segment to `clip.z == 0` (and carry its color the same fraction).
+    if (a.z < 0.0) {
+        let t = a.z / (a.z - b.z);
+        a  = mix(a,  b,  t);
+        ca = mix(ca, cb, t);
+    } else if (b.z < 0.0) {
+        let t = b.z / (b.z - a.z);
+        b  = mix(b,  a,  t);
+        cb = mix(cb, ca, t);
+    }
+
+    let s_ndc  = a.xyz / a.w;
+    let e_ndc  = b.xyz / b.w;
 
     // Corners 0, 2 belong to the start endpoint; 1, 3 to the end.
     let pick_start = (corner == 0u || corner == 2u);
     let base_ndc   = select(e_ndc, s_ndc, pick_start);
-    let base_w     = select(e_clip.w, s_clip.w, pick_start);
-    let color      = select(end_color, start_color, pick_start);
+    let base_w     = select(b.w, a.w, pick_start);
+    let color      = select(cb, ca, pick_start);
 
     // Direction along the segment in screen-pixel space (NDC * half-viewport).
     let half_vp     = camera.viewport_size * 0.5;

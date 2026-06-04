@@ -17,8 +17,9 @@ use rye_math::Rotor4;
 
 use crate::consts::{CONTROL_H, CONTROL_W, PLAY_PAUSE_W};
 use crate::state::{
-    hyperslice_cull_active, DeferredAction, Demo, RotationMode, RotorTerm, SectionLayer,
-    SurfaceMode, ViewMode, WireframeColorMode, WireframeProjection,
+    apply_projection_selection_defaults, hyperslice_cull_active, DeferredAction, Demo,
+    RotationMode, RotorTerm, SectionLayer, SurfaceMode, ViewMode, WireframeColorMode,
+    WireframeProjection,
 };
 
 /// Render one [`SectionLayer`]'s controls: a perimeter-outline checkbox and a
@@ -168,9 +169,8 @@ impl Demo {
                     ui.checkbox(&mut self.example_callout.open, "Example callout");
                     ui.checkbox(&mut self.mode_annotation_open.open, "Mode annotation")
                         .on_hover_text(
-                            "Floating note explaining the active projection / space \
-                             mode. Appears only for a non-default projection or with \
-                             Curvature turned up.",
+                            "Floating note explaining the active projection. Appears \
+                             only for a non-default projection.",
                         );
                     ui.separator();
                     // One-shot action: opens the About window and the menu should fold
@@ -225,7 +225,6 @@ impl Demo {
             wireframe_projection,
             wireframe_hyperslice,
             wireframe_hyperslice_thickness,
-            space_blend,
             points_enabled,
             points_show_vertices,
             points_show_cell_centers,
@@ -304,13 +303,15 @@ impl Demo {
                             // cell index (the contextual stepper below owns it).
                             let selected = wireframe_projection.same_variant(mode);
                             if ui.radio(selected, mode.label()).clicked() && !selected {
-                                *wireframe_projection = match (mode, *wireframe_projection) {
+                                let next = match (mode, *wireframe_projection) {
                                     (
                                         WireframeProjection::Schlegel { .. },
                                         WireframeProjection::Schlegel { cell_index },
                                     ) => WireframeProjection::Schlegel { cell_index },
                                     (m, _) => m,
                                 };
+                                *wireframe_projection = next;
+                                apply_projection_selection_defaults(next, wireframe_enabled);
                             }
                         }
                     });
@@ -363,36 +364,6 @@ impl Demo {
                             );
                         });
                     });
-                });
-                // Curvature is a DIFFERENT axis from Projection above. The
-                // Projection radio picks the 4D->R³ map (where a vertex lands
-                // on screen); Curvature morphs the EDGE GEOMETRY between a flat
-                // R⁴ chord and an S³ great-circle arc (whether the line between
-                // two landed vertices is straight or bowed). They compose, but
-                // conflating them confuses, so the slider sits in its own
-                // separator-delimited group below the projection knob. Writes
-                // the same `space_blend` field the `wireframe space` /
-                // top-level `space` console command drives, clamped to [0, 1].
-                //
-                // Deliberately OUTSIDE the `wireframe_enabled` enable-gate the
-                // other wireframe controls sit in: the morph is only visible in
-                // the wireframe layer, but gating the slider behind that toggle
-                // is the same dead-end the bare `space spherical` command had
-                // (mutate a field nothing draws). A user reaching for the
-                // Curvature slider IS asking to see curved edges, so dragging it
-                // above zero auto-enables the wireframe, mirroring the console
-                // handler. Holding it at zero never flips the overlay on.
-                ui.separator();
-                ui.label(egui::RichText::new("Curvature (flat <-> spherical)").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Blend");
-                    if ui
-                        .add(egui::Slider::new(space_blend, 0.0..=1.0).fixed_decimals(2))
-                        .changed()
-                        && *space_blend > 0.0
-                    {
-                        *wireframe_enabled = true;
-                    }
                 });
                 ui.separator();
 
