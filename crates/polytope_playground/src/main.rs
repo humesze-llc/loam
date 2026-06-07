@@ -64,7 +64,8 @@ use rye_egui::Console;
 use rye_math::WPlane;
 use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
 use rye_physics::polytope::{
-    polytope_section_faces_append, polytope_section_overlay_with_vertices, vertex_color_by_position,
+    polytope_section_faces_append, polytope_section_overlay_with_vertices,
+    vertex_color_by_position, Polytope4,
 };
 use rye_render::{
     device::RenderDevice,
@@ -100,11 +101,12 @@ const PERSPECTIVE_SCALE_DENOM_EPSILON: f32 = 1e-4;
 /// *width* artifact of a behind-eye endpoint, but it cannot remove this *length*
 /// discontinuity, which is inherent to an extended arc reaching past a close
 /// camera. Tying the radius to a fraction `< 1` of the live camera distance keeps
-/// every arc endpoint in front of the eye at ANY zoom (the zoom-robust property)
-/// when zooming in (the zoom-robust property). On zoom-OUT the radius is held at
-/// [`STEREOGRAPHIC_VIEW_RADIUS_MAX`] rather than growing without bound, which also
-/// brings the arcs on-screen (their NDC shrinks) so a pulled-back camera frames a
-/// larger shape's full arc halo.
+/// every arc endpoint in front of the eye when zooming in (the zoom-robust
+/// property). On zoom-OUT the radius is held at
+/// [`STEREOGRAPHIC_CELL16_RADIUS_MAX`] rather than growing without bound, which
+/// also brings the arcs on-screen (their NDC shrinks) so a pulled-back camera
+/// frames the figure. This fraction applies to the 16-cell (the only shape the
+/// clip bounds; see [`stereographic_view_radius`]).
 ///
 /// `0.75` leaves a nearest-approach margin of `0.25 ×` the camera distance (a
 /// gentle off-axis sweep, never a graze); at an 8-unit camera distance it yields
@@ -119,38 +121,50 @@ const STEREOGRAPHIC_VIEW_RADIUS_FRACTION: f32 = 0.75;
 /// backstop there.
 const STEREOGRAPHIC_VIEW_RADIUS_FLOOR: f32 = 2.5;
 
-/// Ceiling on the stereographic clip radius. Beyond this the arc would be drawn
-/// deep into the steep near-pole region, where the fixed-count
+/// Ceiling on the stereographic clip radius FOR THE 16-CELL. Beyond this the arc
+/// would be drawn deep into the steep near-pole region, where the fixed-count
 /// [`SPACE_TESSELLATION_SAMPLES`] arc sampling (uniform in 4D arc-angle) is far
 /// too coarse for the nonlinear projection: consecutive samples jump several-fold
 /// in image magnitude, so the rendered arc facets into long straight chords
 /// (jagged) and those chords twitch as rotation shifts which sample brackets the
-/// boundary (the bounce). Capping at `6.0` keeps the arc in the gentle region
-/// where the 16 samples read as a smooth curve, and matches the eyes-on-confirmed
-/// extent. To let arcs extend further AND stay smooth, raise this together with
-/// the arc sample count (or subdivide adaptively by projected segment length).
-const STEREOGRAPHIC_VIEW_RADIUS_MAX: f32 = 6.0;
+/// boundary (the bounce). `10.0` keeps the 16-cell's arcs extended but bounded
+/// within the (mostly) well-sampled region. To extend further AND stay smooth,
+/// raise this together with the arc sample count (or subdivide adaptively by
+/// projected segment length) — a future arc-extent slider would drive both.
+const STEREOGRAPHIC_CELL16_RADIUS_MAX: f32 = 10.0;
 
 /// Reference clip radius for tests (which have no live camera): the value
-/// [`stereographic_view_radius`] yields at an 8-unit camera distance and beyond
-/// (where it saturates at [`STEREOGRAPHIC_VIEW_RADIUS_MAX`]). Eyes-on-confirmed to
-/// kill the rubberband while keeping the near-pole arcs a smooth extended halo.
-/// The live render path uses the camera-adaptive [`stereographic_view_radius`]
-/// instead, so this is compiled only for tests.
+/// [`stereographic_view_radius`] yields for the 16-cell at an 8-unit camera
+/// distance (`0.75 × 8`). A representative mid-range radius the clip-mechanics
+/// tests exercise; the live render path uses the camera- and shape-adaptive
+/// [`stereographic_view_radius`], so this is compiled only for tests.
 #[cfg(test)]
-const STEREOGRAPHIC_VIEW_RADIUS: f32 = STEREOGRAPHIC_VIEW_RADIUS_MAX;
+const STEREOGRAPHIC_VIEW_RADIUS: f32 = 6.0;
 
-/// Camera-adaptive stereographic clip radius: a fraction of the live distance
-/// from the eye to the figure, clamped to `[FLOOR, MAX]`. The fraction keeps it
-/// below the camera distance so zoom-in never rubberbands; the MAX ceiling keeps
-/// it out of the under-tessellated steep near-pole region so zoom-out never
-/// jaggeds or bounces (see [`STEREOGRAPHIC_VIEW_RADIUS_MAX`]); the floor keeps the
-/// figure itself from being clipped at close range.
-fn stereographic_view_radius(camera_distance: f32) -> f32 {
-    (camera_distance * STEREOGRAPHIC_VIEW_RADIUS_FRACTION).clamp(
-        STEREOGRAPHIC_VIEW_RADIUS_FLOOR,
-        STEREOGRAPHIC_VIEW_RADIUS_MAX,
-    )
+/// Per-shape, camera-adaptive stereographic clip radius.
+///
+/// **The 16-cell is special.** The default `+w` pole sits exactly on a 16-cell
+/// vertex (`±e_w`), so its near-pole edges genuinely blow up to infinity and must
+/// be bounded. Its radius is a fraction of the live camera distance (zoom-robust:
+/// shrinks on zoom-in so an endpoint never reaches the camera plane, no
+/// rubberband), floored so a close zoom never clips the figure, and capped at
+/// [`STEREOGRAPHIC_CELL16_RADIUS_MAX`] so a far zoom never drives the arc into the
+/// under-tessellated steep region (no jaggedness/bounce).
+///
+/// **Every other polytope has its vertices OFF the `+w` pole** (the tesseract's
+/// reach `dot = ½`, the 24-cell's `1/√2`, etc.), so its stereographic image is
+/// naturally bounded and is drawn with NO clip (`f32::INFINITY` — the clip never
+/// engages), giving the full undistorted conformal extent. A vertex only reaches
+/// the pole if rotated exactly onto it, a transient the near-plane line clip
+/// already keeps finite.
+fn stereographic_view_radius(polytope: Polytope4, camera_distance: f32) -> f32 {
+    match polytope {
+        Polytope4::Cell16 => (camera_distance * STEREOGRAPHIC_VIEW_RADIUS_FRACTION).clamp(
+            STEREOGRAPHIC_VIEW_RADIUS_FLOOR,
+            STEREOGRAPHIC_CELL16_RADIUS_MAX,
+        ),
+        _ => f32::INFINITY,
+    }
 }
 
 /// Cap on the reconstructed near-pole image magnitude (see `near_pole_view_point`).
@@ -1159,12 +1173,13 @@ impl Demo {
         );
 
         let mut camera = Camera::<EuclideanR3>::at_origin();
-        camera.position = Vec3::new(0.0, 4.0, 13.0);
+        camera.position = Vec3::new(0.0, 3.0, 9.0);
         let mut orbit: OrbitController<EuclideanR3> = OrbitController::default();
-        // Wider orbit so all four bodies in the row are visible at default zoom,
-        // with extra room for larger shapes' stereographic arcs; the user can
-        // scroll-zoom in toward MIN_DISTANCE or out toward the raised MAX_DISTANCE.
-        orbit.set_orbit(13.0, -0.25);
+        // Default framing: all four bodies in the row visible at startup. `8.0`
+        // is the original startup distance (the old code asked for 9.5 but the
+        // pre-bump MAX_DISTANCE = 8 clamped it); the raised MAX_DISTANCE only
+        // widens the scroll-out range, it does not push the startup view back.
+        orbit.set_orbit(8.0, -0.25);
 
         // Freecam preset; inactive at startup. The `camera freecam` console
         // command calls `freecam.set_active(true, camera.position)` which
@@ -1960,11 +1975,9 @@ impl Demo {
         // large-but-finite clamp point, which would draw as a giant disc while
         // the touching edges are dropped. Gating the point push on the same
         // predicate keeps the points overlay consistent with the wireframe.
-        // `None` for every other projection, so nothing is dropped there.
-        let points_clip_radius = stereographic_clip_radius(
-            &wireframe_projection,
-            stereographic_view_radius(self.camera_distance_to_focus()),
-        );
+        // `None` for every other projection, so nothing is dropped there. The
+        // radius is resolved per shape in the loop (only the 16-cell is clipped).
+        let cam_dist = self.camera_distance_to_focus();
         // Active-mode palette: bright green for vertices that belong to a
         // currently-intersected cell, dim gray otherwise. Same hues the
         // wireframe overlay uses so the visual identity stays consistent.
@@ -1983,6 +1996,11 @@ impl Demo {
             let Some(polytope) = entry.shape.polytope4() else {
                 continue;
             };
+            // Per-shape clip: finite for the 16-cell, none for the rest.
+            let points_clip_radius = stereographic_clip_radius(
+                &wireframe_projection,
+                stereographic_view_radius(polytope, cam_dist),
+            );
             let topo = polytope.topology();
             let body_pos = body_position(slot, n);
             let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
@@ -2220,11 +2238,10 @@ impl Demo {
         let cap_scale = perspective_scale_at_w(w_slice, &cap_projection);
         // Near-pole drop radius per layer, shared with the wireframe edges and the
         // cap outline. The cross layer is drop-w (Identity), so its radius is
-        // `None` and every triangle is kept, bit-identical to before this clip.
-        // The cap layer is `None` unless the active projection is Stereographic.
-        let view_radius = stereographic_view_radius(self.camera_distance_to_focus());
-        let cross_clip = stereographic_clip_radius(&cross_projection, view_radius);
-        let cap_clip = stereographic_clip_radius(&cap_projection, view_radius);
+        // `None` and every triangle is kept; the cap layer is `None` unless the
+        // active projection is Stereographic. The radius is resolved PER SHAPE in
+        // the loop (only the 16-cell is clipped), so capture the distance here.
+        let cam_dist = self.camera_distance_to_focus();
 
         // Reused per-vertex projected-point buffer for the triangle-granularity
         // fill clip, taken out so the `append_layer` closure can hold it `&mut`
@@ -2245,6 +2262,10 @@ impl Demo {
             let Some(polytope) = entry.shape.polytope4() else {
                 continue;
             };
+            // Per-shape clip: finite for the 16-cell, none for the rest.
+            let view_radius = stereographic_view_radius(polytope, cam_dist);
+            let cross_clip = stereographic_clip_radius(&cross_projection, view_radius);
+            let cap_clip = stereographic_clip_radius(&cap_projection, view_radius);
             let topo = polytope.topology();
             let body_pos = body_position(slot, n);
             let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
@@ -2438,11 +2459,10 @@ impl Demo {
         // Resolve once per frame; same projection applied to every body's wireframe so all
         // bodies share a consistent R³ embedding.
         let wireframe_projection = self.resolved_wireframe_projection();
-        // Camera-adaptive stereographic clip radius for this frame, captured once
-        // (Copy f32) so the perimeter closure and the per-edge `push_blended_edge`
-        // calls below share it without re-borrowing `self`. See
-        // `stereographic_view_radius` for why it tracks the camera distance.
-        let view_radius = stereographic_view_radius(self.camera_distance_to_focus());
+        // Camera-to-focus distance captured once (Copy f32); the stereographic
+        // clip radius is resolved PER SHAPE inside the loop below, since only the
+        // 16-cell is clipped (see `stereographic_view_radius`).
+        let cam_dist = self.camera_distance_to_focus();
         // Per-layer perimeter toggles + the honest layer's always-drop-w
         // projection (the active projection is forced to `Identity` for the
         // cross-section so its outline can never follow a distorting projection).
@@ -2484,6 +2504,10 @@ impl Demo {
             let Some(polytope) = entry.shape.polytope4() else {
                 continue;
             };
+            // Per-shape stereographic clip radius (the perimeter closure and the
+            // per-edge `push_blended_edge` below both consume it): finite + capped
+            // for the 16-cell, `f32::INFINITY` (no clip) for every other shape.
+            let view_radius = stereographic_view_radius(polytope, cam_dist);
             let topo = polytope.topology();
             let body_pos = body_position(slot, n);
             // Body's R³ position. The body sits at body_pos.w = 0 in 4D, so the perspective
@@ -3567,7 +3591,7 @@ impl RotatePolytopesApp {
                             // freecam left it. Freecam's `set_active(false)`
                             // releases the cursor grab.
                             demo.orbit = OrbitController::default();
-                            demo.orbit.set_orbit(9.5, -0.25);
+                            demo.orbit.set_orbit(8.0, -0.25);
                             demo.freecam.set_active(false, demo.camera.position);
                             out.line("camera: orbit (reset to world origin)");
                         }
@@ -5460,15 +5484,14 @@ mod section_cap_projection_tests {
     // temporal behavior is a visual property and needs human eyes-on (see the
     // wireframe overlay note); a test named "flicker_free" would be a doc lie.
 
-    /// The camera-adaptive clip radius stays below the camera distance at every
-    /// reasonable zoom (so a near-pole arc can never reach the camera plane and
-    /// rubberband, the zoom-robust property), clears the legitimate image of a
-    /// unit-circumradius polytope (so real geometry is never clipped), stays below
-    /// the pole-clamp magnitude ceiling (so the near-pole blow-up still reliably
-    /// exceeds it), and saturates at [`STEREOGRAPHIC_VIEW_RADIUS_MAX`] on zoom-out
-    /// (so the arc never reaches the under-tessellated steep region, which would
-    /// jag and bounce). The below-camera-distance and saturation properties are
-    /// the load-bearing ones.
+    /// The per-shape, camera-adaptive clip radius. For the 16-cell (the only shape
+    /// with vertices on the `+w` pole) the radius stays below the camera distance
+    /// at every reasonable zoom (no rubberband), clears the legitimate image of a
+    /// unit-circumradius polytope (real geometry never clipped), stays below the
+    /// pole-clamp magnitude ceiling (the near-pole blow-up still exceeds it), and
+    /// saturates at [`STEREOGRAPHIC_CELL16_RADIUS_MAX`] on zoom-out (the arc never
+    /// reaches the under-tessellated steep region). Every other shape is
+    /// unclipped (`INFINITY`), since its image is naturally bounded.
     #[test]
     fn stereographic_view_radius_tracks_camera_distance() {
         // The legit image of the worst non-pole vertex (the `+w`-cell corner at
@@ -5481,47 +5504,56 @@ mod section_cap_projection_tests {
         .length();
         let clamp_ceiling = (2.0 / rye_math::STEREOGRAPHIC_POLE_EPSILON).sqrt();
 
-        // Across the orbit's zoom range and beyond, the radius stays a fixed
-        // fraction below the camera distance, clears the figure, and sits under
-        // the clamp ceiling. At very close range the figure floor can exceed the
-        // distance (the eye is inside the figure); above the floor's reach the
+        // Across the orbit's zoom range and beyond, the 16-cell radius stays a
+        // fixed fraction below the camera distance, clears the figure, and sits
+        // under the clamp ceiling. At very close range the figure floor can exceed
+        // the distance (the eye is inside the figure); above the floor's reach the
         // strict-below-distance property holds, which is the rubberband fix.
         for distance in [2.0_f32, 4.0, 8.0, 16.0, 40.0] {
-            let r = stereographic_view_radius(distance);
+            let r = stereographic_view_radius(Polytope4::Cell16, distance);
             assert!(
                 r > legit,
-                "radius {r} at distance {distance} must clear the figure {legit}"
+                "16-cell radius {r} at distance {distance} must clear the figure {legit}"
             );
             assert!(
                 r < clamp_ceiling,
                 "radius {r} must stay below the clamp ceiling"
             );
-            // Above where the floor dominates, the radius is strictly below the
-            // camera distance (arcs stay in front of the eye).
             if distance * STEREOGRAPHIC_VIEW_RADIUS_FRACTION >= STEREOGRAPHIC_VIEW_RADIUS_FLOOR {
                 assert!(
                     r < distance,
-                    "radius {r} must stay below camera distance {distance} (no plane crossing)"
+                    "16-cell radius {r} must stay below camera distance {distance}"
                 );
             }
-            // Never past the gentle-region ceiling, at any distance.
             assert!(
-                r <= STEREOGRAPHIC_VIEW_RADIUS_MAX,
-                "radius {r} must never exceed the cap {STEREOGRAPHIC_VIEW_RADIUS_MAX}"
+                r <= STEREOGRAPHIC_CELL16_RADIUS_MAX,
+                "16-cell radius {r} must never exceed the cap {STEREOGRAPHIC_CELL16_RADIUS_MAX}"
             );
         }
 
-        // On zoom-out the radius saturates at the cap (does not grow into the
-        // under-tessellated steep region), which is what keeps far-zoom arcs
-        // smooth and bounce-free.
+        // Zoom-out saturates the 16-cell radius at its cap (no growth into the
+        // under-tessellated steep region), keeping far-zoom arcs smooth.
         assert_eq!(
-            stereographic_view_radius(40.0),
-            STEREOGRAPHIC_VIEW_RADIUS_MAX
+            stereographic_view_radius(Polytope4::Cell16, 40.0),
+            STEREOGRAPHIC_CELL16_RADIUS_MAX
         );
-        // The test reference equals the live value at an 8-unit camera distance
-        // (and beyond), so fixtures using the constant exercise a representative
-        // radius.
-        assert!((stereographic_view_radius(8.0) - STEREOGRAPHIC_VIEW_RADIUS).abs() < 1e-5);
+        // The test reference is the 16-cell value at an 8-unit camera distance.
+        assert!(
+            (stereographic_view_radius(Polytope4::Cell16, 8.0) - STEREOGRAPHIC_VIEW_RADIUS).abs()
+                < 1e-5
+        );
+
+        // Every other shape is unclipped at every distance: the tesseract,
+        // 24-cell, etc. have their vertices off the pole, so their image is
+        // bounded and we draw the full conformal extent (INFINITY -> no clip).
+        for polytope in [Polytope4::Tesseract, Polytope4::Cell24, Polytope4::Cell600] {
+            for distance in [2.0_f32, 8.0, 40.0] {
+                assert!(
+                    stereographic_view_radius(polytope, distance).is_infinite(),
+                    "{polytope:?} must be unclipped (no radius limit)"
+                );
+            }
+        }
     }
 
     /// `stereographic_clip_radius` returns `Some(R)` exactly for Stereographic and
