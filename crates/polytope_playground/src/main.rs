@@ -130,7 +130,7 @@ const STEREOGRAPHIC_VIEW_RADIUS_FLOOR: f32 = 2.5;
 /// boundary (the bounce). `10.0` keeps the 16-cell's arcs extended but bounded
 /// within the (mostly) well-sampled region. To extend further AND stay smooth,
 /// raise this together with the arc sample count (or subdivide adaptively by
-/// projected segment length) — a future arc-extent slider would drive both.
+/// projected segment length); a future arc-extent slider would drive both.
 const STEREOGRAPHIC_CELL16_RADIUS_MAX: f32 = 10.0;
 
 /// Reference clip radius for tests (which have no live camera): the value
@@ -153,7 +153,7 @@ const STEREOGRAPHIC_VIEW_RADIUS: f32 = 6.0;
 ///
 /// **Every other polytope has its vertices OFF the `+w` pole** (the tesseract's
 /// reach `dot = ½`, the 24-cell's `1/√2`, etc.), so its stereographic image is
-/// naturally bounded and is drawn with NO clip (`f32::INFINITY` — the clip never
+/// naturally bounded and is drawn with NO clip (`f32::INFINITY`, so the clip never
 /// engages), giving the full undistorted conformal extent. A vertex only reaches
 /// the pole if rotated exactly onto it, a transient the near-plane line clip
 /// already keeps finite.
@@ -185,7 +185,7 @@ const STEREOGRAPHIC_POLE_FAR_CAP: f32 = 1.0e4;
 /// near-singularity samples are clipped; the affine projections and Schlegel's
 /// bounded-finite clamp keep every sample. `view_radius` is the camera-adaptive
 /// [`stereographic_view_radius`] in the live render path (tests pass the fixed
-/// [`STEREOGRAPHIC_VIEW_RADIUS`]); it is a body-local radius, so the same 4D edge
+/// `STEREOGRAPHIC_VIEW_RADIUS`); it is a body-local radius, so the same 4D edge
 /// clips identically at every row slot regardless of the body's R³ position.
 fn stereographic_clip_radius(
     projection: &rye_math::Projection<4>,
@@ -273,7 +273,7 @@ fn local_r3_to_world(p: [f32; 3], section_scale: f32, body_pos_r3: Vec3) -> [f32
 /// first tuple element, the point whose magnitude the stereographic clip tests)
 /// and its world R³ point (the second). Returning the projected point keeps the
 /// clip honest without re-projecting: the perimeter outline and the cap fill both
-/// drop a sample whose projected magnitude exceeds [`STEREOGRAPHIC_VIEW_RADIUS`],
+/// drop a sample whose projected magnitude exceeds `STEREOGRAPHIC_VIEW_RADIUS`,
 /// using the same pre-translate point [`stereographic_clip_radius`] is defined
 /// against.
 ///
@@ -390,14 +390,14 @@ fn cell_w_range(cell: &[u32], local_vertices: &[Vec4]) -> (f32, f32) {
 /// convention so the two paths are visually seamless.
 ///
 /// Under [`rye_math::Projection::Stereographic`] the polyline is clipped at
-/// [`STEREOGRAPHIC_VIEW_RADIUS`]: a sub-segment is emitted only when BOTH its
+/// `STEREOGRAPHIC_VIEW_RADIUS`: a sub-segment is emitted only when BOTH its
 /// endpoints' body-local projected magnitudes are within the radius, so a
 /// near-pole sample (which the pole-denominator clamp maps to a huge finite
 /// point) is dropped rather than drawn. The clip is a sample-granularity drop in
 /// the same streaming `continue` idiom as the rasterizer's non-finite cull, not
 /// a magnitude rescale: rescaling a near-pole sample to the radius would keep the
 /// 180-degree direction flip across a pole crossing (see
-/// [`STEREOGRAPHIC_VIEW_RADIUS`]). When the projected point re-enters the radius
+/// `STEREOGRAPHIC_VIEW_RADIUS`). When the projected point re-enters the radius
 /// the polyline resumes from the new in-bounds sample, never bridging across the
 /// dropped gap, so the edge runs out toward the view boundary and the offscreen
 /// blow-up is culled. No clip is applied for other projections
