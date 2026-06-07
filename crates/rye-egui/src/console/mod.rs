@@ -154,7 +154,11 @@ pub struct ConsoleWriter {
 }
 
 impl ConsoleWriter {
-    fn new() -> Self {
+    /// An empty writer. The console builds one per `execute` and drains it into
+    /// scrollback; exposed `pub` so command handlers can be unit-tested in
+    /// isolation (run the handler against a fresh writer, inspect the field it
+    /// mutated) without standing up a full `Console` and `Ctx`.
+    pub fn new() -> Self {
         Self { lines: Vec::new() }
     }
 
@@ -167,6 +171,12 @@ impl ConsoleWriter {
     /// bubble unrecoverable errors via `Result` instead.
     pub fn error(&mut self, text: impl Into<String>) {
         self.lines.push(HistoryLine::error(text));
+    }
+}
+
+impl Default for ConsoleWriter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

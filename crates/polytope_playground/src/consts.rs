@@ -56,6 +56,26 @@ pub(crate) const CARD_ITEM_SPACING_X: f32 = 4.0;
 pub(crate) const W_SCRUB_RATE: f32 = 0.5;
 pub(crate) const W_RANGE: f32 = 1.5;
 
+/// Lower bound on the wireframe Hyperslice slab full-width. A user-set
+/// thickness of 0 is clamped up to this so the slab stays a real (if razor-
+/// thin) band: a w-range that *crosses* `w_slice` survives, one entirely to
+/// one side is culled. (The cull tests each cell's w-range, not a single
+/// edge's, so "survives" means the cell's edges are kept.) Without the floor,
+/// thickness 0 would demand an exact f32 equality (`w_min == w_slice == w_max`)
+/// that never fires for a generic rotor, hiding the whole wireframe. The value
+/// is one ulp-scale band around a unit-circumradius polytope's w-range; small
+/// enough to read as "the slice plane" yet wide enough to admit a straddling
+/// w-range.
+pub(crate) const HYPERSLICE_MIN_THICKNESS: f32 = 1e-4;
+
+/// Default wireframe Hyperslice slab full-width when the affordance is first
+/// enabled. A polytope cross-section at a given `w_slice` is one infinitely-
+/// thin 3-flat; a slab of this width keeps edges within `+/- 0.1` of the
+/// slice so the surviving wireframe reads as "the edges near the current
+/// cut" rather than the full graph or a single razor plane. Tuned against the
+/// demo's `BODY_SIZE`-scaled polytopes (w-extent ~0.7).
+pub(crate) const HYPERSLICE_DEFAULT_THICKNESS: f32 = 0.2;
+
 /// Animation-time scrub rate for the left / right arrow keys, in
 /// seconds-of-rot_time per real second held. 1.0 means a one-second
 /// real-time hold advances `rot_time` by one second of animation.
@@ -88,3 +108,12 @@ pub(crate) const BODY_SIZE: f32 = 0.7;
 
 /// Center-y for all bodies; floor is at y=0.
 pub(crate) const BODY_Y: f32 = 0.9;
+
+/// Subdivisions per wireframe edge when the `space` blend is active (anything
+/// other than pure flat). Each edge becomes this many sub-segments so the
+/// great-circle arc reads as a smooth curve rather than a chord of chords.
+/// Adjacent polytope vertices subtend a small great-circle angle, so 16 is
+/// already visually smooth; higher values multiply the per-frame wireframe
+/// rebuild cost (the dominant cost for the 600-cell) for no visible gain.
+/// Pure-flat mode bypasses tessellation entirely and emits one segment per edge.
+pub(crate) const SPACE_TESSELLATION_SAMPLES: usize = 16;

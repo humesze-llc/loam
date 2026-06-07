@@ -143,6 +143,10 @@ impl Demo {
         }
         if row_changed {
             self.rebuild_bodies();
+            // A row edit can change the leading polychoron the Schlegel diagram
+            // projects through (and its cell count); re-resolve so a stale cache
+            // can't index the wrong polytope's face planes.
+            self.resolve_schlegel_cache();
         }
     }
 

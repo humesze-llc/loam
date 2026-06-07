@@ -33,6 +33,7 @@ pub mod rasterizable;
 pub mod sectionable;
 pub mod space;
 pub mod spherical;
+pub mod spherical_embedded;
 pub mod tangent;
 
 pub use bivector::{
@@ -43,10 +44,11 @@ pub use euclidean::{EuclideanR3, Iso3};
 pub use euclidean_r2::{EuclideanR2, Iso2};
 pub use euclidean_r4::{EuclideanR4, Iso4Flat};
 pub use hyperbolic::{HyperbolicH3, Iso3H};
-pub use rasterizable::{Projection, RasterizableSpace};
+pub use rasterizable::{Projection, RasterizableSpace, STEREOGRAPHIC_POLE_EPSILON};
 pub use sectionable::{
     SectionableSpace, WPlane, EDGE_PARALLEL_EPSILON, SLICE_PERTURBATION_EPSILON,
 };
 pub use space::{Space, WgslSpace};
 pub use spherical::{Iso4, SphericalS3};
+pub use spherical_embedded::SphericalS3Embedded;
 pub use tangent::Tangent;

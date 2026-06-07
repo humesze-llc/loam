@@ -331,6 +331,17 @@ impl PointRasterNode {
         {
             let p_native = S::array_to_point(*p);
             let p3 = S::project_point(p_native, projection);
+            // Same CPU-side backstop as `LineRasterNode::upload`: a central
+            // projection (Schlegel, Stereographic, Perspective4D) can map a
+            // vertex on the projection center / pole to a NaN or infinity, and
+            // a single non-finite point poisons the GPU view-projection divide
+            // into a full-screen garbage quad rather than a missing dot.
+            // `is_finite` rejects every quiet-NaN bit pattern AND both
+            // infinities; `continue` drops the offending point without
+            // emitting it.
+            if !p3.is_finite() {
+                continue;
+            }
             instances.push(PointInstance {
                 pos: p3.to_array(),
                 radius_px: *size,

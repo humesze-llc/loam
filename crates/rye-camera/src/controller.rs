@@ -21,7 +21,11 @@ use crate::Camera;
 const ORBIT_RADIANS_PER_PIXEL: f32 = 0.006;
 const ZOOM_LOG_STEP: f32 = 0.12;
 const MIN_DISTANCE: f32 = 1.5;
-const MAX_DISTANCE: f32 = 8.0;
+// Zoom-out ceiling, raised from the original 8 so a caller can pull back to
+// frame a larger 4D shape (e.g. the polytope_playground 120-cell). Held at 20
+// rather than further out because the scene fog washes out geometry beyond
+// roughly that range, so additional zoom buys nothing.
+const MAX_DISTANCE: f32 = 20.0;
 const INITIAL_HEIGHT: f32 = 0.6;
 const INITIAL_RADIUS: f32 = 3.5;
 const MIN_ORBIT_PITCH: f32 = -1.45;
