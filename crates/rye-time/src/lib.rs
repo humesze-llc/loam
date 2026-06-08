@@ -1,22 +1,16 @@
 //! `rye-time`: deterministic fixed-timestep scheduling for Rye.
 //!
-//! This crate answers one question: given wall-clock time has advanced by
-//! some amount, how many fixed-duration simulation ticks should run?
+//! Given that wall-clock time advanced by some amount, how many
+//! fixed-duration simulation ticks should run?
 //!
 //! ## The deterministic-sim split
 //!
-//! For lockstep multiplayer, the **simulation** is a pure function:
-//!
-//! ```text
-//! fn tick(state, input, tick_number) -> state'
-//! ```
-//!
-//! It must be bit-reproducible given the same inputs. It does NOT consult
-//! wall-clock time, time only enters as the tick number.
-//!
-//! This crate is the wall-clock-to-tick-count *adapter* that the local
-//! render loop uses. Replays and rollback netcode drive the sim directly
-//! by tick number and never touch [`FixedTimestep`].
+//! The simulation is a pure, bit-reproducible function
+//! `tick(state, input, tick_number) -> state'`; time enters only as the
+//! tick number, never wall-clock. This crate is the
+//! wall-clock-to-tick-count adapter the local render loop uses. Replays
+//! and rollback netcode drive the sim by tick number directly and never
+//! touch [`FixedTimestep`].
 //!
 //! ## Typical loop
 //!
