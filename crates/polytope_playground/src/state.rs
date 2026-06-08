@@ -714,10 +714,14 @@ pub(crate) fn compose_active_rotor(base_angles: &[f32; 6], active: &[bool; 6], t
     r.normalize()
 }
 
-/// True when `row` contains a 120-cell or 600-cell, whose SDFs (120 / 600 face
-/// hyperplanes each, against the per-pixel Wolfe-greedy projection) overrun the
-/// browser WebGPU shader budget and crash the tab. Free function so the gate is
-/// unit-testable; [`Demo::sdf_blocked_by_heavy_polychora`] is the specialization.
+/// True when `row` contains a 120-cell or 600-cell. Blocked from SDF for TWO
+/// reasons, either sufficient: (1) their SDFs (120 / 600 face hyperplanes each,
+/// against the per-pixel Wolfe-greedy projection) overrun the browser WebGPU
+/// shader budget and crash the tab; (2) their `cell{120,600}_face_planes` are the
+/// known-wrong dual-vertex approximation (see `rye_shape::polytope_geom`), so the
+/// SDF is geometrically wrong even where it fits the budget. Do NOT re-enable on a
+/// perf fix alone; the face planes must be corrected first. Free function so the
+/// gate is unit-testable; [`Demo::sdf_blocked_by_heavy_polychora`] specializes it.
 pub(crate) fn row_blocks_sdf(row: &[ShapeEntry]) -> bool {
     row.iter().any(|e| {
         matches!(
@@ -1119,6 +1123,18 @@ impl Demo {
         n: usize,
         rotor: Rotor4,
     ) -> BodyUniform {
+        // The 120-cell and 600-cell have NO authoritative SDF: their
+        // `cell{120,600}_face_planes` are the known-wrong dual-vertex
+        // approximation (see `rye_shape::polytope_geom`), wrong on 96 normals.
+        // Never raymarch them, on any platform or mode; the raster section +
+        // wireframe paths are their correct surfaces. (`row_blocks_sdf` also
+        // refuses to enter Sdf mode with them; this is the belt-and-suspenders.)
+        if matches!(
+            entry.shape.polytope4(),
+            Some(Polytope4::Cell120 | Polytope4::Cell600)
+        ) {
+            return BodyUniform::default();
+        }
         if !self.surface_mode.uses_sdf_for_polychora() && entry.shape.polytope4().is_some() {
             return BodyUniform::default();
         }
