@@ -1260,15 +1260,14 @@ impl Demo {
                 window_pos: egui::Pos2::new(220.0, 120.0),
                 open: false,
             },
-            // On by default: the moment a user picks a non-default projection the
-            // annotation explains the mode without their having to read the
-            // source. `render_mode_annotation` no-ops while the scene is in its
-            // plain drop-w default, so an open flag costs nothing until a
-            // non-default projection is selected. Default position sits below the
-            // example callout's default slot so the two don't stack.
+            // Unwired: the per-projection annotation callout is not shown for now
+            // (defaults closed, and the View toggle is removed), so selecting a
+            // wireframe type no longer spawns a panel. `render_mode_annotation`
+            // and `state::mode_annotation` are kept; the render call early-returns
+            // while `open` stays false. Default position retained for a re-wire.
             mode_annotation_open: rye_egui::CalloutState {
                 window_pos: egui::Pos2::new(220.0, 300.0),
-                open: true,
+                open: false,
             },
             show_formula: false,
             show_controls: true,

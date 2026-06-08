@@ -167,11 +167,10 @@ impl Demo {
                     ui.checkbox(&mut self.show_controls, "Rotation controls (H)");
                     ui.checkbox(&mut self.show_formula, "Formula popup");
                     ui.checkbox(&mut self.example_callout.open, "Example callout");
-                    ui.checkbox(&mut self.mode_annotation_open.open, "Mode annotation")
-                        .on_hover_text(
-                            "Floating note explaining the active projection. Appears \
-                             only for a non-default projection.",
-                        );
+                    // Per-projection mode-annotation callouts (the panels that
+                    // spawned on first selecting each wireframe type) are unwired
+                    // for now: no toggle, defaults closed, never shown. Kept in
+                    // code (see `Demo::render_mode_annotation`).
                     ui.separator();
                     // One-shot action: opens the About window and the menu should fold
                     // away. `Popup::close_all(ctx)` cooperates with the sticky-popup
