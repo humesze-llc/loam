@@ -320,6 +320,12 @@ impl Demo {
                     // polytope's cell count). Other modes need no contextual
                     // param; Hyperslice's slab width lives with the cull toggle
                     // below, so it is not duplicated here.
+                    //
+                    // DORMANT: Schlegel is currently omitted from
+                    // `WireframeProjection::ALL` (see its docs), so the radio above
+                    // never offers it and this stepper never renders. Kept intact
+                    // so re-wiring Schlegel (its own demo, or back into ALL) needs
+                    // no UI change.
                     if let WireframeProjection::Schlegel { cell_index } = wireframe_projection {
                         ui.horizontal(|ui| {
                             ui.label("Boundary cell");

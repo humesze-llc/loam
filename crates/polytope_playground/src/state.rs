@@ -52,13 +52,18 @@ pub(crate) enum ViewMode {
     /// render path verbatim, only over a one-element row
     /// ([`Demo::render_row`]), so every overlay affordance carries over.
     ///
-    /// REQUIRED for Schlegel: a cell-index boundary selection is meaningless
-    /// across a row of different polytopes (a 5-cell has 5 cells, a 600-cell
-    /// has 600), so the unambiguous single subject is what makes the
-    /// cell-index stepper well-defined. Stereographic reads far better on one
-    /// body too. Stereographic / Hyperslice still work in [`Self::Shapes`]
-    /// (they are per-vertex maps that apply to every body uniformly); only
-    /// Schlegel's cell-index strictly needs Single.
+    /// The value is single-shape clarity: Stereographic and the cross-section
+    /// both read far better on one body than across a mixed row. Stereographic /
+    /// Hyperslice also work in [`Self::Shapes`] (per-vertex maps applied to every
+    /// body uniformly); Single just isolates one subject for inspection.
+    ///
+    /// Single was originally introduced because a Schlegel cell-index boundary
+    /// selection is only well-defined over an unambiguous single subject (a 5-cell
+    /// has 5 cells, a 600-cell has 600). That motivation is dormant: Schlegel is
+    /// no longer a selectable wireframe mode (see
+    /// [`WireframeProjection::Schlegel`]); the cell-index stepper machinery is
+    /// kept for a future re-wire but Single now stands on the inspection value
+    /// above.
     Single,
     /// Single-shape filmstrip: one [`ShapeEntry`] (independent of the row) rendered N
     /// times across evenly-spaced `w_slice` values around the slider's current `w`.
@@ -231,6 +236,25 @@ pub(crate) enum WireframeProjection {
     /// `cell{120,600}_face_planes`) and cached on [`Demo::schlegel_params`] at
     /// cell-select time, never inside the per-frame upload. See
     /// [`resolve_schlegel_params`] and [`Demo::resolved_wireframe_projection`].
+    ///
+    /// **NOT WIRED into the playground for now.** This variant is intentionally
+    /// absent from [`Self::ALL`] and [`Self::from_token`], so it cannot be
+    /// selected via the UI radio or console. The reason is presentational, not a
+    /// missing implementation: a Schlegel diagram only reads correctly when the
+    /// chosen boundary cell fills the view and the other cells nest visibly inside
+    /// it, which wants its own framing (camera placed on the cell axis, the cell
+    /// as the outer silhouette) plus the cell-selection UX. Stuffed into the
+    /// shared single-viewport wireframe overlay, alongside the cross-section and
+    /// the other projections, it does not earn its keep. The projection math and
+    /// the (correct, face-plane-based) param resolution are kept and tested so a
+    /// future dedicated Schlegel demo or side viewport can wire them up directly;
+    /// it is simply not a wireframe-overlay mode here.
+    ///
+    /// `allow(dead_code)` because, unwired, nothing freshly constructs this
+    /// variant (it is only ever re-matched in the kept handler arms). The attribute
+    /// is the deliberate marker that the variant is retained on purpose; deleting
+    /// it is the signal that Schlegel has been fully removed.
+    #[allow(dead_code)]
     Schlegel {
         /// Index of the boundary cell in the polytope's canonical cell order.
         cell_index: u32,
@@ -561,14 +585,13 @@ pub(crate) const STEREOGRAPHIC_DEFAULT_POLE: glam::Vec4 = glam::Vec4::new(0.0, 0
 
 impl WireframeProjection {
     /// Parse the console-arg spelling. Hyphens because the console grammar lexes on
-    /// whitespace and `w-pinhole` reads as a single token. `schlegel` parses
-    /// to `cell_index = 0`; the console handler reads the trailing `<cell-index>`
-    /// token separately (the grammar carries it as its own positional arg).
+    /// whitespace and `w-pinhole` reads as a single token. `schlegel` is NOT
+    /// parsed: the Schlegel variant is deliberately not offered in the playground
+    /// (see [`Self::ALL`] and the [`Self::Schlegel`] docs for why).
     pub(crate) fn from_token(token: &str) -> Option<Self> {
         match token {
             "shadow" => Some(WireframeProjection::Shadow),
             "w-pinhole" => Some(WireframeProjection::WPinhole),
-            "schlegel" => Some(WireframeProjection::Schlegel { cell_index: 0 }),
             "stereographic" => Some(WireframeProjection::Stereographic),
             "hyperslice" => Some(WireframeProjection::Hyperslice),
             _ => None,
@@ -576,13 +599,17 @@ impl WireframeProjection {
     }
 
     /// Cycle order for the bare `wireframe perspective` console command and the
-    /// UI radio: shadow -> w-pinhole -> schlegel -> stereographic -> hyperslice ->
-    /// shadow. Schlegel cycles in at `cell_index = 0`; the cell-index stepper then
-    /// picks the boundary cell.
-    pub(crate) const ALL: [Self; 5] = [
+    /// UI radio: shadow -> w-pinhole -> stereographic -> hyperslice -> shadow.
+    ///
+    /// Schlegel is intentionally omitted (the variant still exists, see
+    /// [`Self::Schlegel`]): it is not a user-selectable wireframe-overlay mode in
+    /// the playground for now. A faithful Schlegel diagram wants its own framing
+    /// and cell-selection UX, not a mode crammed into the shared single-viewport
+    /// overlay; the projection math and param resolution are kept for a future
+    /// dedicated Schlegel demo / side window.
+    pub(crate) const ALL: [Self; 4] = [
         WireframeProjection::Shadow,
         WireframeProjection::WPinhole,
-        WireframeProjection::Schlegel { cell_index: 0 },
         WireframeProjection::Stereographic,
         WireframeProjection::Hyperslice,
     ];
@@ -1881,29 +1908,40 @@ mod tests {
         );
     }
 
-    /// Every token in the five-mode set parses to its `WireframeProjection`
-    /// variant, and the context-free `to_projection` produces the matching engine
-    /// `Projection<4>` variant or the documented `Identity` fallback. The fallback
-    /// modes are `Hyperslice` (a demo-side w-cull, drop-w projection) and
-    /// `Schlegel` (resolved Demo-side from the cached face-plane params + rotor,
-    /// which the context-free enum cannot supply). `ALL` is the single cycle
-    /// source the bare console command and the UI radio share, so a variant added
-    /// to the enum but omitted from `ALL`/`from_token` fails here.
+    /// Every token in the four selectable modes parses to its
+    /// `WireframeProjection` variant, and the context-free `to_projection`
+    /// produces the matching engine `Projection<4>` variant or the documented
+    /// `Identity` fallback (Hyperslice is a demo-side w-cull). `ALL` is the single
+    /// cycle source the bare console command and the UI radio share, so a variant
+    /// added to the enum but omitted from `ALL`/`from_token` fails here. Schlegel
+    /// is deliberately excluded from both (see `WireframeProjection::Schlegel`):
+    /// this test pins that it is NOT selectable, while its `to_projection`
+    /// fallback (the kept machinery) is still exercised below.
     #[test]
     fn wireframe_projection_from_token_round_trips() {
-        // Pin the count so an enum addition that skips `ALL` is loud.
+        // Pin the count so an enum addition that skips `ALL`, or a Schlegel
+        // re-wire, is loud.
         assert_eq!(
             WireframeProjection::ALL.len(),
-            5,
-            "ALL must list every selectable projection mode"
+            4,
+            "ALL must list every selectable projection mode (Schlegel is excluded)"
+        );
+        // Schlegel is intentionally not parseable from the console.
+        assert_eq!(
+            WireframeProjection::from_token("schlegel"),
+            None,
+            "Schlegel is deliberately not a selectable playground mode"
         );
         for mode in WireframeProjection::ALL {
             let token = match mode {
                 WireframeProjection::Shadow => "shadow",
                 WireframeProjection::WPinhole => "w-pinhole",
-                WireframeProjection::Schlegel { .. } => "schlegel",
                 WireframeProjection::Stereographic => "stereographic",
                 WireframeProjection::Hyperslice => "hyperslice",
+                // Excluded from ALL; if a re-wire puts it back, this fires loudly.
+                WireframeProjection::Schlegel { .. } => {
+                    unreachable!("Schlegel must not be in ALL while it is unwired")
+                }
             };
             assert_eq!(
                 WireframeProjection::from_token(token),

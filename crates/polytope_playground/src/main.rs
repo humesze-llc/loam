@@ -3058,62 +3058,28 @@ impl RotatePolytopesApp {
                 )
                 .custom(
                     "perspective",
-                    "wireframe 4D->R³ projection (bare cycles): shadow | w-pinhole | schlegel <cell> | stereographic | hyperslice",
-                    &[&["shadow", "w-pinhole", "schlegel", "stereographic", "hyperslice"]],
+                    "wireframe 4D->R³ projection (bare cycles): shadow | w-pinhole | stereographic | hyperslice",
+                    &[&["shadow", "w-pinhole", "stereographic", "hyperslice"]],
                     &[],
                     |d, args, out| {
+                        // Schlegel is intentionally not offered here (see
+                        // `WireframeProjection::Schlegel` docs): it wants its own
+                        // demo, not a wireframe-overlay mode. `from_token` rejects
+                        // "schlegel" and `ALL` omits it, so neither path below can
+                        // produce it.
                         let next = match args.first().copied() {
-                            // Bare: cycle through ALL in variant order. Schlegel
-                            // re-enters at whatever cell index it last carried (or
-                            // 0 on first visit) so a cycle through it doesn't reset
-                            // the user's chosen cell.
+                            // Bare: cycle through ALL in variant order.
                             None => {
                                 let all = WireframeProjection::ALL;
                                 let i = all
                                     .iter()
                                     .position(|p| p.same_variant(d.wireframe_projection))
                                     .unwrap_or(0);
-                                let mut next = all[(i + 1) % all.len()];
-                                if let (
-                                    WireframeProjection::Schlegel { .. },
-                                    WireframeProjection::Schlegel { cell_index },
-                                ) = (next, d.wireframe_projection)
-                                {
-                                    next = WireframeProjection::Schlegel { cell_index };
-                                }
-                                next
-                            }
-                            Some("schlegel") => {
-                                // `schlegel [<cell-index>]`: the index is an optional
-                                // trailing positional. Clamp to the selected
-                                // polytope's cell count so an out-of-range request
-                                // reports the valid bound instead of silently
-                                // wrapping. With no polychoron in the row the index
-                                // is accepted as-is (the cache resolves to None and
-                                // the wireframe draws nothing).
-                                let requested = match args.get(1).copied() {
-                                    None => 0,
-                                    Some(tok) => tok.parse::<u32>().map_err(|e| {
-                                        anyhow!("invalid cell index `{tok}`: {e}")
-                                    })?,
-                                };
-                                let cell_index = match d.schlegel_subject() {
-                                    Some(p) => {
-                                        let max = p.cell_count() as u32 - 1;
-                                        if requested > max {
-                                            out.line(format!(
-                                                "schlegel cell {requested} out of range for the leading polytope (0..={max}); clamped to {max}"
-                                            ));
-                                        }
-                                        requested.min(max)
-                                    }
-                                    None => requested,
-                                };
-                                WireframeProjection::Schlegel { cell_index }
+                                all[(i + 1) % all.len()]
                             }
                             Some(token) => WireframeProjection::from_token(token).ok_or_else(|| {
                                 anyhow!(
-                                    "unknown projection `{token}` (try shadow|w-pinhole|schlegel|stereographic|hyperslice)"
+                                    "unknown projection `{token}` (try shadow|w-pinhole|stereographic|hyperslice)"
                                 )
                             })?,
                         };
@@ -3122,18 +3088,12 @@ impl RotatePolytopesApp {
                             d.wireframe_projection,
                             &mut d.wireframe_enabled,
                         );
-                        // Resolve + cache the Schlegel face-plane params now (at
-                        // select time) so the per-frame upload never re-runs the
-                        // LazyLock cell-table fit. No-op (clears the cache) for the
-                        // other modes.
+                        // No-op (clears any cached Schlegel params) for these modes;
+                        // kept so re-wiring Schlegel later needs no console change.
                         d.resolve_schlegel_cache();
                         out.line(format!(
                             "wireframe perspective: {}",
-                            match d.wireframe_projection {
-                                WireframeProjection::Schlegel { cell_index } =>
-                                    format!("schlegel (cell {cell_index})"),
-                                other => other.label().to_lowercase(),
-                            }
+                            d.wireframe_projection.label().to_lowercase()
                         ));
                         Ok(())
                     },
