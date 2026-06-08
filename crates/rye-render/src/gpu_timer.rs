@@ -2,8 +2,8 @@
 //! submitted GPU work in `write_timestamp` calls; the delta is the GPU's
 //! wall-clock time for that frame.
 //!
-//! Each frame uses one of `FRAMES_IN_FLIGHT` slots: write start, then write end
-//! + `resolve_query_set` + `copy_buffer_to_buffer` into a per-slot map buffer.
+//! Each frame uses one of `FRAMES_IN_FLIGHT` slots: write start, then write end,
+//! `resolve_query_set`, and `copy_buffer_to_buffer` into a per-slot map buffer.
 //! `tick()` schedules `map_async`; the callback converts ticks to nanoseconds
 //! via `Queue::get_timestamp_period` and sends the delta over an `mpsc`
 //! channel, which the next `tick()` drains into `rye_time::frame_trace` as a
@@ -330,7 +330,7 @@ mod tests {
         assert!(is_plausible_frame_delta_ns(4_000_000)); // 240 Hz
         assert!(is_plausible_frame_delta_ns(16_666_667)); // 60 Hz
         assert!(is_plausible_frame_delta_ns(MAX_PLAUSIBLE_FRAME_NS)); // inclusive cap
-        // Desynced-slot garbage the filter exists to drop.
+                                                                      // Desynced-slot garbage the filter exists to drop.
         assert!(!is_plausible_frame_delta_ns(250_000_000));
         assert!(!is_plausible_frame_delta_ns(950_000_000));
         // Zero (start == end) is plausible, not a stall.

@@ -101,7 +101,7 @@ where
     /// - If a slot already exists within `MERGE_RADIUS` of `contact.point`, refresh its geometry
     ///   but preserve its accumulated impulses (this is the warm-start carryover).
     /// - Otherwise, add as a new slot. If we're at `MAX_POINTS`, evict the slot with smallest
-    ///   total accumulated impulse — a low-contribution contact is the best candidate to drop
+    ///   total accumulated impulse; a low-contribution contact is the best candidate to drop
     ///   because the loss of warm-start info there costs least.
     pub fn add_or_update(&mut self, contact: Contact<S>)
     where
