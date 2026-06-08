@@ -853,6 +853,7 @@ use winit::window::WindowAttributes;
 
 mod active;
 mod catalog;
+mod color;
 mod composer;
 mod consts;
 mod filmstrip;
@@ -862,6 +863,7 @@ mod ui;
 
 use active::combo_name;
 use catalog::{parse_row_from_args, SHAPE_CATALOG};
+use color::{unique_edge_palette, w_depth_color};
 use consts::{
     BODY_SIZE, BODY_Y, HYPERSLICE_MIN_THICKNESS, SPACE_TESSELLATION_SAMPLES, T_SCRUB_RATE,
     T_SLIDER_INITIAL, W_SCRUB_RATE,
@@ -870,107 +872,6 @@ use state::{
     body_position, CameraMode, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode,
     WireframeProjection,
 };
-
-// Cool-to-warm diverging palette for the `w-depth` wireframe color mode.
-// Tracks SIGNED w in the body-local frame: cool blue at extreme -w (the
-// vertex sits "behind" the slice plane in 4D), warm orange at extreme +w
-// (vertex sits "in front"), and a near-neutral midpoint at w = 0 (vertex
-// sits on the slice plane). This is the same palette + scheme the
-// `LineRasterStaticR4` shader uses in `tesseract_demo`, where it reads as
-// "which edge is in front of which in the rotating tesseract." Picking up
-// the same colors here lets the playground demonstrate the same w-depth
-// cue across every polytope.
-//
-// Signed (not `|w|`) is the key: a tesseract vertex at +0.5 and one at
-// -0.5 are visually distinguishable, so the viewer can track a vertex
-// migrating between "near" and "far" camps as the rotor swings. The
-// previous |w|-based scheme collapsed both into the same color and made
-// 4D rotation visually indistinguishable from a 3D twist at certain
-// angles.
-const W_DEPTH_BACK: [f32; 3] = [0.30, 0.42, 0.58];
-const W_DEPTH_FRONT: [f32; 3] = [1.00, 0.78, 0.45];
-
-/// Convert HSV to RGB. h, s, v in [0, 1]; output channels in [0, 1].
-/// See e.g. Foley, van Dam et al., *Computer Graphics: Principles and
-/// Practice*, 2nd ed., section 13.3.4.
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let h6 = h.fract() * 6.0;
-    let c = v * s;
-    let x = c * (1.0 - (h6 % 2.0 - 1.0).abs());
-    let m = v - c;
-    let (r, g, b) = match h6.floor() as i32 % 6 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    [r + m, g + m, b + m]
-}
-
-/// Deterministic palette: golden-ratio hue spacing + saturation/value
-/// modulation so consecutive palette indices land far apart in HSV. The
-/// greedy graph-coloring in [`unique_edge_palette`] only ever needs the
-/// first few indices for any of the regular 4-polytopes, so the first ~12
-/// entries are the perceptually-important ones.
-fn unique_edge_palette_color(idx: usize) -> [f32; 4] {
-    // Golden-ratio conjugate: maximally irrational, spreads hues evenly
-    // even for small N. See Knuth, TAOCP vol. 3, section 6.4.
-    const PHI_INV: f32 = 0.618_034;
-    let h = ((idx as f32) * PHI_INV).fract();
-    // 3-cycle on saturation and 2-cycle on value so adjacent indices (which
-    // already differ in hue by ~137 degrees) also differ in S/V.
-    let s = 0.78 + 0.18 * ((idx % 3) as f32 / 2.0);
-    let v = 0.92 - 0.18 * (((idx / 3) % 2) as f32);
-    let [r, g, b] = hsv_to_rgb(h, s, v);
-    [r, g, b, 1.0]
-}
-
-/// Per-edge RGBA palette via greedy graph-coloring on the line graph of
-/// `topo.edges`: two edges sharing a vertex are forbidden the same palette
-/// index, so locally-adjacent edges always read as different colors. The
-/// coloring is deterministic in the input edge order (which is itself
-/// deterministic per [`rye_physics::polytope::Polytope4Topology::edges`]),
-/// so the same polytope paints identically across runs.
-///
-/// Greedy first-fit coloring matches the line graph's chromatic number to
-/// within a factor that depends on vertex ordering; for the six regular
-/// convex 4-polytopes' edge graphs the result is within 1-2 colors of
-/// optimal in practice, which is fine for visual identification.
-fn unique_edge_palette(edges: &[[u32; 2]]) -> Vec<[f32; 4]> {
-    let n = edges.len();
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let [a0, a1] = edges[i];
-            let [b0, b1] = edges[j];
-            if a0 == b0 || a0 == b1 || a1 == b0 || a1 == b1 {
-                adj[i].push(j);
-                adj[j].push(i);
-            }
-        }
-    }
-    let mut color_idx = vec![usize::MAX; n];
-    let mut used = std::collections::HashSet::<usize>::new();
-    for i in 0..n {
-        used.clear();
-        for &nbr in &adj[i] {
-            if color_idx[nbr] != usize::MAX {
-                used.insert(color_idx[nbr]);
-            }
-        }
-        let mut c = 0;
-        while used.contains(&c) {
-            c += 1;
-        }
-        color_idx[i] = c;
-    }
-    color_idx
-        .into_iter()
-        .map(unique_edge_palette_color)
-        .collect()
-}
 
 /// Per-cell "crossing strength" in `[0, 1]`: 1 when `w_slice` sits at the
 /// cell's w-midpoint (the cap face is widest); 0 when the slice is outside
@@ -992,28 +893,6 @@ fn compute_cell_strengths(cells: &[&[u32]], local_vertices: &[Vec4], w_slice: f3
             (1.0 - dist / half_extent).clamp(0.0, 1.0)
         })
         .collect()
-}
-
-/// Per-vertex `w-depth` color: cool blue at -w extreme, warm orange at
-/// +w extreme, near-neutral on the slice plane. `w_extent_local` is the
-/// FIXED post-scale bound on `|w|` for this polytope's canonical vertex
-/// set (`canonical_max_w * body_size`), so the gradient stays stable as
-/// the rotor spins: a vertex that lands at `w = +0.4 * body_size` paints
-/// the same color regardless of orientation. Per-vertex (not per-edge)
-/// so edges that span the slice plane visibly fade cool to warm along their
-/// length, surfacing the w-depth migration directly.
-fn w_depth_color(w: f32, w_extent_local: f32) -> [f32; 4] {
-    let denom = w_extent_local.max(1e-6);
-    // Shift signed w from [-extent, +extent] into [0, 1]; clamp guards
-    // against any vertex slightly past the canonical extent (numeric drift
-    // or non-unit-circumradius polytopes).
-    let t = ((w / denom) * 0.5 + 0.5).clamp(0.0, 1.0);
-    [
-        W_DEPTH_BACK[0] + (W_DEPTH_FRONT[0] - W_DEPTH_BACK[0]) * t,
-        W_DEPTH_BACK[1] + (W_DEPTH_FRONT[1] - W_DEPTH_BACK[1]) * t,
-        W_DEPTH_BACK[2] + (W_DEPTH_FRONT[2] - W_DEPTH_BACK[2]) * t,
-        1.0,
-    ]
 }
 
 #[cfg(test)]
@@ -3707,156 +3586,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod color_tests {
-    //! Unit tests for the pure color/topology helpers used by `render_wireframe_overlay`
-    //! and `render_points`. These are load-bearing primitives behind every wireframe
-    //! color mode; a sign flip or off-by-one would slip past clippy + the GPU-side
-    //! kernel parse tests.
+    //! Tests for `compute_cell_strengths` (per-cell w-slice crossing strength).
     use super::*;
-
-    // ---- hsv_to_rgb ------------------------------------------------------
-
-    /// HSV anchor cases against the standard reference. h=0 -> red, h=1/3 -> green,
-    /// h=2/3 -> blue. Saturation 1, value 1, so output is the pure primary.
-    #[test]
-    fn hsv_to_rgb_primaries() {
-        let red = hsv_to_rgb(0.0, 1.0, 1.0);
-        assert!((red[0] - 1.0).abs() < 1e-5);
-        assert!(red[1].abs() < 1e-5);
-        assert!(red[2].abs() < 1e-5);
-
-        let green = hsv_to_rgb(1.0 / 3.0, 1.0, 1.0);
-        assert!(green[0].abs() < 1e-5);
-        assert!((green[1] - 1.0).abs() < 1e-5);
-        assert!(green[2].abs() < 1e-5);
-
-        let blue = hsv_to_rgb(2.0 / 3.0, 1.0, 1.0);
-        assert!(blue[0].abs() < 1e-5);
-        assert!(blue[1].abs() < 1e-5);
-        assert!((blue[2] - 1.0).abs() < 1e-5);
-    }
-
-    /// Zero saturation collapses to gray regardless of hue: r == g == b == value.
-    #[test]
-    fn hsv_to_rgb_zero_saturation_is_gray() {
-        for h in [0.0, 0.25, 0.5, 0.75, 0.999_f32] {
-            let rgb = hsv_to_rgb(h, 0.0, 0.7);
-            assert!((rgb[0] - 0.7).abs() < 1e-5, "h={h}: r should be 0.7");
-            assert!((rgb[1] - 0.7).abs() < 1e-5, "h={h}: g should be 0.7");
-            assert!((rgb[2] - 0.7).abs() < 1e-5, "h={h}: b should be 0.7");
-        }
-    }
-
-    /// Zero value collapses to black regardless of hue/saturation.
-    #[test]
-    fn hsv_to_rgb_zero_value_is_black() {
-        let rgb = hsv_to_rgb(0.5, 0.8, 0.0);
-        assert!(rgb.iter().all(|c| c.abs() < 1e-5));
-    }
-
-    // ---- unique_edge_palette --------------------------------------------
-
-    /// Adjacent edges (sharing a vertex) get different palette colors. This is the
-    /// defining invariant of the greedy graph-coloring on the line graph; if it
-    /// fails, the whole point of the mode is broken.
-    #[test]
-    fn unique_edge_palette_separates_adjacent_edges() {
-        // A simple line graph: three edges meeting at vertex 0.
-        //     1
-        //     |
-        // 2 - 0 - 3
-        let edges: &[[u32; 2]] = &[[0, 1], [0, 2], [0, 3]];
-        let palette = unique_edge_palette(edges);
-        assert_eq!(palette.len(), 3, "one color per edge");
-        // All three edges share vertex 0, so all three must be distinct in the line graph.
-        for i in 0..palette.len() {
-            for j in (i + 1)..palette.len() {
-                assert_ne!(
-                    palette[i], palette[j],
-                    "edges {i} and {j} share vertex 0; palette must differ"
-                );
-            }
-        }
-    }
-
-    /// Edges with no shared vertex are NOT adjacent in the line graph and CAN end up
-    /// sharing palette indices (greedy first-fit will reuse index 0 for both).
-    #[test]
-    fn unique_edge_palette_non_adjacent_edges_may_share_color() {
-        // Two disconnected edges: (0,1) and (2,3). No shared vertex.
-        let edges: &[[u32; 2]] = &[[0, 1], [2, 3]];
-        let palette = unique_edge_palette(edges);
-        assert_eq!(palette.len(), 2);
-        // Greedy first-fit assigns index 0 to both since they're not adjacent.
-        assert_eq!(palette[0], palette[1]);
-    }
-
-    /// Determinism: calling twice on the same edge slice yields identical output.
-    /// Critical for caching by `Polytope4` variant (`unique_edge_palette_cache`).
-    #[test]
-    fn unique_edge_palette_is_deterministic() {
-        let edges: &[[u32; 2]] = &[[0, 1], [1, 2], [2, 3], [0, 3]];
-        let a = unique_edge_palette(edges);
-        let b = unique_edge_palette(edges);
-        assert_eq!(a, b);
-    }
-
-    // ---- w_depth_color --------------------------------------------------
-
-    /// At w = 0 (the slice plane), the color sits exactly midway between back and front.
-    /// `t = 0.5` means RGB is the literal midpoint of W_DEPTH_BACK and W_DEPTH_FRONT.
-    #[test]
-    fn w_depth_color_zero_w_is_midpoint() {
-        let c = w_depth_color(0.0, 1.0);
-        for ch in 0..3 {
-            let expected = (W_DEPTH_BACK[ch] + W_DEPTH_FRONT[ch]) * 0.5;
-            assert!(
-                (c[ch] - expected).abs() < 1e-5,
-                "channel {ch}: expected {expected}, got {}",
-                c[ch],
-            );
-        }
-        assert!((c[3] - 1.0).abs() < 1e-5, "alpha is 1.0");
-    }
-
-    /// At w = -extent the color is the back tint (cool blue).
-    #[test]
-    fn w_depth_color_neg_extent_is_back() {
-        let c = w_depth_color(-1.0, 1.0);
-        for ch in 0..3 {
-            assert!(
-                (c[ch] - W_DEPTH_BACK[ch]).abs() < 1e-5,
-                "channel {ch}: expected back tint",
-            );
-        }
-    }
-
-    /// At w = +extent the color is the front tint (warm orange).
-    #[test]
-    fn w_depth_color_pos_extent_is_front() {
-        let c = w_depth_color(1.0, 1.0);
-        for ch in 0..3 {
-            assert!(
-                (c[ch] - W_DEPTH_FRONT[ch]).abs() < 1e-5,
-                "channel {ch}: expected front tint",
-            );
-        }
-    }
-
-    /// Vertices past the extent (a polytope canonical max underestimate, or
-    /// numeric drift) clamp to the endpoint colors rather than over-saturating.
-    #[test]
-    fn w_depth_color_clamps_past_extent() {
-        let c_far = w_depth_color(5.0, 1.0);
-        let c_at_extent = w_depth_color(1.0, 1.0);
-        assert_eq!(c_far, c_at_extent, "+w past extent should clamp to front");
-
-        let c_back = w_depth_color(-5.0, 1.0);
-        let c_at_neg_extent = w_depth_color(-1.0, 1.0);
-        assert_eq!(
-            c_back, c_at_neg_extent,
-            "-w past extent should clamp to back"
-        );
-    }
 
     // ---- compute_cell_strengths -----------------------------------------
 
