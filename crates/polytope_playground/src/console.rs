@@ -1,5 +1,5 @@
-//! Console command registration for the polytope playground (the
-//! `wireframe`, `pole`, `section`, `space`, etc. subcommands).
+//! Console command registration (the `wireframe`, `pole`, `section`,
+//! `surface`, `camera`, `floor` commands).
 
 use crate::*;
 
@@ -38,12 +38,9 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
-        // Cross-section + parent-wireframe overlay. Tab-completion is context-aware
-        // via [`SubcommandSet`]: each subcommand's value slot lists only that
-        // subcommand's choices. Bare invocations flip:
-        //   `wireframe`                 -> flips main on/off
-        //   `wireframe nearest-active`  -> flips the alpha gradient toggle
-        //   `wireframe color <mode>`    -> sets the color mode
+        // Cross-section + parent-wireframe overlay. Bare `wireframe` flips
+        // on/off; subcommands each carry their own value choices for context-
+        // aware tab-completion via [`SubcommandSet`].
         c.register(
             rye_egui::subcommands::<Demo>("wireframe", "wireframe + cross-section overlay")
                 .on_bare(|d| {
@@ -135,8 +132,7 @@ impl RotatePolytopesApp {
                                 )
                             })?,
                             None => {
-                                // Cycle through the canonical order so bare
-                                // `wireframe color` visits every mode in turn.
+                                // Bare cycles through the canonical order.
                                 let all = WireframeColorMode::ALL;
                                 let i = all
                                     .iter()
@@ -154,11 +150,8 @@ impl RotatePolytopesApp {
                     &[&["shadow", "w-pinhole", "stereographic", "hyperslice"]],
                     &[],
                     |d, args, out| {
-                        // Schlegel is intentionally not offered here (see
-                        // `WireframeProjection::Schlegel` docs): it wants its own
-                        // demo, not a wireframe-overlay mode. `from_token` rejects
-                        // "schlegel" and `ALL` omits it, so neither path below can
-                        // produce it.
+                        // Schlegel is omitted here (it wants its own demo): both
+                        // `from_token` and `ALL` exclude it.
                         let next = match args.first().copied() {
                             // Bare: cycle through ALL in variant order.
                             None => {
@@ -180,8 +173,7 @@ impl RotatePolytopesApp {
                             d.wireframe_projection,
                             &mut d.wireframe_enabled,
                         );
-                        // No-op (clears any cached Schlegel params) for these modes;
-                        // kept so re-wiring Schlegel later needs no console change.
+                        // No-op for these modes; kept for a future Schlegel re-wire.
                         d.resolve_schlegel_cache();
                         out.line(format!(
                             "wireframe perspective: {}",
@@ -204,22 +196,19 @@ impl RotatePolytopesApp {
                                     p.x, p.y, p.z, p.w
                                 ));
                             }
-                            // The default is a cell-center direction (off every
-                            // 16-cell vertex; see STEREOGRAPHIC_DEFAULT_POLE).
+                            // Cell-center default (see STEREOGRAPHIC_DEFAULT_POLE).
                             Some("reset") | Some("default") => {
                                 d.stereographic_pole = state::STEREOGRAPHIC_DEFAULT_POLE;
                                 out.line("stereographic pole: reset to the cell-center default");
                             }
-                            // The textbook `(x, y, z) / (1 - w)` pole, the old
-                            // default; offered as a named shortcut so a user can
-                            // recover the classic look without typing coordinates.
+                            // The textbook `(x, y, z) / (1 - w)` pole, as a named
+                            // shortcut.
                             Some("+w") => {
                                 d.stereographic_pole = Vec4::W;
                                 out.line("stereographic pole: set to +w (textbook map)");
                             }
-                            // Explicit pole: four floats, normalized onto S³ (the
-                            // map only uses the direction). Reject a near-zero
-                            // vector, which has no well-defined direction.
+                            // Explicit pole: four floats normalized onto S³ (only
+                            // the direction matters); reject a near-zero vector.
                             Some(_) => {
                                 let coords: Result<Vec<f32>> = args
                                     .iter()
@@ -287,11 +276,9 @@ impl RotatePolytopesApp {
                                     let t: f32 = token.parse().map_err(|e| {
                                         anyhow!("invalid thickness `{token}`: {e}")
                                     })?;
-                                    // Lower bound is the predicate's own floor (a razor
-                                    // band that still admits straddling edges); upper bound
-                                    // is the full slider span `2 * W_RANGE`, at which the
-                                    // slab covers every reachable w and the filter is a
-                                    // no-op (equivalent to "off").
+                                    // Floor is the predicate's razor band; the
+                                    // `2 * W_RANGE` cap covers every reachable w, so
+                                    // the filter no-ops there (same as "off").
                                     let max = 2.0 * consts::W_RANGE;
                                     if !(HYPERSLICE_MIN_THICKNESS..=max).contains(&t) {
                                         return Err(anyhow!(
@@ -370,12 +357,9 @@ impl RotatePolytopesApp {
                 ),
         );
 
-        // Polychoral surface renderer: raster (default) / SDF / off. Bare `surface` is
-        // shorthand for "off" so the user can hide cap fills quickly when inspecting the
-        // wireframe and cross-section perimeter on their own. Explicit `surface raster`
-        // and `surface sdf` set those modes; `surface off` is the same as bare.
-        // `surface scale <N>` rescales every polychoron in the row by multiplying the
-        // canonical `BODY_SIZE` (see [`Demo::effective_body_size`]); default 1.0.
+        // Polychoral surface renderer: raster (default) / SDF / off. Bare
+        // `surface` is shorthand for "off". `surface scale <N>` rescales the row
+        // by multiplying `BODY_SIZE` (see [`Demo::effective_body_size`]).
         c.register(
             rye_egui::cmd(
                 "surface",

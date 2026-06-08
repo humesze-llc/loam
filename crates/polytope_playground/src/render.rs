@@ -5,31 +5,17 @@ use crate::*;
 
 impl Demo {
     pub(crate) fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
-        // Scene renders to the full window. The bottom controls overlay floats on top
-        // (Area, not a docked panel; doesn't reserve pixels); the Render settings modal
-        // is also free-floating, so the scene viewport is always the framebuffer.
+        // Scene renders to the full window; the overlay and Render modal float on
+        // top without reserving pixels, so the viewport is always the framebuffer.
         let cfg = &rd.surface_bundle.config;
         let viewport = Viewport::full([cfg.width, cfg.height]);
         if self.view_mode == ViewMode::Filmstrip {
-            // Filmstrip: each cell shows the `strip_subject`
-            // polytope (independent of `self.row`) at a different
-            // `w_slice`. We swap the GPU body list to just the
-            // subject for the duration of this render, then
-            // restore via `rebuild_bodies` so the Shapes view and
-            // any subsequent state read sees the full row.
+            // Each cell shows the `strip_subject` at a different `w_slice`. Swap
+            // the GPU body list to just the subject for this render, then restore
+            // via `rebuild_bodies` so later state reads see the full row.
             let entry = self.strip_subject;
-            // 2D filmstrip rendering. cols is the column count
-            // (horizontal axis), rows is the row count (vertical).
-            // Default axis assignment: w on columns, t on rows;
-            // `strip_swap_axes` flips it.
-            //
-            // Per-cell rendering: viewport (cell rect), w_slice
-            // (cell's w), and body (cell's rotor for that t).
-            // The base rotor `self.rot_state` is offset along
-            // omega_animation by `(t_offset)` to give the cell's
-            // rotor: `exp(omega_animation * t_offset) * rot_state`.
-            // For the w-only and t-only 1D cases, the second
-            // axis collapses to a single cell with offset=0.
+            // 2D grid: w on columns, t on rows by default (`strip_swap_axes`
+            // flips it). A 1D case collapses the second axis to one cell.
             let strip_w_extent = self.effective_body_size();
             let (cols, rows, w_on_cols) = match (self.strip_w, self.strip_t) {
                 (true, true) => {
@@ -41,7 +27,7 @@ impl Demo {
                 }
                 (true, false) => (self.strip_count_w, 1, true),
                 (false, true) => (1, self.strip_count_t, false),
-                // UI invariant prevents both being off; defensive.
+                // UI invariant prevents both being off.
                 (false, false) => (1, 1, true),
             };
             let col_vps = viewport.split_horizontal(cols as u32);
@@ -49,8 +35,7 @@ impl Demo {
             for (col_idx, col_vp) in col_vps.into_iter().enumerate() {
                 let row_vps = col_vp.split_vertical(rows as u32);
                 for (row_idx, cell_vp) in row_vps.into_iter().enumerate() {
-                    // Decide what (w_offset, t_offset) this cell
-                    // corresponds to based on which axis carries
+                    // (w_offset, t_offset) for this cell, by which axis carries
                     // which dimension.
                     let (w_idx, w_n, t_idx, t_n) = if w_on_cols {
                         (col_idx, cols, row_idx, rows)
@@ -67,20 +52,13 @@ impl Demo {
                     let t_offset = if !self.strip_t || t_n <= 1 {
                         0.0
                     } else {
-                        // Fan FORWARD only: cell 0 = now, cell
-                        // last = rot_time + strip_t_extent. Reads
-                        // as "what the rotor will look like at
-                        // this future time."
+                        // Fan forward only: cell 0 = now, last = rot_time +
+                        // strip_t_extent ("the rotor at this future time").
                         let t_norm = t_idx as f32 / (t_n - 1) as f32;
                         t_norm * self.strip_t_extent
                     };
-                    // Cell's rotor: the orientation at animation time
-                    // `rot_time + t_offset`, via the same `rotor_at_time`
-                    // dispatch the spin + t-scrub use. For Composer this
-                    // equals the old `exp(omega * t_offset) * rot_state`
-                    // (omega commutes with itself); for Active it's the
-                    // product-of-exp sampled at the future time, which the
-                    // old sum-based offset got wrong with 2+ active planes.
+                    // Cell's rotor: the orientation at `rot_time + t_offset`, via
+                    // the same `rotor_at_time` dispatch the spin + t-scrub use.
                     let cell_rotor = if t_offset == 0.0 {
                         self.rot_state
                     } else {
@@ -97,8 +75,7 @@ impl Demo {
                 }
             }
             let result = self.node.execute_strip(rd, view, &grid_cells);
-            // Restore the full row of bodies for any non-strip
-            // consumer (state save, mode switch, etc.).
+            // Restore the full row for any non-strip consumer.
             self.rebuild_bodies();
             result
         } else {
@@ -112,29 +89,23 @@ impl Demo {
                 self.node.flush_uniforms(&rd.queue);
                 self.node.execute_in_viewport(rd, view, viewport)?;
             }
-            // Shared depth attachment for the rasterized section pass + the parent
-            // wireframe's depth-test. Ensured + cleared once per Shapes-view frame so
-            // the order is: SDF (color only) -> section_faces (writes depth + color
-            // when raster mode is on) -> wireframe (tests depth, no write). In SDF
-            // mode no pass writes depth, so the cleared `1.0` buffer makes every
-            // wireframe fragment pass the depth-test trivially -- visual unchanged.
+            // Shared depth for the section pass + the wireframe's depth-test.
+            // Order: SDF (color only) -> section_faces (writes depth in Raster) ->
+            // wireframe (tests, no write). In SDF mode no pass writes depth, so the
+            // cleared `1.0` lets every wireframe fragment pass.
             self.ensure_and_clear_shared_depth(rd)?;
             if matches!(self.surface_mode, SurfaceMode::Raster) {
                 let _scope = rye_time::frame_trace::scope("pp-section-faces");
                 self.render_section_faces(rd, view)?;
             }
-            // Cross-section + parent-wireframe overlay (when toggled). Only in Shapes
-            // view since Filmstrip's per-cell viewport composition would require
-            // per-cell depth-clear + per-cell uploads that aren't worth the v1 plumbing.
+            // Cross-section + wireframe overlay. Shapes view only: Filmstrip's
+            // per-cell composition would need per-cell depth-clear + uploads not
+            // worth the v1 plumbing.
             if self.wireframe_enabled {
-                // pp-wireframe is the project-memory-flagged hot path
-                // (`project_polychoral_raster_perf`). Want a per-frame number here so
-                // we can confirm (or refute) that hypothesis with browser data.
                 let _scope = rye_time::frame_trace::scope("pp-wireframe");
                 self.render_wireframe_overlay(rd, view)?;
             }
-            // Points overlay (vertex markers + cell-center sprites). Drawn last so the
-            // discs sit on top of wireframe edges and section caps at the same depth.
+            // Points overlay, drawn last so discs sit on top of edges and caps.
             if self.points_enabled {
                 let _scope = rye_time::frame_trace::scope("pp-points");
                 self.render_points(rd, view)?;
@@ -144,13 +115,9 @@ impl Demo {
     }
 
     /// Ensure the shared section-faces depth attachment exists at the current
-    /// swapchain size + sample count, then clear it to `1.0`. Called once per
-    /// Shapes-view frame at the top of the rasterizer chain.
-    ///
-    /// The buffer is shared between `section_faces` (which writes depth when raster
-    /// mode is on) and `parent_wireframe` (which depth-tests against it without
-    /// writing). Sharing means we pay one ensure + one clear per frame regardless of
-    /// surface mode.
+    /// swapchain size + sample count, then clear it to `1.0`. Shared between
+    /// `section_faces` (writes depth in Raster) and `parent_wireframe` (tests, no
+    /// write), so one ensure + clear per frame covers both.
     fn ensure_and_clear_shared_depth(&mut self, rd: &RenderDevice) -> Result<()> {
         let cfg = &rd.surface_bundle.config;
         DepthBuffer::ensure(
@@ -187,58 +154,26 @@ impl Demo {
         Ok(())
     }
 
-    /// Build a combined section-faces mesh across every polychoral body in `self.row`,
-    /// upload it, clear the section-faces depth attachment, and execute the triangle
-    /// raster pass. No-op when no polychoral body is present in the row.
+    /// Build the combined point sprites mesh (vertex markers + cell-center
+    /// sprites) across every polychoral body in the row, upload it, and execute
+    /// the point-disc raster pass. Same body-local project-then-translate pattern
+    /// as the wireframe and section-faces paths.
     ///
-    /// Per-body world transform mirrors `render_wireframe_overlay`: canonical vertices
-    /// `v` become `body_position + effective_body_size() * rot_state.apply(v)`. The section
-    /// algorithm then runs on these world vertices against the demo's `w_slice`,
-    /// producing R³ geometry that composes with the camera the SDF raymarcher uses.
-    ///
-    /// Depth: within a single cap, the fan triangles are coplanar (the cap is a 2D
-    /// polygon in R³) and don't occlude one another. Different caps within one
-    /// polytope, and caps across different polychoral bodies, all project to
-    /// different camera depths after the view-projection step, so they DO require a
-    /// depth attachment to resolve front-to-back occlusion correctly. The shared
-    /// depth buffer is ensured + cleared at the top of the Shapes-view render path
-    /// (see `Demo::ensure_and_clear_shared_depth`); this pass writes into it.
-    /// Build the combined point sprites mesh (vertex markers + cell-center sprites) across
-    /// every polychoral body in the row, upload it, and execute the point-disc raster pass.
-    ///
-    /// Same body-local + perspective + world-translate pattern as the wireframe and section-
-    /// faces paths: each body's vertices and cell centers are computed in body-local 4D,
-    /// projected through `wireframe_projection`, and translated by the body's R³ position so
-    /// the perspective scale doesn't smear the body across its row x-offset.
-    ///
-    /// Coloring: sprites honor the active [`WireframeColorMode`] so the
-    /// points overlay reads as part of the same wireframe rendering pass.
-    /// Per-vertex sprites get the same color the matching wireframe vertex
-    /// would carry; per-cell-center sprites get the dominant-cell color
-    /// (cell strength for `Active`, cell-center w for `WDepth`, position-
-    /// derived gradient otherwise). For `UniqueEdge` mode the points fall
-    /// back to the position-gradient because the unique-edge palette is
-    /// edge-indexed and has no canonical vertex assignment.
+    /// Sprites honor the active [`WireframeColorMode`] so the overlay reads as
+    /// part of the wireframe pass; `UniqueEdge` falls back to the position
+    /// gradient (the edge-indexed palette has no canonical vertex assignment).
     fn render_points(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
         let cfg = &rd.surface_bundle.config;
-        // Rendered row: full `row` in Shapes, just the `strip_subject` in Single.
-        // Disjoint field borrow so the `&mut self.points_mesh_scratch` below stays
-        // accessible.
+        // Rendered row: full `row` in Shapes, the `strip_subject` in Single.
         let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
         let n = render_row.len();
         let wireframe_projection = self.resolved_wireframe_projection();
-        // Near-pole drop radius, shared with the wireframe edges and the cap
-        // outline (`stereographic_clip_radius`): under Stereographic a vertex or
-        // cell-center within the angular epsilon of the pole projects to the
-        // large-but-finite clamp point, which would draw as a giant disc while
-        // the touching edges are dropped. Gating the point push on the same
-        // predicate keeps the points overlay consistent with the wireframe.
-        // `None` for every other projection, so nothing is dropped there. The
-        // radius is resolved per shape in the loop (only the 16-cell is clipped).
+        // Near-pole drop radius shared with the edges and cap outline: a point in
+        // the pole band would draw as a giant clamp disc while its edges drop, so
+        // the same predicate gates it. Resolved per shape (only 16-cell clipped).
         let cam_dist = self.camera_distance_to_focus();
-        // Active-mode palette: bright green for vertices that belong to a
-        // currently-intersected cell, dim gray otherwise. Same hues the
-        // wireframe overlay uses so the visual identity stays consistent.
+        // Active-mode palette: green for vertices in an intersected cell, gray
+        // otherwise. Same hues as the wireframe overlay.
         const ACTIVE_GREEN: [f32; 4] = [0.40, 1.00, 0.55, 1.0];
         const INACTIVE_GRAY: [f32; 4] = [0.55, 0.55, 0.58, 0.85];
         let color_mode = self.wireframe_color_mode;
@@ -263,18 +198,15 @@ impl Demo {
             let body_pos = body_position(slot, n);
             let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
 
-            // Per-frame, per-polytope body-local 4D vertices (rotated + scaled).
-            // Shared by the vertex AND cell-center loops: for WDepth we need
-            // the maximum |w| across them to normalize the gradient, and for
-            // Active we need them to derive cell strengths.
+            // Body-local 4D vertices (rotated + scaled), shared by the vertex and
+            // cell-center loops (WDepth normalization, Active cell strengths).
             let local_vertices: Vec<Vec4> = topo
                 .vertices
                 .iter()
                 .map(|v| body_size * self.rot_state.apply(*v))
                 .collect();
-            // Same canonical-max-w normalization the wireframe overlay uses
-            // (see render_wireframe_overlay), keeping the points' color in
-            // step with the edges across the same w-depth scheme.
+            // Canonical-max-w normalization (see render_wireframe_overlay), so
+            // the points' w-depth color stays in step with the edges.
             let w_extent_local: f32 = if matches!(color_mode, WireframeColorMode::WDepth) {
                 let canonical_max_w = topo
                     .vertices
@@ -286,10 +218,8 @@ impl Demo {
             } else {
                 1.0
             };
-            // Cell strengths only computed for the Active mode; saves work in
-            // the common case. Same definition the wireframe overlay uses
-            // (`compute_cell_strengths`) so "vertex in an active cell" reads
-            // consistently across edges + dots.
+            // Cell strengths only for Active mode (`compute_cell_strengths`, same
+            // as the wireframe overlay).
             let cell_strengths: Vec<f32> = if matches!(color_mode, WireframeColorMode::Active) {
                 compute_cell_strengths(topo.cells, &local_vertices, w_slice)
             } else {
@@ -310,16 +240,14 @@ impl Demo {
                             v_local,
                             &wireframe_projection,
                         );
-                    // Drop a near-pole vertex (clean blink) instead of a giant
-                    // clamp disc; matches the wireframe/perimeter drop.
+                    // Drop a near-pole vertex (clean blink) instead of a giant disc.
                     if !sample_in_radius(v3_local, points_clip_radius) {
                         continue;
                     }
                     let v_world = v3_local + body_pos_r3;
                     let color = match color_mode {
-                        // Position-gradient also covers UniqueEdge, since the
-                        // unique-edge palette is edge-indexed (no canonical
-                        // assignment for a vertex shared by several edges).
+                        // Position covers UniqueEdge too (edge-indexed palette has
+                        // no per-vertex assignment).
                         WireframeColorMode::VertexGradient | WireframeColorMode::UniqueEdge => {
                             vertex_color_by_position(*v)
                         }
@@ -338,16 +266,10 @@ impl Demo {
                 }
             }
             if self.points_show_cell_centers {
-                // Pull cell centroids radially inward by `CELL_CENTER_INSET` so
-                // they read as "interior markers" instead of coinciding with the
-                // DUAL polytope's vertices. Mathematically `polytope.cell_centers()`
-                // returns each cell's centroid at the inradius, which IS the
-                // dual's vertex set (16-cell's cell-centroids form a tesseract,
-                // tesseract's form a 16-cell, etc). At full inradius the sprites
-                // look like a smaller dual polytope sitting at the inradius; the
-                // inset puts them visibly INSIDE the body's cap so a viewer reads
-                // "one dot per cell, in the cell's direction" rather than
-                // "vertices of the wrong polytope."
+                // Pull centroids inward by `CELL_CENTER_INSET` so they read as
+                // interior markers. `cell_centers()` returns centroids at the
+                // inradius, which is the DUAL's vertex set; at full inradius the
+                // sprites look like the wrong polytope, so inset them inside the cap.
                 const CELL_CENTER_INSET: f32 = 0.5;
                 let centers = polytope.cell_centers();
                 for (ci, c) in centers.iter().enumerate() {
@@ -378,14 +300,13 @@ impl Demo {
                     };
                     mesh.positions.push(c_world.to_array());
                     mesh.colors.push(color);
-                    // Cell-center sprites half-sized so they don't compete visually with the
-                    // brighter vertex discs.
+                    // Half-sized so they don't compete with the vertex discs.
                     mesh.sizes.push(self.points_size_px * 0.5);
                 }
             }
         }
 
-        // Camera matches the wireframe overlay / section faces (same view-projection).
+        // Camera matches the wireframe overlay / section faces.
         let view_dir = self.camera.view();
         let aspect = cfg.width as f32 / cfg.height as f32;
         let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
@@ -399,9 +320,8 @@ impl Demo {
             mesh,
             &rye_math::Projection::Identity,
         );
-        // No depth attachment: see `PointRasterNode::new` site for the rationale
-        // (drop-w + ReadOnly LessEqual was occluding non-w=0 vertices behind their
-        // own caps).
+        // No depth attachment: see `PointRasterNode::new` (drop-w + ReadOnly
+        // LessEqual occluded non-w=0 vertices behind their own caps).
         self.points_node.execute(rd, view, None, None)?;
         Ok(())
     }
@@ -425,27 +345,22 @@ impl Demo {
         let cfg = &rd.surface_bundle.config;
         let cross = self.cross_section;
         let cap = self.projected_cap;
-        // Nothing to fill: both layers off. The perimeter outlines are drawn by
-        // the wireframe overlay, not here, so an all-alpha-zero section skips the
-        // triangle passes entirely.
+        // Both layers off: perimeter outlines belong to the wireframe overlay,
+        // so an all-alpha-zero section skips the triangle passes entirely.
         if !cross.fill_visible() && !cap.fill_visible() {
             return Ok(());
         }
 
-        // Resolve the active projection ONCE (the Schlegel arm reads
-        // `schlegel_params` + `rot_state` immutably) before any `&mut` scratch
-        // borrow. The honest layer overrides this to drop-w via
-        // `section_layer_projection`; the projected cap keeps it.
+        // Resolve once before any `&mut` scratch borrow. The honest layer
+        // overrides this to drop-w via `section_layer_projection`.
         let wireframe_projection = self.resolved_wireframe_projection();
         let w_slice = self.w_slice;
 
-        // Build whichever layers are visible, in one pass over the row so the
-        // body-local 4D section vertices are computed once and shared. Each layer
-        // gets its own scratch mesh; both keep their capacity across frames.
+        // One pass over the row; the body-local 4D vertices are shared. Each
+        // layer keeps its own scratch mesh and capacity across frames.
         self.build_section_layer_meshes(wireframe_projection, w_slice, cross, cap);
 
-        // Camera matches the SDF raymarcher's effective view-projection (same as
-        // the wireframe overlay uses), so pixel-aligned composition over the SDF.
+        // Camera matches the SDF raymarcher, for pixel-aligned composition.
         let view_dir = self.camera.view();
         let aspect = cfg.width as f32 / cfg.height as f32;
         let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
@@ -463,18 +378,13 @@ impl Demo {
     }
 
     /// Append every polychoral body's cross-section caps into the visible layer
-    /// scratch meshes, mapping each layer's body-local R³ caps to world R³ under
-    /// that layer's projection ([`state::section_layer_projection`]: drop-w for
-    /// the honest cross-section, the active `wireframe_projection` for the
-    /// projected cap). Both meshes are cleared on entry and reuse their
-    /// allocations across frames; a layer that is not `SectionLayer::fill_visible`
-    /// is skipped so its mesh stays empty.
+    /// scratch meshes, each under its own projection
+    /// ([`state::section_layer_projection`]: drop-w for the honest cross-section,
+    /// the active projection for the cap). Both meshes are cleared on entry and
+    /// reuse allocations; an invisible layer is skipped.
     ///
-    /// Single pass over the row: the body-local 4D section vertices
-    /// (`rot_state`-rotated, `effective_body_size`-scaled) are identical for both
-    /// layers, so they are computed once per body and both layers' caps are
-    /// appended from the same `polytope_section_faces_append` source before the
-    /// per-layer world transform.
+    /// Single pass over the row: the body-local 4D section vertices are identical
+    /// for both layers, computed once per body before the per-layer transform.
     fn build_section_layer_meshes(
         &mut self,
         wireframe_projection: rye_math::Projection<4>,
@@ -486,25 +396,20 @@ impl Demo {
         let n = render_row.len();
         let body_size = self.effective_body_size();
 
-        // The honest layer is always drop-w; the projected cap follows the active
-        // projection. `Identity` makes `perspective_scale_at_w` report `Some(1.0)`,
-        // so the honest cap is just scaled-by-one and translated (drop-w + world
-        // translate), bit-identical to the inhabitant's view of the slice 3-flat.
+        // Honest layer is drop-w (Identity makes `perspective_scale_at_w` report
+        // `Some(1.0)`, a scale-by-one + translate); the cap follows the active
+        // projection.
         let cross_projection = state::section_layer_projection(true, wireframe_projection);
         let cap_projection = state::section_layer_projection(false, wireframe_projection);
         let cross_scale = perspective_scale_at_w(w_slice, &cross_projection);
         let cap_scale = perspective_scale_at_w(w_slice, &cap_projection);
-        // Near-pole drop radius per layer, shared with the wireframe edges and the
-        // cap outline. The cross layer is drop-w (Identity), so its radius is
-        // `None` and every triangle is kept; the cap layer is `None` unless the
-        // active projection is Stereographic. The radius is resolved PER SHAPE in
-        // the loop (only the 16-cell is clipped), so capture the distance here.
+        // Near-pole drop radius resolved per shape below (only the 16-cell is
+        // clipped); the cross layer is drop-w so it never clips.
         let cam_dist = self.camera_distance_to_focus();
 
-        // Reused per-vertex projected-point buffer for the triangle-granularity
-        // fill clip, taken out so the `append_layer` closure can hold it `&mut`
-        // alongside the immutable `section_world_vertices_scratch` borrow without
-        // a second `&mut self`. Put back at the end so its capacity persists.
+        // Reused per-vertex projected-point buffer for the fill clip, taken out so
+        // `append_layer` can hold it `&mut` alongside the immutable
+        // `section_world_vertices_scratch` borrow. Put back so capacity persists.
         let mut proj_scratch = std::mem::take(&mut self.section_clip_projected_scratch);
 
         let cross_mesh = &mut self.section_faces_mesh_scratch;
@@ -528,10 +433,8 @@ impl Demo {
             let body_pos = body_position(slot, n);
             let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
 
-            // Body-local 4D section vertices (rotor-rotated, scaled, NO world
-            // translate): keep the body's R³ position out of the 4D perspective
-            // math so it doesn't get scaled by `focal / (focal - w)`. Shared by
-            // both layers below.
+            // Body-local 4D section vertices (no world translate): keep the body's
+            // R³ position out of the perspective divide. Shared by both layers.
             self.section_world_vertices_scratch.clear();
             self.section_world_vertices_scratch.extend(
                 topo.vertices
@@ -539,23 +442,17 @@ impl Demo {
                     .map(|v| body_size * self.rot_state.apply(*v)),
             );
 
-            // Match the SDF's per-body solid coloring: every cap uses the body's
-            // catalog color; per-face Lambert adds the geometric depth. Alpha is
-            // the layer's own `surface_alpha`; below 1.0 the layer renders through
+            // Match the SDF's per-body coloring: catalog color, Lambert depth.
+            // Alpha is the layer's `surface_alpha`; below 1.0 it renders through
             // the no-depth-write pipeline so layers behind composite through.
             let [r, g, b] = entry.body_color;
 
-            // Append + world-transform a single layer's caps for this body. The
-            // section algorithm emits body-local drop-w R³;
-            // `cap_vertex_projected_and_world` maps it through the layer's
-            // projection (affine scale-and-translate, or per-vertex reconstruction
-            // at `w_slice` for non-affine) and also returns the body-local
-            // projected point the near-pole clip tests. Under a clipped projection
-            // (Stereographic) a fill triangle is dropped when ANY of its three
-            // projected vertices exceeds `clip_radius`, matching the per-segment
-            // perimeter rule so fill and outline cull in lockstep. The triangle
-            // drop is in-place over the just-appended index range; dropped
-            // triangles leave orphan vertices that no kept triangle references.
+            // Append + world-transform one layer's caps.
+            // `cap_vertex_projected_and_world` maps each body-local cap vertex
+            // through the layer's projection and returns the projected point the
+            // clip tests. Under Stereographic a fill triangle is dropped when any
+            // vertex exceeds `clip_radius`, matching the perimeter rule so fill
+            // and outline cull in lockstep.
             let append_layer = |mesh: &mut rye_shape::TriangleMesh<3>,
                                 proj_scratch: &mut Vec<Vec3>,
                                 alpha: f32,
@@ -580,7 +477,7 @@ impl Demo {
                     proj_scratch.push(projected);
                 }
                 // Drop fill triangles touching a near-pole vertex (no-op for the
-                // affine `None` layers, which keep every triangle).
+                // affine `None` layers).
                 retain_in_radius_triangles(
                     &mut mesh.indices,
                     start_i,
@@ -616,12 +513,10 @@ impl Demo {
         self.section_clip_projected_scratch = proj_scratch;
     }
 
-    /// Upload + execute one already-built section layer's triangle mesh. Picks the
-    /// opaque vs translucent node by the layer's `alpha`: opaque (>= 1.0) writes
-    /// depth so caps occlude one another within a polytope; translucent (< 1.0)
-    /// skips depth-write so the parent wireframe (and any layer drawn behind) shows
-    /// through. `is_cross_section` selects which scratch mesh to upload. Each call
-    /// is a self-contained submit, so the two nodes are reused across both layers.
+    /// Upload + execute one built section layer's mesh. Picks the opaque vs
+    /// translucent node by `alpha`: opaque (>= 1.0) writes depth so caps occlude
+    /// within a polytope; translucent (< 1.0) skips depth-write so layers behind
+    /// show through. `is_cross_section` selects the scratch mesh.
     fn execute_section_layer(
         &mut self,
         rd: &RenderDevice,
@@ -630,12 +525,9 @@ impl Demo {
         alpha: f32,
         is_cross_section: bool,
     ) -> Result<()> {
-        // Disjoint field borrows: the depth attachment, the chosen scratch mesh,
-        // and the chosen node are three distinct fields, so the borrow checker
-        // accepts the immutable depth + scratch reads alongside the `&mut` node
-        // within this one method body (the same pattern the pre-split path used).
-        // The shared depth attachment is ensured + cleared once per frame by
-        // `ensure_and_clear_shared_depth`; here we just consume its view.
+        // Disjoint field borrows let the immutable depth + scratch reads coexist
+        // with the `&mut` node. The shared depth is ensured + cleared per frame by
+        // `ensure_and_clear_shared_depth`; here we consume its view.
         let depth_view = &self
             .section_faces_depth
             .as_ref()
@@ -646,8 +538,7 @@ impl Demo {
         } else {
             &self.section_faces_projected_scratch
         };
-        // Empty-mesh handling lives in `TriangleRasterNode::execute` (it short-
-        // circuits when `index_count == 0`); no redundant early-return here.
+        // Empty-mesh short-circuit lives in `TriangleRasterNode::execute`.
         let node = if alpha >= 1.0 {
             &mut self.section_faces
         } else {
@@ -659,124 +550,86 @@ impl Demo {
         Ok(())
     }
 
-    /// Build the three overlay meshes (section triangles, section perimeter edges, parent
-    /// wireframe) from the current row + rotor + w_slice, upload them, clear the overlay
-    /// depth buffer, and execute the three raster passes on top of the existing SDF render.
-    ///
-    /// Distance from the camera eye to the scene focus (the orbit target), used to
-    /// scale the stereographic clip radius (see [`stereographic_view_radius`]).
-    /// Reads the live eye position rather than `orbit.distance` so it is correct in
-    /// FreeRoam too, where the orbit controller is not driving the camera.
+    /// Distance from the camera eye to the orbit target, used to scale the
+    /// stereographic clip radius (see [`stereographic_view_radius`]). Reads the
+    /// live eye position, not `orbit.distance`, so it is correct in FreeRoam too.
     fn camera_distance_to_focus(&self) -> f32 {
         (self.camera.position - self.orbit.target).length()
     }
 
-    /// Per-body transform: each canonical Polytope4 vertex `v` becomes the world Vec4
-    /// `body.position + effective_body_size() * rot_state.apply(v)`. The section algorithm
-    /// then runs on these world vertices against the demo's `w_slice`, producing geometry
-    /// in world R³ that composes cleanly with the SDF camera frame.
-    ///
-    /// Non-polychoral shapes (Clifford torus, duocylinder, etc.) in the row are skipped:
-    /// they have no [`rye_physics::polytope::Polytope4`] mapping and the cross-section
-    /// algorithm doesn't apply to smooth surfaces.
+    /// Build the section-perimeter and parent-wireframe overlay meshes from the
+    /// current row + rotor + w_slice, upload them, and execute the raster passes
+    /// over the SDF render. Non-polychoral shapes in the row are skipped (no
+    /// [`rye_physics::polytope::Polytope4`] mapping).
     fn render_wireframe_overlay(
         &mut self,
         rd: &RenderDevice,
         view: &wgpu::TextureView,
     ) -> Result<()> {
         let cfg = &rd.surface_bundle.config;
-        // Rendered row: full `row` in Shapes, just the `strip_subject` in Single.
-        // Bound via disjoint field borrows so the `&mut self.unique_edge_palette_cache`
-        // inside the loop stays accessible; no allocation on this hot path.
+        // Rendered row: full `row` in Shapes, the `strip_subject` in Single.
+        // Disjoint field borrows keep `&mut self.unique_edge_palette_cache`
+        // accessible in the loop.
         let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
         let n = render_row.len();
 
-        // Build combined meshes across the rendered row.
         let mut section_edges = LineMesh::<3>::default();
         let mut parent_lines = LineMesh::<3>::default();
-        // Uniform-alpha endpoints when `nearest-active` is off; the active-mode mapping
-        // interpolates between DIM (cells the slice misses entirely) and BRIGHT (cells
-        // the slice is at the midpoint of).
-        // When `wireframe nearest-active` is OFF, every edge gets the user-
-        // tuneable uniform alpha (`wireframe_alpha`, default 1.0). When ON,
-        // edges interpolate between DIM (cells the slice misses entirely)
-        // and BRIGHT (cells the slice is at the midpoint of). DIM/BRIGHT
-        // stay hardcoded because they encode "very off" / "very on" peaks
-        // of the activity gradient, not a global opacity setting.
+        // `nearest-active` off: uniform `wireframe_alpha`. On: per-edge interp
+        // between DIM (slice misses the cell) and BRIGHT (slice at its midpoint).
+        // DIM/BRIGHT are activity-gradient peaks, not a global opacity.
         const PARENT_ALPHA_DIM: f32 = 0.10;
         const PARENT_ALPHA_BRIGHT: f32 = 0.85;
         let parent_alpha_uniform = self.wireframe_alpha;
         let parent_width = self.wireframe_width_px;
-        // Active-mode palette. Green for edges in any currently-intersected cell;
-        // neutral gray for the rest. Chosen for clear binary contrast against the
-        // grayish-blue scene backdrop and the dim ground checkerboard.
+        // Active-mode palette: green for edges in an intersected cell, gray
+        // otherwise (binary contrast against the scene backdrop).
         const ACTIVE_GREEN: [f32; 4] = [0.40, 1.00, 0.55, 1.0];
         const INACTIVE_GRAY: [f32; 4] = [0.55, 0.55, 0.58, 1.0];
         let nearest_active = self.wireframe_nearest_active;
         let color_mode = self.wireframe_color_mode;
-        // Resolve once per frame; same projection applied to every body's wireframe so all
-        // bodies share a consistent R³ embedding.
+        // Same projection for every body, so all share a consistent R³ embedding.
         let wireframe_projection = self.resolved_wireframe_projection();
-        // Camera-to-focus distance captured once (Copy f32); the stereographic
-        // clip radius is resolved PER SHAPE inside the loop below, since only the
-        // 16-cell is clipped (see `stereographic_view_radius`).
+        // Clip radius resolved per shape in the loop (only the 16-cell clips).
         let cam_dist = self.camera_distance_to_focus();
-        // Per-layer perimeter toggles + the honest layer's always-drop-w
-        // projection (the active projection is forced to `Identity` for the
-        // cross-section so its outline can never follow a distorting projection).
+        // Honest layer's outline is forced to drop-w so it can never follow a
+        // distorting projection.
         let cross_perimeter = self.cross_section.perimeter;
         let cap_perimeter = self.projected_cap.perimeter;
         let cross_section_projection = state::section_layer_projection(true, wireframe_projection);
-        // Flat-chord vs S³-arc morph for every edge (0 = chord). Captured once so
-        // the per-edge helper stays free of `&self`.
-        // Edge geometry is derived from the projection, not a control:
-        // Stereographic draws S3 great-circle arcs, every affine projection draws
-        // flat R4 chords (see `state::default_edge_blend`).
+        // Edge geometry is projection-derived: Stereographic draws S³ arcs, the
+        // affine projections draw flat R4 chords (see `state::default_edge_blend`).
         let space_blend = state::default_edge_blend(self.wireframe_projection);
-        // Wireframe Hyperslice cull: when on, only edges whose body-local
-        // w-interval intersects the slab around `w_slice` survive. Captured
-        // once per frame. This is a third, independent slicing affordance
-        // alongside the SDF raymarch's w-slice (raymarch/hyperslice4d.rs) and
-        // the cyan section perimeter; it culls the *parent wireframe edges* to
-        // those near the current 4D cut so the graph thins to "what the slice
-        // is passing through" instead of the whole polytope. A demo-side
-        // per-edge FILTER, deliberately NOT a `Projection` variant: the
-        // projection returns a Vec3 that has already discarded w, so it cannot
-        // honestly carry a keep/drop signal, and a sentinel-NaN projection
-        // would mis-clip boundary-crossing edges at vertex granularity.
+        // Wireframe Hyperslice cull: keep only edges whose body-local w-interval
+        // intersects the slab around `w_slice`, thinning the graph to what the
+        // slice passes through. A demo-side per-edge filter, deliberately not a
+        // `Projection` variant (the projection has discarded w, so it cannot
+        // carry a keep/drop signal).
         //
-        // The `Hyperslice` projection mode IS this cull paired with drop-w: it
-        // resolves to `Projection::Identity` (the slicing is the cull, not a
-        // projection), so selecting it activates the filter even when the
-        // independent `wireframe_hyperslice` toggle is off. The standalone toggle
-        // still composes the cull with any other projection mode.
+        // The `Hyperslice` projection mode IS this cull paired with drop-w
+        // (resolves to `Identity`), so selecting it activates the filter even with
+        // the standalone toggle off; the toggle composes with any other mode.
         let hyperslice_on = self.hyperslice_cull_active();
         let hyperslice_thickness = self.wireframe_hyperslice_thickness;
         let hyperslice_w_slice = self.w_slice;
-        // Reused great-circle sampling buffer, taken from the demo so its
-        // capacity persists across frames; `push_blended_edge` clears it per
-        // edge, and it is put back after the loop.
+        // Reused great-circle buffer; `push_blended_edge` clears it per edge,
+        // put back after the loop so capacity persists.
         let mut slerp_scratch = std::mem::take(&mut self.slerp_scratch);
 
         for (slot, entry) in render_row.iter().enumerate() {
             let Some(polytope) = entry.shape.polytope4() else {
                 continue;
             };
-            // Per-shape stereographic clip radius (the perimeter closure and the
-            // per-edge `push_blended_edge` below both consume it): finite + capped
-            // for the 16-cell, `f32::INFINITY` (no clip) for every other shape.
+            // Per-shape clip radius: finite for the 16-cell, `f32::INFINITY` else.
             let view_radius = stereographic_view_radius(polytope, cam_dist);
             let topo = polytope.topology();
             let body_pos = body_position(slot, n);
-            // Body's R³ position. The body sits at body_pos.w = 0 in 4D, so the perspective
-            // projection at this body's location collapses to a pure R³ translation; doing
-            // the projection in body-local 4D and translating in R³ AFTER is the only way
-            // to keep the body's apparent x-position stable when Perspective4D scales the
-            // (x, y, z) channel by `focal / (focal - w)`.
+            // Body's R³ position. The body sits at `w = 0`, so projecting in
+            // body-local 4D and translating in R³ AFTER keeps its apparent
+            // x-position stable when Perspective4D scales (x, y, z) by
+            // `focal / (focal - w)`.
             let body_pos_r3 = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
-            // Body-local 4D vertices: rotor-rotated, scaled, NO world translate yet. The
-            // translate happens after the chosen `wireframe_projection` maps each vertex
-            // from R⁴ to R³.
+            // Body-local 4D vertices (no world translate; that follows projection).
             let body_size = self.effective_body_size();
             let local_vertices: Vec<Vec4> = topo
                 .vertices
@@ -784,17 +637,13 @@ impl Demo {
                 .map(|v| body_size * self.rot_state.apply(*v))
                 .collect();
 
-            // Cross-section perimeter outlines, one per enabled layer overlaid in
-            // this one viewport. `polytope_section_overlay_with_vertices` returns
-            // the slice's body-local drop-w R³ perimeter (computed once, shared by
-            // both layers): the honest cross-section maps it through drop-w (NEVER
-            // the active projection, so its outline matches the SDF slice), and the
-            // projected cap maps it through the active `wireframe_projection` so its
-            // outline sits on the projected wireframe. Each layer maps endpoints to
-            // world R³ and, under a clipped projection (Stereographic), drops a
-            // whole perimeter segment when either endpoint's body-local projected
-            // magnitude exceeds the clip radius (per-segment because a perimeter
-            // segment is a single cap edge, not a polyline).
+            // Cross-section perimeter outlines, one per enabled layer.
+            // `polytope_section_overlay_with_vertices` returns the body-local
+            // drop-w perimeter once; the honest layer maps it through drop-w (so
+            // its outline matches the SDF slice), the cap through the active
+            // projection. Under Stereographic a segment is dropped when either
+            // endpoint exceeds the clip radius (per-segment: a perimeter segment
+            // is a single cap edge).
             if cross_perimeter || cap_perimeter {
                 let (_tri, perim) = polytope_section_overlay_with_vertices(
                     topo.edges,
@@ -843,16 +692,12 @@ impl Demo {
                 }
             }
 
-            // Per-cell "crossing strength" in [0, 1] - shared with render_points
-            // via `compute_cell_strengths` so both passes agree on what "active"
-            // means for a given w_slice + rotated polytope.
+            // Per-cell crossing strength in [0, 1], shared with render_points via
+            // `compute_cell_strengths` so both passes agree on "active".
             let cell_strengths = compute_cell_strengths(topo.cells, &local_vertices, self.w_slice);
 
-            // Per-edge brightness: max strength across cells the edge belongs to. An edge
-            // belongs to a cell when both endpoints sit in that cell's vertex list. This
-            // lets a single edge "light up" as soon as ANY containing cell is being
-            // crossed deep; doesn't require the slice to specifically hit the cell whose
-            // boundary the edge sits on.
+            // Per-edge brightness: max strength over cells containing both
+            // endpoints, so an edge lights up when any containing cell is crossed.
             let edge_strength = |i: u32, j: u32| -> f32 {
                 let mut best = 0.0_f32;
                 for (cell, strength) in topo.cells.iter().zip(cell_strengths.iter()) {
@@ -863,12 +708,8 @@ impl Demo {
                 best
             };
 
-            // Active-mode binary classification: an edge is "active" if at least one of
-            // its containing cells has the slice strictly between its w-range endpoints
-            // (i.e., the slice is currently producing a cap from that cell). Uses the
-            // same `edges-in-cell` membership rule as `edge_strength`; threshold is
-            // `cell_strength > 0.0`, which corresponds exactly to `w_min < w_slice <
-            // w_max` after the `(1 - dist / half_extent)` clamp.
+            // Active-mode binary: an edge is active if some containing cell has the
+            // slice strictly inside its w-range (`cell_strength > 0.0`).
             let edge_is_active = |i: u32, j: u32| -> bool {
                 topo.cells
                     .iter()
@@ -876,23 +717,12 @@ impl Demo {
                     .any(|(cell, &s)| s > 0.0 && cell.contains(&i) && cell.contains(&j))
             };
 
-            // Hyperslice cull, evaluated per edge before any color / projection
-            // / tessellation work. The kept-edge decision is CELL-level, matching
-            // `edge_is_active` and the cross-section: an edge survives iff some
-            // cell containing BOTH endpoints has its w-range overlapping the slab.
-            // The edge-level test (its own endpoints straddling the slab) would
-            // cull a far-side edge of an active cell even though that edge is
-            // colored active-green, since the coloring reads the whole cell's
-            // w-range, not the edge's. Folding `cell_w_range` here keeps the two
-            // in lockstep.
-            //
-            // This is the slab-with-thickness band, a SUPERSET of `edge_is_active`
-            // (which is the zero-width `w_min < w_slice < w_max` plane): the cull
-            // keeps every active-green edge plus the thickness margin the user
-            // dials in, so active edges are never culled while the band still
-            // thins the graph. Same `cells.iter()` membership cost as the two
-            // coloring closures above, so the cull introduces no new asymptotic
-            // work and no per-frame allocation.
+            // Hyperslice cull, CELL-level to match `edge_is_active`: an edge
+            // survives iff some cell containing both endpoints has its w-range
+            // overlapping the slab. The edge-level test would cull a far-side edge
+            // of an active cell that the cell-level coloring paints green. The
+            // slab band is a superset of `edge_is_active` (the zero-width plane),
+            // so active edges are never culled while the band thins the graph.
             let edge_in_slab_cell = |i: u32, j: u32| -> bool {
                 topo.cells.iter().any(|cell| {
                     if !(cell.contains(&i) && cell.contains(&j)) {
@@ -903,25 +733,13 @@ impl Demo {
                 })
             };
 
-            // Parent wireframe: every polytope edge as a world-R³ line. Base RGB is
-            // picked by `wireframe_color_mode`:
-            // - `VertexGradient`: per-vertex position-derived RGB from the canonical
-            //   vertex set so each vertex gets a distinct hue from its 4D coordinates
-            //   and the polytope's symmetry shows as smooth gradients (same scheme as
-            //   `Polytope4::lines_colored_by_position`).
-            // - `UniqueEdge`: each edge gets a distinct palette color via greedy
-            //   graph-coloring on the line graph (see `unique_edge_palette`).
-            // - `WDepth`: per-endpoint cool-blue-to-warm-orange by SIGNED w
-            //   in body-local frame, normalized against the polytope's canonical
-            //   max |w| (fixed-band, not per-frame), so a vertex paints the same
-            //   color at the same w regardless of rotor orientation.
-            // - `Active`: binary green/gray by cell-activity (see `edge_is_active`).
-            // Alpha is then modulated per-edge by the `nearest-active` strength (when
-            // that toggle is on) or held uniform.
-            // UniqueEdge palette is topology-only (greedy graph-coloring on the line
-            // graph). Memoize by `Polytope4` variant so the 600-cell's ~520k pair-checks
-            // run once per launch instead of once per frame. Cache lives on Demo; an
-            // empty cache simply triggers first-use population for the visited variants.
+            // Base RGB per `wireframe_color_mode`: `VertexGradient` position-
+            // derived hue, `UniqueEdge` greedy line-graph coloring, `WDepth`
+            // signed-w cool-to-warm, `Active` binary green/gray. Alpha is then the
+            // `nearest-active` strength or uniform.
+            //
+            // UniqueEdge palette is topology-only; memoize by `Polytope4` so the
+            // 600-cell's ~520k pair-checks run once per launch, not per frame.
             let edge_palette: &[[f32; 4]] = if matches!(color_mode, WireframeColorMode::UniqueEdge)
             {
                 self.unique_edge_palette_cache
@@ -930,17 +748,10 @@ impl Demo {
             } else {
                 &[]
             };
-            // For `WDepth` we normalize against this polytope's CANONICAL max
-            // |w| (NOT the per-frame rotated max). The rotor preserves
-            // magnitudes, so the maximum |w| any rotated vertex can reach is
-            // bounded by the canonical max times `body_size`. Holding the
-            // gradient endpoints fixed across frames is what makes the color
-            // cue temporally stable: a vertex migrating from -w to +w as
-            // the rotor swings paints a continuous cool-to-warm shift rather
-            // than a per-frame normalized re-saturation. Mirrors the
-            // `LineRasterStaticR4` shader's hardcoded `[-0.5, +0.5]` band
-            // (which is correct for the tesseract); here it's per-polytope
-            // because the 16-cell, 5-cell, etc. don't share that band.
+            // WDepth normalizes against the CANONICAL max |w| (not the rotated
+            // per-frame max), so the color stays temporally stable as the rotor
+            // swings a vertex from -w to +w. Per-polytope because the band differs
+            // (the tesseract's `[-0.5, +0.5]` does not fit the 16-cell, 5-cell).
             let w_extent_local: f32 = if matches!(color_mode, WireframeColorMode::WDepth) {
                 let canonical_max_w = topo
                     .vertices
@@ -957,13 +768,9 @@ impl Demo {
                 let ja = j as usize;
                 let a = local_vertices[ia];
                 let b = local_vertices[ja];
-                // Cell-level Hyperslice cull (see `edge_in_slab_cell`),
-                // evaluated before any color / projection / tessellation work so
-                // a culled edge costs only the membership fold. The local-`w`
-                // frame the slab tests against is the same one the SDF marcher
-                // and the section algorithm slice (the body sits at world
-                // `w = 0`). The `&&` short-circuits the fold entirely when the
-                // affordance is off.
+                // Cell-level Hyperslice cull before any color / projection work,
+                // so a culled edge costs only the membership fold; `&&`
+                // short-circuits it when the affordance is off.
                 if hyperslice_on && !edge_in_slab_cell(i, j) {
                     continue;
                 }
@@ -997,11 +804,8 @@ impl Demo {
                 };
                 color_a[3] = alpha;
                 color_b[3] = alpha;
-                // Emit the edge in body-local 4D, projected to world R³. `blend`
-                // is projection-derived (Stereographic -> 1 = S³ arc, affine -> 0
-                // = one chord per edge). Projection is shared with the flat path:
-                // Shadow is identity-on-(x, y, z), Perspective4D scales each
-                // component by focal/(focal-w).
+                // Emit the edge in body-local 4D, projected to world R³;
+                // `blend` is projection-derived (Stereographic -> 1, affine -> 0).
                 push_blended_edge(
                     &mut parent_lines,
                     a,
@@ -1018,11 +822,10 @@ impl Demo {
             }
         }
 
-        // Put the great-circle sampling buffer back so its capacity is reused
-        // next frame instead of reallocating.
+        // Put the great-circle buffer back so its capacity is reused next frame.
         self.slerp_scratch = slerp_scratch;
 
-        // Upload (each call is a no-op when its mesh is empty).
+        // Upload (no-op when a mesh is empty).
         self.section_edges.upload::<EuclideanR3, 3>(
             &rd.device,
             &rd.queue,
@@ -1038,9 +841,8 @@ impl Demo {
             1,
         );
 
-        // Camera. Build the same view+projection matrix the SDF raymarcher uses
-        // implicitly via its ray basis, so the rasterized overlay aligns pixel-for-pixel
-        // with the raymarched scene.
+        // Same view+projection as the SDF raymarcher, so the overlay aligns
+        // pixel-for-pixel.
         let view_dir = self.camera.view();
         let aspect = cfg.width as f32 / cfg.height as f32;
         let view_mat = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
@@ -1051,12 +853,9 @@ impl Demo {
         self.parent_wireframe
             .set_camera(&rd.queue, view_proj, vp_size);
 
-        // Section perimeter edges then dim parent wireframe. Both depth-test (no write)
-        // against the shared section-faces depth attachment so lines behind a cap get
-        // correctly occluded across polytopes in a row. The shared buffer is ensured +
-        // cleared earlier in the frame; here we just borrow the view. In SDF mode no
-        // pass writes depth, so the cleared `1.0` buffer makes every fragment pass the
-        // test, preserving the historical visual.
+        // Perimeter edges then parent wireframe, both depth-testing (no write)
+        // against the shared section-faces depth so lines behind a cap occlude
+        // correctly. In SDF mode the cleared `1.0` lets every fragment pass.
         let depth_view = self
             .section_faces_depth
             .as_ref()

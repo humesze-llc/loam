@@ -1,33 +1,15 @@
-//! `rye-app`: thin App trait + event-loop runner that extracts the winit boilerplate
-//! every Rye example currently rewrites.
+//! `rye-app`: thin App trait + event-loop runner that extracts the winit
+//! boilerplate every Rye example would otherwise rewrite.
 //!
-//! ## What this crate is, and isn't
+//! Apps implement [`App`] on a struct that owns their state; the runner [`run`]
+//! (or [`run_with_config`]) handles window creation, [`RenderDevice`] +
+//! surface-error recovery, [`ShaderDb`]/[`AssetWatcher`] hot-reload,
+//! [`InputState`] routing, [`FixedTimestep`]-driven `App::tick`, and FPS/title
+//! bookkeeping. It is not an ECS, scene graph, render-graph orchestrator, or
+//! camera framework; apps own those directly.
 //!
-//! This is a *small framework*. Apps implement [`App`] on a struct that owns their state,
-//! and the runner [`run`] (or [`run_with_config`]) handles:
-//!
-//! - Window creation and the winit `ApplicationHandler` impl.
-//! - [`RenderDevice`] construction and surface-error recovery.
-//! - [`ShaderDb`] + [`AssetWatcher`] for shader hot-reload.
-//! - [`InputState`] event routing -> drained `FrameInput` per redraw.
-//! - [`FixedTimestep`] driving `App::tick` at the fixed-rate.
-//! - FPS bookkeeping and rate-limited title updates.
-//!
-//! It is **explicitly not**:
-//!
-//! - An ECS or scene graph. Apps own their state directly.
-//! - A render-graph orchestrator. Apps own their `RenderNode`s and compose them inside
-//!   [`App::render`].
-//! - A camera framework. The user owns [`Camera<S>`] and a [`CameraController<S>`] in
-//!   their `App` struct, advanced from inside `App::update`. The framework only hands
-//!   them the drained input.
-//!
-//! A frame-capture pipeline is included behind the `capture` feature (default-on); see
-//! [`capture`] for the console commands, hotkeys, and two-tap (pre-egui / post-egui)
-//! readback model. External screen recorders (OBS) remain the right tool for long
-//! recording sessions that need codec choice + audio + multi-source mixing.
-//!
-//! Designed for a small ergonomic gain; explicitly not an ECS or scene graph.
+//! A frame-capture pipeline ships behind the `capture` feature (default-on); see
+//! [`capture`]. External recorders (OBS) remain better for long sessions.
 //!
 //! ## Lifecycle
 //!
@@ -62,16 +44,12 @@
 use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::sync::Arc;
-// `web_time::Instant` is a drop-in for `std::time::Instant` that works on both native
-// (re-exports the std type verbatim) and wasm32 (backs it with `performance.now()`).
-// `std::time::Instant::now` panics on wasm32, so the swap is mandatory for the browser
-// runtime path.
+// `web_time::Instant` works on native (std type) and wasm32 (`performance.now()`);
+// `std::time::Instant::now` panics on wasm32, so the swap is mandatory there.
 use web_time::Instant;
 
-// Capture module dispatch: real pipeline on native with `capture` feature on; stub
-// API everywhere else (wasm, or `--no-default-features` lean native builds). The two
-// files expose the same public surface so demos don't need `cfg` gates at their
-// `rye_app::capture::*` call sites.
+// Real capture pipeline on native+`capture`; stub elsewhere. Both expose the
+// same surface so demos need no `cfg` gates at `rye_app::capture::*` call sites.
 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
 pub mod capture;
 
@@ -107,100 +85,63 @@ use rye_render::device::RenderDevice;
 use rye_shader::ShaderDb;
 use rye_time::FixedTimestep;
 
-// Convenience re-exports so apps don't have to depend on each crate
-// individually for the most common types.
+// Convenience re-exports so apps depend on `rye-app` alone for common types.
 pub use rye_camera::{
     Camera, CameraController, CameraView, FirstPersonController, OrbitController,
 };
-pub use rye_input::FrameInput as Input;
-// Re-export the egui surface so apps that override `App::ui` depend on
-// `rye-app` only and the version pin lives in `rye-egui`.
 pub use rye_egui::{egui, world_to_screen, BottomOverlay, LinearIndicator};
+pub use rye_input::FrameInput as Input;
 
 // ---------------------------------------------------------------------------
 // App trait
 // ---------------------------------------------------------------------------
 
 /// The framework calls back into your App through this trait. All methods except
-/// [`App::setup`], [`App::space`], and [`App::render`] have default impls; override
-/// only what you need.
-///
-/// `Self::Space` is the ambient geometry. The user's app owns an instance of it
-/// (typically as a struct field) so that hot-reload can re-emit shader preludes against
-/// the same instance the renderer is using.
+/// [`App::setup`], [`App::space`], and [`App::render`] have default impls.
 pub trait App: Sized + 'static {
-    /// **Shader-prelude** geometry. The framework runs `ShaderDb::apply_events` against
-    /// this instance during hot-reload, so `rye_distance` / `rye_log` / `rye_exp` etc.
-    /// in WGSL evaluate under this metric. Apps that don't care about geometry use
-    /// `EuclideanR3`.
+    /// Shader-prelude geometry. `ShaderDb::apply_events` runs against this instance
+    /// on hot-reload, so `rye_distance` / `rye_log` / `rye_exp` in WGSL evaluate
+    /// under this metric. Geometry-agnostic apps use `EuclideanR3`.
     ///
-    /// **This is not a commitment about the camera, the player, or the scene.** Those
-    /// are user-owned types and may use a different Space, or no Space at all. Two
-    /// valid patterns:
-    ///
-    /// - **All-in geometry**: scene, camera, player, and shader prelude all share one
-    ///   Space. e.g. `App::Space = HyperbolicH3` + `Camera<HyperbolicH3>`. The camera
-    ///   orbits along honest H³ geodesics, the player moves along honest H³ geodesics,
-    ///   the shader applies H³ to distance / fog math.
-    /// - **Hybrid** (fractal-demo-style): scene is Cartesian, camera orbits in flat
-    ///   Euclidean space, but the shader prelude is non-Euclidean to apply a
-    ///   geodesic-fog metric. e.g. `App::Space = HyperbolicH3` + `Camera<EuclideanR3>`.
-    ///   The camera math is Cartesian; the shader applies H³ only to the fog distance.
-    ///
-    /// The conflation hazard: if you write `Camera<Self::Space>` without thinking, you
-    /// commit your scene to live in that Space's coordinates. For H³ that means the
-    /// Poincaré ball; orbit distances inherited from a Euclidean default
-    /// (`OrbitController::default()` -> `distance ≈ 3.55`) will `exp_target` into a
-    /// tangent vector that lands at `tanh(1.78) ≈ 0.94` of the way to the ideal
-    /// boundary, where the metric explodes. If your scene's geometry isn't actually in
-    /// H³, use `Camera<EuclideanR3>` and treat `App::Space` purely as the
-    /// shader-prelude axis.
+    /// This is not a commitment about the camera, player, or scene; those are
+    /// user-owned and may use a different Space or none. Hazard: writing
+    /// `Camera<Self::Space>` commits the scene to that Space's coordinates. For
+    /// H³ (the Poincaré ball), a Euclidean-default orbit distance lands the camera
+    /// near the ideal boundary where the metric explodes; use `Camera<EuclideanR3>`
+    /// and treat `App::Space` purely as the shader-prelude axis when the scene
+    /// isn't actually in H³.
     type Space: WgslSpace + 'static;
 
     /// One-shot construction after `RenderDevice` and `ShaderDb` are ready. Build
-    /// render nodes, load shaders, allocate gameplay state, and store everything
-    /// (including `Self::Space` and any `Camera<S>` / `CameraController<S>`) inside
-    /// the returned `Self`.
+    /// render nodes, load shaders, allocate state, and store it all (including
+    /// `Self::Space` and any cameras) in the returned `Self`.
     fn setup(ctx: &mut SetupCtx<'_>) -> anyhow::Result<Self>;
 
-    /// Borrow the user-owned `Self::Space` so the framework can pass it to
-    /// `ShaderDb::apply_events` on hot-reload.
+    /// Borrow the user-owned `Self::Space` for `ShaderDb::apply_events`.
     fn space(&self) -> &Self::Space;
 
-    /// Per-tick simulation step at the fixed-timestep rate (60 Hz by default;
-    /// configurable via [`RunConfig::fixed_hz`]). `n` is usually 0 or 1 per frame;
-    /// can spike up to [`RunConfig::max_ticks_per_frame`] if the renderer stalled.
+    /// Per-tick simulation step at the fixed-timestep rate ([`RunConfig::fixed_hz`]).
+    /// Usually 0 or 1 per frame; can spike to [`RunConfig::max_ticks_per_frame`].
     fn tick(&mut self, _dt: f32, _ctx: &mut TickCtx) {}
 
-    /// Per-frame update: input drained, ready for the app to advance its camera
-    /// controller, recompute uniforms, etc. Runs *after* all the frame's ticks.
+    /// Per-frame update with drained input, after all the frame's ticks. Advance
+    /// the camera controller, recompute uniforms, etc.
     fn update(&mut self, _ctx: &mut FrameCtx<'_>) {}
 
-    /// Custom `WindowEvent` handling beyond the input routing the framework runs first.
-    /// Most apps don't need this; useful for keyboard-driven mode toggles,
-    /// drag-and-drop, etc.
+    /// Custom `WindowEvent` handling beyond the framework's input routing.
     ///
-    /// **Wasm worker context: not called for keyboard events.** The worker can't
-    /// construct a `WindowEvent::KeyboardInput` (winit's `KeyEvent` has a
-    /// `pub(crate)` field) so hotkey handlers placed here fire on native only.
-    /// Use [`App::on_key`] for keyboard hotkeys instead; it fires on both paths.
+    /// Not called for keyboard events in the wasm worker (it can't construct a
+    /// `WindowEvent::KeyboardInput`); use [`App::on_key`] for hotkeys, which fires
+    /// on both paths.
     fn on_event(&mut self, _ev: &WindowEvent, _ctx: &mut FrameCtx<'_>) {}
 
-    /// Keyboard hotkey hook, fired for every key press AND release after
-    /// the framework's input routing. Use this for mode toggles, hotkeys,
-    /// and other key-driven UI flips. Default impl is empty; demos with no
-    /// hotkeys ignore it.
+    /// Keyboard hotkey hook, fired for every press and release after input
+    /// routing. Use for edge-triggered toggles (Space, Tab, digits, etc.);
+    /// continuous WASD belongs in [`App::update`] reading held-key axes.
     ///
-    /// Why a separate hook from [`App::on_event`]: the wasm worker has no
-    /// way to construct a `winit::event::KeyEvent` (one of its fields is
-    /// `pub(crate)`), so the worker can't route keyboard events through
-    /// `on_event` like the native runner does. `on_key` takes `KeyCode +
-    /// ElementState`, which both runners can produce, so demos that use
-    /// `on_key` see hotkeys on both native and wasm.
-    ///
-    /// Continuous WASD-style integration belongs in [`App::update`] reading
-    /// [`rye_input::FrameInput`] (held-key axes); use `on_key`
-    /// for edge-triggered toggles (Space, Tab, T, R, digits, etc.).
+    /// Separate from [`App::on_event`] because the wasm worker can't construct a
+    /// `winit::event::KeyEvent` but can produce `KeyCode + ElementState`, so
+    /// `on_key` reaches both native and wasm.
     fn on_key(
         &mut self,
         _code: winit::keyboard::KeyCode,
@@ -209,62 +150,38 @@ pub trait App: Sized + 'static {
     ) {
     }
 
-    /// Hot-reload notification: the framework polled `AssetWatcher`, applied events to
-    /// `ShaderDb` against `self.space()`, and any consumer pipelines you built may be
-    /// stale. Rebuild what you care about.
+    /// Hot-reload notification: events were applied to `ShaderDb` against
+    /// `self.space()`; rebuild any consumer pipelines that may be stale.
     fn on_shader_reload(&mut self, _ctx: &mut SetupCtx<'_>) {}
 
-    /// **Legacy render path.** Implement either this OR `App::record`; the runner
-    /// always calls `record`, whose default impl calls this. Each invocation of
-    /// `render` typically creates its own command encoder + queue.submit (per pass
-    /// or per node), so a demo with three nodes pays at least three submits per
-    /// frame. On wasm32, each submit crosses the JS boundary and adds compositor
-    /// latency; the `App::record` path lets the runner batch the demo's draws
-    /// with ui-paint + composite into a single per-frame submit.
-    ///
-    /// New demos should override `record` instead. This method remains for
-    /// backwards-compatibility with the broad set of examples that built against
-    /// the original `App` trait; replacing them all in one sweep is bigger than
-    /// the engine's blast-radius budget for now.
+    /// Legacy render path. Implement either this or `App::record`; the runner
+    /// always calls `record`, whose default impl calls this. Each `render` call
+    /// typically does its own `queue.submit`, so an N-node demo pays N submits;
+    /// `record` lets the runner batch into a single per-frame submit. New demos
+    /// should override `record`; this remains for the existing examples.
     fn render(&mut self, _rd: &RenderDevice, _view: &wgpu::TextureView) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// **Preferred render path.** The runner owns one command encoder for the entire
-    /// frame, shares it with the demo via [`RenderCtx::encoder`], then continues
-    /// using the same encoder for ui-paint and the wasm-side gamma composite.
-    /// Everything reaches the GPU in a single `queue.submit`.
+    /// Preferred render path: the runner owns one frame-wide command encoder
+    /// (shared via [`RenderCtx::encoder`]) for the demo's passes, ui-paint, and
+    /// the wasm composite, reaching the GPU in a single `queue.submit`. Default
+    /// impl falls back to [`App::render`], so migration is opt-in.
     ///
-    /// Default impl falls back to [`App::render`] (the legacy multi-submit path),
-    /// so the migration is opt-in: override `record` to get the single-submit
-    /// behaviour. The runner doesn't care which method you override.
-    ///
-    /// Implementation contract:
-    ///
-    /// - **Do NOT call `encoder.finish()` or `queue.submit(...)`**: the runner
-    ///   does that exactly once at end-of-frame. Submitting prematurely splits
-    ///   the frame's work and defeats the optimization.
-    /// - **Multiple render passes per call are fine**: open a render pass on the
-    ///   encoder, draw, drop the pass; open the next, etc. wgpu serializes them
-    ///   correctly within the same encoder.
-    /// - **Use `ctx.view` as the color target** for the bulk of your scene draws.
-    ///   The runner has already selected the right view (MSAA / scene-target /
-    ///   swapchain) based on platform + capture state.
+    /// Contract:
+    /// - Do NOT call `encoder.finish()` or `queue.submit`; the runner does that
+    ///   once at end-of-frame.
+    /// - Multiple render passes per call are fine on the shared encoder.
+    /// - Use `ctx.view` as the color target; the runner already selected the
+    ///   right view (MSAA / scene-target / swapchain) for the platform.
     fn record(&mut self, ctx: &mut RenderCtx<'_>) -> anyhow::Result<()> {
-        // Legacy adapter: invoke `render` with the (rd, view) pair, ignoring the
-        // shared encoder. Old demos that override `render` keep working; the
-        // runner still does one extra submit at end-of-frame for ui-paint +
-        // composite, which is a wash with the old code's separate encoders for
-        // those passes (slight net win).
         self.render(ctx.rd, ctx.view)
     }
 
-    /// Build this frame's egui UI. Called after [`App::update`] and before
-    /// [`App::render`]; the framework paints the resulting widgets as a 2D overlay on
-    /// the surface view.
-    ///
-    /// Default impl is a no-op; apps that want UI override this with immediate-mode
-    /// egui code:
+    /// Build this frame's egui UI, after [`App::update`]; painted as a 2D overlay.
+    /// Gate gameplay input on [`FrameCtx::ui_has_focus`] so typing into a field
+    /// doesn't also fire WASD. For a label following a 3D object, use
+    /// [`world_to_screen`] to place an `egui::Area`.
     ///
     /// ```ignore
     /// fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
@@ -274,17 +191,10 @@ pub trait App: Sized + 'static {
     ///     });
     /// }
     /// ```
-    ///
-    /// Gameplay code that reads input should gate on [`FrameCtx::ui_has_focus`] so a
-    /// player typing into a settings field doesn't also fire WASD movement.
-    ///
-    /// For "egui label that follows a 3D object," use [`world_to_screen`] to project
-    /// the world point and place an `egui::Area` at the resulting pixel.
     fn ui(&mut self, _ctx: &egui::Context, _frame: &mut FrameCtx<'_>) {}
 
-    /// Title bar text. Default returns the static name `"rye app"`. Override for live
-    /// FPS / state readouts; the framework rate-limits the actual `set_title` call to
-    /// roughly once a second.
+    /// Title bar text. Override for live readouts; the runner rate-limits the
+    /// `set_title` call to ~1 Hz.
     fn title(&self, _fps: f32) -> Cow<'static, str> {
         Cow::Borrowed("rye app")
     }
@@ -298,11 +208,10 @@ pub trait App: Sized + 'static {
 pub struct SetupCtx<'a> {
     pub rd: &'a RenderDevice,
     pub shader_db: &'a mut ShaderDb,
-    /// `None` when filesystem watching failed to initialise (e.g. no inotify on the
-    /// running system); apps can still load shaders, but won't get hot-reload.
+    /// `None` when filesystem watching failed to init; apps still load shaders
+    /// but get no hot-reload.
     pub watcher: Option<&'a mut AssetWatcher>,
-    /// Wall-clock seconds since `run` was called. Always 0 in `setup`, non-zero on
-    /// subsequent `on_shader_reload` calls.
+    /// Wall-clock seconds since `run`. Always 0 in `setup`.
     pub time: f32,
 }
 
@@ -313,21 +222,17 @@ pub struct TickCtx {
     pub tick: u64,
 }
 
-/// Render-time context. Handed to `App::record` each frame. Owns a shared command
-/// encoder that the demo writes its scene passes into; the runner reuses the same
-/// encoder for ui-paint and the wasm-side composite, then submits it exactly once
-/// at end of frame.
+/// Render-time context for `App::record`. Owns the shared frame encoder; the
+/// runner reuses it for ui-paint and the wasm composite, then submits once.
 ///
-/// `view` is the color target the demo's main scene passes should write into. It's
-/// the runner's "best target right now": MSAA view on native+MSAA-on, the offscreen
-/// sRGB scene texture on wasm, the swapchain view otherwise. The demo doesn't need
-/// to know which case applies; pipelines built with [`RenderDevice::target_format`]
-/// + [`RenderDevice::sample_count`] match this view automatically.
+/// `view` is the runner's best color target for the platform (MSAA view, wasm
+/// sRGB scene texture, or swapchain). Pipelines built with
+/// [`RenderDevice::target_format`] + [`RenderDevice::sample_count`] match it.
 pub struct RenderCtx<'a> {
     pub rd: &'a RenderDevice,
     pub view: &'a wgpu::TextureView,
-    /// Shared command encoder. Open render passes on it, draw, drop the pass; do
-    /// NOT call `finish()` or `queue.submit`. The runner does that at end of frame.
+    /// Shared command encoder. Open passes, draw, drop; do NOT call `finish()`
+    /// or `queue.submit`.
     pub encoder: &'a mut wgpu::CommandEncoder,
 }
 
