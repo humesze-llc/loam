@@ -1346,10 +1346,9 @@ mod hyperslice_filter_tests {
         );
     }
 
-    /// Agreement contract: every active-colored edge (containing cell strength
-    /// > 0) is kept by the cull. The slab band is a superset of the strict-
-    /// interior plane, so `active => kept` for any thickness at or above the
-    /// floor.
+    /// Agreement contract: every active-colored edge (cell strength above 0)
+    /// is kept by the cull. The slab band is a superset of the strict-interior
+    /// plane, so `active => kept` for any thickness at or above the floor.
     #[test]
     fn cull_keeps_every_active_edge() {
         let w_slice = -0.182_f32;

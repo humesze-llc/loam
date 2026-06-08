@@ -117,7 +117,7 @@ pub enum PaletteMode {
     /// gradients shimmer (the classic GIF flicker).
     #[default]
     Local,
-    /// One palette trained on the first ~[`GIF_WARMUP_FRAMES`] captures, reused for
+    /// One palette trained on the first ~`GIF_WARMUP_FRAMES` captures, reused for
     /// every frame. Kills the wobble at slightly worse per-frame fidelity; the warmup
     /// also avoids training on transient overlays like the console.
     Global,
@@ -279,7 +279,7 @@ enum SequenceWriter {
     },
 }
 
-/// Warmup buffer for global-palette mode: the first [`GIF_WARMUP_FRAMES`] captures,
+/// Warmup buffer for global-palette mode: the first `GIF_WARMUP_FRAMES` captures,
 /// so the palette trains on representative content, not the startup overlay.
 struct WarmingState {
     buffer: Vec<WarmupFrame>,
@@ -1310,7 +1310,7 @@ fn write_png_bytes(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<
 // ---------------------------------------------------------------------------
 
 /// Register the `capture` console command (subcommands png / frames / gif / apng /
-/// toggle / stop / panel; see [`capture_help`] for the grammar).
+/// toggle / stop / panel; see `capture_help` for the grammar).
 pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
     // Per-subcommand `arg_choices` drive context-aware completion; `palette=` is the
     // only kv key with enumerable values. Handlers own arg parsing + enqueue.
