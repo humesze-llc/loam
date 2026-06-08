@@ -1,94 +1,90 @@
 # Rye
 
-**Rye** is a game engine where non-Euclidean geometry is a primitive, not a camera trick.
+**Rye** is a geometry engine for spaces where curvature and dimension are structural, not visual. Today's `Space` trait models smooth Riemannian manifolds: the implemented geometries include Euclidean space in two, three, and four dimensions; the three constant-curvature Thurston-family geometries; and `BlendedSpace`, a variable-curvature Riemannian manifold. The longer-term design goal is broader than Riemannian geometry: a capability hierarchy that can eventually admit Lorentzian manifolds, pseudo-Riemannian structure, fractal-dimensional spaces, and other exotic geometries without pretending they all share one identical interface.
 
-It's a personal project I started because I wanted to build games where the geometry itself is the gameplay rather than the backdrop, and you can't really do that in Bevy or Godot without faking it. A sphere physically rolling along a hyperbolic geodesic. A 4D rigid body colliding via its 3D cross-section. A manifold whose curvature varies smoothly between two source geometries so a player flies between them instead of teleporting.
+The engine exists because the spaces, manifolds, and dimensions that show up in geometry textbooks deserve a computational realization that lets you simulate in them and see the results, on consumer hardware, in a browser. The frontier of which classes of spaces admit that realization is itself an open research question.
 
-Where I'd like it to go is a research platform for computational physics over Riemannian geometric structure, where every new abstract primitive ships alongside the engineering pipeline that makes it run on consumer hardware. Right now the engine is in proof-of-concept territory, and the first real game built on it is in active development in parallel.
+Named for Riemann.
 
-**Why open source.** As far as I've been able to find, there are no open-source resources for computational physics in 4D or curved geometry, in Rust or any other language. The math is there in the textbooks; it's mostly just been waiting to be lifted into algorithms. Rye is meant to do that lift in the open, with an asset format (signed distance fields) that's space-agnostic so contributors can add their own `Space` implementations or `Primitive` implementations without having to touch engine internals. I don't have a PhD in differential geometry or computational physics, and I'll need help from people who do - particularly on the harder primitives I haven't built yet, and on optimization once the surface area gets bigger.
+## What you can run today
 
-Named for Riemann. Also, I like whiskey.
+**`polytope_playground`** is the flagship demonstration. The six regular convex 4-polytopes rotate side-by-side under user-composed bivector velocities, and you inspect the three-dimensional cross-section through the available rendering modes: a raymarched signed-distance-field surface, the exact polychoral cross-section, and a wireframe overlay, with per-edge color cues for slice activity and signed-w depth. (The 120- and 600-cell render through the exact cross-section path; their SDF is a not-yet-correct approximation, so the raymarch surface is disabled for them.) The demo will grow over time, hosting additional 4D experiments inside the same harness.
 
-## What the project commits to
+```
+cargo run --release -p polytope_playground               # native
+cd crates/polytope_playground && trunk serve --release   # browser (local)
+```
 
-Two halves that have to stay in lockstep:
+A hosted, click-to-run browser build is the next step.
 
-- **Math.** Every new geometric primitive (`Space` trait, `BlendedSpace`, `Bivector4` rotors, future pseudo-Riemannian and fractal-dimensional spaces) ships with mathematical-invariant tests that catch wrongness no game would notice: Gauss-Bonnet on small triangles, isometry preservation of distance, parallel-transport length preservation, holonomy round-trip closure, curvature continuity across transition zones.
-- **Engineering.** Performance is treated as a research deliverable, not a postscript. Every primitive that lands ships with a real-time WGSL implementation, designed and tuned for consumer GPU hardware: the math has to survive the trip from textbook to GPU shader without losing its rigor or its frame budget, and the rigid-body physics has to settle into stable stacks the way you'd expect. Benchmark coverage grows alongside the primitives; today's evidence is the example demos and the visual-correctness tests.
+`BlendedSpace<A, B, F>` (for example, a continuous Euclidean-to-hyperbolic manifold) is the first concrete variable-curvature primitive: a single Riemannian manifold whose metric interpolates continuously between two source geometries, rather than a portal or a camera trick. The framework and the math are real and tested (RK4 geodesic integration, Gauss-Newton `log` shooting, and RK4 parallel transport, on CPU and GPU), but it is a research direction more than a polished output, and is performance-limited at present; a standalone demo will land once it is solid enough to record.
 
-Pure research without performance won't ship games, and performance without rigor isn't a research platform; both halves matter equally and the project doesn't move forward without both.
+## What Rye provides
 
-If you'd like to follow along, collaborate, or hear about the game ahead of release, get in touch at [humesze@proton.me](mailto:humesze@proton.me).
+A geometry in Rye today is anything that implements `Space`, the trait that surfaces smooth Riemannian structure at the math layer. The current implementations are the two-, three-, and four-dimensional Euclidean spaces, three-dimensional hyperbolic space, three-dimensional spherical space, and `BlendedSpace<A, B, F>` — a single Riemannian manifold whose metric interpolates continuously between two source geometries, supporting RK4 geodesic integration, Gauss-Newton shooting for the logarithm map, and RK4 parallel transport along the discovered connection. Downstream systems are organized around capability traits (`WgslSpace`, `RasterizableSpace`, `PhysicsSpace`) rather than hard-coded geometry cases, so a new geometry can be wired through rendering, interaction, and simulation by implementing the capabilities it actually supports instead of rewriting every subsystem.
 
-## What's shipping
+The four-dimensional physics is built on a first-party geometric algebra. `Bivector4` and `Rotor4` with invariant-decomposition exponential give the right rotation primitive for a space where the standard quaternion shortcut does not apply. The polychoral content covers the six regular convex 4-polytopes with exact topology (vertices, edges, and cells at unit circumradius) and an exact cross-section algorithm that renders cells as Lambert-shaded triangles. Collision detection extends the GJK and EPA algorithms into four dimensions; the contact manifold representation and the projected Gauss-Seidel solver follow the structure of the 3D literature, lifted carefully.
 
-The engine is pre-1.0. The `Space` and `WgslSpace` trait surfaces are stable and additive-only; everything else can still move. Recent landings, in order of how proud I am of them:
+Geometric content can be authored as a typed `Scene` graph backed by signed distance fields, which emits WGSL on demand. The authoring model is deliberately space-aware without being space-hard-coded: a primitive declares its shape mathematically, and the emit chain combines that scene code with the selected space prelude. The same `Scene` can be rendered in Euclidean, hyperbolic, spherical, or `BlendedSpace` contexts when the relevant capability implementations exist, which is what makes the cross-geometry comparison demos possible. Apart from `glam` for SIMD vectors and matrices and `bytemuck` for zero-copy GPU upload, the math layer is first-party: the `Space` trait and its implementations, the 4D geometric algebra, the polytope topology, the cross-section algorithm, the SDFs, the WGSL emit chains, and the rigid-body solver are all written here.
 
-- `BlendedSpace<A, B, F>`, the first concrete second-thesis primitive. Not portals between spaces, but a single Riemannian manifold whose curvature interpolates continuously between two source geometries. RK4 geodesic integration, Gauss-Newton `log` shooting, and RK4 parallel transport, on both CPU and GPU.
-- 4D physics. `Bivector4` and `Rotor4` with invariant-decomposition exponential, `EuclideanR4` `PhysicsSpace`, 4D GJK and EPA, persistent contact manifolds, and a projected Gauss-Seidel solver for tall stacks.
-- 4D polytope rendering. `Hyperslice4DNode` with face-hyperplane SDFs for the 5-cell, tesseract, 16-cell, and 24-cell, plus a Rotor4 inverse-sandwich path so bodies can rotate arbitrarily in 4D and you watch the cross-section morph.
-- `rye-app`, a thin App-trait framework with `Camera<S>` and `OrbitController<S>` / `FirstPersonController<S>` generic over `Space`.
-- `rye-text`, an `ab_glyph`-backed HUD overlay (rasterization, no text shaping) sufficient for game UIs and HUDs while a richer `glyphon`-based path waits on a workspace `wgpu` bump.
+Hardware-agnostic GPU access is through wgpu, which gives Rye Vulkan, DirectX 12, Metal, and WebGPU backends from a single codebase. The WebGPU path is not a port-later afterthought; the playground compiles to WebAssembly via `trunk` and runs on OffscreenCanvas in a dedicated worker, with the renderer's interop budget monitored per-frame. That browser path is what makes the engine's goal possible: visualization work that functions as shareable research output rather than as software someone has to compile.
 
-## Examples
+## Workspace
 
-`cargo run --release --example <name>` from the workspace root. They double as demos and as integration tests for the relevant subsystems.
-
-| Example | Demonstrates |
+| Crate | Role |
 |---|---|
-| `blended` | First-class `BlendedSpace<E³, H³>` demo. Checkerboard floor and spheres under a smooth metric transition. Visibly distinct E³ side, transition zone, and Poincaré-chart H³ side in one view. WASD fly-through, drag to look. |
-| `rotate_polytopes` | Interactive 4D-rotation demo over `Hyperslice4DNode`. All six convex regular polychora (pentatope through 600-cell) rotating under user-composed `Bivector4` velocity (toggle planes 1..6, watch slice signatures morph). Drag-and-drop shape-row reordering, a composer for sequenced rotor terms, and a live `exp(...)` formula popup. |
-| `pentatope_slice` | Live-physics 4D viewer. A pentatope falls onto a 4D floor and the 3D viewport renders its cross-section at user-controlled `w₀` (↑/↓ to scrub). |
-| `hypersphere` | Drop up to 32 4D balls onto a 4D floor under gravity. Two modes: **slice** (3D cross-section at `w₀`) and **ghost** (`G` toggle; full 4D extent as translucent volume). |
-| `fractal_app` | Mandelbulb scene on the `rye-app` framework with `Camera<S>` and `OrbitController<S>`. Reference for what an app looks like on the framework. |
-| `fractal` | Original Mandelbulb ray-marcher with WGSL hot reload and orbit camera; the legacy raw-winit version. APNG and GIF capture via `--capture-apng` / `--capture-gif`. |
-| `geodesic_spheres` | Three spheres rendered in E³, H³, and S³ via the `WgslSpace` prelude swap. Same scene, different metric. |
-| `lattice` | The same typed `Scene` rendered in all three Spaces side-by-side; no per-Space WGSL written by the caller. |
-| `corridor` | Extruded corridor stress-testing the typed primitive emit path under booleans and repeats. |
-| `physics3d` | Mixed spheres and oriented boxes falling onto a floor. Exercises the full GJK + EPA + manifold + PGS path in 3D. |
-| `physics4d` | Headless 4D demo (`--floor` / `--collide` / free-fall). 4D GJK + EPA + orientation transport. Prints per-tick state to stdout. |
-| `physics2d` | 2D rigid bodies under gravity with polygon SAT, friction, and the manifold + PGS solver. The reference for stack settling. |
-| `text_smoke` | Smoke test for `rye-text` (ab_glyph-backed screen-space HUD overlay). Renders ASCII labels at multiple sizes and colors over a clear-color background. |
-| `sysinfo` | Enumerates every wgpu adapter the host can see, with backend, device type, driver, vendor/device IDs, and selected limits. Useful for bug reports and first-run sanity checks. |
+| `rye-math` | `Space` traits and metrics, bivector/rotor geometric algebra, projections |
+| `rye-shape` | geometry and topology data: the `Shape` enum, polytope topology, vertex/face generators |
+| `rye-scene` | declarative SDF scene graph; emits WGSL on demand |
+| `rye-render` | render nodes and GPU helpers (raymarch, rasterizer, line) |
+| `rye-physics` | 4D rigid-body physics: geometric algebra, 4D GJK/EPA, contact solver |
+| `rye-app` | native and wasm application shell, cameras and controllers |
+| `polytope_playground`, `tesseract_demo` | demos, not API |
 
-`examples/capture.rs` is a frame-capture utility module (APNG / GIF), pulled in by demos that opt into recording rather than run as a standalone example.
+Supporting crates: `rye-egui` (UI), `rye-text` (HUD overlay), `rye-camera`, `rye-input`, `rye-time`, `rye-shader`, `rye-asset`, `rye-player`. The stable surfaces (`rye-math`, `rye-shape`) do not depend on the volatile ones (`rye-render`, the app shell); the dependency graph stays a tree.
 
-## Why not just use Bevy or Godot?
+## Correctness and reproducibility
 
-This is the most common question I receive from friends I show the project to. The reality is, Bevy is the best ergonomic Rust game engine going, and Godot is the best general-purpose 2D/3D engine for indie work. For 99% of projects, you should reach for one of those.
+Mathematical correctness is enforced by an invariant test suite, not by inspection of rendered output. Core primitives ship with tests that check properties no visualization would catch: Gauss-Bonnet on small geodesic triangles (angle defect / excess scaling with area), isometry preservation of distance, parallel-transport length preservation, nonzero-and-bounded holonomy from transport around a closed loop in curved space (the connection carries real curvature), curvature continuity across `BlendedSpace` transition zones, and exact graph-coloring invariants for polytope line-graphs. A primitive whose visualization looks correct but whose invariants fail does not ship.
 
-Equally true: you can't make geodesic-faithful hyperbolic, 4D, or variable-metric games in Bevy or Godot, without camera or postprocessing tricks: both assume Euclidean ℝ³ at the transform layer, and both treat curved geometry as something to fake with shader effects rather than something the simulation natively understands. Rye exists to handle these as first-class primitives, and the design choices below all flow from that one constraint:
+Reproducibility is treated as a research commitment. The simulation code is structured toward replayable execution: fixed timestep, deterministic iteration order in simulation-critical containers, and input routed through frame/tick boundaries rather than applied arbitrarily from event callbacks. Same-binary same-architecture bit-identical replay is the target for the runtime, because reproducible numerical experiments and shareable computational results eventually need more than "it looked the same when I ran it twice."
 
-- **Transform is Euclidean elsewhere; here it's a `Space` trait.** Bevy's `Transform` and camera math assume ℝ³, which makes a hyperbolic metric as a first-class citizen invasive to retrofit. In Rye the `Space` trait at the math layer is the substrate, and Euclidean ℝ³ is one implementation among several (E², E³, E⁴, H³, S³, `BlendedSpace<A, B, F>` so far).
-- **No ECS.** Bevy is built on an entity-component-system substrate where everything composes through component queries, which is the right model when entity composition is the primary axis of complexity. For Rye the geometry primitive is the substrate instead, and the thesis lives in the `Space` trait and what every other crate routes through it; an ECS layer over that wouldn't pay rent. Library-style composition (each engine concern is a normal callable Rust crate, and the app constructs and calls them explicitly) handles the scope I care about while keeping the math primitives as the visible spine.
-- **Determinism, scoped honestly.** Bevy's parallel scheduler makes lockstep, replay, and rollback netcode hard because task execution order is non-deterministic across runs. Rye's simulation runs on a fixed timestep with a deterministic task graph: tasks that don't share state run in parallel via Rayon, but outputs are reduced in a fixed order each tick. IO (asset loading, networking) is async via Tokio and feeds into per-tick input queues at tick boundaries, never touching sim state directly. The scope of the determinism claim, in three layers: same-binary same-architecture replay (bit-identical state given the same seed and inputs) is the design target and the layer that seeded reproducibility and single-machine debugging need. Same-architecture cross-machine determinism (lockstep multiplayer between players on the same arch) is the engineering target as netcode demands it. Cross-architecture (x86 ↔ ARM) determinism is out of scope for v0; transcendental f32 routines vary per platform-libm and matching them would mean shipping a soft-float layer no current consumer needs.
-- **Shader hot reload from day one.** For shader-heavy work like ray marching, editing a WGSL file should reflect on screen immediately, so it's baked into `rye-shader` rather than reached for later.
-- **Ergonomics is the open problem, not the win.** Bevy and Godot have years of editor and tooling investment Rye can't match, and that's fine, because Rye isn't competing with them on developer experience for Euclidean games. What it does need is ergonomic tooling for visualizing and authoring scenes in curved and higher-dimensional geometry, which is genuinely new territory; there's no inherited best practice for "scene editor for 4D" or "asset pipeline for variable-curvature manifolds." Figuring that out is part of the research, not a stable destination this README can promise yet.
+## Intellectual lineage
 
-## Building and running
+Rye builds on prior work that has shaped both its mathematical content and its visualization choices.
 
-Hardware-agnostic via wgpu. Vulkan, DX12, Metal, WebGPU.
+Marc ten Bosch's *4D Toys*, and the body of research that produced it, is the direct conceptual ancestor of the polytope playground. The framing of four-dimensional objects as inhabitants of a four-dimensional space whose three-dimensional slices the viewer inspects, rather than as projections rendered onto a two-dimensional screen, is his. The polytope playground is a spiritual successor: regular convex 4-polytopes rather than arbitrary 4D solids, browser-deployable rather than installed, exact polychoral cross-sections rather than approximations, but the same fundamental commitment to letting a viewer move through a four-dimensional space and see what is there.
 
-Stable Rust toolchain (pinned via `rust-toolchain.toml`). Standard `cargo build --workspace --all-targets` to compile everything; `cargo test --workspace` to run the test suite (~200 tests including math invariants and naga shader-validation probes).
+HackerPoet (CodeParade)'s HyperEngine and the Hyperbolica project (the commercial non-Euclidean game built on HyperEngine) demonstrated that non-Euclidean rendering is a viable interactive medium and made the architectural patterns inspectable. Zeno Rogue's HyperRogue and RogueViz cover breadth across hyperbolic geometries and projection models that any non-Euclidean engine has to engage with. Michael Walczyk's `polychora` showed what 4-polytope generation and slicing looks like in Rust specifically.
+
+The mathematical content draws on the standard references in differential geometry, geometric algebra, and computer graphics:
+
+- Coxeter, H. S. M. *Regular Polytopes*. The f-vector tables, edge lengths at unit circumradius, and the pentatope midpoint section.
+- Foley, J. D., van Dam, A., et al. *Computer Graphics: Principles and Practice*, 2nd ed. §13.3.4 for the HSV-to-RGB conversion behind the wireframe color modes.
+- Hestenes, D. *New Foundations for Classical Mechanics*, 2nd ed. §2.5 for the rotor-as-rotation-operator construction.
+- Hestenes, D. & Sobczyk, G. *Clifford Algebra to Geometric Calculus*. The foundations behind `Bivector4` / `Rotor4` and the invariant-decomposition exponential.
+- Knuth, D. *The Art of Computer Programming*, vol. 3, §6.4 for the golden-ratio hue spacing in the unique-edge palette.
+
+The mature open-source 3D physics literature (Bullet, Jolt, ODE, Rapier in Rust) established the GJK/EPA/PGS pipeline that Rye's four-dimensional physics extends. The novelty in Rye is not in any individual algorithm but in the integration: a single engine in which variable-curvature Riemannian manifolds, four-dimensional rigid-body physics, and polychoral cross-section rendering live together, deploy to a browser, and are exercised by a math-invariant test suite that catches violations no visualization would notice.
+
+## Research directions
+
+Rye's long-term target is a hierarchy of computational spaces. The current trait surface assumes smooth Riemannian structure, which is correct for the geometries implemented today but inadequate for the directions the engine is moving toward. The longer-term thesis is that the architecture should refine as new classes of spaces are added: generalization of the metric-tensor assumption to admit pseudo-Riemannian and Lorentzian structure, relaxation of the smoothness assumption to admit fractal Hausdorff-dimensional spaces, and refinements within the metric-space family that the engine has not yet been asked to handle. The refactor happens when the mathematics demands it, not preemptively.
+
+The engine exists to make certain kinds of work tractable. Computational physics in geometries where the standard frameworks do not apply: fluid and continuum dynamics on curved manifolds, rigid-body dynamics in higher dimensions, transport phenomena on spaces whose curvature varies. Visualization of mathematical objects that have historically been the domain of static figures and offline-rendered animation: polychora, hyperbolic tilings, manifolds of constant curvature, the boundary structure of fractal sets. Numerical experiments that benefit from interactive parameter exploration, where the cost of changing a coefficient and seeing the result needs to be a frame rather than a recompile. Pedagogy of geometric concepts that resist textbook illustration: an upcoming Flatland demo will let a viewer occupy a two-dimensional cross-section while a four-dimensional object passes through, on the same principle that lets the polytope playground work but turned toward the question of how a 2D observer would perceive a 3D world, the analogy for how a 3D observer must perceive a 4D one.
+
+Where exactly the frontier of consumer-hardware feasibility lies for each of these is itself open. Some geometries that are mathematically natural turn out to be computationally tractable in ways that surprise; others resist real-time visualization for reasons that take serious effort to characterize. Mapping that frontier, finding the classes of spaces where a capability layer stops being well-defined and the classes where it is well-defined but no known algorithm is fast enough, is part of what the engine is for.
+
+This section will be replaced, over time, by the work that has been done with Rye. Until then it is an invitation: if a direction here, or a direction not here, is one you would want to explore, get in touch.
 
 ## Getting involved
 
-I use AI coding tools (primarily Claude Code) heavily across this project. The mathematical correctness of every primitive is enforced by the invariant test suite regardless of whether code was AI-drafted or hand-written; the engineering decisions and the responsibility for what ships are mine. PRs from contributors who use AI are welcome on the same terms.
+I use AI coding tools, primarily Claude Code, heavily across this project. The mathematical correctness of every primitive is enforced by the invariant test suite regardless of whether code was AI-drafted or hand-written; the engineering decisions and the responsibility for what ships are mine. Contributions from collaborators who use AI are welcome on the same terms.
 
-This is a single-maintainer project right now, so speculative PRs aren't the right way to help; I can't manage code review on unannounced work. There are tagged GitHub issues marked as up-for-grabs that I'd be glad to have collaborators on. Pick one and reach out before starting.
+This is a single-maintainer project, so speculative pull requests are not the right way to help; code review on unannounced work is not something I can manage at the volume that would invite. As the project opens to outside work I'll tag issues as up-for-grabs; until then, the best move is to reach out before starting anything. Particularly welcome are collaborators with formal background in differential geometry, pseudo-Riemannian geometry, geometric algebra, numerical methods on manifolds, or fractal geometry: there are primitives I have not built yet where domain expertise would land more cleanly than my engineering instincts alone.
 
-For longer conversations (engine direction, the game in development, research collaboration, anything that doesn't fit in an issue thread) get in touch at [humesze@proton.me](mailto:humesze@proton.me).
+For longer conversations (engine direction, research collaboration, the visualizations or simulations you would like the engine to support) get in touch at [humesze@proton.me](mailto:humesze@proton.me).
 
 ## License
 
-Rye is dual-licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option. Both licenses require attribution; please retain the copyright notice and license text in substantial portions of the work.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual-licensed as above, without any additional terms or conditions.
+Dual-licensed under MIT OR Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
