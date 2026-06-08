@@ -1,32 +1,16 @@
 //! Triangle rasterizer pipeline. Per-vertex color, optional depth attachment,
-//! alpha-blended composition on top of the existing color attachment. Parallel to
-//! [`crate::line_raster::LineRasterNode`] in shape; the two are designed to share a
-//! depth attachment within a frame so filled triangles and outline edges occlude each
-//! other correctly.
+//! alpha-blended. Parallel to [`crate::line_raster::LineRasterNode`]; the two
+//! share a depth attachment within a frame so fills and edges occlude correctly.
 //!
-//! Triangles are native to the rasterizer (no quad expansion); the WGSL is small.
+//! Vertex buffer is per-vertex [`TriangleVertex`] (R³ position + color), uniform
+//! is [`TriangleRasterUniforms`] (view-projection only). Depth is opt-in via
+//! [`crate::DepthMode`]; the caller owns the depth texture and clears it once per
+//! frame ([`TriangleRasterNode::execute`] uses `LoadOp::Load`).
 //!
-//! ## Pipeline shape
-//!
-//! - **Vertex buffer**: per-vertex [`TriangleVertex`] (position in R³ + color).
-//! - **Index buffer**: u32 indices into the vertex buffer.
-//! - **Uniform buffer**: [`TriangleRasterUniforms`] -- just the view-projection matrix.
-//! - **Depth attachment**: opt-in at construction via [`crate::DepthMode`]
-//!   ([`crate::DepthMode::Off`] / [`crate::DepthMode::ReadWrite`] /
-//!   [`crate::DepthMode::ReadOnly`]). Same semantics as
-//!   [`crate::line_raster::LineRasterNode`]: the caller owns the depth texture lifecycle
-//!   and clears it once per frame; [`TriangleRasterNode::execute`] uses `LoadOp::Load`.
-//!
-//! ## Why per-vertex color + no normals
-//!
-//! `TriangleMesh<N>`'s docs spell this out: lighting in R⁴ has no standard convention, so
-//! normals are deliberately omitted at v1. Per-vertex color covers the cross-section /
-//! face-fill / debug-fill use cases the rasterizer was built for. When a caller wants lit
-//! shading (e.g., polychoral cross-section cell caps), [`FragmentShading::FaceNormalLambert`]
-//! computes the face normal in the fragment shader from screen-space derivatives of
-//! world-space position; no normal vertex attribute required. This stays honest to the
-//! "no convention for normals in R^N" invariant: derivatives are local to the projected
-//! R³ surface, computed downstream of [`RasterizableSpace::project_point`].
+//! Normals are omitted because R⁴ has no standard lighting convention (see
+//! `TriangleMesh<N>`). For lit shading [`FragmentShading::FaceNormalLambert`]
+//! derives the face normal from screen-space derivatives of world position,
+//! exact for the flat-triangle case and needing no normal attribute.
 
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
@@ -49,14 +33,11 @@ use crate::device::RenderDevice;
 /// Embedded WGSL source. Naga-validated in tests for ABI drift detection.
 const TRIANGLE_RASTER_WGSL: &str = include_str!("triangle_raster.wgsl");
 
-/// Camera uniform handed to the triangle vertex shader. Just the view-projection matrix; no
-/// viewport size (triangles don't need pixel-to-NDC scaling the way the line rasterizer's
-/// quad expansion does). 64 bytes, 16-byte aligned, matches WGSL `CameraUniform` std140
-/// layout exactly.
+/// Camera uniform for the triangle vertex shader: view-projection only, no
+/// viewport size. 64 bytes, matching WGSL `CameraUniform` std140 layout.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct TriangleRasterUniforms {
-    /// World-to-clip transform. Bit-identical to whatever the rest of the frame uses.
     pub view_projection: [[f32; 4]; 4],
 }
 
@@ -68,9 +49,9 @@ impl Default for TriangleRasterUniforms {
     }
 }
 
-/// Per-vertex GPU layout. Position is in R³ (after the upload path projects from R^N via
-/// [`RasterizableSpace::project_point`]); color is RGBA in linear space. 32 bytes per vertex
-/// with explicit padding so the attribute offsets stay stable across compilers.
+/// Per-vertex GPU layout: R³ position (projected from R^N via
+/// [`RasterizableSpace::project_point`]) + linear RGBA. 32 bytes with explicit
+/// padding so attribute offsets stay stable.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable, Default)]
 pub struct TriangleVertex {
@@ -79,32 +60,20 @@ pub struct TriangleVertex {
     pub color: [f32; 4],
 }
 
-/// Fragment-shader selector for [`TriangleRasterNode`]. Picked at construction time so
-/// the pipeline state matches the chosen entry point; switching modes after construction
-/// would require a new pipeline (cheap but the caller usually knows up front which path
-/// it wants).
+/// Fragment-shader selector, fixed at construction so the pipeline state matches
+/// the entry point. Switching modes needs a new pipeline.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum FragmentShading {
-    /// Pass per-vertex color through unmodified. Use for overlays, debug fills, and any
-    /// mesh whose shading is already baked into vertex colors. This is the v1 behavior
-    /// and the default.
+    /// Pass per-vertex color through unmodified. The default.
     #[default]
     Flat,
-    /// Face-normal Lambert. Computes the face normal from screen-space derivatives of
-    /// world-space position in the fragment shader, multiplies the vertex color by
-    /// Lambert intensity + ambient floor. Suitable for faceted surfaces (e.g.,
-    /// polychoral cross-section cell caps) where each triangle is geometrically flat,
-    /// since derivative-based normals are exact for that case.
-    ///
-    /// No normal vertex attribute is required; the [`TriangleMesh`] format does not
-    /// change between modes.
+    /// Lambert lit by a face normal derived from screen-space derivatives of
+    /// world position; exact for flat triangles (e.g. cross-section cell caps).
     FaceNormalLambert,
 }
 
 impl FragmentShading {
-    /// WGSL entry-point name to bind into the fragment stage. Stable across versions;
-    /// callers don't see this string but it's how the pipeline picks between the two
-    /// shaders embedded in `triangle_raster.wgsl`.
+    /// WGSL entry-point name for the fragment stage.
     fn entry_point(self) -> &'static str {
         match self {
             Self::Flat => "fs_flat",
@@ -113,8 +82,7 @@ impl FragmentShading {
     }
 }
 
-/// Triangle rasterizer node. Parallel to [`crate::line_raster::LineRasterNode`]; both
-/// own their pipeline + buffers and are constructed standalone.
+/// Triangle rasterizer node, parallel to [`crate::line_raster::LineRasterNode`].
 pub struct TriangleRasterNode {
     pipeline: RenderPipeline,
     uniform_buf: Buffer,
@@ -130,8 +98,8 @@ pub struct TriangleRasterNode {
     /// Number of indices currently uploaded; `0` means [`Self::execute`] is a no-op.
     index_count: u32,
 
-    /// Tracks whether the pipeline was created with a depth attachment so
-    /// [`Self::execute`] can validate the caller's depth-view argument.
+    /// Whether the pipeline has a depth attachment; [`Self::execute`] validates
+    /// the caller's depth-view argument against it.
     has_depth: bool,
 }
 
@@ -191,8 +159,7 @@ impl TriangleRasterNode {
             push_constant_ranges: &[],
         });
 
-        // Per-vertex attribute layout: position at offset 0, color at offset 16 (after
-        // the 4-byte _pad0). Matches `TriangleVertex` exactly.
+        // Matches `TriangleVertex`: position at 0, color at 16 (past _pad0).
         let vertex_attrs = [
             VertexAttribute {
                 format: VertexFormat::Float32x3,
@@ -260,7 +227,7 @@ impl TriangleRasterNode {
             cache: None,
         });
 
-        // Buffers start empty; grow on first upload.
+        // Placeholders; grown on first upload.
         let vertex_buf = device.create_buffer(&BufferDescriptor {
             label: Some("triangle_raster vertex buffer"),
             size: 64,
@@ -295,12 +262,9 @@ impl TriangleRasterNode {
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    /// Upload a [`TriangleMesh`] for rendering. Projects each vertex from R^N to R³ via
-    /// [`RasterizableSpace::project_point`]; copies the index list verbatim (already u32 in
-    /// the source).
-    ///
-    /// Vertices and colors must have the same length per the [`TriangleMesh`] invariant;
-    /// indices reference into the vertex array (u32 triples). Empty meshes are no-ops.
+    /// Upload a [`TriangleMesh`], projecting each vertex from R^N to R³ via
+    /// [`RasterizableSpace::project_point`] and copying indices verbatim. Empty
+    /// meshes are no-ops.
     pub fn upload<S, const N: usize>(
         &mut self,
         device: &Device,
@@ -310,7 +274,6 @@ impl TriangleRasterNode {
     ) where
         S: RasterizableSpace<N>,
     {
-        // Pack per-vertex GPU records.
         let n_vertices = mesh.vertices.len();
         assert_eq!(
             mesh.colors.len(),
@@ -328,13 +291,13 @@ impl TriangleRasterNode {
             });
         }
 
-        // Flatten triangle indices [u32; 3] into a single index buffer.
+        // Flatten [u32; 3] triples into one index buffer.
         let mut indices: Vec<u32> = Vec::with_capacity(mesh.indices.len() * 3);
         for tri in &mesh.indices {
             indices.extend_from_slice(tri);
         }
 
-        // Grow buffers if needed; round up to next power of two to amortize re-allocations.
+        // Grow to the next power of two to amortize reallocations.
         if verts.len() as u32 > self.vertex_capacity {
             let new_cap = (verts.len() as u32).next_power_of_two().max(16);
             self.vertex_buf = device.create_buffer(&BufferDescriptor {
@@ -365,12 +328,9 @@ impl TriangleRasterNode {
         self.index_count = indices.len() as u32;
     }
 
-    /// Draw the uploaded triangles onto `view`. `LoadOp::Load` for both color and depth, same
-    /// as [`crate::line_raster::LineRasterNode::execute`]; multiple raster nodes share one
-    /// cleared color + depth buffer within a frame.
-    ///
-    /// `depth_view` must be `Some` when the pipeline was constructed with a depth format and
-    /// `None` otherwise. Mismatch panics with a descriptive message.
+    /// Draw the uploaded triangles onto `view`. `LoadOp::Load` for color and
+    /// depth so raster nodes share one cleared buffer per frame. `depth_view`
+    /// must be `Some` iff the pipeline has a depth format; mismatch panics.
     pub fn execute(
         &self,
         rd: &RenderDevice,
@@ -441,9 +401,8 @@ impl TriangleRasterNode {
 mod tests {
     use super::*;
 
-    /// Embedded WGSL parses and validates against naga. Mirrors the line_raster validation
-    /// test; catches drift between the Rust-side vertex layout and the shader's `@location`
-    /// declarations.
+    /// Embedded WGSL parses and validates against naga; catches drift between
+    /// the Rust vertex layout and the shader's `@location` declarations.
     #[test]
     fn triangle_raster_wgsl_validates() {
         let module = naga::front::wgsl::parse_str(TRIANGLE_RASTER_WGSL)

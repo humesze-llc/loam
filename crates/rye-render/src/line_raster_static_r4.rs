@@ -1,40 +1,18 @@
-//! Line rasterizer: static-mesh R⁴ variant.
+//! Line rasterizer: static-mesh R⁴ variant. Use for R⁴ line meshes that don't
+//! change between frames (polytope edges, static field-line bundles) where the
+//! rotation + Perspective4D projection runs on the GPU. Eliminating the
+//! per-frame instance upload also halves wasm JS-interop pressure (each
+//! `queue.write_buffer` spawns short-lived JS proxies).
 //!
-//! Use this when:
-//! - The line mesh lives in R⁴ and doesn't change between frames (a polytope's
-//!   edges, a static field-line bundle, etc.).
-//! - You want the per-frame rotation + Perspective4D projection applied on the
-//!   GPU rather than recomputed on the CPU each frame.
-//! - You're chasing zero per-frame allocations + minimum JS-interop calls on
-//!   the wasm32 backend (per the 2026-05-22 perf characterization). Every
-//!   `queue.write_buffer` call creates short-lived JS proxy objects; eliminating
-//!   the per-frame instance-buffer upload halves the JS-interop pressure for
-//!   small line meshes.
+//! Contrast [`crate::LineRasterNode`], the R³ dynamic-upload variant that
+//! re-uploads segments every frame; right for already-projected meshes that
+//! change frame-to-frame, wrong for rotating a fixed polytope.
 //!
-//! Contrast with [`crate::LineRasterNode`] which is the R³ dynamic-upload
-//! variant: every frame re-uploads the segment list. Right for already-projected
-//! meshes whose contents change frame-to-frame (cross-section overlays in
-//! polytope_playground), wrong for "rotating a fixed polytope" (tesseract_demo).
-//!
-//! ## Per-frame flow
-//!
-//! 1. Setup-time: caller builds the canonical R⁴ mesh (e.g. via
-//!    `Polytope4::Tesseract.topology()` + an edge-to-segment fan-out) and uploads
-//!    it ONCE via `Self::upload_mesh`.
-//! 2. Per frame: caller integrates a `Rotor4`, converts it via
-//!    [`rye_math::Rotor4::to_mat4`], and calls `Self::set_transform` with the
-//!    matrix + view*proj + viewport + focal_distance. That writes a single
-//!    144-byte uniform; no other per-frame GPU work.
-//! 3. Caller records the pass via `Self::record` into the shared encoder
-//!    (same pattern as `LineRasterNode::record`).
-//!
-//! ## Pipeline shape
-//!
-//! Same quad-expansion + AA structure as [`crate::LineRasterNode`]; the only
-//! difference is the vertex stage applies a rotor matrix + Perspective4D
-//! projection before the standard view*proj transform. See
-//! [`line_raster_static_r4.wgsl`](../../../src/line_raster_static_r4.wgsl)
-//! for the shader.
+//! Per-frame: upload the mesh ONCE via `Self::upload_mesh`, then each frame
+//! `Self::set_transform` writes a single 144-byte uniform (rotor matrix +
+//! view*proj + viewport + focal_distance) and `Self::record` draws it. Pipeline
+//! shape matches [`crate::LineRasterNode`] (quad expansion + AA); the vertex
+//! stage adds a rotor matrix + Perspective4D projection ahead of view*proj.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2};
@@ -73,19 +51,17 @@ impl Default for LineRasterStaticR4Uniforms {
             rotor_matrix: Mat4::IDENTITY.to_cols_array_2d(),
             view_projection: Mat4::IDENTITY.to_cols_array_2d(),
             viewport_size: [1.0, 1.0],
-            // Picks a "neutral" focal distance that produces the canonical
-            // "cube-within-cube" tesseract view when used with unit-circumradius
-            // polytopes. Callers should set this via `set_transform` before the
-            // first draw; the default exists so `record()` between
-            // `new` and the first transform write doesn't produce NaNs.
+            // Neutral focal distance giving the cube-within-cube tesseract view
+            // for unit-circumradius polytopes; keeps a pre-set_transform
+            // record() from producing NaNs.
             focal_distance: 2.0,
             _pad: 0.0,
         }
     }
 }
 
-/// Per-instance line data for the R⁴ pipeline. Same 80-byte size as the R³
-/// variant's `LineInstance`, just with full Vec4 positions instead of Vec3+pad.
+/// Per-instance line data for the R⁴ pipeline. 80 bytes, matching the R³
+/// `LineInstance`, with full Vec4 positions instead of Vec3+pad.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct LineInstance4D {
@@ -98,8 +74,7 @@ struct LineInstance4D {
 }
 
 /// Antialiased line rasterizer with GPU-side rotor + Perspective4D transforms.
-/// One instance per visible edge; instance buffer is uploaded once (or only
-/// when the topology changes), and the per-frame uniform write carries the
+/// One instance per edge, uploaded once; the per-frame uniform carries the
 /// rotor + camera + viewport + focal_distance.
 pub struct LineRasterStaticR4Node {
     pipeline: RenderPipeline,
@@ -138,15 +113,9 @@ impl LineRasterStaticR4Node {
             mapped_at_creation: false,
         });
 
-        // Seed the uniform with a sensible default so `record()` is well-defined
-        // before the first `set_transform` write.
+        // The buffer is zero-cleared at creation (wgpu invariant); the first
+        // set_transform before any record() establishes valid data.
         let defaults = LineRasterStaticR4Uniforms::default();
-        // No queue.write_buffer here at construction time; the buffer's initial
-        // contents are zero-cleared (wgpu invariant), and the first set_transform
-        // before any record() establishes valid data. If a caller records without
-        // setting the transform first, the result is whatever zero-cleared bytes
-        // produce in the shader (likely degenerate but not undefined-behavior).
-        // Tracking via this _ binding keeps the struct in scope as a doc of intent.
         let _ = defaults;
 
         let bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -178,10 +147,8 @@ impl LineRasterStaticR4Node {
             push_constant_ranges: &[],
         });
 
-        // One u32 per corner-index vertex; 80 bytes of per-instance data
-        // matching the WGSL @location(1..=5) slots. Same layout shape as the
-        // R³ pipeline but the position attributes are Float32x4 (not x3) to
-        // carry the w coordinate.
+        // One u32 corner index per vertex; instance attributes fill WGSL
+        // @location(1..=5), positions as Float32x4 to carry w.
         let corner_attrs = [VertexAttribute {
             format: VertexFormat::Uint32,
             offset: 0,
@@ -307,14 +274,10 @@ impl LineRasterStaticR4Node {
         }
     }
 
-    /// Upload an R⁴ line mesh. Intended to be called ONCE (or only when the
-    /// topology changes, e.g. user toggled to a different polytope); per-frame
-    /// rotation is handled by `Self::set_transform` without re-uploading.
-    ///
-    /// Allocates a scratch `Vec<LineInstance4D>` once per call; fine for the
-    /// setup-time use case; if callers ever start calling this every frame,
-    /// migrate to the [`crate::LineRasterNode`] dynamic-upload pattern instead
-    /// (or extend this node with a scratch-buffer field).
+    /// Upload an R⁴ line mesh, intended to be called once (or on topology
+    /// change); per-frame rotation goes through `Self::set_transform`. Allocates
+    /// a scratch `Vec` per call, fine at setup time; for per-frame uploads use
+    /// [`crate::LineRasterNode`] instead.
     pub fn upload_mesh(&mut self, device: &Device, queue: &Queue, mesh: &LineMesh<4>) {
         let n = mesh.segments.len();
         debug_assert_eq!(mesh.colors.len(), n);
@@ -453,28 +416,22 @@ mod tests {
 
     #[test]
     fn default_uniforms_match_wgsl_size() {
-        // Sanity: the Rust struct's size must match the WGSL `TransformUniform`
-        // layout. 64 (rotor) + 64 (view_proj) + 8 (viewport) + 4 (focal) + 4
-        // (pad) = 144 bytes.
+        // Must match WGSL `TransformUniform`: 64 + 64 + 8 + 4 + 4 = 144.
         assert_eq!(std::mem::size_of::<LineRasterStaticR4Uniforms>(), 144);
         assert_eq!(std::mem::align_of::<LineRasterStaticR4Uniforms>(), 4);
     }
 
     #[test]
     fn instance_size_matches_r3_node() {
-        // Keeping the per-instance size identical to the R³ node's
-        // `LineInstance` (80 bytes) means a future "unified pipeline" path
-        // could share the same buffer layout. Not strictly required but
-        // worth tracking via test so a casual layout change shouts loud.
+        // Same 80 bytes as the R³ node's `LineInstance` so a future unified
+        // pipeline could share the layout.
         assert_eq!(std::mem::size_of::<LineInstance4D>(), 80);
     }
 
     #[test]
     fn shader_wgsl_validates() {
-        // Catches WGSL syntax + naga validation errors at unit-test time
-        // instead of at runtime pipeline creation (which would surface as
-        // a black canvas with a wgpu error in the browser console). Mirrors
-        // the validation test in `line_raster.rs`.
+        // Catches WGSL syntax + naga validation errors at test time rather than
+        // as a black canvas at runtime pipeline creation.
         let module = naga::front::wgsl::parse_str(SHADER_WGSL)
             .unwrap_or_else(|e| panic!("line_raster_static_r4 WGSL parse failed:\n{e}"));
         let flags = naga::valid::ValidationFlags::all();
