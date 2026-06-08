@@ -1,23 +1,11 @@
-//! Per-frame input accumulator. Routes raw winit events into a [`FrameInput`] snapshot
-//! the rest of the engine consumes.
+//! Per-frame input accumulator. Routes raw winit events into a
+//! [`FrameInput`] snapshot the rest of the engine consumes.
 //!
-//! ## Drain semantic
-//!
-//! [`InputState`] accumulates mouse motion / scroll / key state as winit events arrive.
-//! [`InputState::take_frame`] returns the current snapshot **and resets the per-tick deltas**
-//! (mouse delta, scroll lines): callers see exactly the motion that happened since the last
-//! drain. Held state (button-down, WASD axes) is preserved across drains so a user holding
-//! a key continues to produce non-zero `move_*` until they release.
-//!
-//! ## Focus / cursor-loss contract
-//!
-//! Window focus loss and cursor exit are handled by [`InputState::cursor_invalidated`]
-//! (called from the framework's `WindowEvent::CursorLeft` / `Focused(false)` branches). It
-//! zeroes the cursor-relative state to avoid a snap when the cursor re-enters at a different
-//! position. [`InputState::release_buttons`] is similarly called on focus loss to drop held
-//! buttons cleanly. Apps that bind their own keyboard handling should call
-//! [`InputState::release_buttons`] when their gameplay needs the same clean-on-defocus
-//! semantic.
+//! [`InputState::take_frame`] resets per-tick deltas (mouse delta, scroll)
+//! while preserving held state (button-down, WASD axes) across drains.
+//! [`InputState::cursor_invalidated`] / [`InputState::release_buttons`]
+//! are called on focus loss / cursor exit to drop cursor-relative and held
+//! state cleanly.
 
 use glam::{Vec2, Vec3};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
@@ -27,21 +15,12 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 /// scroll events into the same `scroll_lines` units as `LineDelta`.
 pub const SCROLL_PIXELS_PER_LINE: f32 = 50.0;
 
-/// Accumulated input for one simulation tick, consumed by [`InputState::take_frame`].
+/// Accumulated input for one simulation tick, consumed by
+/// [`InputState::take_frame`].
 ///
-/// `mouse_delta` / `mouse_raw_delta` / `scroll_lines` reset to zero each frame.
-/// `left_mouse_down` persists until the button is released. `move_*` axes are
-/// recomputed from held keys each frame: +1 / 0 / -1, not accumulated.
-///
-/// `mouse_delta` is the OS-clamped cursor delta (`WindowEvent::CursorMoved`).
-/// It stops accumulating when the cursor hits the screen edge or leaves the
-/// window. Right for orbit controllers and any UI-facing handler that wants
-/// the cursor's actual position to mean something.
-///
-/// `mouse_raw_delta` is the raw device delta (`DeviceEvent::MouseMotion`).
-/// It accumulates regardless of cursor position; the OS reports the
-/// underlying mouse motion before clamping. Right for FPS-style mouse-look
-/// where you grab the cursor and want infinite-yaw / infinite-pitch.
+/// `mouse_delta` is the OS-clamped cursor delta (`CursorMoved`); stops at the
+/// screen edge. `mouse_raw_delta` is the raw device delta (`MouseMotion`);
+/// accumulates past the edge for FPS-style infinite-yaw mouse-look.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FrameInput {
     pub mouse_delta: Vec2,
@@ -57,8 +36,8 @@ pub struct FrameInput {
 }
 
 impl FrameInput {
-    /// Returns the WASD axes as a (possibly zero) direction vector.
-    /// Callers must scale and apply to their coordinate system.
+    /// WASD axes as a (possibly zero) direction vector; callers scale and
+    /// apply to their coordinate system.
     pub fn move_dir(&self) -> Vec3 {
         Vec3::new(self.move_right, self.move_up, -self.move_forward)
     }
@@ -119,10 +98,8 @@ impl InputState {
         }
     }
 
-    /// Drain accumulated input for one tick.
-    ///
-    /// Resets `mouse_delta` and `scroll_lines` to zero. `left_mouse_down`
-    /// persists. Move axes are recomputed from held keys.
+    /// Drain accumulated input for one tick: resets deltas, persists
+    /// `left_mouse_down`, recomputes move axes from held keys.
     pub fn take_frame(&mut self) -> FrameInput {
         let held = &self.held_keys;
         self.frame.move_forward = axis(held, KeyCode::KeyW, KeyCode::KeyS);
@@ -146,15 +123,8 @@ impl InputState {
     }
 
     /// Accumulate raw device motion (`DeviceEvent::MouseMotion`) into
-    /// `FrameInput::mouse_raw_delta`. Independent of `cursor_moved`; both
-    /// accumulators run in parallel and the consumer picks one. Right for
-    /// FPS-style mouse-look that wants infinite-yaw delta past the screen
-    /// edge.
-    ///
-    /// Internal: only the runner's `device_event` handler is expected to
-    /// call this. Exposed `pub` because the runner lives in a separate
-    /// crate (`rye-app`) and Rust's visibility doesn't have a workspace-
-    /// internal mode. `#[doc(hidden)]` to keep it out of demo-facing docs.
+    /// `FrameInput::mouse_raw_delta`. `pub` only because the runner lives in
+    /// a separate crate; `#[doc(hidden)]` keeps it out of demo-facing docs.
     #[doc(hidden)]
     pub fn accumulate_raw_motion(&mut self, dx: f64, dy: f64) {
         self.frame.mouse_raw_delta += Vec2::new(dx as f32, dy as f32);

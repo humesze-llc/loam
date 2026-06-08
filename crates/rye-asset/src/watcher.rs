@@ -1,13 +1,9 @@
 //! Filesystem watcher built on [`notify`] (native targets only).
 //!
-//! Hot-reload is a desktop-only convenience: a `notify::RecommendedWatcher` tracks paths and
-//! the app polls a channel each frame to drain events. On `wasm32` the browser has no
-//! filesystem to watch, so this module ships a no-op stub that keeps the public API shape
-//! (so consumers compile against both targets without `cfg`-littering their call sites) but
-//! never emits events and never errors out on `watch` / `unwatch`.
-//!
-//! Both impls share the [`AssetEvent`] + [`AssetEventKind`] types and the per-poll
-//! deduplication merge rule ([`merge_kinds`]); only the [`AssetWatcher`] struct differs.
+//! Native backs [`AssetWatcher`] with `notify::RecommendedWatcher`; the
+//! `wasm32` stub keeps the same API shape but never emits events. Both
+//! impls share [`AssetEvent`], [`AssetEventKind`], and the per-poll
+//! deduplication rule ([`merge_kinds`]).
 
 use std::path::PathBuf;
 
@@ -35,16 +31,10 @@ mod native {
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{channel, Receiver};
 
-    /// Watches one or more filesystem paths and yields coalesced [`AssetEvent`]s on
-    /// demand. Native impl backed by `notify::RecommendedWatcher`.
-    ///
-    /// Events arrive on a background thread managed by `notify`;
-    /// [`poll`](Self::poll) drains the channel non-blockingly and deduplicates events
-    /// per path within one poll cycle. Editor saves that produce a burst of raw events
-    /// (remove temp -> create target -> modify) collapse to a single `Modified` or
-    /// `Created` event per file. That's the usual shape a shader cache wants.
-    ///
-    /// Not `Sync`: own one per app. `Send` is fine.
+    /// Watches filesystem paths and yields coalesced [`AssetEvent`]s on
+    /// demand. [`poll`](Self::poll) drains non-blockingly and deduplicates
+    /// per path per cycle, so an editor save burst collapses to one event
+    /// per file. Not `Sync`: own one per app.
     pub struct AssetWatcher {
         watcher: RecommendedWatcher,
         rx: Receiver<notify::Result<notify::Event>>,
@@ -55,8 +45,7 @@ mod native {
         pub fn new() -> Result<Self> {
             let (tx, rx) = channel();
             let watcher = notify::recommended_watcher(move |res| {
-                // If the receiver has been dropped the app is shutting down;
-                // silently drop the event.
+                // A dropped receiver means the app is shutting down.
                 let _ = tx.send(res);
             })
             .context("creating notify watcher")?;
@@ -87,10 +76,9 @@ mod native {
 
             while let Ok(res) = self.rx.try_recv() {
                 let Ok(event) = res else {
-                    // `warn` (not `debug`) because notify errors are usually platform-
-                    // watcher failures (handle exhaustion on Windows, permission denied,
-                    // dropped events) that silently degrade hot-reload. A user not
-                    // seeing reloads should at least see something in stderr.
+                    // `warn`, not `debug`: notify errors are platform-watcher
+                    // failures that silently degrade hot-reload, so surface
+                    // them when reloads stop working.
                     tracing::warn!("notify error: {:?}", res.err());
                     continue;
                 };
@@ -123,13 +111,9 @@ mod web {
     use anyhow::Result;
     use std::path::Path;
 
-    /// No-op stub for the wasm32 target. The browser has no filesystem to watch, so
-    /// `AssetWatcher::new` succeeds, `watch` / `unwatch` succeed, and `poll` always
-    /// returns an empty vector. Consumers compile against the same API as native and
-    /// silently skip the hot-reload path.
+    /// No-op stub for wasm32: every call succeeds and `poll` returns empty,
+    /// so consumers compile against the native API and skip hot-reload.
     pub struct AssetWatcher {
-        // Zero-sized field keeps the `Send` / non-`Sync` characteristics consistent
-        // with the native impl (notify's watcher is also `Send + !Sync`).
         _private: (),
     }
 
@@ -159,13 +143,10 @@ pub use web::AssetWatcher;
 
 /// Merge two events for the same path within a single poll cycle.
 ///
-/// `Created` is preserved across a subsequent `Modified`, on Windows, `fs::write` on a fresh
-/// file emits Create+Modify, and downstream consumers expect "new file" to look different
-/// from "existing file changed." Otherwise the later event wins, which correctly handles
-/// save-by-atomic-replace (Remove->Create->target exists).
-///
-/// Only used by the native watcher (the wasm stub never emits events), so we gate the
-/// definition to silence dead-code warnings on wasm32.
+/// `Created` survives a later `Modified` because Windows `fs::write` on a
+/// fresh file emits Create+Modify and consumers want "new file" distinct
+/// from "changed file." Otherwise the later event wins, handling
+/// save-by-atomic-replace correctly.
 #[cfg(not(target_arch = "wasm32"))]
 fn merge_kinds(old: AssetEventKind, new: AssetEventKind) -> AssetEventKind {
     use AssetEventKind::*;
