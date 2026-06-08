@@ -1,15 +1,11 @@
 //! `rye-scene`: signed-distance field primitives and scene builders for Rye.
 //!
-//! [`Primitive`] is the typed abstraction for geometric objects. Every primitive emits a WGSL
-//! function `fn {name}(p: vec3<f32>) -> f32` that uses only `rye_*` Space-prelude functions,
-//! guaranteeing correctness across E³, H³, and S³.
+//! [`Primitive`] is the typed abstraction for geometric objects; each emits a
+//! WGSL `fn {name}(p: vec3<f32>) -> f32` using only `rye_*` Space-prelude
+//! functions, so SDFs stay correct across E³, H³, and S³.
 //!
-//! [`combinator`] provides Space-agnostic combinators (union, intersection, smooth-min) that
-//! operate on the scalar distances returned by primitive SDFs.
-//!
-//! Demo-shaped scene wrappers (geodesic spheres, corridor, lattice) live in their respective
-//! `examples/<name>/scene.rs` files. The crate proper keeps only the typed primitive + scene
-//! layer.
+//! [`combinator`] provides Space-agnostic combinators (union, intersection,
+//! smooth-min) over the scalar distances returned by primitive SDFs.
 
 pub mod combinator;
 pub mod primitive;
@@ -53,9 +49,7 @@ mod tests {
         assert_eq!(h3, s3);
     }
 
-    /// `HalfSpace`'s emission gates on `WgslSpace::is_chart_flat`. EuclideanR3 reports flat, so
-    /// the chart-coord `dot(p, n) - d` formula is honest and gets emitted. Curved Spaces fall
-    /// through to the sentinel arm (covered separately).
+    /// `HalfSpace` emits the honest chart-coord `dot(p, n) - d` in flat E³.
     #[test]
     fn halfspace_emits_dot_in_flat_chart() {
         use rye_math::EuclideanR3;
@@ -66,13 +60,11 @@ mod tests {
         let src = p.to_wgsl(&EuclideanR3, "sdf_floor");
         assert!(src.contains("fn sdf_floor(p: vec3<f32>) -> f32"));
         assert!(src.contains("dot(p,"));
-        // Floor at y = -0.5: normal = (0, 1, 0), offset = -0.5.
         assert!(src.contains("-0.500000"));
     }
 
-    /// `HalfSpace` in a curved Space has no honest closed-form SDF today, so it sentinels until
-    /// artanh-of-Möbius (H³) / chord-distance (S³) implementations land. Pinned here so a future
-    /// regression that re-enables raw `dot()` in curved Spaces fails loud.
+    /// `HalfSpace` sentinels in a curved Space; pinned so a regression that
+    /// re-enables raw chart-coord `dot()` there fails loud.
     #[test]
     fn halfspace_sentinels_in_curved_chart() {
         use rye_math::HyperbolicH3;
@@ -119,13 +111,9 @@ mod tests {
     }
 
     // ---- Scene-tree integration tests ------------------------------------
-    //
-    // These cover behaviours the legacy demo-scene tests used to gate. The demo wrappers
-    // themselves now live in their respective examples; this layer pins the behaviour at the
-    // underlying typed-scene API.
 
-    /// A Scene with a sphere and a half-space plane in flat E³ must emit both `rye_distance`
-    /// (sphere) and `dot(p,` (plane), all inside a single `rye_scene_sdf` entry point.
+    /// Sphere + plane in E³ emits both `rye_distance` and `dot(p,` inside one
+    /// `rye_scene_sdf`.
     #[test]
     fn scene_with_sphere_and_plane_emits_both_paths_in_e3() {
         use rye_math::EuclideanR3;
@@ -135,12 +123,10 @@ mod tests {
         assert!(src.contains("fn rye_scene_sdf"));
         assert!(src.contains("rye_distance"));
         assert!(src.contains("dot(p,"));
-        // Plane offset literal appears in the emitted dot() call.
         assert!(src.contains("-0.500000"));
     }
 
-    /// A sphere-only scene must not emit any `dot()` calls; the half-space gate stays inert when
-    /// no plane leaves are present.
+    /// A sphere-only scene emits no `dot()` calls.
     #[test]
     fn sphere_only_scene_emits_no_chart_coord_dot() {
         use rye_math::EuclideanR3;
@@ -151,8 +137,7 @@ mod tests {
         assert!(!src.contains("dot(p,"));
     }
 
-    /// Sphere centres baked into the WGSL must literally match the input point. Pins the
-    /// per-sphere literal-emission contract the lattice / corridor scenes rely on.
+    /// Baked sphere centres match the input point literally.
     #[test]
     fn sphere_center_appears_as_wgsl_literal() {
         use rye_math::EuclideanR3;
@@ -161,10 +146,8 @@ mod tests {
         assert!(src.contains("0.500000, 0.000000, 0.000000"));
     }
 
-    /// Same construction in H³ must NOT emit the E³-style literal, because the lattice-style usage
-    /// pre-computes centres via `space.exp` and tanh-compresses them. This test fakes the
-    /// compression by exping a tangent vector through HyperbolicH3 and confirming the emitted
-    /// literal differs.
+    /// A tangent vector exped through H³ compresses below its E³ coordinate, so
+    /// the H³ scene does not emit the E³-style literal.
     #[test]
     fn lattice_centres_compress_under_hyperbolic_exp() {
         use rye_math::{HyperbolicH3, Space};
@@ -177,8 +160,8 @@ mod tests {
     }
 
     // ---- Semantic-SDF correctness + Lipschitz-bound tests ------------------
-    // The string-emit tests above verify the right WGSL is produced. These verify the
-    // mathematical SDF each primitive represents: sign correctness, surface zero, Lipschitz-1.
+    // These verify the math each primitive represents: sign, surface zero,
+    // Lipschitz-1; the string-emit tests above cover the WGSL text.
 
     fn sphere_sdf_cpu(p: Vec3, center: Vec3, radius: f32) -> f32 {
         (p - center).length() - radius
@@ -208,8 +191,7 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            // Map to [-1, 1].
-            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0 // [-1, 1]
         };
         (0..count)
             .map(|_| {
@@ -233,7 +215,7 @@ mod tests {
         for &(a, b) in samples {
             let dist_ab = (a - b).length();
             if dist_ab < 1e-6 {
-                continue; // skip degenerate pairs
+                continue;
             }
             let lhs = (sdf(a) - sdf(b)).abs();
             let rhs = dist_ab * (1.0 + 1e-5);
@@ -250,15 +232,11 @@ mod tests {
     fn sphere_sdf_distance_and_signs() {
         let center = Vec3::new(1.0, 2.0, 3.0);
         let radius = 0.5_f32;
-        // At centre: distance = -radius.
         assert!((sphere_sdf_cpu(center, center, radius) + radius).abs() < 1e-6);
-        // On surface: distance = 0.
         let on_surface = center + Vec3::X * radius;
         assert!(sphere_sdf_cpu(on_surface, center, radius).abs() < 1e-6);
-        // Far away: distance = |p - c| - r.
         let far = center + Vec3::X * 10.0;
         assert!((sphere_sdf_cpu(far, center, radius) - (10.0 - radius)).abs() < 1e-5);
-        // Sign: negative inside, positive outside.
         assert!(sphere_sdf_cpu(center + Vec3::X * 0.1, center, radius) < 0.0);
         assert!(sphere_sdf_cpu(center + Vec3::X * 1.0, center, radius) > 0.0);
     }
@@ -275,13 +253,9 @@ mod tests {
     #[test]
     fn box3_sdf_distance_and_signs() {
         let h = Vec3::splat(0.4);
-        // At origin (interior): -min(half_extent).
         assert!((box3_sdf_cpu(Vec3::ZERO, h) + 0.4).abs() < 1e-6);
-        // On face: zero.
         assert!(box3_sdf_cpu(Vec3::new(0.4, 0.0, 0.0), h).abs() < 1e-6);
-        // Outside one face: distance to face along that axis.
         assert!((box3_sdf_cpu(Vec3::new(1.4, 0.0, 0.0), h) - 1.0).abs() < 1e-5);
-        // Outside corner: 3D Euclidean distance to the corner.
         let corner = Vec3::splat(0.4);
         let outside_corner = corner + Vec3::splat(1.0);
         let expected = (outside_corner - corner).length();
@@ -300,11 +274,8 @@ mod tests {
     fn halfspace_sdf_distance_and_signs() {
         let normal = Vec3::Y;
         let offset = -0.5_f32;
-        // On the plane y = -0.5: zero.
         assert!(halfspace_sdf_cpu(Vec3::new(0.0, -0.5, 0.0), normal, offset).abs() < 1e-6);
-        // Above the plane: positive.
         assert!((halfspace_sdf_cpu(Vec3::new(0.0, 1.0, 0.0), normal, offset) - 1.5).abs() < 1e-5);
-        // Below the plane: negative.
         assert!(halfspace_sdf_cpu(Vec3::new(0.0, -1.0, 0.0), normal, offset) < 0.0);
     }
 
@@ -338,13 +309,10 @@ mod tests {
         use glam::Vec4;
         let center = Vec4::new(0.5, 1.0, -0.5, 0.25);
         let radius = 0.7_f32;
-        // On surface along +x.
         let on_surface = center + Vec4::X * radius;
         assert!(hypersphere_sdf_cpu(on_surface, center, radius).abs() < 1e-5);
-        // Far in 4D: distance is true 4D Euclidean.
         let far = center + Vec4::W * 5.0;
         assert!((hypersphere_sdf_cpu(far, center, radius) - (5.0 - radius)).abs() < 1e-5);
-        // Lipschitz-1 spot check.
         let mut state: u32 = 0x9999_AAAA;
         let mut nf32 = || {
             state ^= state << 13;
@@ -371,11 +339,8 @@ mod tests {
         use glam::Vec4;
         let normal = Vec4::Y;
         let offset = 0.0_f32;
-        // y = 0 plane: zero.
         assert!(halfspace4d_sdf_cpu(Vec4::new(1.0, 0.0, 2.0, 3.0), normal, offset).abs() < 1e-6);
-        // y > 0: positive.
         assert!(halfspace4d_sdf_cpu(Vec4::new(0.0, 2.0, 0.0, 0.0), normal, offset) > 0.0);
-        // Lipschitz-1: gradient is unit normal.
         let mut state: u32 = 0x5555_3333;
         let mut nf32 = || {
             state ^= state << 13;
