@@ -1,44 +1,19 @@
-// Line rasterizer: static-mesh R⁴ variant. Mesh vertices live in R⁴ and are
-// uploaded ONCE; per-frame work is the host writing a single uniform with the
-// current rotor + Perspective4D focal_distance + view_projection. The vertex
-// shader applies rotor, Perspective4D projection, view_projection to each
-// endpoint before the standard quad-expansion + AA logic.
+// Line rasterizer: static-mesh R⁴ variant. Mesh vertices live in R⁴, uploaded
+// ONCE; per-frame the host writes one uniform (rotor + focal_distance +
+// view_projection). vs_main applies rotor, Perspective4D projection, then
+// view_projection per endpoint; quad-expansion + AA mirror `line_raster.wgsl`.
 //
-// Quad-expansion + AA fragment shader are mirrored from `line_raster.wgsl`
-// (the R³ dynamic variant); the only divergence is the per-endpoint transform
-// chain in vs_main. Keeping the two shaders separate (vs trying to share via
-// WGSL "imports") avoids the naga-side composer dependency the project has
-// otherwise avoided so far.
-//
-// ## Depth-cue coloring
-//
-// Unlike the R³ variant; which interpolates a per-endpoint gradient between
-// `start_color` and `end_color`: this shader paints every line with ONE
-// color computed from the segment's midpoint w-coordinate AFTER the rotor.
-// Within a line the color is uniform; across lines the color tracks 4D depth.
-// This is the depth cue that lets a viewer read "which line is in front of
-// which" in a rotating tesseract: the cube-within-cube structure of a
-// Perspective4D-projected tesseract corresponds to a clean +w / -w split, and
-// the color encodes that split directly. As the rotor spins, edges migrate
-// between the +w and −w camps and the colors animate with the geometry.
-//
-// `start_color` is reused as a per-line tint/opacity modulator: rgb multiplies
-// the depth gradient (uniform white = pure depth-cue palette), alpha passes
-// through to the AA blend. `end_color` is ignored on this path; callers
-// usually upload the same value for both endpoints anyway.
+// Depth-cue coloring: every line gets ONE color from its post-rotor midpoint
+// w-coordinate (cool back / warm front), so color tracks 4D depth across lines
+// in a rotating polytope. `start_color.rgb` tints it (white = pure palette),
+// `start_color.a` passes to the AA blend; `end_color` is ignored on this path.
 
 struct TransformUniform {
-    // 4×4 rotation matrix derived from the host-side `Rotor4` once per frame
-    // via `Rotor4::to_mat4()`. Columns are the rotor applied to the canonical
-    // basis vectors; column-major upload matches WGSL's `mat4x4<f32>` storage.
+    // Host-side `Rotor4::to_mat4()`, column-major.
     rotor_matrix: mat4x4<f32>,
-    // Standard R3 -> clip transform applied AFTER the 4D -> 3D projection.
     view_projection: mat4x4<f32>,
-    // Render-target dimensions in pixels for pixel-to-NDC offset conversion
-    // in the quad-expansion stage.
     viewport_size: vec2<f32>,
-    // Perspective4D focal distance along the w-axis. Vertices at `w = focal`
-    // are degenerate; the host clamps the denominator to avoid div-by-zero.
+    // Perspective4D focal distance along w; denominator clamped below.
     focal_distance: f32,
     _pad: f32,
 };
@@ -51,10 +26,8 @@ struct VsOut {
     @location(2)       color:       vec4<f32>,
 };
 
-// Perspective4D projection: scale x/y/z by focal/(focal - w). Same formula as
-// `EuclideanR4::project_point` on the host. Clamp denominator to keep
-// numerically-degenerate w values (when a rotation places a vertex at
-// w = focal) from producing infinities.
+// Perspective4D projection along w; mirrors `EuclideanR4::project_point`.
+// Clamp the denominator so a vertex at w = focal does not produce infinities.
 fn project_perspective_4d(p4: vec4<f32>, focal: f32) -> vec3<f32> {
     let denom = max(focal - p4.w, 1.0e-4);
     let scale = focal / denom;
@@ -70,24 +43,16 @@ fn vs_main(
     @location(4) end_color:   vec4<f32>,
     @location(5) width_px:    f32,
 ) -> VsOut {
-    // Stage 1: apply the per-frame rotor in R⁴ (host pre-converted Rotor4 to
-    // a 4×4 matrix; here it's a single mat-vec multiply per endpoint).
+    // Rotor (R⁴) -> Perspective4D (R⁴ -> R³) -> view_projection (R³ -> clip).
     let s_4d = transform.rotor_matrix * start_pos;
     let e_4d = transform.rotor_matrix * end_pos;
-    // Stage 2: project from R⁴ to R³ via the standard pinhole formula along w.
     let s_3d = project_perspective_4d(s_4d, transform.focal_distance);
     let e_3d = project_perspective_4d(e_4d, transform.focal_distance);
-    // Stage 3: standard R3 -> clip via view*proj.
     var a = transform.view_projection * vec4<f32>(s_3d, 1.0);
     var b = transform.view_projection * vec4<f32>(e_3d, 1.0);
 
-    // Near-plane clip before the perspective divide (see `line_raster.wgsl` for
-    // the full rationale): glam's `perspective_rh` puts the near plane at
-    // `clip.z == 0` and `clip.z < 0` for anything nearer, including behind the
-    // eye (`w <= 0`), where the divide would flip the NDC across the screen.
-    // Both endpoints in front (the common case here, since a unit-circumradius
-    // polytope never reaches the camera) take no clip. The depth-cue color is a
-    // single value for the whole segment, so a clipped endpoint keeps it.
+    // Near-plane clip before the perspective divide; see `line_raster.wgsl`
+    // for the rationale (behind-eye `w <= 0` would flip NDC across the screen).
     if (a.z < 0.0 && b.z < 0.0) {
         var culled: VsOut;
         culled.clip       = vec4<f32>(0.0, 0.0, -1.0, 1.0);
@@ -104,27 +69,17 @@ fn vs_main(
     let s_ndc  = a.xyz / a.w;
     let e_ndc  = b.xyz / b.w;
 
-    // Corners 0, 2 belong to the start endpoint; 1, 3 to the end. (Mirrors
-    // the same convention as the R³ variant; the quad-expansion + AA logic
-    // below is bit-identical to `line_raster.wgsl`.)
+    // Corners 0, 2 belong to the start endpoint; 1, 3 to the end.
     let pick_start = (corner == 0u || corner == 2u);
     let base_ndc   = select(e_ndc, s_ndc, pick_start);
     let base_w     = select(b.w, a.w, pick_start);
 
-    // Depth-cue color: average the segment's rotated w-coordinates, normalize,
-    // and lerp between a cool "back" tint and a warm "front" tint. Identical
-    // value at both endpoints (no within-line gradient). `start_color` is
-    // applied as a tint multiplier so callers can dim individual edges (or
-    // pass white for the pure depth palette).
-    //
-    // The [-0.5, +0.5] band picked here matches a unit-circumradius tesseract:
-    // every vertex sits on the unit 3-sphere, so w spans exactly that range.
-    // A rotor leaves magnitudes invariant, so the rotated w stays in band.
-    // Different polytopes (24-cell, 600-cell) with their own circumradius will
-    // still produce a usable gradient; the `clamp` keeps the lerp valid; only
-    // the visible contrast shrinks slightly.
+    // Depth-cue color from the segment's mean post-rotor w. The [-0.5, +0.5]
+    // band matches a unit-circumradius tesseract (w on the unit 3-sphere);
+    // the clamp keeps the lerp valid for other circumradii.
     let mid_w  = (s_4d.w + e_4d.w) * 0.5;
     let w_norm = clamp(mid_w + 0.5, 0.0, 1.0);
+    // Cool-back / warm-front diverging pair.
     let back_tint  = vec3<f32>(0.30, 0.42, 0.58);
     let front_tint = vec3<f32>(1.00, 0.78, 0.45);
     let depth_rgb  = mix(back_tint, front_tint, w_norm);

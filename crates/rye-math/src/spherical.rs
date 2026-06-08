@@ -1,32 +1,18 @@
 //! Spherical 3-space (S³), the third constant-curvature `Space`.
 //!
-//! ## Dual representation
+//! Upper-hemisphere model: `Point` is a `Vec3` with `|p| < 1`, lifted to the
+//! unit 4-vector `(p, √(1−|p|²))` on S³ ⊂ R⁴; the origin is the north pole.
+//! This keeps the WGSL ABI at `vec3<f32>` (the v0 `WgslSpace` contract) at the
+//! cost of upper-hemisphere-only coverage: an isometry that pushes a point below
+//! the equator returns out-of-domain (a debug warning fires). The fractal demo's
+//! `ball_scale` keeps coordinates near the origin, well clear of the equator.
 //!
-//! Points live in the **upper hemisphere** model: `Vec3` with `|p| < 1`. A point `p`
-//! corresponds to the unit 4-vector `(p, √(1−|p|²))` on S³ ⊂ R⁴. The origin `Vec3::ZERO` is
-//! the north pole `(0,0,0,1)`.
+//! Isometries are SO(4) matrices: composition is matmul, inverse is transpose.
+//! Curvature `K = +1`; geodesic triangles have positive angle excess.
 //!
-//! This keeps the point type as `Vec3` and the WGSL ABI as `vec3<f32>`, matching the v0
-//! `WgslSpace` contract. The tradeoff: coverage is limited to the upper hemisphere. Isometries
-//! that push a point below the equator (w ≤ 0) return an out-of-domain value; a debug warning
-//! fires and the caller should ensure points stay in the interior.
-//!
-//! For the fractal demo, `ball_scale` keeps all scene coordinates near the origin, so
-//! isometries (camera rotations) stay well within the upper hemisphere.
-//!
-//! Isometries live as 4×4 matrices in SO(4). Composition is matmul; inverse is transpose.
-//!
-//! ## Curvature
-//!
-//! Fixed at `K = +1`. Geodesic triangles have positive angle excess:
-//! `(α + β + γ) − π = area`.
-//!
-//! ## Domain constraint
-//!
-//! `|p|² < 1`. The boundary `|p| = 1` is the equator where `w = 0` and the tangent-vector
-//! formula `vw = −dot(v,p)/w` would blow up. Methods clamp to a saturation shell at
-//! `|p|² = SPHERE_R2_MAX`. Out-of-domain inputs produce degraded-but-finite results, never NaN
-//! or panic.
+//! Domain `|p|² < 1`. The boundary `|p| = 1` is the equator where `w = 0` and the
+//! tangent formula `vw = −dot(v,p)/w` blows up; methods clamp to a saturation
+//! shell at `SPHERE_R2_MAX`, so out-of-domain inputs degrade finitely, never NaN.
 
 use std::borrow::Cow;
 
@@ -35,8 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::space::{Space, WgslSpace};
 
-/// Closest `|p|²` is allowed to 1.0. At the equator `w = sqrt(1 − |p|²) -> 0`
-/// and the tangent formula saturates; this shell keeps `w ≥ ~1e-3`.
+/// Closest `|p|²` allowed to 1.0; keeps `w ≥ ~1e-3` so the tangent formula does
+/// not saturate at the equator.
 const SPHERE_R2_MAX: f32 = 1.0 - 1e-6;
 
 fn clamp_to_hemisphere(p: Vec3) -> Vec3 {
@@ -57,7 +43,7 @@ fn to_sphere(p: Vec3) -> Vec4 {
 }
 
 /// Project a 4D sphere point back to upper-hemisphere coords by discarding w.
-/// Only correct when `q.w ≥ 0`; emits a warning when called on lower hemisphere points.
+/// Only correct when `q.w ≥ 0`; warns on lower-hemisphere points.
 fn from_sphere(q: Vec4) -> Vec3 {
     #[cfg(debug_assertions)]
     if q.w < 0.0 {
@@ -70,10 +56,8 @@ fn from_sphere(q: Vec4) -> Vec3 {
     q.truncate()
 }
 
-/// An orientation-preserving isometry of S³.
-///
-/// Stored as a 4×4 matrix in SO(4). Composition is matmul; inverse is
-/// transpose (SO(4) matrices are orthogonal).
+/// An orientation-preserving isometry of S³, an SO(4) matrix. Composition is
+/// matmul; inverse is transpose.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Iso4 {
     pub matrix: Mat4,
@@ -84,10 +68,8 @@ impl Iso4 {
         matrix: Mat4::IDENTITY,
     };
 
-    /// Pure spatial rotation fixing the north pole (the w axis).
-    ///
-    /// Embeds SO(3) into SO(4) in the upper-left 3×3 block; the w row and
-    /// column are the identity.
+    /// Pure spatial rotation fixing the north pole: SO(3) in the upper-left 3×3
+    /// block, identity w row and column.
     pub fn from_rotation(rotation: Quat) -> Self {
         let r = Mat3::from_quat(rotation);
         Self {
@@ -100,29 +82,21 @@ impl Iso4 {
         }
     }
 
-    /// Geodesic translation mapping the north pole `(0,0,0,1)` to `target`.
-    ///
-    /// Implemented as a Givens rotation in the 2D plane spanned by `e_w` and the xyz direction
-    /// of `target`. The angle is the geodesic distance from the north pole to `target`.
-    ///
-    /// `target` must be in the upper hemisphere. Out-of-domain targets are clamped to the
-    /// saturation shell rather than producing invalid matrices.
+    /// Geodesic translation mapping the north pole to `target`: a Givens rotation
+    /// in the `{e_w, xyz-direction-of-target}` plane by the geodesic distance.
+    /// Out-of-domain targets clamp to the saturation shell.
     pub fn from_translation(target: Vec3) -> Self {
         let qt = to_sphere(clamp_to_hemisphere(target));
-        // c = cos(angle), s = sin(angle) = |qt.xyz|
         let c = qt.w;
         let s = qt.truncate().length();
         if s < 1e-7 {
             return Self::IDENTITY;
         }
-        let n = qt.truncate() / s; // unit direction in xyz subspace
-        let k = c - 1.0; // reused below
+        let n = qt.truncate() / s;
+        let k = c - 1.0;
 
-        // Givens rotation in the {n_4d, e_w} plane by angle θ (cos=c, sin=s) mapping e_w ->
-        // qt. Derivation: for each basis vector e_i, decompose into (component along n_4d,
-        // component along e_w, perpendicular) and apply the 2D rotation. The result is the
-        // same algebraic form as H³'s Lorentz boost with sinh->sin, cosh->cos, and a sign
-        // flip on the (xyz, w) block (SO(4) vs SO⁺(3,1)).
+        // Same algebraic form as H³'s Lorentz boost with sinh->sin, cosh->cos,
+        // and a sign flip on the (xyz, w) block (SO(4) vs SO⁺(3,1)).
         Self {
             matrix: Mat4::from_cols(
                 Vec4::new(1.0 + k * n.x * n.x, k * n.x * n.y, k * n.x * n.z, -s * n.x),
@@ -136,7 +110,7 @@ impl Iso4 {
 
 /// Spherical 3-space, upper hemisphere model, curvature `K = +1`.
 ///
-/// Stateless unit struct. See the [module docs](self) for the representation rationale and
+/// Stateless unit struct. See the [module docs](self) for the representation and
 /// domain constraint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SphericalS3;
@@ -149,9 +123,8 @@ impl Space for SphericalS3 {
     fn distance(&self, a: Vec3, b: Vec3) -> f32 {
         let qa = to_sphere(clamp_to_hemisphere(a));
         let qb = to_sphere(clamp_to_hemisphere(b));
-        // Chord formula: d = 2·asin(|qa − qb| / 2).
-        // Better conditioned than acos(dot(qa,qb)) for small d, where acos(1 − ε) quantizes in
-        // f32 (same issue as H³'s acosh form).
+        // Chord half-angle `d = 2·asin(|qa − qb| / 2)`: better conditioned for
+        // small d than `acos(dot)`, where `acos(1 − ε)` quantizes in f32.
         let half_chord = (qa - qb).length() * 0.5;
         2.0 * half_chord.clamp(0.0, 1.0).asin()
     }
@@ -162,8 +135,7 @@ impl Space for SphericalS3 {
             return at;
         }
         let q = to_sphere(at);
-        // Lift v to a 4D tangent perpendicular to q.
-        // Constraint: dot(v4, q) = dot(v, at) + vw·q.w = 0 -> vw = −dot(v,at)/q.w
+        // Lift v to a 4D tangent perpendicular to q: vw = −dot(v,at)/q.w.
         let vw = -v.dot(at) / q.w;
         let v4 = Vec4::new(v.x, v.y, v.z, vw);
         let mag = v4.length();
@@ -178,7 +150,7 @@ impl Space for SphericalS3 {
         let qf = to_sphere(clamp_to_hemisphere(from));
         let qt = to_sphere(clamp_to_hemisphere(to));
         let d_dot = qf.dot(qt).clamp(-1.0, 1.0);
-        // Component of qt perpendicular to qf, points along the geodesic.
+        // Component of qt perpendicular to qf, along the geodesic.
         let perp4 = qt - d_dot * qf;
         let n = perp4.length();
         if n < 1e-7 {
@@ -186,8 +158,7 @@ impl Space for SphericalS3 {
         }
         let half_chord = (qt - qf).length() * 0.5;
         let d = 2.0 * half_chord.clamp(0.0, 1.0).asin();
-        // 4D tangent: perp4 * (d / n). Return xyz, w is implied by the tangent constraint and
-        // recovered in exp.
+        // Return xyz; w is recovered in exp via the tangent constraint.
         perp4.truncate() * (d / n)
     }
 
@@ -196,11 +167,10 @@ impl Space for SphericalS3 {
         let to = clamp_to_hemisphere(to);
         let qf = to_sphere(from);
         let qt = to_sphere(to);
-        // Lift v to 4D tangent at qf.
         let vw = -v.dot(from) / qf.w;
         let v4 = Vec4::new(v.x, v.y, v.z, vw);
-        // Sphere PT formula: v4' = v4 − (dot(v4,qt) / (1 + dot(qf,qt))) · (qf + qt) Undefined
-        // when qf and qt are antipodal (dot = −1). Clamp denominator.
+        // v4' = v4 − (dot(v4,qt) / (1 + dot(qf,qt))) · (qf + qt); undefined at
+        // antipodes (dot = −1), so clamp the denominator.
         let c = qf.dot(qt);
         let denom = (1.0 + c).max(1e-7);
         let v4_transported = v4 - v4.dot(qt) / denom * (qf + qt);
@@ -229,7 +199,7 @@ impl Space for SphericalS3 {
     }
 
     fn iso_transport(&self, iso: Iso4, at: Vec3, v: Vec3) -> Vec3 {
-        // Exact for isometries via the geodesic round-trip identity.
+        // Exact via the geodesic round-trip identity.
         let target = self.exp(at, v);
         let m_at = self.iso_apply(iso, at);
         let m_target = self.iso_apply(iso, target);
@@ -329,11 +299,8 @@ mod tests {
     fn to_sphere_from_sphere_round_trip() {
         let p = Vec3::new(0.2, -0.3, 0.1);
         let q = to_sphere(p);
-        // On S³: |q|² = 1
         assert_relative_eq!(q.length(), 1.0, epsilon = 1e-6);
-        // w = sqrt(1 - |p|²)
         assert_relative_eq!(q.w, (1.0 - p.length_squared()).sqrt(), epsilon = 1e-6);
-        // Round-trip
         assert_relative_eq!(from_sphere(q).x, p.x, epsilon = 1e-6);
         assert_relative_eq!(from_sphere(q).y, p.y, epsilon = 1e-6);
         assert_relative_eq!(from_sphere(q).z, p.z, epsilon = 1e-6);
@@ -351,8 +318,7 @@ mod tests {
     #[test]
     fn distance_at_origin_matches_arc_length() {
         let s = s3();
-        // Origin = north pole. Distance to (r, 0, 0) = acos(w) = acos(sqrt(1-r²))
-        // which equals asin(r) for r in [0,1).
+        // Distance from the north pole to (r, 0, 0) is asin(r).
         let r = 0.4;
         let p = Vec3::new(r, 0.0, 0.0);
         assert_relative_eq!(s.distance(Vec3::ZERO, p), r.asin(), epsilon = 1e-5);
@@ -446,10 +412,9 @@ mod tests {
         let s = s3();
         let from = Vec3::ZERO;
         let to = Vec3::new(0.3, 0.0, 0.0);
-        let v = Vec3::new(0.0, 0.05, 0.0); // tangent at origin (perpendicular to direction of motion)
+        let v = Vec3::new(0.0, 0.05, 0.0); // tangent at origin, perpendicular to motion
         let v_to = s.parallel_transport(from, to, v);
-        // Spherical norm: |v4| where v4 = (v, vw). At origin w=1 so v4=(v,0) and |v4|=|v|.
-        // After PT the norm must be preserved.
+        // Spherical norm |v4| (v4 = (v, vw)) must be preserved by transport.
         let norm_from = {
             let qf = to_sphere(from);
             let vw = -v.dot(from) / qf.w;
@@ -465,7 +430,7 @@ mod tests {
 
     #[test]
     fn small_scale_distance_matches_euclidean() {
-        // At the north pole (origin), the metric factor is 1: ds_S³ = ds_R³.
+        // At the origin the metric factor is 1: ds_S³ = ds_R³.
         let s = s3();
         let eps = 1e-3;
         let p = Vec3::new(eps, 0.0, 0.0);
@@ -474,9 +439,8 @@ mod tests {
 
     #[test]
     fn angle_excess_in_small_triangle_scales_with_area() {
-        // S³ has K = +1. Gauss-Bonnet: (α + β + γ) − π = K · area = area.
-        // For a small equilateral triangle at the origin with side length L,
-        // area ≈ (√3/4)·L² to leading order.
+        // Gauss-Bonnet at K = +1: (α + β + γ) − π = area. A small equilateral
+        // triangle of side L has area ≈ (√3/4)·L².
         let s = s3();
         let l = 0.05_f32;
         let a = Vec3::ZERO;
@@ -486,11 +450,8 @@ mod tests {
         let angle_at = |p: Vec3, q: Vec3, r: Vec3| -> f32 {
             let u3 = s.log(p, q);
             let w3 = s.log(p, r);
-            // Riemannian inner product: lift to 4D tangents.
-            // In the 3D upper-hemisphere coords the metric is not Euclidean
-            // away from the origin, so the 3D dot product gives the wrong
-            // angle. The 4D tangent constraint dot(v4, q) = 0 gives
-            // vw = -dot(v3, p) / q.w.
+            // The 3D metric is not Euclidean away from the origin, so take the
+            // Riemannian angle from the lifted 4D tangents (vw = -dot(v3, p)/q.w).
             let qp = to_sphere(p);
             let u4 = Vec4::new(u3.x, u3.y, u3.z, -u3.dot(p) / qp.w);
             let w4 = Vec4::new(w3.x, w3.y, w3.z, -w3.dot(p) / qp.w);
