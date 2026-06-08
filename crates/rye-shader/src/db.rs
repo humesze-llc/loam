@@ -25,18 +25,16 @@ struct Entry {
     path: PathBuf,
     module: ShaderModule,
     scene_source: Option<String>,
-    /// Incremented on every successful (re)compile. Render code caches the generation it
-    /// last built a pipeline against; mismatch means the pipeline needs rebuilding.
+    /// Bumped on every successful (re)compile; render code rebuilds its pipeline
+    /// on a generation mismatch.
     generation: u64,
     /// Debug label for the module; reused on recompile.
     label: String,
 }
 
-/// Cache of compiled shaders, invalidated on asset events.
-///
-/// Hot-reload failures preserve the previous successful module: the user sees stale
-/// output and a log line, not a crash. When a shader file is removed, the entry is
-/// retained (stale) until a create or modify event restores it.
+/// Cache of compiled shaders, invalidated on asset events. A failed hot-reload
+/// (or removed file) keeps the last good module rather than crashing; a later
+/// create/modify restores it.
 pub struct ShaderDb {
     device: Device,
     entries: HashMap<ShaderId, Entry>,
@@ -45,8 +43,7 @@ pub struct ShaderDb {
 }
 
 impl ShaderDb {
-    /// Construct. `device` is cloned internally on recompile; wgpu's Device is cheap to
-    /// clone (internally reference-counted).
+    /// Construct. `device` is cloned on recompile (wgpu's Device is refcounted).
     pub fn new(device: Device) -> Self {
         Self {
             device,
@@ -56,19 +53,15 @@ impl ShaderDb {
         }
     }
 
-    /// Load a shader from disk, prepending the Space's WGSL prelude.
-    ///
-    /// Returns a [`ShaderId`] that remains valid across hot reloads of the same path.
-    /// Call [`ShaderDb::load`] twice with the same path and you get the same ID and a
-    /// fresh compilation.
+    /// Load a shader from disk, prepending the Space's WGSL prelude. The returned
+    /// [`ShaderId`] is stable across reloads; loading the same path twice yields
+    /// the same ID and a fresh compilation.
     pub fn load<S: WgslSpace>(&mut self, path: impl AsRef<Path>, space: &S) -> Result<ShaderId> {
         self.load_inner(path, None, space)
     }
 
-    /// Load a shader from disk with an additional scene module.
-    ///
-    /// The scene source is stored with the entry and reused on hot reloads of the shader
-    /// file.
+    /// Load a shader plus a scene module; the scene source is stored and reused on
+    /// reloads of the shader file.
     pub fn load_with_scene<S: WgslSpace>(
         &mut self,
         path: impl AsRef<Path>,
@@ -78,15 +71,10 @@ impl ShaderDb {
         self.load_inner(path, Some(scene_source), space)
     }
 
-    /// Load a shader from disk for geodesic ray marching.
-    ///
-    /// Assembles four layers: Space prelude + scene SDF + geodesic march kernel
-    /// ([`crate::GEODESIC_MARCH_KERNEL`]) + user shading WGSL. The kernel defines
-    /// `rye_march_geodesic`, `rye_estimate_normal`, and `rye_safe_normalize` for the
-    /// user shading fragment to call.
-    ///
-    /// The assembled scene + kernel is stored and reused on hot reloads of the user
-    /// shading file.
+    /// Load a shader for geodesic ray marching: assembles Space prelude + scene
+    /// SDF + geodesic march kernel ([`crate::GEODESIC_MARCH_KERNEL`], which defines
+    /// `rye_march_geodesic` / `rye_estimate_normal` / `rye_safe_normalize`) + user
+    /// shading. The scene + kernel is stored and reused on reloads.
     pub fn load_geodesic_scene<S: WgslSpace>(
         &mut self,
         path: impl AsRef<Path>,
@@ -150,22 +138,19 @@ impl ShaderDb {
             .module
     }
 
-    /// Generation counter for `id`. Increments on every successful (re)compile. Render
-    /// code caches the value it last built a pipeline against and rebuilds on mismatch.
+    /// Generation counter for `id`; bumps on every successful (re)compile so
+    /// render code can rebuild its pipeline on mismatch.
     pub fn generation(&self, id: ShaderId) -> u64 {
         self.entries.get(&id).map(|e| e.generation).unwrap_or(0)
     }
 
-    /// Apply filesystem events, recompiling affected shaders.
-    ///
-    /// Compile errors are logged but do not remove the stale module; rendering continues
-    /// against the last good compile until the source file is fixed.
+    /// Apply filesystem events, recompiling affected shaders. Compile errors are
+    /// logged but keep the last good module; rendering continues until fixed.
     pub fn apply_events<S: WgslSpace>(&mut self, events: &[AssetEvent], space: &S) {
         for event in events {
             let canonical = match canonicalize(&event.path) {
                 Ok(p) => p,
-                // Removed files can't be canonicalized; fall back to the raw path for
-                // lookup.
+                // Removed files can't be canonicalized; look up by raw path.
                 Err(_) => event.path.clone(),
             };
             let Some(&id) = self.path_index.get(&canonical) else {
@@ -223,10 +208,8 @@ fn canonicalize(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("canonicalizing {}", path.display()))
 }
 
-/// Concatenate the Space's WGSL prelude with the user shader source.
-///
-/// Extracted for testability, this is the hot-reloadable logic that doesn't require a
-/// wgpu Device.
+/// Concatenate the Space's WGSL prelude with the user shader source. Extracted for
+/// testability; the Device-free part of the hot-reload path.
 #[cfg(test)]
 pub(crate) fn assemble_source(space_wgsl: &str, user_source: &str) -> String {
     assemble_source_with_scene(space_wgsl, None, user_source)
@@ -256,12 +239,9 @@ pub(crate) fn assemble_source_with_scene(
     out
 }
 
-/// Parse and validate a complete WGSL module.
-///
-/// This is intentionally headless: `rye-shader` can reject a broken
-/// [`rye_math::WgslSpace`] prelude or user shader without requiring a GPU adapter,
-/// window, or render pipeline. `wgpu` still performs backend validation when the
-/// module is created.
+/// Parse and validate a complete WGSL module. Headless: rejects a broken
+/// [`rye_math::WgslSpace`] prelude or user shader without a GPU adapter. `wgpu`
+/// still does its own backend validation at module creation.
 pub fn validate_wgsl(source: &str) -> std::result::Result<(), WgslValidationError> {
     let module = naga::front::wgsl::parse_str(source)?;
     let flags = naga::valid::ValidationFlags::all();
@@ -297,8 +277,8 @@ fn main() {
 }
 "#;
 
-    // 4D variant of `ABI_PROBE`. `EuclideanR4`'s prelude uses `vec4<f32>` for both
-    // points and tangent vectors; the v0 ABI is otherwise identical.
+    // 4D variant of `ABI_PROBE`; `EuclideanR4` uses `vec4<f32>` throughout, v0 ABI
+    // otherwise identical.
     const ABI_PROBE_VEC4: &str = r#"
 @compute @workgroup_size(1)
 fn main() {
@@ -367,11 +347,9 @@ fn main() {
         validate_wgsl(&src).expect("SphericalS3 WGSL prelude should validate");
     }
 
-    /// `EuclideanR4`'s prelude is the v0 ABI in `vec4<f32>`. No render node consumes it
-    /// today (4D rendering ships through the hyperslice path, not a native 4D geodesic
-    /// march), but the prelude's mathematical content is honest, flat-space
-    /// `exp`/`log`/`distance`/`parallel_transport` for ℝ⁴, so naga validation pins the
-    /// contract for any future consumer.
+    /// `EuclideanR4`'s prelude is the v0 ABI in `vec4<f32>`. No render node
+    /// consumes it yet (4D ships via hyperslice, not native geodesic march), but
+    /// the flat-space ℝ⁴ math is honest, so naga validation pins the contract.
     #[test]
     fn euclidean_r4_space_prelude_validates_against_abi_probe() {
         let src = assemble_source(&EuclideanR4.wgsl_impl(), ABI_PROBE_VEC4);
@@ -438,15 +416,10 @@ fn main() {
             .expect("BlendedSpace<E3,H3,LinearBlendX> + geodesic kernel should validate");
     }
 
-    // ---- CPU port of `rye_march_geodesic` for hit-point tests --------
-    //
-    // Mirrors `kernel.wgsl::rye_march_geodesic` line-for-line. Used by the `cpu_march_*`
-    // tests below to assert the algorithm produces the right hit point against a known
-    // SDF without needing a GPU adapter (the existing GPU probes are `#[ignore]`d
-    // locally and run via lavapipe in CI).
-    //
-    // The kernel reads `RYE_MAX_ARC` from the Space prelude as a WGSL constant; here
-    // it's an explicit parameter so the test pins which value it's exercising.
+    // CPU port of `kernel.wgsl::rye_march_geodesic`, mirrored line-for-line, so
+    // the `cpu_march_*` tests can check hit points against a known SDF without a
+    // GPU adapter. `rye_max_arc` is a parameter here (the kernel reads it as a
+    // prelude constant) so each test pins the value it exercises.
     fn march_geodesic_cpu<S: Space<Point = Vec3, Vector = Vec3>>(
         space: &S,
         sdf: impl Fn(Vec3) -> f32,
@@ -470,8 +443,8 @@ fn main() {
         let min_step = 0.0001 * scale;
 
         for _ in 0..256 {
-            // `rye_origin_distance(p)` in the kernel; for every Space currently shipped,
-            // equivalent to the Riemannian distance from origin to p.
+            // `rye_origin_distance(p)` in the kernel; Riemannian distance from
+            // origin to p for every Space shipped today.
             if space.distance(Vec3::ZERO, p) > rye_max_arc * 0.92 {
                 return None;
             }
@@ -495,10 +468,9 @@ fn main() {
         None
     }
 
-    /// Sphere-trace a unit ray against a sphere centered at the origin in EuclideanR3.
-    /// The hit point should land on the sphere's surface within the kernel's `hit_eps`,
-    /// and the reported `t_scene` should equal the camera-space distance from the ray
-    /// origin to the surface.
+    /// Sphere-trace a unit ray against an origin-centered sphere in EuclideanR3;
+    /// the hit should land on the surface within `hit_eps` and `t_scene` equal the
+    /// camera-space distance to it.
     #[test]
     fn cpu_march_hits_centered_sphere_in_euclidean_r3() {
         let space = EuclideanR3;
@@ -509,7 +481,7 @@ fn main() {
         let (hit, t) = march_geodesic_cpu(&space, sdf, ro, rd, 1.0, 1.0e9)
             .expect("ray should hit centered sphere");
 
-        // Expected hit: front of the sphere along -Z, i.e. (0, 0, 0.5).
+        // Front of the sphere along -Z: (0, 0, 0.5).
         let expected = Vec3::new(0.0, 0.0, sphere_radius);
         let position_drift = (hit - expected).length();
         assert!(
@@ -517,9 +489,8 @@ fn main() {
             "hit {hit:?} should be within hit_eps of expected {expected:?} (drift {position_drift})",
         );
 
-        // Expected t_scene = 1.5 (camera-space distance ro.z - radius). Tolerance covers
-        // the kernel's last-step overshoot of up to one hit_eps (0.001) plus
-        // float-stepping noise.
+        // t_scene = ro.z - radius = 1.5; tolerance covers last-step overshoot
+        // (up to one hit_eps) plus float-stepping noise.
         let expected_t = 1.5_f32;
         assert!(
             (t - expected_t).abs() < 5e-3,
@@ -527,9 +498,8 @@ fn main() {
         );
     }
 
-    /// A ray pointing away from the only object in the scene must miss. The kernel exits
-    /// when `t_scene > 40.0` or after 256 iterations; either path returns the
-    /// `w = -1.0` miss sentinel.
+    /// A ray pointing away from the only object must miss (exit on `t_scene > 40`
+    /// or the 256-iteration cap).
     #[test]
     fn cpu_march_misses_when_ray_points_away_in_euclidean_r3() {
         let space = EuclideanR3;
@@ -794,9 +764,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             tx.send(res).expect("map callback receiver should exist");
         });
-        // wgpu v27 made `PollType::Wait` a struct variant. Default `submission_index =
-        // None` waits on the most recent submission; `timeout = None` waits indefinitely
-        // (matches the v26 behaviour).
+        // `submission_index = None` waits on the most recent submission;
+        // `timeout = None` waits indefinitely.
         device
             .poll(wgpu::PollType::Wait {
                 submission_index: None,
@@ -832,44 +801,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     /// CPU/GPU parity for `BlendedSpace<EuclideanR3, HyperbolicH3, LinearBlendX>`,
-    /// restricted to `rye_exp`. Transport parity has its own probe at
-    /// `blended_e3_h3_gpu_probe_transport_matches_cpu`.
+    /// restricted to `rye_exp` (the highest-leverage method; transport has its own
+    /// probe). `rye_log` and `rye_distance` are intentionally divergent (chart-diff
+    /// vs Gauss-Newton; midpoint chord-metric vs full Riemannian) and the kernel
+    /// doesn't call `rye_log`.
     ///
-    /// The other two ABI methods are intentionally divergent:
-    /// - `rye_log` returns the chart-coordinate difference; CPU runs Gauss-Newton
-    ///   shooting. The geodesic march kernel does not call it.
-    /// - `rye_distance` uses the midpoint chord-metric `sqrt(f((a+b)/2)) * |a-b|`; CPU
-    ///   computes the full Riemannian distance via `log` length scaled by the conformal
-    ///   factor at `a`.
-    ///
-    /// `rye_exp` is the highest-leverage method (each kernel sub-step's geodesic
-    /// position depends on it directly).
-    ///
-    /// Tolerance: GPU uses 16 RK4 sub-steps, CPU uses 32. Both are 4th-order so
-    /// per-step truncation scales as h^5; halving sub-steps increases per-step error by
-    /// 32x and halves the step count, so cumulative error grows by ~16x. For the smooth
-    /// conformal factor in this instantiation, the absolute drift stays under 5e-3
-    /// across the test sample (small `v` magnitudes well inside the H3 Poincare ball).
+    /// Tolerance 5e-3: GPU runs 16 RK4 sub-steps, CPU 32; both 4th-order, so
+    /// cumulative drift grows ~16x but stays small for the smooth conformal factor
+    /// and the small `v` well inside the H3 ball.
     #[test]
     #[ignore = "requires a working wgpu adapter; run manually when changing BlendedSpace WGSL"]
     fn blended_e3_h3_gpu_probe_exp_matches_cpu() {
         let space = BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-0.5, 0.5));
         let cases = [
-            // Pure E3 region (alpha = 0): straight-line motion expected; tightest tolerance.
+            // Pure E3 (alpha = 0): straight-line motion.
             gpu_case(
                 Vec3::new(-1.0, 0.05, 0.0),
                 Vec3::new(-0.8, 0.05, 0.0),
                 Vec3::new(0.1, 0.0, 0.0),
             ),
-            // Mid-zone (alpha ~ 0.5): variable-metric integration exercises the conformal
-            // factor's gradient throughout the geodesic step.
+            // Mid-zone (alpha ~ 0.5): exercises the conformal factor's gradient.
             gpu_case(
                 Vec3::new(0.0, 0.05, 0.0),
                 Vec3::new(0.1, 0.05, 0.0),
                 Vec3::new(0.05, 0.0, 0.0),
             ),
-            // Pure H3 region (alpha = 1) at moderate radius; f(p) = 4/(1-|p|^2)^2 ~
-            // 15.4x identity at r=0.7, so the geodesic is non-linear in chart coords.
+            // Pure H3 (alpha = 1) at r=0.7: f(p) ~ 15.4x identity, non-linear.
             gpu_case(
                 Vec3::new(0.7, 0.0, 0.0),
                 Vec3::new(0.71, 0.05, 0.0),
@@ -893,30 +850,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     /// CPU/GPU parity for
-    /// `BlendedSpace<EuclideanR3, HyperbolicH3, LinearBlendX>::parallel_transport`. Both
-    /// sides run 8 RK4 sub-steps along the chart-coordinate line from `a` to `b`, so
-    /// agreement is to 4th-order truncation modulo f32 noise.
-    ///
-    /// Chosen test paths sample the three regions: pure E3 (transport reduces to
-    /// identity, tightest tolerance), the mid-zone where the conformal factor's gradient
-    /// is non-zero, and pure H3 at moderate radius where the metric varies fastest.
-    /// Tolerance matches the exp probe's 5e-3 budget.
+    /// `BlendedSpace<EuclideanR3, HyperbolicH3, LinearBlendX>::parallel_transport`.
+    /// Both sides run 8 RK4 sub-steps along the chart-coordinate line `a` to `b`.
+    /// Paths sample pure E3 (identity transport), the mid-zone, and pure H3 at
+    /// moderate radius. Tolerance matches the exp probe's 5e-3.
     #[test]
     #[ignore = "requires a working wgpu adapter; run manually when changing BlendedSpace WGSL"]
     fn blended_e3_h3_gpu_probe_transport_matches_cpu() {
         let space = BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-0.5, 0.5));
         let cases = [
-            // Pure E3: transport is identity in flat space; any drift is pure GPU-vs-CPU
-            // floating-point noise.
+            // Pure E3: transport is identity; drift is pure GPU-vs-CPU noise.
             gpu_case(
                 Vec3::new(-1.0, 0.05, 0.0),
                 Vec3::new(-0.8, 0.05, 0.0),
                 Vec3::new(0.1, 0.0, 0.0),
             ),
-            // Long traversal across the transition zone (-0.5 -> +0.5) and out into H3
-            // at r ~ 0.7. The conformal-factor gradient varies fastest here, and the
-            // path length plus large transport vector amplifies per-step truncation.
-            // This is the case that discriminates 8-step RK4 from single-step Euler.
+            // Long traversal across the transition zone into H3 at r ~ 0.7; the
+            // case that discriminates 8-step RK4 from single-step Euler.
             gpu_case(
                 Vec3::new(-0.6, 0.0, 0.0),
                 Vec3::new(0.7, 0.0, 0.0),
@@ -959,11 +909,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
     }
 
-    /// Hot-reload's text path: read a shader file, assemble against a Space prelude,
-    /// validate via naga, mutate the file, repeat. Pins the I/O + assembly + validation
-    /// pipeline that [`ShaderDb::reload`] depends on without needing a wgpu Device
-    /// (constructing one headlessly in CI is heavy and platform-flaky). The Device-bound
-    /// layer is just `create_shader_module` over the same validated source.
+    /// Hot-reload's text path: read, assemble against a Space prelude, validate via
+    /// naga, mutate, repeat. Pins the Device-free I/O + assembly + validation that
+    /// [`ShaderDb::reload`] depends on (the Device-bound layer is just
+    /// `create_shader_module` over the same validated source).
     #[test]
     fn hot_reload_pipeline_reads_assembles_and_validates_mutated_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -976,9 +925,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let src1 = assemble_source(&EuclideanR3.wgsl_impl(), &read1);
         validate_wgsl(&src1).expect("v1 must validate");
 
-        // Mutate the file in place: bytes change, path is identical (the same shape the
-        // watcher sees on a save). Tweak a constant rather than the structure so the v2
-        // source still validates.
+        // Mutate in place (same path, changed bytes, as the watcher sees a save);
+        // tweak a constant, not structure, so v2 still validates.
         let v2 = ABI_PROBE.replace("vec3<f32>(0.1, 0.2, 0.3)", "vec3<f32>(0.4, 0.5, 0.6)");
         assert_ne!(v1, v2, "test mutation should produce different source");
         std::fs::write(&path, &v2).unwrap();

@@ -1,37 +1,14 @@
 //! Per-frame allocation counter via a [`GlobalAlloc`] wrapper. Demos opt in by
-//! installing [`CountingAllocator`] as their `#[global_allocator]`; once installed,
-//! every `alloc` / `dealloc` increments process-global atomic counters and the
-//! per-frame delta is surfaced through `rye_time::frame_trace::FrameTrace`.
+//! installing [`CountingAllocator`] as their `#[global_allocator]`; every
+//! alloc/dealloc bumps process-global atomic counters and the per-frame delta is
+//! surfaced through `rye_time::frame_trace::FrameTrace`.
 //!
-//! ## Why a GlobalAlloc wrapper instead of `tracking-allocator` / `dhat`
-//!
-//! `dhat` is a heavy profiling tool with file-based output; great for one-off
-//! deep-dives, awful for "show the current allocation rate in the overlay every
-//! frame." `tracking-allocator` is similarly oriented at offline profiles.
-//!
-//! All we need for the wasm-perf story is "bytes net + allocs count this frame";
-//! that's a four-atomic increment per allocation, ~5-10ns of overhead on native,
-//! basically free relative to the underlying `System::alloc`. Cheap enough to
-//! leave on by default in debug + release wasm builds without measurable impact.
-//!
-//! ## Why atomics and not thread-locals
-//!
-//! `GlobalAlloc` is called from any thread; on wasm32 we're single-threaded so
-//! thread-locals would suffice, but atomics are correct everywhere and the cost
-//! is one `fetch_add` per call. Relaxed ordering is fine because we don't
-//! synchronize OTHER memory through these counters; they're plain counts.
-//!
-//! ## Why "installed" is its own bool
-//!
-//! The counters start at zero. If a demo never installs the wrapper, the per-
-//! frame delta is identically zero forever, which would print as "0 allocs"
-//! misleadingly. The wrapper sets `ALLOC_INSTALLED` on first call so
-//! `frame_trace` can distinguish "no allocator wired" from "no allocations
-//! this frame." The latter is the steady-state goal we're driving toward.
-//!
-//! ## Usage
-//!
-//! In a demo's `main.rs`:
+//! Lighter than `dhat`/`tracking-allocator` (offline, file-based): all we need is
+//! net bytes + alloc count this frame, a four-atomic increment per call (~5-10ns),
+//! cheap enough to leave on in release wasm. Atomics not thread-locals so the
+//! wrapper is correct off the single wasm thread too; `Relaxed` since no other
+//! memory is synchronized through these counts. `ALLOC_INSTALLED` lets
+//! `frame_trace` distinguish "no allocator wired" from "no allocations this frame."
 //!
 //! ```ignore
 //! use rye_time::alloc::CountingAllocator;
@@ -41,57 +18,36 @@
 //! static GLOBAL: CountingAllocator<System> = CountingAllocator::new(System);
 //! ```
 //!
-//! The wrapper is generic over the inner allocator so wasm targets can swap in
-//! `wee_alloc` or a custom allocator without changing the counting layer.
+//! Generic over the inner allocator so wasm can swap in `wee_alloc`.
 
 use std::alloc::{GlobalAlloc, Layout};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Process-global counter of total bytes allocated since startup. Monotonic
-/// (never decreases); the per-frame delta is computed by sampling at frame
-/// boundaries and subtracting. `Relaxed` ordering everywhere; no other memory
-/// is synchronized through these counters.
+/// Total bytes allocated since startup. Monotonic; per-frame delta is sampled at
+/// frame boundaries and subtracted.
 pub(crate) static TOTAL_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Process-global counter of total bytes deallocated since startup. Same shape
-/// as [`TOTAL_ALLOC_BYTES`]; the net heap delta over a frame is
-/// `(alloc_bytes_end - alloc_bytes_start) - (dealloc_bytes_end - dealloc_bytes_start)`.
+/// Total bytes deallocated since startup; net heap delta is alloc-delta minus
+/// dealloc-delta.
 pub(crate) static TOTAL_DEALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Process-global allocation-call count since startup. Useful per-frame as the
-/// "alloc churn" signal that's independent of allocation size: a million 1-byte
-/// allocations is a different problem than one 1 MB allocation.
+/// Allocation-call count since startup; the size-independent "churn" signal.
 pub(crate) static TOTAL_ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Process-global deallocation-call count since startup.
+/// Deallocation-call count since startup.
 pub(crate) static TOTAL_DEALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Sentinel: was a [`CountingAllocator`] ever called? If false, the counters
-/// are all zero because nothing was installed, not because nothing allocated.
-/// `frame_trace` reads this to decide whether to attach `AllocDelta` to
-/// completed frames.
+/// Sentinel: was a [`CountingAllocator`] ever called? Distinguishes "no allocator
+/// wired" (counters all zero) from "no allocations." Read by `frame_trace`.
 pub(crate) static ALLOC_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-/// `GlobalAlloc` wrapper that counts every alloc + dealloc through atomic
-/// counters. Generic over the inner allocator so the demo can wrap `System`
-/// (native), `wee_alloc` (wasm-lean), or any other GlobalAlloc.
-///
-/// ## Drop semantics
-///
-/// `GlobalAlloc` is `unsafe` to implement; we delegate every call to the inner
-/// allocator without modification + only add counter updates. Safety contract
-/// is therefore "as safe as `A`."
-///
-/// ## Layout::size()
-///
-/// We count `Layout::size()` bytes per allocation, not the actual aligned size
-/// returned by the allocator (which can be larger to satisfy alignment). The
-/// `size()` value matches what Rust code "thinks" it allocated; reads slightly
-/// low vs. true heap pressure but matches what a programmer would expect to
-/// see in the overlay.
+/// `GlobalAlloc` wrapper that counts every alloc/dealloc through atomic counters.
+/// Generic over the inner allocator. Calls delegate unmodified, so it is "as safe
+/// as `A`." Counts `Layout::size()` (what Rust code thinks it allocated), not the
+/// aligned size; reads slightly low vs true heap pressure but matches expectation.
 pub struct CountingAllocator<A: GlobalAlloc> {
     inner: A,
 }
 
 impl<A: GlobalAlloc> CountingAllocator<A> {
-    /// Construct a counting wrapper around `inner`. `const fn` so the
-    /// constructor can be called in a `#[global_allocator] static` definition.
+    /// Wrap `inner`. `const fn` so it can be called in a `#[global_allocator]`
+    /// static.
     pub const fn new(inner: A) -> Self {
         Self { inner }
     }
@@ -99,8 +55,6 @@ impl<A: GlobalAlloc> CountingAllocator<A> {
 
 unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // Mark installed on first call. AcqRel not needed (no other memory
-        // ordering depends on this); Relaxed + a one-way write is fine.
         ALLOC_INSTALLED.store(true, Ordering::Relaxed);
         TOTAL_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         TOTAL_ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
@@ -121,10 +75,8 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // Account realloc as one dealloc of the old size + one alloc of the
-        // new. This matches how Rust code thinks about it (`Vec::push` past
-        // capacity = "I allocated more"). The underlying allocator may or
-        // may not actually move the buffer; we don't care.
+        // One dealloc of the old size + one alloc of the new, matching how Rust
+        // code thinks of it; whether the buffer actually moves is irrelevant.
         ALLOC_INSTALLED.store(true, Ordering::Relaxed);
         TOTAL_DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
         TOTAL_DEALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
@@ -144,25 +96,20 @@ pub struct AllocSnapshot {
     pub dealloc_count: u64,
 }
 
-/// Per-frame delta computed by subtracting two [`AllocSnapshot`]s. Signed bytes
-/// (net = alloc - dealloc) so a frame that drops a 10 MB buffer reads as
-/// negative net.
+/// Per-frame delta from subtracting two [`AllocSnapshot`]s. `net_bytes` is signed
+/// (alloc - dealloc) so a frame that drops more than it allocates reads negative.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllocDelta {
-    /// Net bytes added to the heap this frame. Negative when this frame
-    /// dropped more than it allocated.
+    /// Net bytes added this frame; negative when this frame dropped more.
     pub net_bytes: i64,
-    /// Bytes allocated this frame, regardless of how many were dropped.
-    /// Useful as the "allocation pressure" signal that doesn't cancel out.
+    /// Bytes allocated this frame; the pressure signal that doesn't cancel out.
     pub alloc_bytes: u64,
     pub alloc_count: u64,
     pub dealloc_count: u64,
 }
 
-/// Read the current allocation counters. Returns `None` when no
-/// [`CountingAllocator`] has been installed (the sentinel
-/// `ALLOC_INSTALLED` was never set), so callers can distinguish "nothing
-/// allocated" from "no allocator wired."
+/// Read the current allocation counters, or `None` when no [`CountingAllocator`]
+/// has been installed.
 pub fn current_snapshot() -> Option<AllocSnapshot> {
     if !ALLOC_INSTALLED.load(Ordering::Relaxed) {
         return None;
@@ -175,8 +122,8 @@ pub fn current_snapshot() -> Option<AllocSnapshot> {
     })
 }
 
-/// Compute the delta between two snapshots. `start` must be the earlier
-/// snapshot; counters are monotonic so `end >= start` per-field.
+/// Delta between two snapshots; `start` must be the earlier one (counters are
+/// monotonic, so `end >= start` per-field).
 pub fn delta(start: AllocSnapshot, end: AllocSnapshot) -> AllocDelta {
     let alloc_bytes = end.alloc_bytes.saturating_sub(start.alloc_bytes);
     let dealloc_bytes = end.dealloc_bytes.saturating_sub(start.dealloc_bytes);
@@ -235,10 +182,8 @@ mod tests {
 
     #[test]
     fn current_snapshot_is_none_when_uninstalled() {
-        // This test is best-effort: if some other test in this run installed
-        // the allocator, ALLOC_INSTALLED is true forever. We only assert the
-        // "None" branch when the bool is observably false; otherwise the
-        // installed-path semantics already test the Some branch.
+        // Best-effort: ALLOC_INSTALLED is sticky, so only assert the None branch
+        // when the bool is observably false.
         if !ALLOC_INSTALLED.load(Ordering::Relaxed) {
             assert!(current_snapshot().is_none());
         }

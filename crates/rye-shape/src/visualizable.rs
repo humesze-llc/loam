@@ -1,77 +1,49 @@
 //! [`Visualizable`] trait + mesh data types for the rasterization tier.
 //!
-//! Symmetric to the `Primitive` (SDF role) trait in `rye-scene` and the `Collider` (physics
-//! role) trait in `rye-physics`: this trait carries the rasterization role. Implementations
-//! live downstream (`rye-scene` impls it for [`crate::Shape`] variants; `rye-physics` impls it
-//! for `Polytope4`).
+//! The rasterization-role counterpart to `Primitive` (SDF) in `rye-scene` and
+//! `Collider` (physics) in `rye-physics`. Impls live downstream (`rye-scene` for
+//! [`crate::Shape`], `rye-physics` for `Polytope4`).
 //!
-//! ## Why this trait + the mesh types live in `rye-shape`
+//! The trait + mesh types live here despite `rye-shape`'s data-only charter: a
+//! trait *definition* is a data-shape interface, not behavior, and the mesh types
+//! ([`LineMesh<N>`], [`TriangleMesh<N>`], [`PointMesh<N>`]) are pure data both
+//! impl sites must see.
 //!
-//! `rye-shape`'s charter is "data only, no behavior, dep-graph leaf." Defining a trait here
-//! would seem to violate that. The resolution: trait *definitions* are data-shape interfaces,
-//! not behavior. The trait says "if you can produce a `LineMesh<N>`, here is the function
-//! signature to do so" without any associated logic. Impls live in role crates (`rye-scene`,
-//! `rye-physics`) where they belong, alongside their respective behavior traits.
+//! `N` is the ambient dimension (2/3/4...). Const-generic so dimension mismatches
+//! are compile errors and vertex storage is stack-friendly (`[f32; N]`). The viral
+//! parameter is contained by `rye-scene`'s `RasterMesh` enum and `rye-render`'s
+//! generic upload path.
 //!
-//! The mesh types ([`LineMesh<N>`], [`TriangleMesh<N>`], [`PointMesh<N>`]) are pure data:
-//! arrays of points + colors + sizes. They're returned from the trait method, so they have to
-//! live in a crate both impl sites can see, which means here.
-//!
-//! ## Const-generic dim
-//!
-//! `N` is the ambient dimension: 2 for R², 3 for R³, 4 for R⁴, etc. Const-generic so
-//! dimension mismatches are compile-time errors and vertex storage is stack-friendly
-//! (`[f32; N]`, not `Vec<f32>`). The viral type parameter is contained by:
-//!
-//! - Scene-level wrappers in `rye-scene` use an enum (`SceneNode::Lines3 | Lines4 | ...`) so
-//!   downstream code only sees `RasterMesh` (enum), not generic types.
-//! - The rasterizer pipelines in `rye-render` take the mesh type as a generic argument; only
-//!   the upload path has to spell out `N`.
-//!
-//! ## Color convention
-//!
-//! All colors are RGBA linear-space `[f32; 4]`. Linear (not sRGB) because the fragment shader
-//! interpolates and combines colors in linear space; sRGB conversion happens at the output
-//! attachment via wgpu's swapchain format. RGBA (not RGB) because alpha is essential for AA
-//! coverage at silhouettes.
+//! Colors are RGBA linear `[f32; 4]`: linear because the fragment shader
+//! interpolates in linear space (sRGB conversion is at the output attachment), and
+//! alpha because it carries AA coverage at silhouettes.
 
 use serde::{Deserialize, Serialize};
 
-/// Why a shape cannot produce a particular mesh representation. Returned by [`Visualizable`]
-/// methods so callers can distinguish "skip this primitive" from "your input is wrong."
-///
-/// Callers that just want to filter can `.ok()` to drop the reason and treat the result as an
-/// [`Option`]. Callers that want diagnostics get a concrete variant they can pattern-match.
+/// Why a shape cannot produce a particular mesh. Callers that filter can `.ok()`
+/// to an [`Option`]; callers that want diagnostics pattern-match the variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotVisualizable {
-    /// Shape extends to infinity in some direction (e.g., [`crate::Shape::HalfSpace`], an
-    /// infinite plane). No bounded mesh representation exists; the editor / debug renderer
-    /// may still draw a "ghost" via a different mechanism (clipped at the view frustum, say).
+    /// Shape extends to infinity (e.g. [`crate::Shape::HalfSpace`]); no bounded
+    /// mesh exists.
     Unbounded,
 
-    /// Shape's natural dimension doesn't match the requested `N`. For example, asking for
-    /// `Visualizable<3>` output on a [`crate::Shape::HyperSphere4D`] (intrinsically 4D)
-    /// returns this variant. The caller should either pick a different `N` or project first.
+    /// Shape's natural dimension doesn't match the requested `N` (e.g.
+    /// `Visualizable<3>` on a [`crate::Shape::HyperSphere4D`]). Pick a different
+    /// `N` or project first.
     WrongDimension,
 
-    /// Shape's parameters are degenerate: zero radius, empty vertex list, collinear polytope
-    /// vertices. Not a bug, just nothing to draw.
+    /// Degenerate parameters: zero radius, empty/collinear vertices. Nothing to
+    /// draw, not a bug.
     Degenerate,
 }
 
-/// Anything that can emit rasterizable geometry in N-dimensional space.
-///
-/// Three orthogonal output flavors:
-/// - [`to_lines`](Self::to_lines): wireframe edges. Most common; works for polytopes,
-///   parametric grids on smooth shapes, debug gizmos.
-/// - [`to_triangles`](Self::to_triangles): filled surfaces. For polytopes this means 2-face
-///   triangulation; for smooth shapes it's parametric sampling. Optional; many shapes return
-///   [`NotVisualizable::Unbounded`] or skip it.
-/// - [`to_points`](Self::to_points): vertex markers. For polytopes the literal vertex set; for
-///   smooth shapes a sampled set (e.g., sphere poles, torus parameter origin).
-///
-/// Implementations are in the role crates that own the shape data (`rye-scene` for
-/// [`crate::Shape`], `rye-physics` for `Polytope4`).
+/// Anything that can emit rasterizable geometry in RN. Three orthogonal output
+/// flavors: [`to_lines`](Self::to_lines) (wireframe edges),
+/// [`to_triangles`](Self::to_triangles) (filled surfaces; often
+/// [`NotVisualizable::Unbounded`] for smooth shapes), and
+/// [`to_points`](Self::to_points) (vertex markers). Impls live in the role crates
+/// that own the data (`rye-scene`, `rye-physics`).
 pub trait Visualizable<const N: usize> {
     /// Emit the shape as line segments in RN.
     fn to_lines(&self) -> Result<LineMesh<N>, NotVisualizable>;
@@ -83,33 +55,28 @@ pub trait Visualizable<const N: usize> {
     fn to_points(&self) -> Result<PointMesh<N>, NotVisualizable>;
 }
 
-/// Line segments in RN. One entry per segment in [`segments`](Self::segments) /
-/// [`colors`](Self::colors) / [`widths`](Self::widths); array lengths must match.
-///
-/// Per-segment width is scalar (constant along the segment). Varying-width lines are
-/// expressible as multiple segments at the change points; per-segment scalar keeps the GPU
-/// instance-buffer layout simple. Per-endpoint color allows gradient edges (depth-fade,
-/// cell-membership coloring, hover-highlight transitions).
+/// Line segments in RN. [`segments`](Self::segments) / [`colors`](Self::colors) /
+/// [`widths`](Self::widths) lengths must match. Width is per-segment scalar
+/// (keeps the GPU instance layout simple); color is per-endpoint (gradient edges).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "[f32; N]: Serialize",
     deserialize = "[f32; N]: Deserialize<'de>"
 ))]
 pub struct LineMesh<const N: usize> {
-    /// `(start, end)` pairs. Each endpoint is a fixed-size array of `N` floats.
+    /// `(start, end)` endpoint pairs, each an `[f32; N]`.
     pub segments: Vec<([f32; N], [f32; N])>,
-    /// `(start_color, end_color)` per segment, RGBA in linear space. `colors.len() ==
-    /// segments.len()`. Gradient interpolation is done in linear space by the fragment shader.
+    /// `(start_color, end_color)` per segment, RGBA linear; `colors.len() ==
+    /// segments.len()`.
     pub colors: Vec<([f32; 4], [f32; 4])>,
     /// Width per segment in pixels. `widths.len() == segments.len()`.
     pub widths: Vec<f32>,
 }
 
-/// Filled triangles in RN. Vertices indexed by [`indices`](Self::indices); per-vertex color.
-///
-/// Per-vertex normals are deliberately omitted at v1. Lighting an R⁴ triangle has no standard
-/// convention; v1 deliverables (Schlegel face fills, slice cross-sections) only need
-/// flat-shaded or color-only triangles. Add a `normals` field if a real consumer asks for it.
+/// Filled triangles in RN, indexed by [`indices`](Self::indices), per-vertex
+/// color. No normals: lighting an R⁴ triangle has no standard convention and the
+/// v1 consumers (Schlegel fills, slice sections) only need color. Add `normals`
+/// when a consumer asks.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "[f32; N]: Serialize",
@@ -124,11 +91,9 @@ pub struct TriangleMesh<const N: usize> {
     pub colors: Vec<[f32; 4]>,
 }
 
-/// Point markers in RN, instanced as sprite quads by the rasterizer.
-///
-/// Sizes are screen-space pixel radii. The GPU sprite is centered at the projected screen
-/// position and expanded perpendicular to the view direction; the fragment shader applies a
-/// radial smoothstep for antialiased disc rendering.
+/// Point markers in RN, instanced as sprite quads. [`sizes`](Self::sizes) are
+/// screen-space pixel radii; the fragment shader radial-smoothsteps them into
+/// antialiased discs.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "[f32; N]: Serialize",
@@ -147,8 +112,8 @@ pub struct PointMesh<const N: usize> {
 mod tests {
     use super::*;
 
-    /// [`LineMesh<3>`] round-trips through RON serialization. Pins the const-generic-with-serde
-    /// behavior we rely on for scene file persistence.
+    /// [`LineMesh<3>`] round-trips through RON; pins the const-generic-with-serde
+    /// behavior scene persistence relies on.
     #[test]
     fn line_mesh_3d_ron_round_trip() {
         let original: LineMesh<3> = LineMesh {
@@ -221,9 +186,8 @@ mod tests {
         assert_eq!(parsed.sizes, original.sizes);
     }
 
-    /// Default-constructed meshes have empty buffers, matching the `Vec::default()` semantics
-    /// the `Default` derive expands to. Used by callers that build meshes incrementally
-    /// (push segments / triangles in a loop) instead of constructing the struct literal.
+    /// Default-constructed meshes have empty buffers, for callers that build them
+    /// incrementally rather than via a struct literal.
     #[test]
     fn default_meshes_are_empty() {
         let lm: LineMesh<3> = LineMesh::default();

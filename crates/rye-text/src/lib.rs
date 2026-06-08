@@ -1,21 +1,13 @@
 //! `rye-text`: screen-space text rendering for game HUDs and overlays.
 //!
-//! Library-composition API with no global state and no `App`-trait coupling. Apps
-//! construct a [`TextRenderer`] in `setup`, queue text strings each frame in `update`,
-//! and call [`TextRenderer::render`] from `App::render` after the main scene.
+//! No global state, no `App`-trait coupling: construct a [`TextRenderer`] in
+//! `setup`, [`queue`](TextRenderer::queue) strings per frame, and
+//! [`render`](TextRenderer::render) after the main scene.
 //!
-//! # Backend
-//!
-//! Uses [`ab_glyph`] for glyph rasterization and a hand-rolled wgpu pipeline for atlas +
-//! textured-quad drawing. ASCII printable characters (`0x20..=0x7E`) are pre-baked at a
-//! fixed atlas size at construction; per-call font sizes scale the resulting quads
-//! bilinearly. Adequate for game HUD readouts (numbers, short Latin labels); not adequate
-//! for typographic-quality text or non-Latin scripts.
-//!
-//! For richer text (mixed fonts, layout, multiline word wrap, complex UI), apps should
-//! reach for `rye-egui` instead, which uses egui's own text system. `rye-text` exists
-//! for the minimal-deps case where an app wants screen-space ASCII text without the full
-//! egui stack.
+//! [`ab_glyph`] rasterization + a hand-rolled wgpu atlas/textured-quad pipeline.
+//! Printable ASCII (`0x20..=0x7E`) is pre-baked at a fixed atlas size; per-call
+//! sizes scale the quads bilinearly. For HUD readouts only, not typographic or
+//! non-Latin text; reach for `rye-egui` when an app needs more.
 //!
 //! # Example
 //!
@@ -47,9 +39,7 @@ struct GlyphEntry {
     px_height: f32,
     /// Horizontal advance to the next glyph, at bake size.
     h_advance: f32,
-    /// Pixel offset from baseline to glyph's top-left corner, at bake size.
-    /// Positive `top` means above baseline (typical for letters);
-    /// negative for descenders.
+    /// Pixel offset from baseline to the glyph's top-left, at bake size.
     bearing_x: f32,
     bearing_y: f32,
 }
@@ -82,11 +72,8 @@ pub struct TextRenderer {
     pipeline: RenderPipeline,
     bind_group: BindGroup,
     uniform_buf: Buffer,
-    // The atlas resources are referenced only through `bind_group`'s
-    // resource bindings; we hold them on the struct so they stay
-    // alive for the bind group's lifetime. Dropping them would free
-    // the GPU resource the bind group still references and crash on
-    // the next render.
+    // Held only to keep the GPU resources alive for the bind group's lifetime;
+    // dropping them would free what `bind_group` still references.
     #[allow(dead_code)]
     atlas_tex: Texture,
     #[allow(dead_code)]
@@ -107,12 +94,9 @@ pub struct TextRenderer {
 }
 
 impl TextRenderer {
-    /// Construct a renderer.
-    ///
-    /// `font_bytes` is the raw TTF/OTF font data (typically loaded via `include_bytes!`
-    /// or read from disk). `bake_size_px` is the pixel size at which glyphs are
-    /// rasterized into the atlas; smaller per-frame sizes look fine, larger sizes may
-    /// show bilinear blurring. 48 is a reasonable default.
+    /// Construct a renderer. `font_bytes` is raw TTF/OTF data; `bake_size_px` is
+    /// the atlas rasterization size (smaller per-frame sizes are clean, larger
+    /// blur). 48 is a reasonable default.
     pub fn new(
         device: &Device,
         queue: &Queue,
@@ -307,14 +291,9 @@ impl TextRenderer {
         })
     }
 
-    /// Queue a string to be drawn this frame at `position` (top-left, pixel coordinates
-    /// from top-left of viewport).
-    ///
-    /// `size_px` is the rendered glyph size; values close to the renderer's bake size
-    /// give the cleanest result. Color is RGBA in 0..1 with straight (non-premultiplied)
-    /// alpha.
-    ///
-    /// Newlines (`\n`) advance to the next line. Other control characters are skipped.
+    /// Queue a string for this frame at `position` (viewport-pixel top-left).
+    /// `size_px` near the bake size is cleanest; `color` is RGBA 0..1, straight
+    /// alpha. `\n` advances a line; other control chars are skipped.
     pub fn queue(&mut self, text: &str, position: [f32; 2], size_px: f32, color: [f32; 4]) {
         layout_text(
             text,
@@ -395,8 +374,7 @@ impl TextRenderer {
         Ok(())
     }
 
-    /// Bake size that glyphs were rasterized at; per-frame sizes
-    /// close to this value look cleanest.
+    /// Bake size glyphs were rasterized at; per-frame sizes near this look best.
     pub fn bake_size_px(&self) -> f32 {
         self.bake_size_px
     }
@@ -406,23 +384,18 @@ impl TextRenderer {
         self.line_height_px
     }
 
-    /// Borrow the loaded font data (parsed lazily via [`FontRef`]
-    /// each call). Useful for measurement helpers built on top.
+    /// Borrow the loaded font data. Useful for measurement helpers built on top.
     pub fn font_bytes(&self) -> &[u8] {
         &self.font_data
     }
 }
 
-/// Pure layout: append the vertices for `text` (six per glyph, two triangles) into
-/// `out`. No GPU resources touched, so this can be tested with a hand-built glyph table.
-///
-/// `position` is the top-left of the first line in viewport coordinates; `size_px` is
-/// the rendered glyph height; `scale = size_px / bake_size_px` rescales the baked atlas
-/// geometry to the requested size. Newlines reset `cursor_x` to `position[0]` and
-/// advance `cursor_y` by `line_height_px * scale`. Non-printable / out-of-ASCII chars
-/// are skipped silently; chars with no glyph in the table (atlas didn't fit them) are
-/// also skipped.
-#[allow(clippy::too_many_arguments)] // pure layout helper, parameters are the layout state.
+/// Pure layout: append `text`'s vertices (six per glyph) into `out`. No GPU
+/// resources, so testable with a hand-built glyph table. `scale = size_px /
+/// bake_size_px`; newlines reset `cursor_x` and advance `cursor_y` by
+/// `line_height_px * scale`; non-printable, out-of-ASCII, and untabled chars are
+/// skipped.
+#[allow(clippy::too_many_arguments)] // parameters are the layout state.
 fn layout_text(
     text: &str,
     position: [f32; 2],
@@ -512,8 +485,7 @@ fn bake_ascii_atlas(
     let mut atlas = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE) as usize];
     let mut entries: HashMap<char, GlyphEntry> = HashMap::with_capacity(96);
 
-    // Simple shelf packer: glyphs flow left-to-right; new shelf when
-    // the current row is full.
+    // Shelf packer: glyphs flow left-to-right, new shelf when the row is full.
     let pad = 1u32;
     let mut shelf_y: u32 = pad;
     let mut shelf_x: u32 = pad;
@@ -524,8 +496,8 @@ fn bake_ascii_atlas(
         let gid: GlyphId = font.glyph_id(c);
         let h_adv = scaled.h_advance(gid);
 
-        // Position glyph at origin so px_bounds is offset-from-origin
-        // (we only need the size + offset, not absolute placement).
+        // Glyph at origin so px_bounds is offset-from-origin (we need size +
+        // offset, not absolute placement).
         let mut glyph: Glyph = scaled.scaled_glyph(c);
         glyph.position = Point { x: 0.0, y: 0.0 };
 
@@ -536,8 +508,8 @@ fn bake_ascii_atlas(
                 let gw = bounds.width().ceil() as u32;
                 let gh = bounds.height().ceil() as u32;
                 if gw == 0 || gh == 0 {
-                    // Glyph has no rasterizable area (rare); record
-                    // empty entry so cursor still advances correctly.
+                    // No rasterizable area; record an empty entry so the cursor
+                    // still advances.
                     entries.insert(
                         c,
                         GlyphEntry {
@@ -671,11 +643,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 mod tests {
     use super::*;
 
-    /// Pure-CPU sanity check that atlas baking works on a real font.
-    /// Doesn't require a wgpu device.
+    /// Pure-CPU check that atlas baking works on a real font; no wgpu device.
     #[test]
     fn baking_roundtrip_with_system_arial() {
-        // Arial is reliably present on Windows. Skip cleanly if not.
+        // Arial is reliably present on Windows; skip cleanly if not.
         let path = std::path::Path::new(r"C:\Windows\Fonts\arial.ttf");
         if !path.exists() {
             eprintln!("skip: arial.ttf not present at {path:?}");
@@ -694,10 +665,9 @@ mod tests {
         assert!(a.px_width > 0.0 && a.px_height > 0.0);
     }
 
-    /// Build a minimal glyph table for layout tests: every printable ASCII char gets a
-    /// unit-square glyph at the same UV slot. The math we want to pin (cursor advance,
-    /// newline reset, vertex count) doesn't depend on the actual atlas geometry, only on
-    /// per-glyph `h_advance`.
+    /// Minimal glyph table for layout tests: every printable ASCII char is a
+    /// unit-square glyph. The pinned math (advance, newline reset, vertex count)
+    /// depends only on `h_advance`, not atlas geometry.
     fn mock_glyph_table(h_advance: f32) -> HashMap<char, GlyphEntry> {
         (0x20u8..=0x7Eu8)
             .map(|c| {
@@ -737,8 +707,7 @@ mod tests {
     }
 
     /// Newline resets `cursor_x` to `position[0]` and advances `cursor_y` by
-    /// `line_height_px * scale`. Two-line text should produce vertices on two distinct
-    /// y-bands.
+    /// `line_height_px * scale`.
     #[test]
     fn layout_newline_resets_x_and_advances_y() {
         let glyphs = mock_glyph_table(10.0);
@@ -756,14 +725,12 @@ mod tests {
         );
         assert_eq!(out.len(), 12); // 6 verts × 2 glyphs
 
-        // First glyph's top-left vertex sits at (cursor_x = 5, cursor_y + line_height).
-        // After mock bearing_x = 0, bearing_y = 0: x0 = 5, y0 = 0 + (16 + 0)*1 = 16.
+        // Glyph 'a' top-left: x0 = 5, y0 = (16 + 0)*1 = 16 (mock bearings zero).
         let first = out[0];
         assert_eq!(first.pos[0], 5.0);
         assert!((first.pos[1] - 16.0).abs() < 1e-5);
 
-        // Seventh vertex is the start of glyph 2 ('b'), after the newline.
-        // cursor_x reset to 5 (position[0]); cursor_y advanced by line_h = 16.
+        // Glyph 'b' (vertex 6), after the newline: x reset to 5, y advanced 16.
         let second = out[6];
         assert_eq!(
             second.pos[0], 5.0,
@@ -776,14 +743,12 @@ mod tests {
         );
     }
 
-    /// Cursor advances by `h_advance * scale` per glyph, both horizontally on the
-    /// baseline and through the resulting vertex positions.
+    /// Cursor advances by `h_advance * scale` per glyph.
     #[test]
     fn layout_cursor_advances_by_h_advance_scaled() {
         let glyphs = mock_glyph_table(10.0);
         let mut out = Vec::new();
-        // Render at 32 px when bake is 16 px => scale = 2 => effective advance = 20
-        // per glyph.
+        // 32px render at 16px bake => scale 2 => effective advance 20 per glyph.
         layout_text(
             "ab",
             [0.0, 0.0],
@@ -795,15 +760,12 @@ mod tests {
             &mut out,
         );
 
-        // Glyph 0 starts at x = 0; glyph 1 starts at x = 20 (one
-        // scaled advance later). The top-left vertex of each glyph
-        // is the first of its 6-vertex chunk.
+        // Glyph 0 at x = 0; glyph 1 at x = 20 (one scaled advance later).
         assert_eq!(out[0].pos[0], 0.0);
         assert_eq!(out[6].pos[0], 20.0);
     }
 
-    /// Non-ASCII / control chars are skipped without crashing or emitting bogus vertices.
-    /// Tabs, form-feeds, raw bytes 0x80+, emoji are all silently dropped.
+    /// Non-ASCII / control chars (tabs, 0x80+, emoji) are silently dropped.
     #[test]
     fn layout_skips_unprintable_and_out_of_range_chars() {
         let glyphs = mock_glyph_table(10.0);
@@ -822,9 +784,8 @@ mod tests {
         assert_eq!(out.len(), 24);
     }
 
-    /// Chars with no entry in the glyph table (because the atlas didn't fit them) are
-    /// silently skipped, NOT rendered as missing-glyph fallback boxes. This keeps the
-    /// layout deterministic when the atlas is partial.
+    /// Untabled chars are silently skipped, not rendered as fallback boxes;
+    /// keeps layout deterministic when the atlas is partial.
     #[test]
     fn layout_skips_missing_glyphs() {
         let mut glyphs = mock_glyph_table(10.0);
@@ -844,9 +805,9 @@ mod tests {
         assert_eq!(out.len(), 6);
     }
 
-    /// `WGSL_SHADER` is the shader module string the GPU pipeline loads. A naga-front
-    /// parse + validate pass catches syntax / type / binding errors at test time rather
-    /// than at first `TextRenderer::new` call (which needs a wgpu adapter).
+    /// Parse + validate `WGSL_SHADER` via naga so syntax / type / binding errors
+    /// surface at test time, not at first `TextRenderer::new` (which needs a wgpu
+    /// adapter).
     #[test]
     fn wgsl_shader_validates_via_naga() {
         let module = naga::front::wgsl::parse_str(WGSL_SHADER).expect("WGSL parse");
