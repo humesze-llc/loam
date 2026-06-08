@@ -69,6 +69,7 @@ mod composer;
 mod console;
 mod consts;
 mod filmstrip;
+mod projections;
 mod render;
 mod shapes;
 mod state;
