@@ -1,9 +1,7 @@
-//! Filmstrip view: one polytope sampled across an axis of `w`, an
-//! axis of `t`, or both at once (a 2D grid). The grid math itself
-//! lives in `rye_render::Viewport::split_vertical`; this module
-//! handles the demo's per-cell parameter controls (axis toggles,
-//! counts, t-extent, subject picker) and the per-cell axis-label
-//! overlay drawn on top of the rendered scene.
+//! Filmstrip view: one polytope sampled across `w`, `t`, or both (a
+//! 2D grid). The grid split lives in
+//! `rye_render::Viewport::split_vertical`; this module owns the
+//! per-cell controls and the axis-label overlay.
 
 use rye_app::egui;
 use rye_physics::polytope::Polytope4;
@@ -14,13 +12,9 @@ use crate::consts::BODY_SIZE;
 use crate::state::Demo;
 
 impl Demo {
-    /// Render axis labels around the filmstrip grid. Top edge
-    /// gets w-value tags above each column (whichever axis
-    /// carries w); left edge gets t-offset tags beside each row
-    /// (whichever axis carries t). The cell whose offset along
-    /// each axis is closest to zero is highlighted in active-set
-    /// warning gold. For 1D cases the orthogonal-axis labels
-    /// are omitted (just one row or one column).
+    /// Axis labels around the filmstrip grid: w tags on the w-carrying
+    /// edge, t tags on the t-carrying edge. The cell nearest offset
+    /// zero is highlighted in gold.
     pub(crate) fn render_filmstrip_cell_labels(&mut self, ctx: &egui::Context) {
         let (cols, rows, w_on_cols) = match (self.strip_w, self.strip_t) {
             (true, true) => {
@@ -54,12 +48,8 @@ impl Demo {
             .inner_margin(egui::Margin::symmetric(6, 2))
             .corner_radius(3);
 
-        // Per-axis cell label + center-cell flag. `axis_label`
-        // computes the (text, is_current) pair: w cells fan
-        // symmetrically around the slider so the center index
-        // is "current"; t cells fan FORWARD from the current
-        // `rot_time`, so index 0 is "current" and the rest are
-        // future predictions.
+        // w fans symmetrically (center index is current); t fans
+        // forward from `rot_time` (index 0 is current).
         let w_axis_label = |i: usize, n: usize| -> (String, bool) {
             let off = if n <= 1 {
                 0.0
@@ -132,17 +122,10 @@ impl Demo {
         }
     }
 
-    /// Single-view body: just the subject picker. Single mode renders exactly
-    /// one shape (`strip_subject`, shared with the filmstrip) with the full
-    /// surface / wireframe / projection / points stack, so this body needs no
-    /// w/t-axis fan controls. The subject is chosen from the same catalog menu
-    /// the filmstrip and shape-row `+` button use, so a user who picks a
-    /// 120/600-cell here gets the same heavy-SDF hint they would in those views.
-    ///
-    /// The Schlegel boundary-cell stepper (in the Render modal) reads this
-    /// subject's `cell_count()` for its upper bound, which is the whole reason
-    /// Single mode exists: the cell index is well-defined only against one
-    /// unambiguous polytope.
+    /// Single-view body: just the subject picker. Single mode renders
+    /// one `strip_subject` with no w/t fan, which is why it exists: the
+    /// Schlegel boundary-cell stepper's `cell_count()` bound is well-
+    /// defined only against one unambiguous polytope.
     pub(crate) fn render_single_body(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         let heavy = matches!(
@@ -156,9 +139,6 @@ impl Demo {
             );
         }
         ui.horizontal(|ui| {
-            // Same catalog menu as the filmstrip subject picker + the shape-row
-            // `+` button, so the visuals (nested category submenus, hover names)
-            // stay identical across every shape-selection surface.
             let subject_button = ui
                 .button(format!("subject: {}", self.strip_subject.label))
                 .on_hover_text("Pick the single polytope to inspect");
@@ -172,12 +152,9 @@ impl Demo {
         });
     }
 
-    /// Filmstrip body: subject combo (over the catalog, so the
-    /// user can pick any of the shipped polytopes independent of
-    /// `self.row`) plus per-axis count DragValues. Heavy-shape
-    /// warning surfaces here when the subject is 120/600-cell
-    /// since `render_shapes_section` (where the warning otherwise
-    /// lives) is hidden in this view.
+    /// Filmstrip body: catalog subject combo plus per-axis count
+    /// DragValues. Carries its own heavy-shape warning since
+    /// `render_shapes_section`, which usually shows it, is hidden here.
     pub(crate) fn render_filmstrip_body(&mut self, ui: &mut egui::Ui) {
         let heavy = matches!(
             self.strip_subject.shape,
@@ -189,10 +166,8 @@ impl Demo {
                 "120/600-cell SDFs are heavy; expect <60 fps.",
             );
         }
-        // Row 1: axis toggles + (when both are on) the swap.
-        // Invariant: at least one of `strip_w` / `strip_t` must
-        // be on. Clicking the on-toggle while the other is off
-        // is a no-op (visual checkbox stays checked).
+        // Invariant: at least one of `strip_w`/`strip_t` stays on, so
+        // toggling off the last active axis is a no-op.
         ui.horizontal(|ui| {
             let mut w_on = self.strip_w;
             let mut t_on = self.strip_t;
@@ -223,7 +198,6 @@ impl Demo {
                     );
             }
         });
-        // Row 2: counts + t-extent + subject combo.
         ui.horizontal(|ui| {
             if self.strip_w {
                 ui.add(
@@ -253,9 +227,6 @@ impl Demo {
                      [t, t+Δt] seconds of animation time",
                 );
             }
-            // Same Popup::menu pattern as the `+` shape menu in
-            // the shape row, so the subject picker has identical
-            // visuals (nested category submenus).
             let subject_button = ui
                 .button(format!("subject: {}", self.strip_subject.label))
                 .on_hover_text("Pick the polytope rendered in each filmstrip cell");

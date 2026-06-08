@@ -84,7 +84,7 @@ pub fn minkowski_support_r4<A: SupportFn4, B: SupportFn4>(
 /// vertices; EPA receives exactly that.
 ///
 /// The variants are asymmetric in size (an inline `[MinkowskiPoint4; 5]` is ~240 bytes;
-/// `Separated` is 0). We keep it inline — the enum is a short-lived stack return from
+/// `Separated` is 0). We keep it inline; the enum is a short-lived stack return from
 /// narrowphase, not a stored field, so the size asymmetry doesn't matter in practice.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -166,7 +166,7 @@ pub fn gjk_intersect_r4<A: SupportFn4, B: SupportFn4>(
 
     // ---- Phase 2: grow the (already-enclosing) simplex to 5 points.
     // Each iteration picks a direction orthogonal to the current simplex's affine hull and adds
-    // the support point there — either it's a genuine new hull vertex (simplex grows) or it's
+    // the support point there; either it's a genuine new hull vertex (simplex grows) or it's
     // co-located with an existing vertex (polytope is too thin along that axis, try the opposite
     // sign, then bail).
     let mut tried: Vec<Vec4> = Vec::new();

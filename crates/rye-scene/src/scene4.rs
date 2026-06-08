@@ -2,17 +2,14 @@
 //!
 //! Build a [`Scene4`] from [`SceneNode4`] combinators and emit WGSL for either:
 //!
-//! - **Native 4D**: `fn rye_scene_sdf_4d(p: vec4<f32>) -> f32`,
-//!   useful for full 4D ray-march renderers (future).
-//! - **Hyperslice**: `fn rye_scene_sdf(p: vec3<f32>) -> f32` that evaluates the 4D SDF at
-//!   `vec4(p, w_slice)`, where `w_slice` is a uniform. This is the production path today,
-//!   `Hyperslice4DNode` consumes it as the SDF for a 3D ray march.
+//! - **Native 4D**: `fn rye_scene_sdf_4d(p: vec4<f32>) -> f32` (future full-4D
+//!   ray march).
+//! - **Hyperslice**: `fn rye_scene_sdf(p: vec3<f32>) -> f32` evaluating the 4D SDF
+//!   at `vec4(p, w_slice)`. Production path today; `Hyperslice4DNode` consumes it.
 //!
-//! ## Why a parallel `Scene4`, not `Scene<S, const DIM>`
-//!
-//! The 3D and 4D paths share no shader code (different SDF signatures, different ray equations,
-//! different uniforms), so dimensioning [`crate::scene::Scene`] generically saves no
-//! implementation work and obscures the difference. Parallel hierarchies keep each clear.
+//! Parallel to [`crate::scene::Scene`] rather than `Scene<S, const DIM>`: the 3D
+//! and 4D paths share no shader code, so genericizing saves nothing and obscures
+//! the difference.
 //!
 //! ## Example
 //!
@@ -43,11 +40,8 @@ use serde::{Deserialize, Serialize};
 use crate::primitive4::Primitive4;
 pub use rye_shape::Shape;
 
-/// A node in the 4D scene tree. Mirrors [`crate::scene::SceneNode`] but operates on 4D
-/// primitives only.
-///
-/// Smooth-min isn't included today; the math is identical (use the same `smooth_min_fn` wrapper
-/// on `f32`) but no demo currently needs it. Add when one does.
+/// A node in the 4D scene tree. Mirrors [`crate::scene::SceneNode`] over 4D
+/// primitives. No smooth-min yet (math is identical; no demo needs it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SceneNode4 {
     Leaf(Shape),
@@ -64,20 +58,18 @@ impl SceneNode4 {
         SceneNode4::Leaf(Shape::HyperSphere4D { center, radius })
     }
 
-    /// Half-space (hyperplane) leaf. ℝ⁴ is the only 4D Space rye ships and it's flat, so
-    /// [`crate::Primitive4`] emits an honest `dot(p, n) - offset` hyperplane SDF here. When a
-    /// curved 4D Space lands (`BlendedSpace4`, hyperbolic 4-space) `Primitive4` will grow a
-    /// `space: &S` parameter and gate this emission on `WgslSpace::is_chart_flat` the same way
-    /// the 3D path does today. The shape itself is canonical, also used by `rye-physics` for
-    /// 4D collision walls.
+    /// Half-space (hyperplane) leaf. ℝ⁴ is flat and the only 4D Space rye ships, so
+    /// [`crate::Primitive4`] emits a plain `dot(p, n) - offset` SDF; a curved 4D
+    /// Space would gate this on `WgslSpace::is_chart_flat` like the 3D path. Also
+    /// used by `rye-physics` for 4D collision walls.
     pub fn halfspace(normal: Vec4, offset: f32) -> Self {
         SceneNode4::Leaf(Shape::HalfSpace4D { normal, offset })
     }
 
-    /// Convex 4D polytope leaf. Note: the static `Primitive4` emit returns a sentinel today;
-    /// the production path is via `Hyperslice4DNode`'s per-frame uniform buffer (the body's
-    /// world-space face hyperplanes are computed CPU-side and uploaded). Until that path lands,
-    /// polytope leaves render invisible.
+    /// Convex 4D polytope leaf. The static `Primitive4` emit returns a sentinel;
+    /// the live path is `Hyperslice4DNode`'s per-frame uniform buffer (face
+    /// hyperplanes computed CPU-side). Until that lands, polytope leaves are
+    /// invisible.
     pub fn polytope(vertices: Vec<Vec4>) -> Self {
         SceneNode4::Leaf(Shape::ConvexPolytope4D { vertices })
     }
@@ -97,9 +89,8 @@ impl SceneNode4 {
     }
 }
 
-/// A complete 4D SDF scene, a single root [`SceneNode4`] that emits either
-/// `rye_scene_sdf_4d(p: vec4<f32>) -> f32` (full 4D) or `rye_scene_sdf(p: vec3<f32>) -> f32`
-/// (hyperslice at the `w_slice` uniform).
+/// A complete 4D SDF scene: a single root [`SceneNode4`] emitting either the
+/// native-4D or hyperslice SDF.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scene4 {
     pub root: SceneNode4,
@@ -110,9 +101,8 @@ impl Scene4 {
         Self { root }
     }
 
-    /// Emit `fn rye_scene_sdf_4d(p: vec4<f32>) -> f32`. Used by future full-4D ray-march
-    /// renderers; the hyperslice path uses [`Self::to_hyperslice_wgsl`]. Kind-tracking bindings
-    /// are emitted but unused (WGSL accepts unused locals).
+    /// Emit `fn rye_scene_sdf_4d(p: vec4<f32>) -> f32` for future full-4D ray
+    /// marchers. Kind-tracking bindings are emitted but unused.
     pub fn to_wgsl_4d(&self) -> String {
         let mut helpers = String::new();
         let mut body = String::new();
@@ -132,35 +122,24 @@ impl Scene4 {
     }
 
     /// Emit the hyperslice SDF module: kind constants, `RyeSceneHit`,
-    /// `rye_scene_at(p3) -> RyeSceneHit`, `rye_scene_sdf(p3) -> f32`
-    /// (thin wrapper), and `rye_scene_max_t(ro, rd) -> f32` (analytical
-    /// far-clip from HalfSpace4D leaves).
+    /// `rye_scene_at(p3) -> RyeSceneHit`, `rye_scene_sdf(p3) -> f32`, and
+    /// `rye_scene_max_t(ro, rd) -> f32` (analytical far-clip from HalfSpace4D
+    /// leaves). `w_slice_expr` is the slicing w-coord, typically `"u.w_slice"`.
     ///
-    /// `w_slice_expr` is the WGSL expression for the slicing w-coord; typically `"u.w_slice"`.
-    ///
-    /// Kind tracking: union picks the closer leaf, intersection picks the farther (boundary)
-    /// leaf, difference returns `RYE_PRIM_OTHER`.
+    /// Kind tracking: union picks the closer leaf, intersection the farther
+    /// (boundary) leaf, difference returns `RYE_PRIM_OTHER`.
     pub fn to_hyperslice_wgsl(&self, w_slice_expr: &str) -> String {
         emit_hyperslice(self, w_slice_expr, None)
     }
 
     /// Like [`Self::to_hyperslice_wgsl`] but with a runtime gate on every
-    /// [`Shape::HalfSpace4D`] leaf: when the WGSL expression
-    /// `halfspace_gate_expr` evaluates to `< 0.5` at runtime, every
-    /// halfspace SDF returns `1.0e9` (effectively absent) AND every
-    /// halfspace's contribution to `rye_scene_max_t` is skipped. When the
-    /// gate evaluates to `>= 0.5`, behavior matches the ungated emit.
+    /// [`Shape::HalfSpace4D`] leaf: when `halfspace_gate_expr` is `< 0.5` the
+    /// halfspace SDF returns `1.0e9` and its `rye_scene_max_t` contribution is
+    /// skipped; `>= 0.5` matches the ungated emit. Lets a uniform flip floor /
+    /// ceiling / cutaway planes per frame without recompiling.
     ///
-    /// Use-case: per-frame toggle of floor / ceiling / cutaway planes via
-    /// a single uniform read, without re-compiling the shader on every
-    /// flip. Caller writes a `f32` into the uniform pointed at by
-    /// `halfspace_gate_expr` (typically a slot of `u.params`).
-    ///
-    /// `halfspace_gate_expr` should be a scalar `f32` WGSL expression in
-    /// scope at the call sites (`rye_scene_at`, `rye_scene_max_t`).
-    /// Examples: `"u.params.x"`, `"u.floor_enabled"`, `"1.0"` (always on,
-    /// equivalent to the ungated emit), `"0.0"` (always off; every
-    /// halfspace silently disappears).
+    /// `halfspace_gate_expr` is a scalar `f32` WGSL expression in scope at
+    /// `rye_scene_at` / `rye_scene_max_t` (e.g. `"u.params.x"`, `"1.0"`, `"0.0"`).
     pub fn to_hyperslice_wgsl_gated(
         &self,
         w_slice_expr: &str,
@@ -178,18 +157,16 @@ impl Scene4 {
     }
 }
 
-/// WGSL constant block emitted at the top of every Scene4 module. Pinned so kind comparisons
-/// in the kernel and tests reference the same numeric values.
+/// WGSL kind constants emitted atop every Scene4 module. Pinned so kernel and
+/// tests reference the same values.
 const SCENE_KIND_CONSTANTS: &str = "\
 const RYE_PRIM_HYPERSPHERE4D: u32 = 0u;\n\
 const RYE_PRIM_HALFSPACE4D: u32 = 1u;\n\
 const RYE_PRIM_OTHER: u32 = 255u;\n";
 
-/// Shared emit driver for [`Scene4::to_hyperslice_wgsl`] and
-/// [`Scene4::to_hyperslice_wgsl_gated`]. The optional `halfspace_gate_expr` wraps
-/// every `HalfSpace4D` leaf's SDF call in `select(1.0e9, raw, <expr> >= 0.5)`
-/// AND skips its `rye_scene_max_t` contribution under the same condition. When
-/// `None`, the emit is identical to the original ungated form.
+/// Shared emit driver for the two `to_hyperslice_wgsl*` methods. `None` produces
+/// the ungated form; `Some` wraps every `HalfSpace4D` leaf's SDF in
+/// `select(1.0e9, raw, <expr> >= 0.5)` and skips its `rye_scene_max_t` term.
 fn emit_hyperslice(
     scene: &Scene4,
     w_slice_expr: &str,
@@ -207,10 +184,8 @@ fn emit_hyperslice(
     );
     let kind_consts = SCENE_KIND_CONSTANTS;
     let max_t_body = emit_max_t_body(&scene.root, halfspace_gate_expr);
-    // Use a distinct parameter name `p3` and an inner `let p` for the 4D point. WGSL
-    // forbids declaring a `let` with the same name as the function parameter (no shadowing);
-    // naming the parameter `p3` keeps the helper-emit convention (which calls `sdfN_pK(p)`)
-    // intact while sidestepping the collision.
+    // Parameter `p3` with an inner `let p` for the 4D point: WGSL forbids a `let`
+    // shadowing the parameter name, and helpers expect to call `sdfN_pK(p)`.
     format!(
         "// ---- rye-scene scene4 (hyperslice at w = {w_slice_expr}) ----\n\
          {kind_consts}\
@@ -237,9 +212,9 @@ fn emit_hyperslice(
     )
 }
 
-/// Emit the body of `rye_scene_max_t`: ray-plane intersection check for each `HalfSpace4D`
-/// leaf. Only the 3D part of the normal is used (the slice fixes `p.w`). Combinator-agnostic:
-/// visit every leaf, fold into `t_max` via `min` to get a conservative bound.
+/// Emit the body of `rye_scene_max_t`: a ray-plane intersection per `HalfSpace4D`
+/// leaf, folded into `t_max` via `min`. Only the 3D normal is used (the slice
+/// fixes `p.w`); combinator-agnostic, visits every leaf.
 fn emit_max_t_body(node: &SceneNode4, halfspace_gate_expr: Option<&str>) -> String {
     let mut body = String::new();
     walk_max_t(node, &mut body, halfspace_gate_expr);
@@ -249,10 +224,9 @@ fn emit_max_t_body(node: &SceneNode4, halfspace_gate_expr: Option<&str>) -> Stri
 fn walk_max_t(node: &SceneNode4, body: &mut String, halfspace_gate_expr: Option<&str>) {
     match node {
         SceneNode4::Leaf(Shape::HalfSpace4D { normal, offset }) => {
-            // t = (offset - dot(ro, n)) / dot(rd, n), guarded by dot(rd, n) < 0 so we only
-            // catch rays heading toward the plane's solid side. When a runtime gate is set,
-            // wrap the entire t-contribution in `if (<gate> >= 0.5)` so a gated-off halfspace
-            // contributes no early-termination bound (rays march to the global cap instead).
+            // t = (offset - dot(ro, n)) / dot(rd, n), guarded by dot(rd, n) < 0 to
+            // catch only rays heading toward the solid side. A set gate wraps the
+            // whole t-contribution so a gated-off halfspace yields no bound.
             let inner = format!(
                 "\t\tlet n = vec3<f32>({nx:.6}, {ny:.6}, {nz:.6});\n\
                  \t\tlet dr = dot(rd, n);\n\
@@ -295,11 +269,10 @@ fn primitive_kind_constant(shape: &Shape) -> &'static str {
     }
 }
 
-/// Walk the 4D scene tree, append helper functions to `helpers` and `let` bindings to `body`.
-/// Returns `(dist_var, kind_var)`, the WGSL identifiers holding this node's signed distance and
-/// closest-primitive kind. When `halfspace_gate_expr` is Some, every `HalfSpace4D` leaf's SDF
-/// call is wrapped in `select(1.0e9, raw, <expr> >= 0.5)` so the leaf disappears from the
-/// scene when the gate evaluates to off at runtime.
+/// Walk the 4D scene tree, appending helpers to `helpers` and `let` bindings to
+/// `body`. Returns `(dist_var, kind_var)`, the WGSL identifiers for this node's
+/// distance and closest-primitive kind. `Some` gate wraps each `HalfSpace4D` SDF
+/// in `select(1.0e9, raw, <expr> >= 0.5)`.
 fn emit_node_4d(
     node: &SceneNode4,
     counter: &mut u32,
@@ -316,9 +289,8 @@ fn emit_node_4d(
             let d_var = format!("d{idx}");
             let k_var = format!("k{idx}");
             let kind = primitive_kind_constant(prim);
-            // Halfspace leaves with an active gate route through `select`; everything else
-            // emits the raw SDF call unchanged. Keeping the gate confined to HalfSpace4D
-            // avoids polluting hypersphere / polytope SDFs that have no toggle semantic.
+            // Only gated halfspaces route through `select`; everything else emits
+            // the raw call (no toggle semantic on hypersphere / polytope SDFs).
             let gated = matches!(prim, Shape::HalfSpace4D { .. }) && halfspace_gate_expr.is_some();
             if gated {
                 let gate = halfspace_gate_expr.expect("gated branch implies Some");
@@ -362,9 +334,8 @@ fn emit_node_4d(
             let d_var = format!("d{idx}");
             let k_var = format!("k{idx}");
             body.push_str(&format!("\tlet {d_var} = max({ld}, -({rd}));\n"));
-            // Per the to_hyperslice_wgsl docstring: difference's active surface alternates
-            // between left's outside and right's inside, no clean per-region kind. Sentinel
-            // until a caller needs it.
+            // Difference has no clean per-region kind (the active surface
+            // alternates between left's outside and right's inside); sentinel.
             body.push_str(&format!("\tlet {k_var}: u32 = RYE_PRIM_OTHER;\n"));
             (d_var, k_var)
         }
@@ -388,12 +359,9 @@ mod tests {
     fn hyperslice_wraps_4d_with_w_slice() {
         let scene = Scene4::new(SceneNode4::hypersphere(Vec4::ZERO, 0.5));
         let wgsl = scene.to_hyperslice_wgsl("u.w_slice");
-        // Parameter is `p3` to avoid colliding with the inner `let p` 4D point; WGSL doesn't
-        // allow declaring a let with the same name as a function parameter.
         assert!(wgsl.contains("fn rye_scene_sdf(p3: vec3<f32>) -> f32"));
         assert!(wgsl.contains("let p = vec4<f32>(p3, u.w_slice)"));
-        // The hyperslice emit reuses the 4D SDF helpers, so the sphere's `length(p - ...)` body
-        // is still present.
+        // Reuses the 4D SDF helpers, so the sphere body is still present.
         assert!(wgsl.contains("length(p"));
     }
 
@@ -438,8 +406,8 @@ mod tests {
         assert_eq!(scene.to_wgsl_4d(), recovered.to_wgsl_4d());
     }
 
-    /// Polytope leaves still emit (their helper returns the sentinel today). The combinator
-    /// path doesn't break on polytope leaves; it just produces a far-away surface.
+    /// Polytope leaves still emit (helper returns the sentinel); the combinator
+    /// path produces a far-away surface, not a break.
     #[test]
     fn polytope_leaf_emits_sentinel_helper() {
         let scene = Scene4::new(SceneNode4::polytope(vec![Vec4::ZERO; 5]));
@@ -448,34 +416,29 @@ mod tests {
         assert!(wgsl.contains("return 1e9"));
     }
 
-    /// `to_hyperslice_wgsl` emits the per-primitive identity layer: kind constants, a
-    /// `RyeSceneHit` struct, and `rye_scene_at` returning both `dist` and `kind`. The
-    /// hyperslice marcher uses `kind` for floor classification (see the kernel's
-    /// `kernel_has_expected_entry_points` test).
+    /// `to_hyperslice_wgsl` emits the per-primitive identity layer: kind
+    /// constants, `RyeSceneHit`, and `rye_scene_at` returning `dist` + `kind`
+    /// (the marcher uses `kind` for floor classification).
     #[test]
     fn hyperslice_emits_per_primitive_identity_layer() {
         let scene = Scene4::new(
             SceneNode4::hypersphere(Vec4::ZERO, 0.5).union(SceneNode4::halfspace(Vec4::Y, 0.0)),
         );
         let wgsl = scene.to_hyperslice_wgsl("u.w_slice");
-        // Constants pinned by name and value; the kernel references them.
         assert!(wgsl.contains("const RYE_PRIM_HYPERSPHERE4D: u32 = 0u;"));
         assert!(wgsl.contains("const RYE_PRIM_HALFSPACE4D: u32 = 1u;"));
         assert!(wgsl.contains("const RYE_PRIM_OTHER: u32 = 255u;"));
-        // Result struct + per-primitive entry point.
         assert!(wgsl.contains("struct RyeSceneHit { dist: f32, kind: u32 }"));
         assert!(wgsl.contains("fn rye_scene_at(p3: vec3<f32>) -> RyeSceneHit"));
-        // Each leaf must tag its kind constant.
         assert!(wgsl.contains("RYE_PRIM_HYPERSPHERE4D"));
         assert!(wgsl.contains("RYE_PRIM_HALFSPACE4D"));
-        // Union routes kind via `select(rhs, lhs, lhs <= rhs)`: closer leaf wins.
+        // Union routes kind via select: closer leaf wins.
         assert!(wgsl.contains("select("));
         assert!(wgsl.contains("<="));
     }
 
-    /// Difference's kind tracking is intentionally undefined (the active surface alternates
-    /// between left's outside and right's inside). It emits `RYE_PRIM_OTHER` as a sentinel;
-    /// pinning that here so the choice is explicit and a future tightening fails loudly.
+    /// Difference's kind is intentionally the `RYE_PRIM_OTHER` sentinel; pin it so
+    /// a future tightening fails loudly.
     #[test]
     fn hyperslice_difference_emits_kind_sentinel() {
         let scene = Scene4::new(
@@ -485,17 +448,14 @@ mod tests {
         assert!(wgsl.contains(": u32 = RYE_PRIM_OTHER;"));
     }
 
-    /// Gated emit wraps every HalfSpace4D leaf's SDF in a `select(1.0e9, raw, gate >= 0.5)`
-    /// so a runtime uniform flip makes the halfspace effectively invisible. Hyperspheres
-    /// (and any other non-halfspace primitive) are untouched by the gate.
+    /// Gated emit wraps every HalfSpace4D SDF in `select(1.0e9, raw, gate >= 0.5)`;
+    /// non-halfspace primitives are untouched.
     #[test]
     fn hyperslice_gated_wraps_halfspaces_only() {
         let scene = Scene4::new(
             SceneNode4::hypersphere(Vec4::ZERO, 0.5).union(SceneNode4::halfspace(Vec4::Y, 0.0)),
         );
         let wgsl = scene.to_hyperslice_wgsl_gated("u.w_slice", "u.params.x");
-        // The halfspace leaf gets routed through select; the gate expression must appear
-        // verbatim in the emit. Hypersphere leaf stays a plain `sdfN_pK(p)` call.
         assert!(
             wgsl.contains("select(1.0e9,"),
             "gated halfspace must emit select(1.0e9, ...)"
@@ -504,34 +464,25 @@ mod tests {
             wgsl.contains("u.params.x >= 0.5"),
             "gate expression must appear in the select"
         );
-        // The hypersphere leaf's helper is still called raw (no select wrapper around it).
-        // The first leaf (sdf4_p1, since p0 is the union root in traversal order;
-        // leaves are hypersphere=p1, halfspace=p2 in pre-order). Assert that at least
-        // one leaf binds without `_raw`.
+        // Hypersphere leaf (p1 in pre-order) binds raw, no `_raw`/select wrapper.
         assert!(wgsl.contains("let d1 = sdf4_p1(p);"));
     }
 
-    /// Gated emit also wraps the `rye_scene_max_t` halfspace contribution in
-    /// `if (gate >= 0.5) { ... }` so a gated-off halfspace doesn't terminate rays early.
-    /// Without this, the marcher would still treat the floor as a far-clip even after
-    /// the SDF goes to 1.0e9, capping near-horizon rays prematurely.
+    /// Gated emit also guards the `rye_scene_max_t` halfspace contribution in
+    /// `if (gate >= 0.5)` so a gated-off halfspace doesn't terminate rays early.
     #[test]
     fn hyperslice_gated_skips_max_t_when_off() {
         let scene = Scene4::new(SceneNode4::halfspace(Vec4::Y, 0.0));
         let wgsl = scene.to_hyperslice_wgsl_gated("u.w_slice", "u.params.x");
-        // The if-guard appears in the max_t body around the t_max update.
         assert!(
             wgsl.contains("if (u.params.x >= 0.5) {"),
             "gated max_t must guard the halfspace's t-contribution"
         );
-        // The `t_max = t` update is still emitted inside the guarded block.
         assert!(wgsl.contains("t_max = t;"));
     }
 
-    /// The ungated `to_hyperslice_wgsl` must produce identical output to the gated form
-    /// with no halfspace gate active (i.e. when there are no halfspaces at all to gate).
-    /// Catches regressions where the gated path diverges from the canonical emit on a
-    /// halfspace-free scene.
+    /// On a halfspace-free scene the gated emit must match the ungated emit
+    /// byte-for-byte; catches gated-path divergence.
     #[test]
     fn hyperslice_gated_matches_ungated_when_no_halfspaces() {
         let scene = Scene4::new(SceneNode4::hypersphere(Vec4::ZERO, 0.5));

@@ -1,28 +1,16 @@
-//! Final composite pass for browser-WebGPU: sample an sRGB offscreen scene texture
-//! and write gamma-encoded values to a linear swapchain so the canvas compositor
-//! displays them correctly.
+//! Final composite pass for browser-WebGPU: sample an sRGB offscreen scene
+//! texture and write gamma-encoded values to a linear swapchain.
 //!
-//! ## When this runs (and when it doesn't)
+//! Native (D3D/Vulkan/Metal) swapchains advertise sRGB formats, so the GPU
+//! encodes linear output on write and no pass is needed; `RenderDevice::new`
+//! skips the [`CompositeNode`] there. Browser WebGPU (Chrome 2026-05) only
+//! advertises linear canvas formats, so direct writes display ~2.2x dark.
+//! Instead the scene renders into an offscreen `Bgra8UnormSrgb` target, and
+//! this pass samples it (decoded to linear), applies `linear_to_srgb`, and
+//! writes the sRGB-encoded bits the canvas compositor expects.
 //!
-//! - **Native** (D3D/Vulkan/Metal): the swapchain advertises `Bgra8UnormSrgb` or
-//!   similar; GPU hardware encodes linear shader output to sRGB on write to the
-//!   swapchain, and the OS compositor displays it as expected. No composite pass
-//!   needed. `RenderDevice::new` doesn't allocate a [`CompositeNode`] in this case
-//!   and the runner's `composite_to_swap` is a no-op.
-//! - **Browser WebGPU** (Chrome 2026-05): the canvas surface only advertises
-//!   linear formats. Direct linear writes display ~2.2x darker than native. We
-//!   allocate an offscreen `Bgra8UnormSrgb` texture, render the scene + UI into
-//!   it (GPU auto-encodes linear -> sRGB on write because the storage is sRGB),
-//!   then this composite pass samples it (auto-decodes back to linear), applies
-//!   `linear_to_srgb` in the fragment shader, and writes to the linear swapchain.
-//!   The bits in the swapchain are sRGB-encoded, which is what the canvas
-//!   compositor expects.
-//!
-//! ## Cost
-//!
-//! One extra render pass per frame. Fullscreen-triangle vertex (3 vertices) plus
-//! a single sample-and-curve-apply fragment per pixel. Single-digit microseconds
-//! on integrated GPUs at 1080p. Negligible vs. the polytope SDF raymarch.
+//! Cost: one fullscreen-triangle pass per frame, single-digit microseconds
+//! at 1080p; negligible vs. the polytope SDF raymarch.
 
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
@@ -34,21 +22,20 @@ use wgpu::{
     TextureView, TextureViewDimension, VertexState,
 };
 
-/// Final-pass gamma encoder. Owns one pipeline + one sampler + the bind group
-/// layout; the actual bind group is rebuilt on resize (because the scene texture
-/// view changes when the surface resizes).
+/// Final-pass gamma encoder. The bind group is rebuilt on resize, since the
+/// scene texture view changes when the surface resizes.
 pub struct CompositeNode {
     pipeline: RenderPipeline,
     sampler: Sampler,
     bind_group_layout: BindGroupLayout,
-    /// Cached bind group for the current scene-target view. `None` until the first
-    /// `set_scene_view` call; rebuilt whenever the scene target is reallocated.
+    /// `None` until the first `set_scene_view`; rebuilt whenever the scene
+    /// target is reallocated.
     bind_group: Option<BindGroup>,
 }
 
 impl CompositeNode {
-    /// Build a composite node that writes to `target_format`. Typically called
-    /// once at device-creation time and reused for the device's lifetime.
+    /// Build a composite node that writes to `target_format`. Reused for the
+    /// device's lifetime.
     pub fn new(device: &Device, target_format: TextureFormat) -> Self {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("rye-render::composite::shader"),
@@ -131,10 +118,8 @@ impl CompositeNode {
         }
     }
 
-    /// Refresh the cached bind group when the scene-target view changes (which
-    /// happens whenever the surface resizes; the scene_target texture gets
-    /// recreated at the new size, invalidating any view that points at the old
-    /// texture).
+    /// Refresh the cached bind group when the scene-target view changes, e.g.
+    /// after a resize reallocates the scene texture.
     pub fn set_scene_view(&mut self, device: &Device, scene_view: &TextureView) {
         let bg = device.create_bind_group(&BindGroupDescriptor {
             label: Some("rye-render::composite::bg"),
@@ -153,10 +138,8 @@ impl CompositeNode {
         self.bind_group = Some(bg);
     }
 
-    /// Run the composite: read whatever is in the scene texture (bound during the
-    /// last `set_scene_view`) and write gamma-encoded RGBA to `target_view`. No-op
-    /// if `set_scene_view` hasn't been called yet (defensive against bind-group
-    /// invalidation between resize and the next frame).
+    /// Read the bound scene texture and write gamma-encoded RGBA to
+    /// `target_view`. No-op before the first `set_scene_view`.
     pub fn run(&self, encoder: &mut CommandEncoder, target_view: &TextureView) {
         let Some(bind_group) = self.bind_group.as_ref() else {
             return;

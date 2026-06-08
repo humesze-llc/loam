@@ -31,7 +31,7 @@
 use std::fmt::Write;
 
 use glam::Vec4;
-use rye_physics::euclidean_r4::{
+use rye_shape::polytope_geom::{
     cell120_face_planes, cell120_vertices, cell600_face_planes, cell600_vertices,
     icosian_inradius_unit,
 };

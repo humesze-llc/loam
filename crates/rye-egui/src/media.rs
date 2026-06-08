@@ -1,24 +1,19 @@
-//! Custom-painted media-player vocabulary buttons: play/pause, skip (×N rate toggle),
+//! Custom-painted media-player buttons: play/pause, skip (×N rate toggle),
 //! refresh, plus, chevron.
 //!
-//! Each is drawn from primitive shapes (triangles, rects, line segments, arcs) rather
-//! than font glyphs. egui's default font has patchy coverage of the Mathematical
-//! Operators block (circular-arrow code points and several arrow glyphs are missing on
-//! most platforms), so a row built from font characters renders inconsistently. Drawing
-//! the icons from primitives makes the controls look identical on every platform and
-//! avoids depending on a font asset.
+//! Drawn from primitive shapes rather than font glyphs because egui's default
+//! font has patchy coverage of the Mathematical Operators block (circular-arrow
+//! and several arrow glyphs are missing on most platforms), so a font-character
+//! row renders inconsistently across platforms.
 //!
-//! All sizes are passed in by the caller; this module does not impose a layout. A
-//! typical caller pins a row of these to one `(width, height)` so the visual cadence
-//! is consistent.
+//! Sizes come from the caller; this module imposes no layout.
 
 use egui::{
     pos2, vec2, CornerRadius, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
 };
 
-/// Single button that toggles between a play triangle (when `playing == false`) and a
-/// pause symbol (two bars, when `playing == true`). Caller reads `.clicked()` on the
-/// returned response.
+/// Button toggling between a play triangle (`playing == false`) and a pause
+/// symbol (`playing == true`).
 pub fn play_pause_button(ui: &mut Ui, size: Vec2, playing: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let style = ui.style().interact(&response);
@@ -62,12 +57,9 @@ pub fn play_pause_button(ui: &mut Ui, size: Vec2, playing: bool) -> Response {
     response
 }
 
-/// Rate "skip" button drawn as one or two solid triangles. Highlights when
-/// `*rate == value`; clicking when already selected resets `rate = 1.0` (lets the
-/// user step out of a non-default rate without a global Reset).
-///
-/// `double = true` paints two adjacent triangles (`<<` / `>>`), `false` paints one
-/// (`<` / `>`). `forward = true` points right.
+/// Rate "skip" button. Highlights when `*rate == value`; clicking when already
+/// selected resets `rate = 1.0`. `double` paints two adjacent triangles, and
+/// `forward` points them right.
 pub fn rate_toggle(
     ui: &mut Ui,
     size: Vec2,
@@ -128,9 +120,7 @@ pub fn rate_toggle(
     response.on_hover_text(format!("Set rate to ×{value} (click again to reset to ×1)"))
 }
 
-/// `+` button painted as two crossed bars on a button-styled rect. Same
-/// primitive-shape vocabulary as the play / rate / chevron buttons so a row of them
-/// reads as one consistent set of custom-painted controls.
+/// `+` button painted as two crossed bars on a button-styled rect.
 pub fn add_button(ui: &mut Ui, size: Vec2) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let style = ui.style().interact(&response);
@@ -159,9 +149,7 @@ pub fn add_button(ui: &mut Ui, size: Vec2) -> Response {
     response
 }
 
-/// `R` retry button: a clockwise arc with an arrowhead, painted from primitives.
-/// Replaces a font glyph (egui's default font has patchy coverage of the Mathematical
-/// Operators block where circular-arrow code points live).
+/// Retry button: a clockwise arc with an arrowhead, painted from primitives.
 pub fn refresh_button(ui: &mut Ui, size: Vec2) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let style = ui.style().interact(&response);
@@ -215,10 +203,8 @@ pub fn refresh_button(ui: &mut Ui, size: Vec2) -> Response {
     response
 }
 
-/// Allocate a clickable button with a custom-painted up- or down-chevron (`^` / `v`,
-/// drawn as two stroked line segments). Used instead of a font glyph so it doesn't
-/// depend on the egui font having Mathematical Operators (∧/∨) coverage. Returns the
-/// response so the caller can read `.clicked()`.
+/// Button with a custom-painted up- or down-chevron (two stroked line
+/// segments). `hover` is the tooltip string.
 pub fn chevron_button(ui: &mut Ui, size: Vec2, up: bool, hover: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let style = ui.style().interact(&response);
@@ -248,28 +234,15 @@ pub fn chevron_button(ui: &mut Ui, size: Vec2, up: bool, hover: &str) -> Respons
     response.on_hover_text(hover)
 }
 
-/// Two chevrons stacked vertically, painted as line primitives. `pointing_up = false`
-/// draws both chevrons pointing down (the "send away / collapse" direction); `true`
-/// draws them pointing up. Used as a detach / dock affordance for floating panels.
-///
-/// Drawn from primitives rather than text because no Unicode codepoint renders as two
-/// chevrons stacked vertically inside a single line of monospace; the closest "Paired
-/// Arrows" and "Arrow With Double Stroke" codepoints are either side-by-side or
-/// single-arrow variants. Hover and active states inherit from egui's interaction
-/// styling via `style.fg_stroke.color`, so the icon brightens on hover without
-/// per-color hardcoding.
-///
-/// `hover` is the tooltip string. Caller is expected to choose a `size` proportioned
-/// for vertical stacking (height noticeably larger than width); a 12×16 footprint is
-/// the canonical in-title-row size used by `rye-egui::console`.
+/// Two vertically-stacked chevrons, a detach/dock affordance for floating
+/// panels. `pointing_up` flips them up; `hover` is the tooltip string. Choose a
+/// `size` taller than wide; 12×16 is the canonical title-row footprint.
 pub fn dock_chevrons(ui: &mut Ui, size: Vec2, pointing_up: bool, hover: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let style = ui.style().interact(&response);
 
-    // Chevron geometry, scaled to the icon footprint. The proportions (~1/3 width,
-    // ~1/6 height per chevron, ~1/3 height between them) were tuned at the canonical
-    // 12x16 size; clamps keep the shape readable at smaller (title-row icon) and
-    // larger (debug overlay zoom) extremes alike.
+    // Proportions tuned at the canonical 12x16 size; clamps keep the shape
+    // readable at the smaller and larger extremes.
     let half_w = (size.x * 0.34).clamp(2.0, 6.0);
     let half_h = (size.y * 0.16).clamp(1.5, 4.0);
     let gap = (size.y * 0.32).clamp(3.0, 8.0);
@@ -303,10 +276,9 @@ mod tests {
         Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 600.0))
     }
 
-    /// Centralised click driver: lays out `widget` once to capture its rect, then
-    /// drives a press + release in a SECOND frame at the rect centre and re-runs
-    /// `widget` so its `Response` sees the released click. Returns the second-frame
-    /// response.
+    /// Lays out `widget` to capture its rect, then drives a press + release at
+    /// the rect centre in a second frame and re-runs `widget` so its `Response`
+    /// sees the click.
     fn click_at_centre<R>(
         mut widget: impl FnMut(&mut Ui) -> Response,
         result: impl Fn(&Response) -> R,
@@ -364,8 +336,8 @@ mod tests {
         );
     }
 
-    /// Clicking a `rate_toggle` whose value differs from `rate` sets `rate = value`.
-    /// The widget's "selectable" semantics branch on `(*rate - value).abs() < 1e-6`.
+    /// Clicking a `rate_toggle` whose value differs from `rate` sets
+    /// `rate = value`.
     #[test]
     fn rate_toggle_click_selects_value() {
         let mut rate = 1.0_f32;
@@ -379,8 +351,7 @@ mod tests {
         );
     }
 
-    /// Clicking an already-selected `rate_toggle` resets `rate` to 1.0. This is the
-    /// "step out of a non-default rate without a global Reset" affordance.
+    /// Clicking an already-selected `rate_toggle` resets `rate` to 1.0.
     #[test]
     fn rate_toggle_click_when_selected_resets_to_one() {
         let mut rate = 2.0_f32;
@@ -424,9 +395,8 @@ mod tests {
         assert!(clicked);
     }
 
-    /// Allocated rect width / height match the `size` argument exactly. This is the
-    /// contract callers depend on for row layout: a 5-button row with `(28, 29)` per
-    /// button produces a predictable total width.
+    /// Allocated rect matches the `size` argument exactly; the contract callers
+    /// depend on for row layout.
     #[test]
     fn allocated_size_matches_size_argument() {
         let ctx = egui::Context::default();

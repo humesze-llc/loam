@@ -25,6 +25,8 @@
 //!   [`Shape`]; `rye-physics` for `Collider` and [`Visualizable`] on `Polytope4`). The dep
 //!   graph stays a tree.
 
+pub mod polytope;
+pub mod polytope_geom;
 pub mod visualizable;
 
 pub use visualizable::{LineMesh, NotVisualizable, PointMesh, TriangleMesh, Visualizable};

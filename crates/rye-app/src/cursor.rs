@@ -1,67 +1,31 @@
 //! Cursor grab + visibility request channel between the App and the Runner.
 //!
 //! Same shape as [`crate::frame_pacing::request_vsync_on`]: process-global
-//! atomics; the App pokes them from anywhere it has access (console handler,
-//! `App::update`, `App::on_event`); the Runner reads + applies them once per
-//! redraw via `Window::set_cursor_grab` + `set_cursor_visible`.
+//! atomics the App pokes from anywhere, applied once per redraw by the
+//! Runner. `Window::set_cursor_grab` must run on the main thread, which the
+//! App (especially a console command) doesn't always reach directly.
 //!
-//! ## Why a request channel
-//!
-//! `winit::Window::set_cursor_grab` must run on the main thread (the only
-//! thread holding the `Window`). The App, especially when a console command
-//! drives the request, doesn't always have direct `Window` access.
-//! Funnelling through these atomics keeps the call site simple and the
-//! application of the request scoped to the Runner.
-//!
-//! ## Surface
-//!
-//! Grab mode and visibility are independent:
-//!
-//! - [`request_grab_mode`] picks confinement: `None` lets the cursor roam
-//!   freely across the OS desktop; `Confined` keeps it inside the window
-//!   but visible; `Locked` pins it to the window center and reports raw
-//!   motion (the FPS-mouse-look mode).
-//! - [`request_cursor_visible`] picks whether the cursor renders.
-//!
-//! Both default to "released and visible" (the conventional UI state).
-//! Mouse-look apps typically pair `Locked` with `visible = false`; an
-//! adventure-game pointer might pair `Confined` with `visible = true`; a
-//! cinematic mode might pair `None` with `visible = false`.
-//!
-//! [`request_grab`] / [`request_release`] are convenience wrappers for the
-//! common mouse-look toggle.
-//!
-//! [`current_state`] returns what the runner last applied so demos don't
-//! need to mirror their own copy.
+//! Grab mode and visibility are independent. [`request_grab_mode`] picks
+//! confinement ([`GrabMode`]); [`request_cursor_visible`] picks rendering.
+//! Both default to released + visible. [`request_grab`] / [`request_release`]
+//! wrap the common mouse-look pair; [`current_state`] reads what the runner
+//! last applied.
 //!
 //! ## Wasm note
 //!
-//! On wasm32 the request channel routes through the worker -> main DOM-
-//! action plumbing in `wasm::host_action` (plain reference, not an
-//! intra-doc link: that module is `#[cfg(target_arch = "wasm32")]` so
-//! it doesn't exist when docs build for the native target). The worker
-//! drains [`take_pending`] at the end of each frame, translates the
-//! grab mode to a `HostAction::PointerLockRequest` or
-//! `HostAction::PointerLockRelease`, and posts to the main thread. The
-//! main thread calls `canvas.requestPointerLock()` /
-//! `document.exitPointerLock()` and relays the resulting
-//! `pointerlockchange` event back to the worker as
-//! `InputMessage::PointerLockChanged`, which calls [`mark_applied`] so
-//! [`current_state`] stays accurate.
+//! The channel routes through the worker -> main DOM plumbing in
+//! `wasm::host_action` (plain reference, not an intra-doc link: that module
+//! is `#[cfg(target_arch = "wasm32")]`). The worker drains [`take_pending`],
+//! posts a Pointer Lock request/release, and the main thread relays
+//! `pointerlockchange` back as `PointerLockChanged`, which calls
+//! [`mark_applied`].
 //!
-//! Browser Pointer Lock requires "transient activation" (a recent user
-//! gesture). The keystroke that produced the console command opens a
-//! ~5-second window; the worker -> main round-trip is sub-millisecond,
-//! so the activation token is still valid when `requestPointerLock`
-//! runs. If the user releases the lock with Esc (a browser-hardcoded
-//! shortcut we can't suppress), the demo learns via
-//! `PointerLockChanged(false)` and a canvas click re-engages it if the
-//! demo last requested grab.
-//!
-//! The [`GrabMode::Confined`] variant has no direct browser equivalent
-//! and is treated as a Pointer Lock request (the closest behavior we
-//! can deliver). Visibility requests are implicit on wasm: Pointer Lock
-//! auto-hides, release auto-shows.
+//! Pointer Lock requires transient activation; the console keystroke's
+//! ~5-second window survives the sub-millisecond worker round-trip. Esc
+//! release (browser-hardcoded) surfaces as `PointerLockChanged(false)`; a
+//! canvas click re-engages. [`GrabMode::Confined`] has no browser
+//! equivalent and maps to Pointer Lock. Visibility is implicit on wasm:
+//! lock auto-hides, release auto-shows.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -69,22 +33,20 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 /// the engine API doesn't leak winit into demo code.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum GrabMode {
-    /// Cursor moves freely across the OS desktop, including outside the
-    /// window. Default UX.
+    /// Cursor roams freely across the OS desktop. Default UX.
     #[default]
     None,
-    /// Cursor confined inside the window's client rect but otherwise
-    /// moves normally. Pairs with `visible = true` for click discipline
-    /// in modal UIs.
+    /// Confined to the window client rect, otherwise normal. Pairs with
+    /// `visible = true` for modal UIs.
     Confined,
-    /// Cursor pinned at the window center; movement reported as raw
-    /// device delta (`FrameInput::mouse_raw_delta`). Pairs with
-    /// `visible = false` for FPS-style mouse-look.
+    /// Pinned at window center, motion reported as raw device delta
+    /// (`FrameInput::mouse_raw_delta`). Pairs with `visible = false` for
+    /// FPS mouse-look.
     Locked,
 }
 
 /// Snapshot of the last cursor state the runner applied. Read via
-/// [`current_state`] so demos don't need to mirror this themselves.
+/// [`current_state`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CursorState {
     pub grab: GrabMode,
@@ -92,17 +54,15 @@ pub struct CursorState {
 }
 
 impl CursorState {
-    /// Default the runner uses before any request lands: released +
-    /// visible. The conventional UI cursor.
+    /// Runner default before any request lands: released + visible.
     pub const RELEASED: Self = Self {
         grab: GrabMode::None,
         visible: true,
     };
 }
 
-// Encoded pending requests. `0` = no request; nonzero values map to
-// specific transitions. Runner swaps to 0 after reading so subsequent
-// frames don't re-apply unchanged state on every redraw.
+// Encoded pending requests; `0` = none. Runner swaps to 0 after reading so
+// unchanged state isn't re-applied each redraw.
 const NONE: u8 = 0;
 const GRAB_NONE: u8 = 1;
 const GRAB_CONFINED: u8 = 2;
@@ -114,13 +74,11 @@ const VIS_SHOW: u8 = 1;
 const VIS_HIDE: u8 = 2;
 static PENDING_VISIBLE: AtomicU8 = AtomicU8::new(VIS_NONE);
 
-// "Warp cursor to window center" pending flag. Demos pair this with a grab
-// release so the OS-cached cursor position doesn't pop up at a stale spot
-// when the user temporarily un-grabs (e.g., Alt in MMO-style cursor mode).
+// Warp-to-center flag, paired with grab release so the OS-cached cursor
+// doesn't reappear at a stale spot on un-grab.
 static PENDING_WARP_CENTER: AtomicBool = AtomicBool::new(false);
 
-// Last-applied state. Updated by the runner once it commits a transition
-// to the window. Read by [`current_state`].
+// Last-applied state, committed by the runner; read by `current_state`.
 static APPLIED_GRAB: AtomicU8 = AtomicU8::new(GRAB_NONE);
 static APPLIED_VISIBLE: AtomicBool = AtomicBool::new(true);
 
@@ -150,18 +108,15 @@ pub fn request_cursor_visible(visible: bool) {
     PENDING_VISIBLE.store(if visible { VIS_SHOW } else { VIS_HIDE }, Ordering::Release);
 }
 
-/// Request the runner warp the OS cursor to the window's center on its
-/// next redraw. Use this when releasing the grab so the cursor reappears
-/// in a predictable spot (typically the same screen position the user
-/// was aiming at) instead of the OS-cached random position. No-op on wasm
-/// (the browser owns cursor positioning; the warn from `request_grab` covers
-/// this).
+/// Request the runner warp the OS cursor to window center on its next
+/// redraw. Pair with grab release so the cursor reappears where the user
+/// was aiming, not at the OS-cached position. No-op on wasm (browser owns
+/// cursor positioning).
 pub fn request_warp_to_center() {
     PENDING_WARP_CENTER.store(true, Ordering::Release);
 }
 
-/// Convenience: request the FPS-mouse-look pair (Locked + hidden). Common
-/// enough to be its own call.
+/// Convenience: request the FPS-mouse-look pair (Locked + hidden).
 pub fn request_grab() {
     request_grab_mode(GrabMode::Locked);
     request_cursor_visible(false);
@@ -174,11 +129,8 @@ pub fn request_release() {
 }
 
 /// Read + clear the pending grab/visibility transition. Runner-internal;
-/// returns `(grab_change, visible_change)` where each is `Some(new_value)`
-/// if a request landed since the last call, `None` otherwise.
-///
-/// `#[doc(hidden)]` because the engine is the only consumer; demos that
-/// want the applied state read [`current_state`] instead.
+/// each element is `Some(new_value)` if a request landed, else `None`.
+/// Demos read [`current_state`] instead.
 #[doc(hidden)]
 pub fn take_pending() -> (Option<GrabMode>, Option<bool>) {
     let grab_code = PENDING_GRAB.swap(NONE, Ordering::AcqRel);
@@ -206,8 +158,8 @@ pub fn mark_applied(grab: GrabMode, visible: bool) {
     APPLIED_VISIBLE.store(visible, Ordering::Release);
 }
 
-/// Last-applied cursor state. Read this from anywhere (demo, console
-/// handler, render code) instead of mirroring a copy of the grab flag.
+/// Last-applied cursor state. Read from anywhere instead of mirroring a
+/// copy of the grab flag.
 pub fn current_state() -> CursorState {
     CursorState {
         grab: code_to_grab_mode(APPLIED_GRAB.load(Ordering::Acquire)),
@@ -263,23 +215,18 @@ mod tests {
         let s = current_state();
         assert_eq!(s.grab, GrabMode::Confined);
         assert!(!s.visible);
-        // Restore default so sibling tests aren't surprised.
+        // Restore default for sibling tests.
         mark_applied(GrabMode::None, true);
     }
 
-    /// Warp-to-center is a one-shot flag: `request_warp_to_center` sets it,
-    /// `take_pending_warp_center` returns true once and then false until the next
-    /// request. Mirrors the grab/visibility channel's "swap-on-read" semantic so the
-    /// runner doesn't re-warp every frame if no one re-requests.
+    // Warp-to-center is swap-on-read: set once, consumed once, then clears,
+    // so the runner doesn't re-warp every frame.
     #[test]
     fn warp_to_center_is_one_shot() {
-        // Drain anything left over from a sibling test.
         let _ = take_pending_warp_center();
 
-        // No request yet -> false.
         assert!(!take_pending_warp_center());
 
-        // After requesting -> true once, then false on the second read.
         request_warp_to_center();
         assert!(take_pending_warp_center(), "first read after request");
         assert!(
@@ -287,7 +234,7 @@ mod tests {
             "second read should clear the flag"
         );
 
-        // Two requests before a read coalesce: still one consumed event.
+        // Two requests before a read coalesce to one event.
         request_warp_to_center();
         request_warp_to_center();
         assert!(take_pending_warp_center());

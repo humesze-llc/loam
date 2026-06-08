@@ -23,14 +23,12 @@ use crate::state::{
 };
 
 /// Render one [`SectionLayer`]'s controls: a perimeter-outline checkbox and a
-/// fill-alpha slider whose `0` end is the layer's off state. `title` names the
-/// layer; `tooltip` explains what it shows. The perimeter outline only draws in
-/// the wireframe overlay, so its checkbox tooltip says so and notes that the
-/// overlay must be on (the fill draws in Raster mode regardless).
+/// fill-alpha slider whose `0` end is the off state. The perimeter draws only in
+/// the wireframe overlay (the fill draws in Raster regardless), so its tooltip
+/// gates on `wireframe_enabled`.
 ///
-/// Free function (not an `impl Demo` method) so it can take a `&mut SectionLayer`
-/// destructured out of `Demo` in the render-panel closure without re-borrowing
-/// the whole `Demo`.
+/// Free function so it can take a `&mut SectionLayer` destructured out of `Demo`
+/// without re-borrowing the whole `Demo`.
 fn section_layer_controls(
     ui: &mut egui::Ui,
     title: &str,
@@ -51,9 +49,7 @@ fn section_layer_controls(
     }
     ui.horizontal(|ui| {
         ui.label("Fill alpha");
-        // 0 is the off state; the slider spans the full [0, 1] so the user can
-        // drag a layer off or to any visible opacity. The fill draws in Raster
-        // surface mode; below 1.0 it composites through the no-depth-write
+        // 0 is the off state; below 1.0 composites through the no-depth-write
         // pipeline so layers behind show through.
         ui.add(egui::Slider::new(&mut layer.surface_alpha, 0.0..=1.0).fixed_decimals(2))
             .on_hover_text("0 = off; below 1.0 composites translucently over the layers behind");
@@ -61,19 +57,9 @@ fn section_layer_controls(
 }
 
 impl Demo {
-    /// Expanded section of the bottom overlay. Two tab rows
-    /// stacked vertically:
-    ///
-    /// 1. **View tabs** (Shapes / Single / Filmstrip): top-level
-    ///    visual demo. Shapes shows the multi-shape row; Single
-    ///    shows one subject with the full projection stack (the
-    ///    mode Schlegel's cell-index needs); Filmstrip shows one
-    ///    shape across N w-slices.
-    /// 2. **Rotation tabs** (Active set / Composer): how the
-    ///    rotor evolves. Independent of view mode.
-    ///
-    /// Always-visible controls (Spin/Pause, rate buttons,
-    /// sliders) live below this in `render_overlay`.
+    /// Expanded section of the bottom overlay: View tabs (Shapes / Single /
+    /// Filmstrip) over Rotation tabs (Active set / Composer). The always-visible
+    /// controls live below this in `render_overlay`.
     pub(crate) fn render_expanded_body(&mut self, ui: &mut egui::Ui) {
         self.render_view_tab_row(ui);
         match self.view_mode {
@@ -90,12 +76,9 @@ impl Demo {
         }
     }
 
-    /// Top tab row of the expanded body: visual demo selector.
-    /// Shapes (multi-shape side-by-side row), Single (one subject
-    /// with the full projection stack), Filmstrip (one shape
-    /// across multiple w-slices). Tab change is staged into
-    /// `pending_view_mode` for the same `BottomOverlay` two-pass
-    /// reason as `pending_mode`.
+    /// View tab row: Shapes (side-by-side row), Single (one subject, full
+    /// projection stack), Filmstrip (one shape across w-slices). Staged into
+    /// `pending_view_mode` for the `BottomOverlay` two-pass reason.
     pub(crate) fn render_view_tab_row(&mut self, ui: &mut egui::Ui) {
         let mut staged = self.view_mode;
         ui.horizontal(|ui| {
@@ -122,10 +105,8 @@ impl Demo {
         }
     }
 
-    /// Rotation-mode tabs: which source drives `omega`. The tab
-    /// change is staged into `self.pending_mode` rather than
-    /// applied directly so `BottomOverlay`'s two-pass measure-
-    /// then-render captures the same body height in both passes.
+    /// Rotation-mode tabs: which source drives `omega`. Staged into
+    /// `self.pending_mode` so both `BottomOverlay` passes see the same height.
     pub(crate) fn render_rotation_tab_row(&mut self, ui: &mut egui::Ui) {
         let mut staged = self.rotation_mode;
         ui.horizontal(|ui| {
@@ -139,10 +120,8 @@ impl Demo {
         }
     }
 
-    /// Top menu bar: Edit / View. Always visible.
-    ///
-    /// The File menu is intentionally absent until persistence
-    /// and `Quit` via `ViewportCommand::Close` are wired.
+    /// Top menu bar: Edit / View. The File menu is absent until persistence and
+    /// `Quit` via `ViewportCommand::Close` are wired.
     pub(crate) fn render_menu_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("polytope-playground-menu-bar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -161,22 +140,16 @@ impl Demo {
                     }
                 });
                 rye_egui::sticky_menu(ui, "View", |ui| {
-                    // Sticky toggles: clicking each checkbox does NOT close the dropdown
-                    // (per `sticky_menu`'s `CloseOnClickOutside` semantics), so the user
-                    // can flip multiple visibility flags without reopening.
+                    // Sticky toggles: clicking a checkbox does not close the
+                    // dropdown, so several flags can be flipped without reopening.
                     ui.checkbox(&mut self.show_controls, "Rotation controls (H)");
                     ui.checkbox(&mut self.show_formula, "Formula popup");
                     ui.checkbox(&mut self.example_callout.open, "Example callout");
-                    ui.checkbox(&mut self.mode_annotation_open.open, "Mode annotation")
-                        .on_hover_text(
-                            "Floating note explaining the active projection. Appears \
-                             only for a non-default projection.",
-                        );
+                    // Per-projection mode-annotation callouts are unwired (no
+                    // toggle, defaults closed); kept in `render_mode_annotation`.
                     ui.separator();
-                    // One-shot action: opens the About window and the menu should fold
-                    // away. `Popup::close_all(ctx)` cooperates with the sticky-popup
-                    // default to give the user an "explicit close" path for entries that
-                    // aren't sticky toggles.
+                    // One-shot: open About and fold the menu away via
+                    // `Popup::close_all` (the non-sticky path).
                     if ui.button("About this program").clicked() {
                         self.show_help = true;
                         egui::Popup::close_all(ui.ctx());
@@ -186,34 +159,23 @@ impl Demo {
         });
     }
 
-    /// Floating `Render` settings modal. Surfaces the same toggles the console exposes
-    /// (`surface`, `wireframe`, `wireframe points`) so new readers can discover the
-    /// rendering modes without typing commands. Each control writes through the same Demo
-    /// fields the console handlers do; the two interfaces stay in lockstep automatically.
-    ///
-    /// Off by default; opened via the gear button in the bottom overlay. Hosted in
-    /// [`rye_egui::floating_panel`] for consistency with the engine's other floating
-    /// surfaces (the help modal migrates to the same primitive in the same sprint).
+    /// Floating `Render` settings modal, mirroring the console's `surface`,
+    /// `wireframe`, and `wireframe points` toggles so the modes are discoverable
+    /// without typing commands. Each control writes the same Demo fields the
+    /// console handlers do. Off by default; opened via the gear button.
     pub(crate) fn render_render_panel(&mut self, ctx: &egui::Context) {
-        // Snapshot fields the panel can mutate so we can detect a surface-mode change and
-        // call `rebuild_bodies()` AFTER the panel closes its borrow. Doing the rebuild
-        // inside the closure would need `&mut self` while `&mut self.show_render_panel`
-        // is still active.
+        // Snapshot fields the panel mutates so the surface-mode rebuild and
+        // Schlegel re-resolve can run AFTER the destructure-borrow's lifetime
+        // ends (they need `&mut self`, unavailable inside the closure).
         let prev_surface = self.surface_mode;
-        // Snapshot the projection so we can detect a Schlegel select / cell-index
-        // change after the panel's borrow ends and re-resolve the cache (the same
-        // deferred-mutation shape `prev_surface` uses for `rebuild_bodies`).
         let prev_projection = self.wireframe_projection;
-        // Computed BEFORE the destructure so the closure can read it as a captured value
-        // (the destructure exclusively borrows `self.row`).
+        // Before the destructure (which exclusively borrows `self.row`).
         let sdf_disabled = self.sdf_blocked_by_heavy_polychora();
-        // Cell count of the polytope a Schlegel cell index refers to (the leading
-        // polychoron). Captured for the cell-index DragValue's clamp. `None` when
-        // the row has no polychoron, in which case the stepper is disabled.
+        // Leading polychoron's cell count for the cell-index clamp; `None`
+        // disables the stepper.
         let schlegel_cell_count = self.schlegel_subject().map(|p| p.cell_count() as u32);
-        // Destructure-borrow the fields the panel writes so the closure doesn't capture
-        // a whole `&mut self`. This sidesteps the borrow conflict with `show_render_panel`
-        // and lets the closure remain a plain `FnOnce(&mut Ui)`.
+        // Destructure-borrow the panel's fields so the closure stays a plain
+        // `FnOnce(&mut Ui)` and does not conflict with `show_render_panel`.
         let Self {
             show_render_panel,
             surface_mode,
@@ -239,11 +201,9 @@ impl Demo {
             |ui| {
                 ui.label(egui::RichText::new("Surface").strong());
                 ui.radio_value(surface_mode, SurfaceMode::Raster, "Raster (default)");
-                // SDF disabled when the row contains a 120-cell or 600-cell. Those
-                // SDF kernels overrun the browser's WebGPU shader budget and crash
-                // the tab; the user has to remove the heavy polychora first. The
-                // disabled radio surfaces the reason via tooltip so they're not
-                // wondering why the option grayed out.
+                // 120-cell / 600-cell SDF kernels overrun the browser's WebGPU
+                // shader budget and crash the tab, so SDF is disabled (with a
+                // reason tooltip) until the heavy polychora are removed.
                 ui.add_enabled_ui(!sdf_disabled, |ui| {
                     let resp = ui.radio_value(surface_mode, SurfaceMode::Sdf, "SDF raymarch");
                     if sdf_disabled {
@@ -256,13 +216,9 @@ impl Demo {
                 ui.radio_value(surface_mode, SurfaceMode::Off, "Off");
                 ui.separator();
 
-                // Cross-section layers. The slice renders as two overlaid layers
-                // in one viewport: the HONEST cross-section (drop-w, never
-                // reprojected; what the SDF shows) and the PROJECTED cap (the
-                // slice reprojected through the active wireframe projection). Each
-                // has its own perimeter outline + fill alpha. Fills draw in Raster
-                // mode; perimeter outlines draw in the wireframe overlay, so they
-                // gate on `wireframe_enabled` and the tooltips say so.
+                // Two overlaid layers: the honest cross-section (drop-w, what the
+                // SDF shows) and the projected cap (reprojected through the active
+                // wireframe projection), each with its own outline + fill alpha.
                 ui.label(egui::RichText::new("Cross-section").strong());
                 section_layer_controls(
                     ui,
@@ -297,10 +253,9 @@ impl Demo {
                     ui.horizontal(|ui| {
                         ui.label("Projection");
                         for mode in WireframeProjection::ALL {
-                            // Compare by VARIANT, not full `PartialEq`: a Schlegel
-                            // cell-index change must keep the Schlegel button
-                            // selected. Selecting Schlegel preserves the current
-                            // cell index (the contextual stepper below owns it).
+                            // Compare by variant, not full `PartialEq`, so a
+                            // Schlegel cell-index change keeps the button selected
+                            // (the contextual stepper below owns the index).
                             let selected = wireframe_projection.same_variant(mode);
                             if ui.radio(selected, mode.label()).clicked() && !selected {
                                 let next = match (mode, *wireframe_projection) {
@@ -315,11 +270,10 @@ impl Demo {
                             }
                         }
                     });
-                    // Contextual parameter row: only the active mode's knob shows.
-                    // Schlegel -> cell-index stepper (clamped to the leading
-                    // polytope's cell count). Other modes need no contextual
-                    // param; Hyperslice's slab width lives with the cull toggle
-                    // below, so it is not duplicated here.
+                    // Contextual param row: Schlegel's cell-index stepper (clamped
+                    // to the leading polytope's cell count). Dormant: Schlegel is
+                    // omitted from `WireframeProjection::ALL`, so the radio never
+                    // offers it; kept so re-wiring needs no UI change.
                     if let WireframeProjection::Schlegel { cell_index } = wireframe_projection {
                         ui.horizontal(|ui| {
                             ui.label("Boundary cell");
@@ -341,13 +295,10 @@ impl Demo {
                             }
                         });
                     }
-                    // Hyperslice cull: thin the edge graph to a w-slab around the
-                    // current slice. The thickness stepper is enabled whenever the
-                    // cull is running, which includes the Hyperslice PROJECTION
-                    // mode (it resolves to drop-w and turns the cull on without the
-                    // standalone toggle). Gating on the toggle alone left the slab
-                    // width greyed out under that projection even though the cull
-                    // was active.
+                    // Hyperslice cull: thin the edge graph to a w-slab. The
+                    // thickness stepper is enabled whenever the cull runs, which
+                    // includes the Hyperslice projection mode (which turns the cull
+                    // on without the standalone toggle).
                     ui.checkbox(wireframe_hyperslice, "Hyperslice cull (w-slab)");
                     let cull_active =
                         hyperslice_cull_active(*wireframe_hyperslice, *wireframe_projection);
@@ -383,18 +334,13 @@ impl Demo {
                 });
             },
         );
-        // The destructure-borrow's lifetime ended above; safe to call `&mut self`
-        // methods again. Replay the console handler's `rebuild_bodies()` whenever the
-        // user flipped surface mode through the panel, so the SDF kernel's body list
-        // stays in sync with the new mode (`BodyKind::Invalid` for inert polychora).
+        // Destructure-borrow ended; `&mut self` is safe again. Rebuild the SDF
+        // body list when the surface mode changed through the panel.
         if self.surface_mode != prev_surface {
             self.rebuild_bodies();
         }
-        // Re-resolve the cached Schlegel face-plane params if the user changed the
-        // projection mode or dragged the cell-index stepper through the panel.
-        // Deferred to here (same shape as the surface-mode rebuild) because the
-        // resolve runs the LazyLock cell-table fit on first access and must not be
-        // called inside the destructure-borrowed closure (it needs `&mut self`).
+        // Re-resolve the cached Schlegel face-plane params on a projection or
+        // cell-index change (deferred here because the resolve needs `&mut self`).
         if self.wireframe_projection != prev_projection {
             self.resolve_schlegel_cache();
         }
@@ -504,17 +450,13 @@ impl Demo {
         });
     }
 
-    /// Unified controls overlay. `egui::Window` with
-    /// `pivot(CENTER_BOTTOM)` so the bottom edge is the anchor
-    /// and the panel grows upward when the expanded body is
-    /// shown. Always draggable.
+    /// Unified controls overlay. `egui::Window` with `pivot(CENTER_BOTTOM)` so it
+    /// anchors at the bottom edge and grows upward. Always draggable.
     pub(crate) fn render_overlay(&mut self, ctx: &egui::Context) {
         let screen = ctx.content_rect();
         let pad = 16.0;
-        // Cap the overlay width to roughly the 800x600 layout (the
-        // shape the demo was designed against; full-screen widths
-        // stretched the slider strip into a usability problem).
-        // Falls back to the window width if the window is narrower.
+        // Cap to roughly the 800x600 layout; full-screen widths stretched the
+        // slider strip unusably wide. Falls back to the window width if narrower.
         const OVERLAY_MAX_WIDTH: f32 = 768.0;
         const OVERLAY_MIN_WIDTH: f32 = 280.0;
         let natural_w = screen.width() - 2.0 * pad;
@@ -529,11 +471,9 @@ impl Demo {
 
         let default_bottom_centre = egui::pos2(screen.center().x, screen.bottom() - pad);
 
-        // Snapshot the single-view subject so a change made through the Single
-        // body's picker this frame can trigger the same body-rebuild + Schlegel
-        // re-resolve a row edit does (the subject IS the rendered row in Single
-        // mode, so changing it changes which polychoron the diagram projects
-        // through and its cell count). Compared after the deferred-apply block.
+        // Snapshot the Single-view subject: it IS the rendered row in Single mode,
+        // so a picker change needs the same rebuild + Schlegel re-resolve a row
+        // edit does. Compared after the deferred-apply block.
         let prev_strip_subject = self.strip_subject;
 
         egui::Window::new("polytope-playground-overlay")
@@ -557,21 +497,16 @@ impl Demo {
                 self.render_rate_row(ui);
             });
 
-        // Apply any deferred state changes AFTER the overlay
-        // finishes rendering, so both BottomOverlay passes saw
-        // the same content this frame.
+        // Apply deferred changes AFTER the overlay renders, so both BottomOverlay
+        // passes saw the same content this frame.
         if let Some(new_mode) = self.pending_mode.take() {
             self.rotation_mode = new_mode;
         }
         if let Some(new_view) = self.pending_view_mode.take() {
             self.view_mode = new_view;
-            // The rendered row changes with the view mode (full row in Shapes,
-            // the lone `strip_subject` in Single), so re-emit the SDF body slots
-            // and re-resolve the Schlegel cache: the leading polychoron (and its
-            // cell count) the diagram projects through can differ between the row
-            // and the single subject. Filmstrip re-uploads its own per-cell
-            // bodies during render and restores the row after, so this rebuild is
-            // harmless there too.
+            // The rendered row changes with the view mode, so re-emit the SDF body
+            // slots and re-resolve the Schlegel cache (the leading polychoron can
+            // differ between the row and the single subject).
             self.rebuild_bodies();
             self.resolve_schlegel_cache();
         }
@@ -591,24 +526,19 @@ impl Demo {
                 DeferredAction::SeqPushTerm(term) => self.seq.push(term),
             }
         }
-        // A Single-view subject change is a render-row change: re-emit the SDF
-        // body slots and re-resolve the Schlegel cache against the new subject's
-        // topology. Gated on `Single` so picking a filmstrip subject (which does
-        // not change the Schlegel-relevant row) skips the work.
+        // A Single-view subject change is a render-row change; rebuild + re-resolve
+        // against the new topology. Gated on `Single` so a Filmstrip subject pick
+        // skips the work.
         if self.view_mode == ViewMode::Single && self.strip_subject != prev_strip_subject {
             self.rebuild_bodies();
             self.resolve_schlegel_cache();
         }
     }
 
-    /// Two big sliders (w, t) with fixed-width monospace value
-    /// labels.
+    /// Two sliders (w, t) with fixed-width monospace value labels.
     pub(crate) fn render_slider_strip(&mut self, ui: &mut egui::Ui, _area_w: f32) {
-        // Sized so "w +0.000" / "t  7.12s" (8 monospace chars at
-        // FONT_SIZE 13) fit with a few px of breathing room. Larger
-        // t values (10+ chars at huge `rot_time`) would clip the
-        // tail; that's an acceptable trade for killing the visible
-        // deadspace at typical magnitudes.
+        // Sized for "w +0.000" / "t  7.12s" (8 monospace chars). Larger t values
+        // clip the tail; an acceptable trade for killing the deadspace.
         const VALUE_CELL_W: f32 = 72.0;
         let avail = ui.available_width();
         let spacing = ui.spacing().item_spacing.x;
@@ -617,8 +547,7 @@ impl Demo {
 
         let row_size = egui::vec2(avail, CONTROL_H);
         let row_layout = egui::Layout::left_to_right(egui::Align::Center);
-        // Surface-scaled W range so a `surface scale 4.0` body has a slider
-        // wide enough for the slice plane to leave it.
+        // Surface-scaled W range so a scaled body's slider reaches past it.
         let w_range = self.effective_w_range();
         ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
             let formatted = format!("w {:>+.3}", self.w_slice);
@@ -636,14 +565,9 @@ impl Demo {
         let mut t_dragged = false;
         ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
             let formatted = format!("t {:>5.2}s", self.rot_time);
-            // Same `slider_with_edit` widget as the w slider so
-            // click-drag and right-click-edit behave identically
-            // across the two rows. Gate the scrub recomputation on
-            // `dragged` (not `changed`) because the spin's per-frame
-            // `rot_time += dt` would otherwise re-fire the
-            // `(omega * t).exp()` rebuild every frame, snapping the
-            // rotor when omega shifts (e.g., toggling active planes
-            // while spinning).
+            // Gate the scrub recompute on `dragged`, not `changed`: the spin's
+            // per-frame `rot_time += dt` would otherwise re-fire the
+            // `(omega * t).exp()` rebuild every frame and snap the rotor.
             let interaction = slider_with_edit(
                 ui,
                 &mut self.rot_time,
@@ -656,10 +580,8 @@ impl Demo {
             t_dragged = interaction.dragged;
         });
         if t_dragged {
-            // `rotor_at_time` dispatches Active (product-of-exp) vs
-            // Composer (sum-of-bivectors), so scrubbing the t slider
-            // reproduces exactly what the continuous-spin path would
-            // have integrated to at this `rot_time` in either mode.
+            // `rotor_at_time` dispatches Active vs Composer, so scrubbing
+            // reproduces what the spin would have integrated to at this `rot_time`.
             self.rot_state = self.rotor_at_time(self.rot_time);
             self.write_all(self.rot_state);
         }
@@ -713,10 +635,8 @@ impl Demo {
                 {
                     self.expanded = !self.expanded;
                 }
-                // Gear + `?`: matching `CONTROL_W × CONTROL_H` so the utility buttons in
-                // the row read as a single coherent set with the chevron + play / step
-                // buttons. (Pre-sprint `?` was sized `MINI_BUTTON_W` square, odd one
-                // out; bumped along with the new gear for visual consistency.)
+                // Gear + `?` sized `CONTROL_W × CONTROL_H` so the utility buttons
+                // match the chevron + play / step set.
                 let util_size = egui::vec2(CONTROL_W, CONTROL_H);
                 if ui
                     .add(egui::Button::new(egui::RichText::new("⚙").strong()).min_size(util_size))

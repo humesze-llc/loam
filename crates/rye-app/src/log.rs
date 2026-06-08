@@ -1,28 +1,19 @@
-//! Tracing-to-console bridge: every `tracing::info!` / `warn!` / `error!` event the
-//! app emits gets formatted and pushed into a bounded ring buffer. A console command
-//! (`log on|off|toggle`) controls whether the buffer mirrors into scrollback each
-//! frame. The buffer is always filling regardless of mirror state, so toggling on
-//! shows whatever events were emitted since startup (capped at `BUFFER_CAP`).
+//! Tracing-to-console bridge: each `tracing::info!`/`warn!`/`error!` event is
+//! formatted into a bounded ring buffer. `log on|off|toggle` controls whether
+//! the buffer mirrors into scrollback; the buffer always fills, so toggling on
+//! shows history since startup (capped at `BUFFER_CAP`).
 //!
-//! ## What this does NOT capture
-//!
-//! - Raw `println!` / `eprintln!`. Those write to `fd 1` / `fd 2` directly; capturing
-//!   them needs an OS-level pipe redirect. Use `tracing::info!(...)` instead.
-//! - Events filtered out by `EnvFilter` (`RUST_LOG=...` or the runtime filter passed
-//!   to [`RunConfig::log_filter`](crate::RunConfig)).
-//!
-//! ## Wiring (per demo)
+//! Does not capture raw `println!`/`eprintln!` (those need an fd redirect) or
+//! events dropped by `EnvFilter` /
+//! [`RunConfig::log_filter`](crate::RunConfig).
 //!
 //! ```ignore
-//! // In build_console:
-//! rye_app::log::register_command(&mut c);
-//!
-//! // In App::ui, before console.ui:
-//! rye_app::log::pump_into(&mut self.console);
-//! self.console.ui(ctx, &mut self.demo);
+//! rye_app::log::register_command(&mut c);     // build_console
+//! rye_app::log::pump_into(&mut self.console); // App::ui, before console.ui
 //! ```
 //!
-//! The subscriber init happens automatically inside [`run_with_config`](crate::run_with_config).
+//! Subscriber init is automatic in
+//! [`run_with_config`](crate::run_with_config).
 
 use std::collections::VecDeque;
 #[cfg(not(target_arch = "wasm32"))]
@@ -40,39 +31,26 @@ use tracing::Event;
 #[cfg(not(target_arch = "wasm32"))]
 use tracing_subscriber::layer::{Context, Layer};
 
-/// Ring buffer cap. Sized so a busy capture session doesn't blow memory; older lines
-/// drop off the front. Each entry is a short formatted string (~100 chars), so the
-/// total footprint is ~200 KB at full capacity.
+/// Ring buffer cap (oldest lines drop). ~100 chars/entry, so ~200 KB full.
 #[cfg(not(target_arch = "wasm32"))]
 const BUFFER_CAP: usize = 2000;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static BUFFER: Mutex<VecDeque<HistoryLine>> = Mutex::new(VecDeque::new());
 
-/// Per-WindowEvent log toggle. When on, the runner emits a `tracing::info!`
-/// for every meaningful WindowEvent it dispatches to `on_event`. Used for
-/// spike-correlation: if the perf overlay reports a 500ms spike, the log
-/// will have any input events that preceded it within the same frame
-/// window, which narrows the cause (resize event? focus change? specific
-/// key press?). Cursor-moves are filtered because they fire at 60Hz+ and
-/// would drown out the signal.
-///
-/// Architectural note: this is a process-global static rather than a field
-/// on `Runner` because the toggle is set from inside a `Console` command
-/// closure that doesn't have access to the runner. The trade-off is that
-/// multi-App tests with their own runners would share the flag, which
-/// doesn't matter for the actual use case (one demo per process).
+/// Per-WindowEvent log toggle: when on, the runner emits a `tracing::info!`
+/// per dispatched WindowEvent for spike-correlation (cursor-moves filtered
+/// as noise). Global static, not a `Runner` field, because the console
+/// closure can't reach the runner.
 static EVENTS_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Read by the runner's `window_event` handler. Demos shouldn't need this
-/// directly; toggle via the `log events on|off|toggle` console command.
+/// Read by the runner's `window_event` handler; toggle via
+/// `log events on|off|toggle`.
 pub fn events_enabled() -> bool {
     EVENTS_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Set the per-event log state explicitly. Same caveat as `set_enabled`:
-/// race-prone if toggled from multiple threads, fine for a console
-/// command's single-threaded toggle.
+/// Set the per-event log state explicitly.
 pub fn set_events_enabled(b: bool) {
     EVENTS_ENABLED.store(b, Ordering::Relaxed);
 }
@@ -100,9 +78,8 @@ pub fn toggle() -> bool {
     new
 }
 
-/// Drain pending log lines. When disabled, returns empty without touching the buffer
-/// (so newly-enabled mirroring still shows recent history). When enabled, takes
-/// everything queued and hands it to the caller.
+/// Drain pending log lines. Disabled returns empty without draining, so
+/// newly-enabled mirroring still shows recent history.
 pub fn drain() -> Vec<HistoryLine> {
     if !enabled() {
         return Vec::new();
@@ -121,26 +98,16 @@ pub fn pump_into<Ctx: 'static>(console: &mut Console<Ctx>) {
     }
 }
 
-/// Register the `log` console command. Two independent toggles:
+/// Register the `log` console command. Independent toggles:
 ///
-/// - **`log [on|off|toggle]`** controls **tracing -> scrollback**: when on, any
-///   `tracing::info!` / `warn!` / `error!` event the app emits also appears in
-///   the in-canvas console scrollback. Useful for surfacing background events
-///   (capture status, hot-reload notifications, framework warnings) where the
-///   user has the console open.
-/// - **`log echo [on|off|toggle]`** controls **scrollback -> browser**: when
-///   on, every line added to the in-canvas scrollback (command output, user
-///   prompts, error lines, even the `log on`-mirrored tracing events) also
-///   echoes to the browser DevTools console via `web_sys::console::log_1`.
-///   wasm32 only; native does nothing because stderr / stdout already covers
-///   the same need.
+/// - **`log [on|off|toggle]`**: tracing -> scrollback.
+/// - **`log echo [on|off|toggle]`**: scrollback -> browser DevTools console
+///   (wasm32 only; native already has stderr/stdout).
+/// - **`log events [on|off|toggle]`**: per-WindowEvent tracing.
 ///
-/// Architectural note: the two directions deliberately use different
-/// transports (tracing for in, raw `console.log` for out). Routing both
-/// through tracing would create a feedback loop: a tracing event would land
-/// in the scrollback, get re-emitted to tracing, land again, ad infinitum.
-/// The asymmetric transport is the simplest invariant that breaks the loop
-/// without per-line origin tagging.
+/// The two directions use different transports (tracing in, raw
+/// `console.log` out) to avoid a scrollback -> tracing -> scrollback
+/// feedback loop.
 pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
     console.register(
         cmd(
@@ -148,18 +115,6 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
             "mirror tracing events into the scrollback (`log [on|off|toggle]`) \
              or echo scrollback to the browser console (`log echo [on|off|toggle]`)",
             |args, _ctx: &mut Ctx, out| {
-                // Three subcommand families:
-                //
-                //   log [on|off|toggle]            -> tracing  -> scrollback
-                //   log echo  [on|off|toggle]      -> scrollback -> browser console
-                //   log events [on|off|toggle]     -> per-WindowEvent tracing::info!
-                //
-                // Architectural note: the three are independent toggles so
-                // diagnostic combinations don't fight each other. e.g. during
-                // a spike investigation you'd typically run `log events on +
-                // log echo on` to capture event timestamps + scrollback in the
-                // browser DevTools console; for steady-state debug `log on`
-                // alone mirrors tracing to scrollback without echo-spam.
                 if args.first().copied() == Some("echo") {
                     let new = match args.get(1).copied() {
                         Some("on") => {
@@ -243,15 +198,11 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
 // Tracing Layer
 // ---------------------------------------------------------------------------
 //
-// The layer + its supporting visitors are native-only: on wasm32 we route tracing
-// events through `tracing-wasm` (which writes directly to the browser console with
-// matching severity levels) and never install this layer, so gating the items keeps
-// the wasm build warning-free.
+// Native-only: wasm32 routes events through `tracing-wasm` and never installs
+// this layer, so gating the items keeps the wasm build warning-free.
 
-/// Tracing subscriber layer that pushes formatted events into [`BUFFER`].
-///
-/// Installed automatically by [`crate::run_with_config`]. Always captures; the mirror
-/// to console scrollback is gated by [`ENABLED`].
+/// Tracing layer that pushes formatted events into [`BUFFER`]. Installed by
+/// [`crate::run_with_config`]; always captures, mirror gated by [`ENABLED`].
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ConsoleLayer;
 
@@ -294,9 +245,8 @@ fn push(line: HistoryLine) {
     }
 }
 
-/// Extracts the event's `message` field (the printf-style payload of
-/// `tracing::info!("text {x}")`) and any other key=value fields into a one-liner
-/// suitable for a scrollback row.
+/// Splits an event's `message` field from its other key=value fields into a
+/// one-line scrollback row.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 struct FieldVisitor {

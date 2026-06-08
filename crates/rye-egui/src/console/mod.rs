@@ -1,71 +1,40 @@
 //! Quake-style developer console: half-screen drop-down overlay with a command
-//! registry, scrollback, hotkey binding, and tab autocomplete.
+//! registry, scrollback, hotkey binding, and tab autocomplete. Interaction model
+//! follows the idTech console (Quake, 1996).
 //!
-//! The interaction model follows the idTech console (Quake, 1996): a drop-down
-//! activated by `` ` ``, monospace scrollback above an input line, history navigated
-//! with Up/Down, completion via Tab, hotkey binds for arbitrary command lines.
+//! [`Console`] is generic over a `Ctx` type so consuming crates choose what state
+//! commands operate on. Built-in commands that depend on app/runtime state live in
+//! `rye-app`; this module ships only `help`, `clear`, `detach`, `dock`.
 //!
-//! ## What lives here vs what doesn't
-//!
-//! - **Here**: `Console` (the main type), [`Command`] trait + [`cmd`] closure shim,
-//!   [`ConsoleWriter`] (output collector), key handling for the input line, the parser.
-//!   `Console` is generic over a `Ctx` type so consuming crates choose what state
-//!   commands operate on.
-//! - **Not here**: built-in commands (`screenshot`, `capture.start`, `bind`, `quit`).
-//!   Those depend on app/runtime state and live in `rye-app::builtins`. This module
-//!   ships only `help` and `clear`, which need only `Console` itself.
-//!
-//! ## Why egui consumes the keys before TextEdit sees them
-//!
-//! Egui's `TextEdit::singleline` swallows printable characters into the buffer and uses
-//! `Tab` to move focus. Without explicit interception, the toggle key (`` ` ``) types a
-//! backtick into the input the moment the console opens, and `Tab` shifts focus off the
-//! input box. The key handler at the top of [`Console::ui`] uses
-//! `egui::InputState::consume_key` to claim the keystrokes before TextEdit's per-frame
-//! processing runs. Up/Down/Tab/Esc/Ctrl+L/Ctrl+C are intercepted the same way; Enter
-//! is detected via the TextEdit response in the panel module so we still get
-//! `lost_focus`-on-submit semantics.
-//!
-//! ## Constants
-//!
-//! Tunables are module-level `const`s ([`MAX_HISTORY_LINES`], [`MAX_INPUT_HISTORY`],
-//! [`ANIM_DURATION_SECS`], [`PANEL_HEIGHT_FRACTION`]) rather than runtime config; the
-//! values are UX choices, not deployment knobs.
+//! Console keys are intercepted via `egui::InputState::consume_key` before
+//! `TextEdit::singleline` sees them, so the toggle key and Tab don't leak into the
+//! input box or move focus. Enter is detected via the TextEdit response in the panel
+//! module to preserve `lost_focus`-on-submit semantics.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 mod panel;
 
-/// Scrollback line cap. Older lines drop when the buffer exceeds this. Sized for a
-/// session's worth of debugging without unbounded memory.
+/// Scrollback line cap. Older lines drop when the buffer exceeds this.
 pub const MAX_HISTORY_LINES: usize = 2000;
 
-/// Input-history cap (Up/Down nav). 100 covers a typical session; larger and old
-/// entries become noise during cycling.
+/// Input-history cap (Up/Down nav).
 pub const MAX_INPUT_HISTORY: usize = 100;
 
-/// Slide-down animation duration. 0.15s is fast enough to feel responsive, slow enough
-/// to read as motion.
+/// Slide-down animation duration.
 pub const ANIM_DURATION_SECS: f32 = 0.15;
 
-/// Fraction of the viewport height the open console occupies. 0.5 is the Quake
-/// convention: enough scrollback visible, scene visible below.
+/// Fraction of the viewport height the open console occupies (Quake convention).
 pub const PANEL_HEIGHT_FRACTION: f32 = 0.5;
 
-/// Runtime flag controlling whether new scrollback lines also echo to the
-/// browser DevTools console (via direct `console.log`, NOT through `tracing`).
-///
-/// Off by default. On wasm32 the path is `Console::push_history` ->
-/// `web_sys::console::log_1`; on native the flag has no effect because the
-/// native log subscriber already prints to stderr. Toggled via the `log echo`
-/// console subcommand registered by `rye_app::log`. Process-global because the
-/// typical demo has one Console; multi-Console demos would share the toggle.
+/// Echo new scrollback lines to the browser DevTools console via direct
+/// `console.log` (not `tracing`; see `push_history` for the feedback-loop
+/// rationale). Off by default; toggled via `rye_app::log`'s `log echo` subcommand.
 #[cfg(target_arch = "wasm32")]
 static ECHO_TO_BROWSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Enable / disable scrollback echo to the browser DevTools console (wasm32
-/// only). See `ECHO_TO_BROWSER` for the architectural rationale. On native
-/// this is a no-op so demos can call it unconditionally during command setup.
+/// only); no-op on native so demos can call it unconditionally.
 pub fn set_console_echo(enabled: bool) {
     #[cfg(target_arch = "wasm32")]
     ECHO_TO_BROWSER.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -73,9 +42,7 @@ pub fn set_console_echo(enabled: bool) {
     let _ = enabled;
 }
 
-/// Returns the current scrollback-echo state. Always `false` on native (the
-/// native log path is fundamentally different and doesn't go through this
-/// flag).
+/// Current scrollback-echo state. Always `false` on native.
 pub fn console_echo_enabled() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
@@ -128,9 +95,9 @@ impl HistoryLine {
 /// Classifies a scrollback line so the panel can color it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
-    /// User-typed input echoed back. Rendered prominent.
+    /// User-typed input echoed back.
     Input,
-    /// Command-produced output. Rendered standard.
+    /// Command-produced output.
     Output,
     /// Error from command execution or unknown-command lookup.
     Error,
@@ -143,21 +110,16 @@ pub enum LineKind {
 // ---------------------------------------------------------------------------
 
 /// Per-invocation output sink. Commands push lines via [`ConsoleWriter::line`] /
-/// [`ConsoleWriter::error`]; the console drains the collected lines into the scrollback
-/// after the command returns.
-///
-/// The two-phase design (command writes to local Vec, console drains) avoids the borrow
-/// conflict between the command's mutable access to the registry slot and the console's
-/// mutable access to its own scrollback during the same `execute` call.
+/// [`ConsoleWriter::error`]; the console drains them into scrollback after the command
+/// returns. The two-phase design sidesteps the borrow conflict between the command's
+/// mutable registry slot and the console's mutable scrollback during one `execute`.
 pub struct ConsoleWriter {
     lines: Vec<HistoryLine>,
 }
 
 impl ConsoleWriter {
-    /// An empty writer. The console builds one per `execute` and drains it into
-    /// scrollback; exposed `pub` so command handlers can be unit-tested in
-    /// isolation (run the handler against a fresh writer, inspect the field it
-    /// mutated) without standing up a full `Console` and `Ctx`.
+    /// An empty writer. `pub` so command handlers can be unit-tested against a
+    /// fresh writer without standing up a full `Console` and `Ctx`.
     pub fn new() -> Self {
         Self { lines: Vec::new() }
     }
@@ -185,75 +147,53 @@ impl Default for ConsoleWriter {
 // ---------------------------------------------------------------------------
 
 /// Console command implementation. Generic over a `Ctx` type so the consuming crate
-/// decides what state commands can mutate. For Rye this is typically a struct holding
-/// `&mut dyn App`, `&mut Capture`, and an exit signal.
+/// decides what state commands can mutate.
 pub trait Command<Ctx>: 'static {
     /// The name typed at the prompt. Conventionally lowercase, dotted for namespacing
     /// (`capture.start`).
     fn name(&self) -> &str;
 
-    /// One-line description shown by `help` (no argument) when listing every command.
-    /// Conventionally <= ~60 chars so the listing fits in a single console row.
+    /// One-line description shown by `help` when listing every command.
     fn help(&self) -> &str;
 
-    /// Multi-line help shown by `help <name>` for a specific command. Default returns
-    /// just the one-line [`Self::help`] string -- override when the command's surface
-    /// is richer than fits one line (multiple subcommands, multi-step usage examples,
-    /// arg-by-arg explanations).
-    ///
-    /// `\n` line breaks are honored; the panel paints each line into the scrollback as
-    /// its own entry so word-wrap and scroll behavior stay consistent with the rest of
-    /// the console. Returns owned `String` so subcommand-dispatching commands can build
-    /// the listing dynamically from their registered children without storing a static.
+    /// Multi-line help shown by `help <name>`. Default returns the one-line
+    /// [`Self::help`]; override for commands with a richer surface. `\n` breaks paint
+    /// as separate scrollback entries. Owned `String` so subcommand-dispatching
+    /// commands can build the listing from their children.
     fn long_help(&self) -> String {
         self.help().to_string()
     }
 
-    /// Tab-completion choices for the `arg_index`-th positional argument, without
-    /// awareness of values typed in prior slots. Default is empty (no completion /
-    /// free-form arg like a path or number). Override via [`FnCommand::with_args`]
-    /// when an arg is a fixed enum like `pre|post|both`, or include a `key=` entry
-    /// to declare a key-value arg whose values are supplied separately by
-    /// [`Command::arg_value_choices`].
-    ///
-    /// Most commands should override this. Subcommand-style commands whose value
-    /// slot depends on what subcommand was picked should override
-    /// [`Command::arg_choices_ctx`] instead (this method's default returns `&[]`,
-    /// and `arg_choices_ctx`'s default delegates back here).
+    /// Tab-completion choices for the `arg_index`-th positional argument. Default is
+    /// empty (free-form arg). Override via [`FnCommand::with_args`] for a fixed enum,
+    /// or include a `key=` entry for a key-value arg whose values come from
+    /// [`Command::arg_value_choices`]. Subcommand-style commands override
+    /// [`Command::arg_choices_ctx`] instead.
     fn arg_choices(&self, arg_index: usize) -> &[&'static str] {
         let _ = arg_index;
         &[]
     }
 
-    /// Context-aware variant of [`Command::arg_choices`]. Receives the arg tokens
-    /// parsed BEFORE the current completion position (`prior.len() == arg_index`),
-    /// so completion can branch on prior choices.
-    ///
-    /// Default delegates to [`Command::arg_choices`], so commands that don't need
-    /// context don't have to override this. Subcommand dispatch (e.g.
-    /// [`SubcommandSet`]) overrides this to gate the value-slot choices on the
-    /// selected subcommand.
-    ///
-    /// The explicit `'a` lifetime ties the returned slice to `&self`; the nested
-    /// `&[&str]` in `prior` would otherwise confuse lifetime elision.
+    /// Context-aware variant of [`Command::arg_choices`]. `prior` carries the arg
+    /// tokens parsed before the cursor (`prior.len() == arg_index`). Default delegates
+    /// to [`Command::arg_choices`]; [`SubcommandSet`] overrides it to gate value-slot
+    /// choices on the selected subcommand. The explicit `'a` ties the returned slice
+    /// to `&self` past the nested-reference elision.
     fn arg_choices_ctx<'a>(&'a self, arg_index: usize, prior: &[&str]) -> &'a [&'static str] {
         let _ = prior;
         self.arg_choices(arg_index)
     }
 
-    /// Enumerable values for a `key=value` arg at `arg_index` whose key is `key`
-    /// (no trailing `=`). Enables two-step tab completion: the user first Tabs
-    /// onto the `key=` prefix, then a second Tab cycles through these values. An
-    /// empty return means free-form (the user types whatever after the `=`).
+    /// Enumerable values for a `key=value` arg at `arg_index` with key `key` (no
+    /// trailing `=`). Drives two-step tab completion; empty means free-form.
     fn arg_value_choices(&self, arg_index: usize, key: &str) -> &[&'static str] {
         let _ = (arg_index, key);
         &[]
     }
 
-    /// Context-aware variant of [`Command::arg_value_choices`]. Receives the arg
-    /// tokens parsed BEFORE the current completion position; subcommand-dispatching
-    /// commands route kv-value lookups to the active subcommand's value table
-    /// using this. Default delegates to [`Command::arg_value_choices`].
+    /// Context-aware variant of [`Command::arg_value_choices`]; routes kv-value
+    /// lookups to the active subcommand's table. Default delegates to
+    /// [`Command::arg_value_choices`].
     fn arg_value_choices_ctx<'a>(
         &'a self,
         arg_index: usize,
@@ -264,9 +204,8 @@ pub trait Command<Ctx>: 'static {
         self.arg_value_choices(arg_index, key)
     }
 
-    /// Run the command. `args` are whitespace-split tokens after the command name.
-    /// Output goes to `out`; recoverable issues get `out.error(..)`; unrecoverable
-    /// ones return `Err`.
+    /// Run the command. `args` are tokens after the command name. Output goes to
+    /// `out`; recoverable issues get `out.error(..)`, unrecoverable ones return `Err`.
     fn run(&mut self, args: &[&str], ctx: &mut Ctx, out: &mut ConsoleWriter) -> anyhow::Result<()>;
 }
 
@@ -274,21 +213,17 @@ pub trait Command<Ctx>: 'static {
 pub struct FnCommand<F> {
     name: &'static str,
     help: &'static str,
-    /// Optional multi-line text returned by [`Command::long_help`] when set. When `None`,
-    /// `long_help` falls back to repeating `help`. Set via [`FnCommand::with_long_help`].
+    /// Multi-line [`Command::long_help`] text; `None` falls back to `help`.
     long_help: Option<&'static str>,
     arg_choices: Vec<Vec<&'static str>>,
-    /// Per-key value choices for `key=value` args, applied across every arg
-    /// position the key appears at. Keyed by the bare key name (no `=`).
+    /// Per-key value choices for `key=value` args, keyed by the bare key (no `=`).
     value_choices: HashMap<&'static str, Vec<&'static str>>,
     f: F,
 }
 
 impl<F> FnCommand<F> {
-    /// Declare positional-argument choices for tab-completion. Each inner slice lists
-    /// the valid values for that positional position. Trailing free-form args (paths,
-    /// numbers, expressions) can be omitted; the console returns no completions for
-    /// positions beyond the declared list.
+    /// Declare positional-argument choices for tab-completion, one inner slice per
+    /// position. Trailing free-form args can be omitted.
     ///
     /// ```ignore
     /// cmd("capture", "...", |args, ctx, out| { ... }).with_args(&[
@@ -301,10 +236,9 @@ impl<F> FnCommand<F> {
         self
     }
 
-    /// Declare enumerable values for a `key=value` arg. The first Tab completes
-    /// the user's key prefix to `key=`; once `=` is in the input, subsequent
-    /// completions cycle through these values. Free-form numeric args (`fps=N`)
-    /// simply don't call this and only the bare `key=` shows up in tab cycling.
+    /// Declare enumerable values for a `key=value` arg: first Tab completes to
+    /// `key=`, subsequent Tabs cycle these values. Free-form args (`fps=N`) skip
+    /// this and only surface the bare `key=`.
     ///
     /// ```ignore
     /// cmd("capture", "...", |a, c, o| ...)
@@ -316,10 +250,8 @@ impl<F> FnCommand<F> {
         self
     }
 
-    /// Attach a multi-line help block returned by [`Command::long_help`]. Newlines are
-    /// honored; the console paints each line as its own scrollback entry so wrapping +
-    /// scroll behavior stay consistent. Use for commands whose surface (multiple
-    /// subcommand-style args, usage examples) doesn't fit one line.
+    /// Attach a multi-line help block returned by [`Command::long_help`]. Newlines
+    /// paint as separate scrollback entries.
     ///
     /// ```ignore
     /// cmd("wireframe", "wireframe overlay (see help)", handler)
@@ -339,8 +271,8 @@ impl<F> FnCommand<F> {
     }
 }
 
-/// Build a [`Command`] from a closure. The closure mutates a `Ctx` and writes lines
-/// into the [`ConsoleWriter`]. Idiomatic for inline per-demo registrations.
+/// Build a [`Command`] from a closure that mutates `Ctx` and writes to the
+/// [`ConsoleWriter`]. Idiomatic for inline per-demo registrations.
 ///
 /// ```ignore
 /// console.register(cmd("teleport", "teleport <x> <y> <z>", |args, ctx, out| {
@@ -400,80 +332,38 @@ where
 // Subcommand dispatch
 // ---------------------------------------------------------------------------
 
-// Tab-completion for toggle subcommands intentionally returns an empty list at the value
-// slot. The primary UX for a toggle is *bare* invocation (e.g. `wireframe nearest-active`
-// flips), and surfacing `on|off` in completion implied that one of them was required when it
-// isn't. The parser still accepts `on|off|true|false|1|0` for callers that want explicit
-// set; it's just no longer promoted in the cycle.
-
-/// Boxed handler for an on/off toggle subcommand. The framework passes `Some(bool)`
-/// when the user supplied `on|off|true|false|1|0` and `None` when the user invoked the
-/// subcommand bare (no value). The handler is responsible for flipping the field in
-/// the `None` case; the framework can't because it doesn't own the field.
-///
-/// Idiomatic shape for a `bool` field on `Ctx`:
-///
-/// ```ignore
-/// .toggle("axes", "toggle world-axes", |ctx, v| {
-///     ctx.show_axes = v.unwrap_or(!ctx.show_axes);
-///     Ok(())
-/// })
-/// ```
+/// Boxed handler for an on/off toggle subcommand. `Some(bool)` when the user supplied
+/// `on|off|true|false|1|0`, `None` on bare invocation (the handler flips the field).
 type ToggleHandler<Ctx> = Box<dyn FnMut(&mut Ctx, Option<bool>) -> anyhow::Result<()>>;
 
-/// Boxed handler for a fixed-choice subcommand. The framework passes `Some(value)` when the
-/// user supplied a value and `None` when the subcommand was invoked bare (no value),
-/// mirroring [`ToggleHandler`]'s shape. On `None`, the handler is expected to cycle to the
-/// next choice (or whatever's contextually meaningful); the framework can't help because it
-/// doesn't know the current state.
-///
-/// Idiomatic handler for a `Mode` enum field with a `cycle` method:
-///
-/// ```ignore
-/// .choice("color", "...", &["unique", "active"], |ctx, name| {
-///     ctx.color_mode = match name {
-///         Some(n) => parse_mode(n)?,
-///         None => ctx.color_mode.cycle(),
-///     };
-///     Ok(())
-/// })
-/// ```
+/// Boxed handler for a fixed-choice subcommand. `Some(value)` when supplied, `None` on
+/// bare invocation (the handler typically cycles to the next choice).
 type ChoiceHandler<Ctx> = Box<dyn FnMut(&mut Ctx, Option<&str>) -> anyhow::Result<()>>;
 
-/// Boxed handler for a `SubcommandSet`'s bare invocation (no subcommand supplied).
-/// When set via [`SubcommandSet::on_bare`], replaces the default usage-block error
-/// with a caller-defined action, typically flipping a primary toggle field so
-/// `wireframe` alone reads as "flip the overlay's main on/off."
+/// Boxed handler for a `SubcommandSet`'s bare invocation, set via
+/// [`SubcommandSet::on_bare`]; replaces the default usage-block error.
 type BareHandler<Ctx> = Box<dyn FnMut(&mut Ctx) -> anyhow::Result<()>>;
 
-/// Boxed handler for a custom-grammar subcommand. Receives the user's context, the
-/// raw args slice AFTER the subcommand name (positional + key-value tokens, framework
-/// does not parse them), and the writer. Used for subcommands whose grammar doesn't
-/// fit the simpler `.toggle` / `.choice` shapes (e.g. `capture gif post fps=30
-/// scale=720 palette=global`).
+/// Boxed handler for a custom-grammar subcommand. Receives the raw args after the
+/// subcommand name (unparsed) plus the writer. For grammars that don't fit
+/// `.toggle` / `.choice` (e.g. `capture gif post fps=30 scale=720`).
 type CustomHandler<Ctx> =
     Box<dyn FnMut(&mut Ctx, &[&str], &mut ConsoleWriter) -> anyhow::Result<()>>;
 
-/// One entry in a [`SubcommandSet`]. The dispatch kind decides how the framework
-/// parses the value slot and what's offered for tab completion.
+/// One entry in a [`SubcommandSet`]. The kind decides value-slot parsing and tab
+/// completion.
 enum SubcommandKind<Ctx> {
-    /// On/off subcommand. The framework parses `args[1]` as `on|off|true|false|1|0` and
-    /// passes `Some(bool)`; bare invocation (no value) passes `None` and the handler is
-    /// expected to flip its field. No value-slot tab completion is offered (bare-flip is the
-    /// canonical UX; explicit set is supported but not promoted).
+    /// On/off subcommand; no value-slot completion (bare-flip is the canonical UX,
+    /// explicit `on|off` accepted but not promoted).
     Toggle { handler: ToggleHandler<Ctx> },
-    /// Fixed-choice subcommand. The framework completes the value slot from `choices`
-    /// and passes `Some(value)` when present, `None` on bare invocation (handler is
-    /// expected to cycle).
+    /// Fixed-choice subcommand; completes the value slot from `choices`.
     Choice {
         choices: Vec<&'static str>,
         handler: ChoiceHandler<Ctx>,
     },
-    /// Custom-grammar subcommand. Per-slot positional choices drive tab completion
-    /// (slot 0 is the first arg AFTER the subcommand name); per-key value enumerables
-    /// drive two-step kv completion. The framework dispatches by subcommand name and
-    /// then hands the raw args + writer to the handler; arg parsing is the
-    /// handler's responsibility.
+    /// Custom-grammar subcommand. Per-slot positional choices drive completion (slot 0
+    /// is the first arg after the subcommand name); per-key enumerables drive two-step
+    /// kv completion. The handler owns arg parsing.
     Custom {
         arg_choices: Vec<Vec<&'static str>>,
         value_choices: HashMap<&'static str, Vec<&'static str>>,
@@ -486,14 +376,10 @@ struct SubcommandEntry<Ctx> {
     kind: SubcommandKind<Ctx>,
 }
 
-/// A command that dispatches to one of several named subcommands based on the first
-/// positional arg. Provides typed dispatch (no `match arg.to_lowercase()` boilerplate
-/// per command) and context-aware tab completion (the value-slot list narrows to the
-/// chosen subcommand's allowed values).
-///
-/// Build with [`subcommands`] and chain [`SubcommandSet::toggle`] /
-/// [`SubcommandSet::choice`] to register subcommands. Register the whole set as a
-/// single command via `console.register(set)`.
+/// A command that dispatches to named subcommands by the first positional arg, with
+/// typed dispatch and context-aware tab completion (the value slot narrows to the
+/// chosen subcommand). Build with [`subcommands`] and chain
+/// [`SubcommandSet::toggle`] / [`SubcommandSet::choice`].
 ///
 /// ```ignore
 /// let tests = subcommands::<MyCtx>("tests", "select what renders")
@@ -512,27 +398,19 @@ struct SubcommandEntry<Ctx> {
 pub struct SubcommandSet<Ctx> {
     name: &'static str,
     help: &'static str,
-    /// Insertion-ordered subcommands. BTreeMap so iteration is deterministic and Tab
-    /// cycling order is alphabetical, matching the rest of the console.
+    /// BTreeMap so iteration and Tab cycling are alphabetical.
     subs: BTreeMap<&'static str, SubcommandEntry<Ctx>>,
-    /// Cached sorted slice of subcommand names. Populated lazily on first
-    /// [`Command::arg_choices`] / [`Command::arg_choices_ctx`] call so [`Self::toggle`]
-    /// and [`Self::choice`] can stay infallible chainable builders.
+    /// Sorted subcommand names, populated lazily so the builders stay infallible.
     name_cache: std::cell::OnceCell<Vec<&'static str>>,
-    /// Optional bare-invocation handler. When set via [`Self::on_bare`], the
-    /// command's `run` calls it instead of returning the usage-block error when the
-    /// user types just the command name with no subcommand. Use for "primary toggle"
-    /// commands where bare invocation should flip a main field.
+    /// Bare-invocation handler set via [`Self::on_bare`]; replaces the usage-block
+    /// error so the command name alone can flip a primary field.
     bare: Option<BareHandler<Ctx>>,
 }
 
 impl<Ctx: 'static> SubcommandSet<Ctx> {
-    /// Register an on/off subcommand. The framework parses the value slot as
-    /// `on | off | true | false | 1 | 0` when present and passes `Some(bool)`; when
-    /// the user types just the subcommand name with no value, the handler is called
-    /// with `None` so it can flip the field in place.
-    ///
-    /// Idiomatic handler shape for a `bool` field:
+    /// Register an on/off subcommand. The value slot parses
+    /// `on|off|true|false|1|0` to `Some(bool)`; bare invocation passes `None` so the
+    /// handler flips the field in place.
     ///
     /// ```ignore
     /// .toggle("axes", "toggle world-axes", |ctx, v| {
@@ -556,10 +434,8 @@ impl<Ctx: 'static> SubcommandSet<Ctx> {
         self
     }
 
-    /// Register a fixed-choice subcommand. The framework completes the value slot from
-    /// `choices`; the handler receives the raw value string (which is one of `choices`
-    /// only after Tab-completion or exact match, since the framework does not validate
-    /// the value against `choices` before dispatch).
+    /// Register a fixed-choice subcommand. The value slot completes from `choices`;
+    /// the handler receives the raw value string (not validated against `choices`).
     pub fn choice<F>(
         mut self,
         name: &'static str,
@@ -583,16 +459,10 @@ impl<Ctx: 'static> SubcommandSet<Ctx> {
         self
     }
 
-    /// Register a custom-grammar subcommand. Use when `.toggle` / `.choice` are too
-    /// rigid: subcommands with multiple positional args, key-value pairs, or both.
-    ///
-    /// - `arg_choices[i]` lists tab-completion choices for the i-th positional arg
-    ///   AFTER the subcommand name. Include `key=` entries for kv-pair prefixes.
-    /// - `value_choices[k]` lists enumerable values for the `key=value` arg whose
-    ///   bare key is `k` (the framework looks this up when the user types `k=` and
-    ///   hits Tab).
-    /// - `handler` receives the raw args after the subcommand name plus the writer;
-    ///   it owns the parsing of positionals and kv tokens.
+    /// Register a custom-grammar subcommand for multiple positionals, kv pairs, or
+    /// both. `arg_choices[i]` lists completion choices for the i-th arg after the
+    /// subcommand name (include `key=` entries for kv prefixes); `value_choices[k]`
+    /// lists enumerable values for key `k`; `handler` owns parsing of the raw args.
     ///
     /// ```ignore
     /// subcommands::<Ctx>("capture", "...")
@@ -637,11 +507,8 @@ impl<Ctx: 'static> SubcommandSet<Ctx> {
         self
     }
 
-    /// Attach a bare-invocation handler. When set, typing just the command name
-    /// (no subcommand, no args) runs `handler` instead of returning a usage error.
-    /// Use for "primary toggle" commands where bare invocation should flip a main
-    /// field (e.g. `wireframe` toggles the overlay's main on/off, then
-    /// `wireframe nearest-active` and `wireframe color` modulate behavior).
+    /// Attach a bare-invocation handler: typing just the command name runs `handler`
+    /// instead of returning a usage error (e.g. `wireframe` flips the overlay on/off).
     ///
     /// ```ignore
     /// subcommands::<Ctx>("wireframe", "...")
@@ -666,8 +533,7 @@ impl<Ctx: 'static> SubcommandSet<Ctx> {
     }
 }
 
-/// Build a [`SubcommandSet`] for a multi-subcommand console command. See the
-/// [`SubcommandSet`] docs for the full builder pattern.
+/// Build a [`SubcommandSet`]; see its docs for the builder pattern.
 pub fn subcommands<Ctx: 'static>(name: &'static str, help: &'static str) -> SubcommandSet<Ctx> {
     SubcommandSet {
         name,
@@ -687,9 +553,6 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
     }
 
     fn long_help(&self) -> String {
-        // First line is the umbrella's one-liner; subsequent lines list every
-        // registered subcommand with its description. `help <set-name>` then reads as a
-        // mini-manual page for the whole subcommand family.
         let mut out = String::with_capacity(128 + self.subs.len() * 64);
         out.push_str(self.help);
         if !self.subs.is_empty() {
@@ -724,16 +587,13 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
         let Some(entry) = self.subs.get(sub_name) else {
             return &[];
         };
-        // Within-subcommand slot index: arg_index 1 is the first arg AFTER the
-        // subcommand name, which is slot 0 of the subcommand's own grammar.
+        // arg_index 1 is the first arg after the subcommand name = slot 0 of the
+        // subcommand's own grammar.
         let sub_slot = arg_index - 1;
         match &entry.kind {
-            SubcommandKind::Toggle { .. } => {
-                // Empty by design (see the comment on `ON_OFF_CHOICES`'s old slot
-                // above). Bare invocation is the canonical UX; `on|off` is still
-                // accepted as input but not surfaced as a suggestion.
-                &[]
-            }
+            // Empty by design: bare-flip is the canonical UX, `on|off` accepted but
+            // not surfaced.
+            SubcommandKind::Toggle { .. } => &[],
             SubcommandKind::Choice { choices, .. } => {
                 if sub_slot == 0 {
                     choices.as_slice()
@@ -770,8 +630,7 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
 
     fn run(&mut self, args: &[&str], ctx: &mut Ctx, out: &mut ConsoleWriter) -> anyhow::Result<()> {
         let Some((sub_name, rest)) = args.split_first() else {
-            // Bare invocation. If `on_bare` is registered, call it ("primary toggle"
-            // pattern); otherwise emit a usage block listing subcommands.
+            // Bare invocation: run `on_bare` if set, else emit a usage block.
             if let Some(handler) = self.bare.as_mut() {
                 return handler(ctx);
             }
@@ -791,9 +650,6 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
         };
         match &mut entry.kind {
             SubcommandKind::Toggle { handler } => {
-                // Bare subcommand invocation (no value): hand `None` to the handler so
-                // it can flip its field. With a value: parse `on|off|true|false|1|0`
-                // and pass `Some(bool)`.
                 let v: Option<bool> = match rest.first() {
                     None => None,
                     Some(value) => match value.to_ascii_lowercase().as_str() {
@@ -811,9 +667,6 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
                 handler(ctx, v)
             }
             SubcommandKind::Choice { handler, .. } => {
-                // `Some(value)` with an explicit arg, `None` on bare invocation. The
-                // handler decides what to do on `None` (cycle to next choice is the
-                // canonical pattern; alternatives include "error" or "no-op").
                 let value: Option<&str> = rest.first().copied();
                 let _ = out;
                 handler(ctx, value)
@@ -828,10 +681,8 @@ impl<Ctx: 'static> Command<Ctx> for SubcommandSet<Ctx> {
 // ---------------------------------------------------------------------------
 
 /// The dev console. Owns the command registry, scrollback, input line, hotkey binds,
-/// and open/close state.
-///
-/// Construct, register commands and binds during app setup, then call [`Console::ui`]
-/// once per frame from inside the host's egui pass:
+/// and open/close state. Register commands and binds at setup, then call
+/// [`Console::ui`] once per frame inside the host's egui pass.
 ///
 /// ```ignore
 /// let mut console = Console::<MyCtx>::new();
@@ -851,33 +702,25 @@ pub struct Console<Ctx> {
     history: VecDeque<HistoryLine>,
     input: String,
     input_history: VecDeque<String>,
-    /// `Some(i)` while cycling history with Up/Down; `None` after `Enter` or after
-    /// typing into a fresh input.
+    /// `Some(i)` while cycling history with Up/Down; `None` otherwise.
     input_history_pos: Option<usize>,
-    /// Active tab-completion cycle, if any. Cleared on any input edit that isn't a
-    /// tab-complete itself.
+    /// Active tab-completion cycle; cleared on any non-tab input edit.
     tab: Option<TabState>,
     open: bool,
-    /// True for the frame after `open` becomes true so the panel can request focus
-    /// once.
+    /// True for the frame after `open` becomes true so the panel requests focus once.
     pending_focus: bool,
-    /// Right-aligned text in the title row. Host fills with anything useful (fps,
-    /// recording state, current scene); empty by default.
+    /// Right-aligned title-row text; host-supplied, empty by default.
     status: String,
-    /// `false` for the half-screen drop-down (default Quake-style), `true` for a
-    /// draggable / resizable egui Window. Detached mode lets the user click outside
-    /// the console to give keyboard focus back to the app, since the docked console
-    /// permanently captures keyboard while open.
+    /// `false` for the docked drop-down, `true` for a draggable egui Window.
+    /// Detached mode lets the user click out to return keyboard focus to the app,
+    /// which the docked console captures while open.
     detached: bool,
-    /// Set in docked mode when the user clicks outside the panel rect; suppresses the
-    /// input row's per-frame focus re-request so mouse + keyboard go back to the app
-    /// while the console stays visible. Cleared by clicking back inside the panel or
-    /// by reopening the console.
+    /// Set in docked mode on a click outside the panel; suppresses the focus
+    /// re-request so input goes to the app while the console stays visible. Cleared
+    /// by clicking back inside or reopening.
     user_defocused: bool,
-    /// One-frame flag set whenever code outside the TextEdit mutates [`Self::input`]
-    /// (tab-complete cycles, history nav). The panel snaps the TextEdit's internal
-    /// cursor to the end of the new input and clears the flag, so typing continues
-    /// from the tail rather than wherever the cursor previously sat.
+    /// One-frame flag set when code outside the TextEdit mutates [`Self::input`]
+    /// (tab-complete, history nav); the panel then snaps the cursor to the tail.
     pending_cursor_to_end: bool,
 }
 
@@ -888,16 +731,15 @@ struct TabState {
 }
 
 /// What the user is currently typing, partitioned for completion. `prefix` is the
-/// partially-typed token under the cursor; an empty `prefix` with trailing whitespace
-/// means the user has finished the previous token and is starting the next one.
+/// partial token under the cursor; empty `prefix` with trailing whitespace means a
+/// fresh token is starting.
 #[derive(Clone, Debug)]
 enum CompletionContext {
-    /// Completing the command name (no whitespace yet, or whitespace-leading input).
+    /// Completing the command name.
     Command { prefix: String },
-    /// Completing positional argument `arg_index` of `cmd_name`. `prior` carries the
-    /// fully-typed arg tokens BEFORE the cursor (`prior.len() == arg_index`); commands
-    /// that branch their value-slot completion on prior choices (subcommand dispatch)
-    /// read it via [`Command::arg_choices_ctx`].
+    /// Completing positional arg `arg_index` of `cmd_name`. `prior` carries the
+    /// arg tokens before the cursor (`prior.len() == arg_index`), read via
+    /// [`Command::arg_choices_ctx`] for subcommand-aware completion.
     Arg {
         cmd_name: String,
         arg_index: usize,
@@ -922,7 +764,7 @@ impl<Ctx: 'static> Default for Console<Ctx> {
 }
 
 impl<Ctx: 'static> Console<Ctx> {
-    /// Empty console with no commands, no binds, default `` ` `` toggle key.
+    /// Empty console with the default `` ` `` toggle key.
     pub fn new() -> Self {
         Self {
             commands: BTreeMap::new(),
@@ -948,9 +790,8 @@ impl<Ctx: 'static> Console<Ctx> {
         self
     }
 
-    /// Register a command. Replaces any existing command of the same name without
-    /// warning; consuming crates can pre-check via [`Console::has_command`] if they
-    /// care.
+    /// Register a command. Silently replaces any existing command of the same name;
+    /// pre-check via [`Console::has_command`] if needed.
     pub fn register<C: Command<Ctx> + 'static>(&mut self, command: C) {
         let name = command.name().to_string();
         self.commands.insert(name, Box::new(command));
@@ -962,8 +803,8 @@ impl<Ctx: 'static> Console<Ctx> {
         name == "help" || name == "clear" || self.commands.contains_key(name)
     }
 
-    /// Bind `key` (no modifiers) to execute `command_line` when the console is closed.
-    /// Re-binding overwrites the previous binding.
+    /// Bind `key` (no modifiers) to run `command_line` when the console is closed.
+    /// Re-binding overwrites.
     pub fn bind(&mut self, key: egui::Key, command_line: impl Into<String>) {
         self.binds.insert(key, command_line.into());
     }
@@ -978,8 +819,7 @@ impl<Ctx: 'static> Console<Ctx> {
         if !self.open {
             self.open = true;
             self.pending_focus = true;
-            // Reopening clears any prior click-outside defocus so typing lands in the
-            // input again.
+            // Clear any prior click-outside defocus so typing lands in the input.
             self.user_defocused = false;
         }
     }
@@ -1003,8 +843,7 @@ impl<Ctx: 'static> Console<Ctx> {
         self.open
     }
 
-    /// Switch to detached mode: console renders as a draggable / resizable
-    /// [`egui::Window`] instead of the half-screen drop-down. Idempotent.
+    /// Render as a draggable [`egui::Window`] instead of the drop-down. Idempotent.
     pub fn detach(&mut self) {
         self.detached = true;
     }
@@ -1019,27 +858,22 @@ impl<Ctx: 'static> Console<Ctx> {
         self.detached
     }
 
-    /// Append a line to the scrollback. Useful for system messages generated outside
-    /// command execution (e.g., a background recording finishing).
+    /// Append a line to the scrollback, for messages generated outside command
+    /// execution (e.g. a background recording finishing).
     pub fn write(&mut self, line: HistoryLine) {
         self.push_history(line);
     }
 
-    /// Set the title-row status text (right-aligned). Host calls this each frame with
-    /// whatever readout it wants visible in the console: fps, recording elapsed, scene
-    /// name, etc.
+    /// Set the right-aligned title-row status text.
     pub fn set_status(&mut self, text: impl Into<String>) {
         self.status = text.into();
     }
 
-    /// Per-frame entry point. Handles toggle key, hotkey binds (when closed), in-panel
-    /// keys (when open), animation, and panel rendering. Call once per frame from the
-    /// host's egui pass.
+    /// Per-frame entry point: toggle key, binds (when closed), in-panel keys (when
+    /// open), animation, and panel render. Call once per frame from the egui pass.
     pub fn ui(&mut self, egui_ctx: &egui::Context, ctx: &mut Ctx) {
-        // 1. Toggle key always active. `consume_key` strips the Key event, but
-        // printable keys (Backtick, etc.) also produce a Text event that TextEdit reads
-        // independently; strip that too or it leaks into the input box on the second
-        // press.
+        // Toggle key. `consume_key` strips the Key event, but a printable key also
+        // emits a Text event TextEdit reads; strip that too or it leaks into the input.
         let toggle_text = key_text(self.toggle_key);
         let toggle_pressed = egui_ctx.input_mut(|i| {
             let pressed = i.consume_key(egui::Modifiers::NONE, self.toggle_key);
@@ -1055,7 +889,7 @@ impl<Ctx: 'static> Console<Ctx> {
             self.toggle();
         }
 
-        // 2. Bound keys fire only when closed (avoid hijacking typing).
+        // Bound keys fire only when closed (avoid hijacking typing).
         if !self.open && !self.binds.is_empty() {
             let pressed: Vec<String> = {
                 let mut hit = Vec::new();
@@ -1073,14 +907,12 @@ impl<Ctx: 'static> Console<Ctx> {
             }
         }
 
-        // 3. In-panel keys (consume before TextEdit sees them).
+        // In-panel keys (consume before TextEdit sees them).
         if self.open {
             self.handle_panel_keys(egui_ctx);
         }
 
-        // 4. Animate panel height (docked only). Detached mode shows/hides instantly:
-        // the egui Window has its own appearance, so animating a slide value would only
-        // produce dead frames where `open=false` is still being drawn.
+        // Animate panel height (docked only); detached mode shows/hides instantly.
         let target = if self.open { 1.0 } else { 0.0 };
         let progress = egui_ctx.animate_value_with_time(
             egui::Id::new("rye_console_open_progress"),
@@ -1126,20 +958,10 @@ impl<Ctx: 'static> Console<Ctx> {
     }
 
     fn push_history(&mut self, line: HistoryLine) {
-        // Optional echo to the browser DevTools console. Off by default; demos
-        // toggle it via `log echo on` for debugging the in-canvas console
-        // text from outside (the canvas's pixels aren't selectable, so without
-        // this the user can't copy command output for paste-back to a chat /
-        // bug report).
-        //
-        // Architectural note: this deliberately bypasses `tracing` and calls
-        // `web_sys::console::log_1` directly. `tracing::info!` would conflict
-        // with the existing `log on` feature (tracing -> scrollback via
-        // `rye_app::log::ConsoleLayer`); running both directions through
-        // tracing creates a feedback loop where each emitted event lands in
-        // the scrollback, gets re-echoed, lands again, ad infinitum. The
-        // direct console.log path is feedback-free because no Rust subscriber
-        // consumes it.
+        // Optional browser-console echo, off by default. Bypasses `tracing` on
+        // purpose: routing through it would feed back via `rye_app::log::ConsoleLayer`
+        // (tracing -> scrollback -> re-echo -> ...). Direct console.log has no Rust
+        // subscriber, so no loop.
         #[cfg(target_arch = "wasm32")]
         if ECHO_TO_BROWSER.load(std::sync::atomic::Ordering::Relaxed) {
             web_sys::console::log_1(&line.text.as_str().into());
@@ -1191,9 +1013,8 @@ impl<Ctx: 'static> Console<Ctx> {
                 return;
             }
         }
-        // Fresh completion: build context from current input, falling back to the
-        // empty-prefix command list so Tab on a blank prompt cycles through commands
-        // (matches what the ghost preview shows).
+        // Fresh completion; fall back to the empty-prefix command list so Tab on a
+        // blank prompt cycles commands.
         let ctx = self
             .completion_context()
             .unwrap_or(CompletionContext::Command {
@@ -1223,10 +1044,9 @@ impl<Ctx: 'static> Console<Ctx> {
         names
     }
 
-    /// Inspect [`Console::input`] to decide what the user is currently completing: the
-    /// command name, or the n-th positional argument of a known command. Returns `None`
-    /// for empty input. Uses the quote-aware [`tokenize`] so `tests "5 cell" o<Tab>`
-    /// completes on arg 1 with prefix `o`, not on a garbage `cell"` token.
+    /// Decide what the input is completing: command name or n-th positional arg.
+    /// `None` for empty input. Quote-aware via [`tokenize`] so `tests "5 cell" o<Tab>`
+    /// completes arg 1 with prefix `o`.
     fn completion_context(&self) -> Option<CompletionContext> {
         if self.input.is_empty() {
             return None;
@@ -1244,11 +1064,8 @@ impl<Ctx: 'static> Console<Ctx> {
             });
         }
 
-        // After whitespace: we're on an argument. `arg_index` is 0-based positional.
-        // The `else` arm is reached only when `parsed.len() >= 2` (the `len() == 1 &&
-        // !trailing_ws` case returned above), so the partial-token pop is safe. `prior`
-        // captures the fully-typed arg tokens before the cursor so subcommand-dispatching
-        // commands can gate their value-slot completion on what came earlier.
+        // On an argument now (0-based `arg_index`). `prior` captures the arg tokens
+        // before the cursor for subcommand-aware value-slot completion.
         let mut parts = parsed;
         let cmd_name = parts.remove(0);
         let (arg_index, prefix, prior) = if trailing_ws {
@@ -1284,11 +1101,8 @@ impl<Ctx: 'static> Console<Ctx> {
                 };
                 let prior_refs: Vec<&str> = prior.iter().map(String::as_str).collect();
 
-                // Mid-`key=` value completion: if the partial token already
-                // contains an `=`, we're past the key and completing its value.
-                // Look up the enumerable values declared via `with_value_choices`
-                // (or the context-aware variant for subcommand-dispatching commands)
-                // and return them prefixed with `key=`.
+                // Mid-`key=` value completion: an `=` in the partial token means we're
+                // completing the value; return enumerables prefixed with `key=`.
                 if let Some(eq) = prefix.find('=') {
                     let key = &prefix[..eq];
                     let value_prefix = &prefix[eq + 1..];
@@ -1302,13 +1116,9 @@ impl<Ctx: 'static> Console<Ctx> {
                     return matches;
                 }
 
-                // Identify key=value args already provided in earlier positions
-                // (e.g. `fps=30`, `palette=global`) so we don't suggest a choice
-                // that shares the same `key=` prefix. Skips the partial last
-                // token (that's what we're completing). Stage keywords and plain
-                // positionals aren't filtered: re-typing a positional may be
-                // intentional, and the parser would just overwrite an earlier
-                // value.
+                // Collect `key=` prefixes already used in earlier positions so we
+                // don't re-suggest them. Skips the partial last token; bare
+                // positionals aren't filtered (re-typing may be intentional).
                 let parsed: Vec<&str> = self.input.split_whitespace().collect();
                 let trailing_ws = self.input.ends_with(char::is_whitespace);
                 let consumed = if trailing_ws {
@@ -1321,18 +1131,15 @@ impl<Ctx: 'static> Console<Ctx> {
                     .filter_map(|t| t.find('=').map(|i| &t[..=i]))
                     .collect();
 
-                // Sort matches alphabetically so command authors can declare choices
-                // in any order (workflow, frequency, narrative) without affecting Tab
-                // cycling order. Matches the command-name path, which is also sorted.
-                // Uses the context-aware variant so subcommand-dispatching commands
-                // can gate value-slot choices on the prior subcommand pick.
+                // Sorted so authors can declare choices in any order; context-aware
+                // so subcommand dispatch gates value-slot choices on the prior pick.
                 let mut matches: Vec<String> = cmd
                     .arg_choices_ctx(*arg_index, &prior_refs)
                     .iter()
                     .filter(|choice| choice.starts_with(prefix.as_str()))
                     .filter(|choice| {
-                        // Suppress any choice whose `key=` prefix was already used.
-                        // Choices without `=` (bare keywords) are never filtered.
+                        // Suppress any choice whose `key=` prefix was already used;
+                        // bare keywords (no `=`) are never filtered.
                         match choice.find('=') {
                             None => true,
                             Some(eq) => {
@@ -1349,14 +1156,9 @@ impl<Ctx: 'static> Console<Ctx> {
         }
     }
 
-    /// Suffix of the *first* (sort-order) completion that matches the current input.
-    /// The panel paints this as dim ghost text after the cursor so the user sees
-    /// exactly what `Tab` will insert on the next press.
-    ///
-    /// Works for command names and positional argument choices, with one carve-out:
-    /// empty input returns `None` so the bare prompt doesn't visually default to
-    /// the first registered command. Tab on empty still cycles through commands,
-    /// it just doesn't surface a hint until the user types a character.
+    /// Suffix of the first (sort-order) completion matching the input, painted as
+    /// dim ghost text showing what the next `Tab` inserts. Empty input returns `None`
+    /// so the bare prompt doesn't default to the first command.
     pub fn tab_preview(&self) -> Option<String> {
         let ctx = self.completion_context()?;
         let matches = self.completion_matches(&ctx);
@@ -1369,8 +1171,8 @@ impl<Ctx: 'static> Console<Ctx> {
         }
     }
 
-    /// Execute a command line. Echoes input, looks up the command, runs it, drains
-    /// output. Built-in `help` and `clear` short-circuit before registry lookup.
+    /// Execute a command line: echo, look up, run, drain output. Built-ins
+    /// short-circuit before registry lookup.
     pub fn execute(&mut self, line: &str, ctx: &mut Ctx) {
         let line = line.trim();
         if line.is_empty() {
@@ -1392,9 +1194,8 @@ impl<Ctx: 'static> Console<Ctx> {
             return;
         };
 
-        // Built-ins first. Framework-owned, dispatched off the `Builtin` enum so the
-        // name + help info isn't duplicated across `execute`, `builtin_help`, and
-        // `all_command_names` (single source of truth for the four primitives).
+        // Built-ins first, off the `Builtin` enum (single source of truth for name +
+        // help across `execute`, `builtin_help`, `all_command_names`).
         if let Some(builtin) = Builtin::from_name(&name) {
             self.run_builtin(builtin, args.first().map(String::as_str));
             return;
@@ -1421,8 +1222,8 @@ impl<Ctx: 'static> Console<Ctx> {
         }
     }
 
-    /// Dispatch one of the framework built-ins. `target` is the optional first-arg
-    /// token (only used by `help` to look up a specific command).
+    /// Dispatch a framework built-in. `target` is the optional first-arg token (only
+    /// `help` uses it).
     fn run_builtin(&mut self, builtin: Builtin, target: Option<&str>) {
         match builtin {
             Builtin::Help => self.builtin_help(target),
@@ -1442,12 +1243,10 @@ impl<Ctx: 'static> Console<Ctx> {
         match target {
             Some(name) => {
                 if let Some(b) = Builtin::from_name(name) {
-                    // Built-ins only have one-line descriptions; no multi-line variant.
                     self.push_history(HistoryLine::output(format!("{}: {}", b.name(), b.help())));
                 } else {
-                    // Materialize the help lines BEFORE pushing to history: `c` borrows
-                    // `self.commands` immutably and `push_history` borrows `self` mutably,
-                    // so the two can't coexist.
+                    // Materialize before pushing: `c` borrows `self.commands` and
+                    // `push_history` borrows `self` mutably.
                     let prepared: Option<(String, Vec<String>)> =
                         self.commands.get(name).map(|c| {
                             let header_prefix = format!("{}: ", c.name());
@@ -1493,13 +1292,9 @@ impl<Ctx: 'static> Console<Ctx> {
 // Built-in commands
 // ---------------------------------------------------------------------------
 
-/// Framework-owned commands that mutate `Console` internal state directly: history,
-/// detached flag, etc. They can't go through [`Command<Ctx>`] cleanly because that
-/// trait only sees `&mut Ctx` (the user's context), not `&mut Console<Ctx>`. Storing
-/// their name + help in one enum centralizes what was previously duplicated across
-/// [`Console::execute`], [`Console::builtin_help`], and [`Console::all_command_names`].
-///
-/// User crates cannot add new built-ins; framework primitives only.
+/// Framework-owned commands that mutate `Console` state directly (history, detached
+/// flag). They can't go through [`Command<Ctx>`], which only sees `&mut Ctx`. One enum
+/// centralizes their name + help; user crates can't add new built-ins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Builtin {
     Help,
@@ -1509,8 +1304,8 @@ enum Builtin {
 }
 
 impl Builtin {
-    /// Iteration order is alphabetical, matching the rest of the console's sort
-    /// conventions (Tab cycling, help listing). Keep this slice sorted by `name()`.
+    /// Keep sorted by `name()`; iteration order is alphabetical to match Tab cycling
+    /// and the help listing.
     const ALL: &'static [Builtin] = &[
         Builtin::Clear,
         Builtin::Detach,
@@ -1551,15 +1346,9 @@ impl Builtin {
 // Parser
 // ---------------------------------------------------------------------------
 
-/// Printable text the OS produces for a key, when one exists. Used to strip the
-/// corresponding `egui::Event::Text` after consuming the key event for the toggle:
-/// without this, pressing Backtick to toggle the console open and pressing it again to
-/// toggle closed also types `` ` `` into the input box (the Key event is consumed but
-/// the Text event isn't).
-///
-/// Only the keys that plausibly serve as a console-toggle are covered (Backtick is the
-/// default; Tilde is the natural alternate on US layouts). Other keys return `None`;
-/// their Text events stay untouched.
+/// Printable text the OS produces for a toggle key, used to strip the matching
+/// `egui::Event::Text` after consuming the Key event so the toggle char doesn't leak
+/// into the input. Only plausible toggle keys are covered; others return `None`.
 fn key_text(key: egui::Key) -> Option<&'static str> {
     match key {
         egui::Key::Backtick => Some("`"),
@@ -1567,16 +1356,9 @@ fn key_text(key: egui::Key) -> Option<&'static str> {
     }
 }
 
-/// Quote-aware tokenizer. Returns `(command_name, args)` or `None` for an
-/// empty/whitespace-only line. Tokens are whitespace-separated; double-quoted
-/// (`"..."`) and single-quoted (`'...'`) strings preserve internal whitespace.
-/// Inside double quotes, `\"` and `\\` are escapes; inside single quotes, the
-/// content is literal (no escapes, matching shell convention).
-///
-/// Unterminated quotes are tolerated for interactive ergonomics: trailing content
-/// after an opening quote with no matching close becomes one token through end of
-/// line. This lets mid-typing tab completion work without erroring on the partial
-/// quote state.
+/// Split a line into `(command_name, args)` or `None` if empty. Quote-aware:
+/// double quotes honor `\"` / `\\` escapes, single quotes are literal (shell
+/// convention). Unterminated quotes consume to end-of-line for interactive typing.
 fn parse_line(line: &str) -> Option<(String, Vec<String>)> {
     let mut tokens = tokenize(line);
     if tokens.is_empty() {
@@ -1641,18 +1423,15 @@ fn tokenize(line: &str) -> Vec<String> {
     out
 }
 
-/// Splice `choice` into `input` at the position the user is completing, preserving
-/// everything before. For command-name completion this replaces the whole input; for
-/// argument completion it replaces only the last partial token (or appends after a
-/// trailing space when starting a fresh argument).
+/// Splice `choice` into `input` at the completion position. Command-name completion
+/// replaces the whole input; argument completion replaces the last partial token (or
+/// appends after a trailing space).
 fn apply_completion(input: &str, ctx: &CompletionContext, choice: &str) -> String {
     match ctx {
         CompletionContext::Command { .. } => choice.to_string(),
         CompletionContext::Arg { .. } => {
-            // Preserve the input string verbatim up to the start of the partial token
-            // under the cursor, then append the completion choice. Verbatim
-            // preservation is important for quoted args -- a re-tokenize-and-rejoin
-            // would mangle `tests "5 cell"` into `tests 5 cell` on the rejoin step.
+            // Preserve the input verbatim up to the partial token; a
+            // tokenize-and-rejoin would mangle quoted args like `tests "5 cell"`.
             if input.ends_with(char::is_whitespace) {
                 return format!("{input}{choice}");
             }
@@ -1692,12 +1471,10 @@ mod tests {
 
     #[test]
     fn tab_preview_shows_first_match_suffix() {
-        // Use the four built-in commands: clear, detach, dock, help. No additional
-        // registrations needed. Sort order: clear < detach < dock < help.
+        // Built-ins, sorted: clear < detach < dock < help.
         let mut c = Console::<Ctx>::new();
 
-        // Empty input -> no ghost (don't visually default the bare prompt to the
-        // first command; the user hasn't typed anything yet). Tab still works.
+        // Empty input -> no ghost; the bare prompt shouldn't default to a command.
         c.input = String::new();
         assert_eq!(c.tab_preview(), None);
 
@@ -1714,8 +1491,7 @@ mod tests {
         c.input = "h".into();
         assert_eq!(c.tab_preview().as_deref(), Some("elp"));
 
-        // Multiple matches sharing only a prefix -> previews the first by sort order.
-        // `d` matches `detach` and `dock`; alphabetically `detach` is first.
+        // `d` matches `detach` and `dock`; first by sort order is `detach`.
         c.input = "d".into();
         assert_eq!(c.tab_preview().as_deref(), Some("etach"));
 
@@ -1736,13 +1512,11 @@ mod tests {
         c.input = "capture p".into();
         assert_eq!(c.tab_preview().as_deref(), Some("ng"));
 
-        // Multiple matches with common prefix `to` -> ghost = `ggle` suffix beyond
-        // the `t` the user typed (matches: `toggle`, no others starting with `t`).
+        // `t` -> only `toggle`; ghost = `oggle`.
         c.input = "capture t".into();
         assert_eq!(c.tab_preview().as_deref(), Some("oggle"));
 
-        // Trailing whitespace = starting next arg. Previews the first arg-1 choice
-        // alphabetically (`both` < `post` < `pre`).
+        // Trailing whitespace = next arg; first arg-1 choice (`both` < `post` < `pre`).
         c.input = "capture png ".into();
         assert_eq!(c.tab_preview().as_deref(), Some("both"));
 
@@ -1860,12 +1634,8 @@ mod tests {
         let mut ctx: Ctx = 0;
         c.execute("echo hello world", &mut ctx);
 
-        // Invariants asserted (not the exact text formatting):
-        // - one Input line + one Output line, in that order
-        // - the Input line includes the user's typed text (echo + args)
-        // - the Output line contains the echo's joined args
-        // Pinning the precise prompt prefix ("> ") would break on any future
-        // prompt-style change; the invariant is what we care about.
+        // Invariant: one Input then one Output line; Input echoes the typed text,
+        // Output carries the joined args. Exact prompt prefix is not pinned.
         let lines: Vec<&HistoryLine> = c.history.iter().collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].kind, LineKind::Input);
@@ -2180,10 +1950,7 @@ mod tests {
         );
     }
 
-    /// Bare toggle invocation (no value) is a flip. The handler receives `None` and
-    /// is expected to invert the current field state. Verifies the
-    /// "`wireframe nearest-active` flips without explicit on|off" UX path the demos
-    /// rely on.
+    /// Bare toggle invocation passes `None`; the handler inverts the field.
     #[test]
     fn subcommand_toggle_bare_invocation_flips() {
         let mut con = Console::<SubCtx>::new();
@@ -2197,9 +1964,7 @@ mod tests {
         assert_eq!(ctx, (0, "axes=false".into()));
     }
 
-    /// Bare choice invocation passes `None` to the handler; the handler decides what
-    /// "no value" means (cycle, no-op, error). Pins the framework-level contract that
-    /// the handler is invoked at all.
+    /// Bare choice invocation passes `None` to the handler (it's still invoked).
     #[test]
     fn subcommand_choice_bare_invocation_passes_none() {
         let mut con = Console::<SubCtx>::new();
@@ -2209,9 +1974,7 @@ mod tests {
         assert_eq!(ctx.1, "polytope=<bare>");
     }
 
-    /// Bare `SubcommandSet` invocation (no subcommand) calls the registered
-    /// `on_bare` handler instead of returning a usage-block error. Verifies the
-    /// "`wireframe` flips main on/off" UX path.
+    /// Bare `SubcommandSet` invocation calls the `on_bare` handler, not the usage block.
     #[test]
     fn subcommand_bare_runs_on_bare_handler() {
         let mut con = Console::<SubCtx>::new();
@@ -2224,8 +1987,7 @@ mod tests {
         assert_eq!(ctx.1, "bare!");
     }
 
-    /// Without `on_bare`, bare `SubcommandSet` invocation falls back to the usage
-    /// block (the historical behavior).
+    /// Without `on_bare`, bare invocation falls back to the usage block.
     #[test]
     fn subcommand_bare_without_handler_emits_usage() {
         let mut con = Console::<SubCtx>::new();
@@ -2237,22 +1999,14 @@ mod tests {
         assert!(last.text.contains("subcommands"), "got: {}", last.text);
     }
 
-    /// Tab completion at the value slot narrows to ONLY the chosen subcommand's choices.
-    /// This is the load-bearing context-aware-completion test: the value slot
-    /// completion is narrow to the chosen subcommand's allowed values, not the
-    /// union over all subcommands.
-    ///
-    /// Toggle subcommands deliberately surface NO value-slot suggestions: bare
-    /// invocation flips, so `on|off` is supported as input but not promoted in
-    /// the cycle (avoids implying that one of them is required when it isn't).
-    /// Choice subcommands surface their declared choice list.
+    /// Value-slot completion narrows to the chosen subcommand's choices, not the
+    /// union. Toggles surface nothing (bare-flip UX); choices surface their list.
     #[test]
     fn subcommand_value_completion_is_context_aware() {
         let mut con = Console::<SubCtx>::new();
         con.register(sample_subset());
 
-        // `tests axes ` -> toggle, no suggestions (bare invocation is the UX;
-        // typing `on|off` still works but isn't promoted).
+        // `tests axes ` -> toggle, no suggestions.
         con.input = "tests axes ".into();
         let ctx = con.completion_context().unwrap();
         let m = con.completion_matches(&ctx);
@@ -2276,8 +2030,7 @@ mod tests {
         assert!(!m.contains(&"on".into()));
     }
 
-    /// Tab completion at the subcommand slot lists every registered subcommand,
-    /// sorted alphabetically (matches the rest of the console's completion convention).
+    /// The subcommand slot lists every registered subcommand, sorted.
     #[test]
     fn subcommand_first_slot_completion_lists_subcommands() {
         let mut con = Console::<SubCtx>::new();
@@ -2354,9 +2107,7 @@ mod tests {
         );
     }
 
-    /// Multi-slot tab completion: each positional slot AFTER the subcommand name
-    /// returns the slot-specific arg_choices. Slot 0 of `gif` is the stage; slot 1
-    /// is the first kv key.
+    /// Each positional slot after the subcommand name returns its own arg_choices.
     #[test]
     fn custom_multi_slot_completion_per_slot() {
         let mut con = Console::<CustomCtx>::new();
@@ -2394,10 +2145,8 @@ mod tests {
         assert!(m.is_empty(), "got: {m:?}");
     }
 
-    /// Two-step kv-value completion: after the user types `palette=`, ghost/Tab
-    /// should cycle the declared values. This is the context-aware kv path -- the
-    /// same `palette=` prefix in a hypothetical non-gif subcommand wouldn't produce
-    /// these (gif is the only subcommand that declares `palette` value-choices).
+    /// After `palette=`, completion cycles the declared values; the kv lookup is
+    /// scoped to the subcommand that declared them.
     #[test]
     fn custom_subcommand_kv_value_completion_is_context_aware() {
         let mut con = Console::<CustomCtx>::new();

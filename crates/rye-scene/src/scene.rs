@@ -1,13 +1,13 @@
 //! Typed scene tree that assembles SDF primitives into `rye_scene_sdf`.
 //!
-//! Build a [`Scene`] from [`SceneNode`] combinators, then call [`Scene::to_wgsl`] with a Space
-//! to get the complete WGSL scene module.
+//! Build a [`Scene`] from [`SceneNode`] combinators, then call [`Scene::to_wgsl`]
+//! with a Space to get the complete WGSL scene module.
 //!
 //! # Emission strategy
 //!
-//! Each leaf emits a named WGSL helper function (`sdf_p{n}`). Each combinator emits a `let`
-//! binding in the body of `rye_scene_sdf`. The walk is depth-first; children always appear before
-//! their parent in the emitted body, so variables are always in scope when referenced.
+//! Each leaf emits a named helper (`sdf_p{n}`); each combinator emits a `let`
+//! binding in `rye_scene_sdf`. The depth-first walk emits children before their
+//! parent so referenced variables are always in scope.
 //!
 //! # Example
 //!
@@ -34,11 +34,8 @@ use crate::primitive::Primitive;
 use rye_math::WgslSpace;
 pub use rye_shape::Shape as PrimitiveKind;
 
-/// A node in the typed SDF scene tree.
-///
-/// Leaf nodes hold a concrete primitive; interior nodes combine two children using a boolean or
-/// smooth operation. Build trees with the fluent combinator methods and wrap in a [`Scene`] to
-/// emit WGSL.
+/// A node in the typed SDF scene tree. Leaves hold a primitive; interior nodes
+/// combine two children via a boolean or smooth operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SceneNode {
     Leaf(PrimitiveKind),
@@ -61,11 +58,9 @@ impl SceneNode {
         SceneNode::Leaf(PrimitiveKind::Sphere { center, radius })
     }
 
-    /// Half-space leaf. SDF emission depends on the Space the scene is later compiled against
-    /// (per [`Primitive`]'s `HalfSpace` arm): chart-coord `dot(p, n) - d` in flat charts (E³),
-    /// `+1e9` sentinel in curved charts (H³ / S³) until closed-form geodesic-plane SDFs land.
-    /// The shape itself is canonical, also used by `rye-physics` for collision walls regardless
-    /// of the rendering side.
+    /// Half-space leaf. Emission depends on the compile-time Space (see
+    /// [`Primitive`]'s `HalfSpace` arm): chart-coord `dot(p, n) - d` in flat
+    /// charts, `+1e9` sentinel in curved charts until geodesic-plane SDFs land.
     pub fn plane(normal: Vec3, offset: f32) -> Self {
         SceneNode::Leaf(PrimitiveKind::HalfSpace { normal, offset })
     }
@@ -118,11 +113,8 @@ impl Scene {
         Self { root }
     }
 
-    /// Emit the complete WGSL scene module for the given Space.
-    ///
-    /// The output includes all named helper functions and the required `rye_scene_sdf` entry
-    /// point. Prepend this to the Space prelude and the user shader to get a complete shader
-    /// source.
+    /// Emit the complete WGSL scene module (helpers + `rye_scene_sdf` entry
+    /// point) for the given Space. Prepend to the Space prelude and user shader.
     pub fn to_wgsl<S: WgslSpace>(&self, space: &S) -> String {
         let mut helpers = String::new();
         let mut body = String::new();
@@ -153,8 +145,8 @@ impl Scene {
 
 // ---- Recursive emitter ------------------------------------------------------
 
-/// Walk `node` depth-first, appending helper function definitions to `helpers` and `let` bindings to
-/// `body`. Returns the WGSL variable name holding the signed distance for this node.
+/// Walk `node` depth-first, appending helper definitions to `helpers` and `let`
+/// bindings to `body`. Returns the WGSL variable holding this node's distance.
 fn emit_node<S: WgslSpace>(
     node: &SceneNode,
     space: &S,
@@ -234,7 +226,6 @@ mod tests {
         let wgsl = scene.to_wgsl(&EuclideanR3);
         assert!(wgsl.contains("fn rye_scene_sdf"));
         assert!(wgsl.contains("min("));
-        // Two leaf functions
         assert!(wgsl.contains("sdf_p1"));
         assert!(wgsl.contains("sdf_p2"));
     }
@@ -263,7 +254,6 @@ mod tests {
         let scene = Scene::new(SceneNode::sphere(Vec3::ZERO, 0.25));
         let e3 = scene.to_wgsl(&EuclideanR3);
         let h3 = scene.to_wgsl(&HyperbolicH3);
-        // Both spaces produce structurally identical WGSL (rye_distance handles dispatch)
         assert_eq!(e3, h3);
     }
 
@@ -273,7 +263,6 @@ mod tests {
             Scene::new(SceneNode::sphere(Vec3::ZERO, 0.3).union(SceneNode::plane(Vec3::Y, -0.4)));
         let ron_str = scene.to_ron().expect("serialize");
         let recovered: Scene = Scene::from_ron(&ron_str).expect("deserialize");
-        // Verify recovered scene produces the same WGSL
         assert_eq!(scene.to_wgsl(&EuclideanR3), recovered.to_wgsl(&EuclideanR3),);
     }
 }

@@ -1,40 +1,24 @@
 //! The [`Space`] trait, Rye's interface to geometry.
 //!
-//! A `Space` is a Riemannian manifold equipped with an isometry group. Every concrete geometry
-//! (Euclidean R³, hyperbolic H³, spherical S³, Euclidean R⁴, …) implements this trait, and
-//! every other system in the engine that needs to know *what space means* takes `S: Space` as a
-//! generic.
+//! A `Space` is a Riemannian manifold equipped with an isometry group. The
+//! GPU-facing half of the contract lives on [`WgslSpace`].
 //!
-//! The GPU-facing half of the contract lives on [`WgslSpace`], a separate subtrait; see its docs
-//! for the rationale.
+//! Methods take `&self` so parametric geometries (curvature scalar, radius) can
+//! store their parameter; stateless ones monomorphize to direct calls.
 //!
-//! ## Why methods take `&self`
-//!
-//! Stateless geometries like [`crate::EuclideanR3`] carry no data and monomorphize to direct
-//! calls. Parametric geometries (hyperbolic with a curvature scalar, spherical with a radius)
-//! need somewhere to store that parameter. `&self` gives them that without forcing stateless
-//! impls to pay a runtime cost.
-//!
-//! ## Tangent vectors carry an implicit base point
-//!
-//! `Self::Vector` is a tangent vector at *some* point on the manifold; the trait does not enforce
-//! *which* point. Callers tracking tangent vectors outside tight numerical kernels should prefer
-//! [`crate::Tangent`], which bundles the base point with the vector and exposes safe transport /
-//! exponential / scale helpers.
+//! `Self::Vector` is a tangent vector at *some* point; the trait does not track
+//! which. Prefer [`crate::Tangent`] outside tight kernels, it bundles the base
+//! point with the vector.
 
 use std::borrow::Cow;
 
-/// A Riemannian manifold with a transitive isometry group.
-///
-/// Implementors describe a geometry by exposing its point set, tangent vectors, and isometries.
-/// Shader integration lives on [`WgslSpace`].
-///
-/// All methods must be deterministic and side-effect-free.
+/// A Riemannian manifold with a transitive isometry group. Shader integration
+/// lives on [`WgslSpace`]. All methods must be deterministic and side-effect-free.
 pub trait Space {
     /// A point on the manifold.
     type Point: Copy + Send + Sync + 'static;
-    /// A tangent vector at *some* point. The base point is tracked by the caller, not the
-    /// type; use [`crate::Tangent`] when that tracking should be enforced.
+    /// A tangent vector at *some* point; the base point is tracked by the caller.
+    /// Use [`crate::Tangent`] to enforce that tracking.
     type Vector: Copy + Send + Sync + 'static;
     /// An orientation-preserving isometry of the manifold.
     type Iso: Copy + Send + Sync + 'static;
@@ -54,20 +38,12 @@ pub trait Space {
     fn log(&self, from: Self::Point, to: Self::Point) -> Self::Vector;
 
     /// Parallel-transport `v` (a tangent vector at `from`) to `to`, returning the
-    /// corresponding tangent vector at `to`.
+    /// tangent vector at `to`.
     ///
-    /// **Implementations choose the path.** Parallel transport is path-dependent in any non-flat
-    /// geometry, and this signature does not name a path. Closed-form constant-curvature Spaces
-    /// (E³, H³, S³ away from antipodes, E⁴) transport along the unique minimizing geodesic.
-    /// Variable-metric Spaces (`BlendedSpace`, future numerical-only Spaces) may transport along
-    /// a cheaper path, typically the chart-coordinate straight line, when the cost of solving
-    /// the geodesic boundary-value problem outweighs the accuracy gain. Each implementation
-    /// documents its choice.
-    ///
-    /// Callers that need transport along a *specific* path (a camera's polyline over the last few
-    /// frames, a player's integrated trajectory) should call [`Self::parallel_transport_along`]
-    /// with the polyline explicitly. That avoids both the path-uniqueness ambiguity and any
-    /// geodesic boundary-value problem.
+    /// The path is implementation-defined: parallel transport is path-dependent
+    /// in any non-flat geometry and this signature names no path. Each impl
+    /// documents its choice. Callers needing a *specific* path should call
+    /// [`Self::parallel_transport_along`] with the polyline explicitly.
     fn parallel_transport(
         &self,
         from: Self::Point,
@@ -75,26 +51,14 @@ pub trait Space {
         v: Self::Vector,
     ) -> Self::Vector;
 
-    /// Parallel-transport `v` along the piecewise path through the listed points, segment by
-    /// segment. Returns the transported vector at the final point.
+    /// Parallel-transport `v` along the polyline through `path`, segment by
+    /// segment, returning the vector at the final point.
     ///
-    /// **Why this is the path-aware primitive.** Parallel transport is path-dependent in any
-    /// non-flat geometry; "transport from `a` to `b`" is only well-defined once a path is chosen.
-    /// This method lets the caller pin down the *macro* path (the polyline a camera or player
-    /// traversed over the last few frames), so the integrated result no longer depends on
-    /// whether the caller batched the journey into one [`Self::parallel_transport`] call or
-    /// many. Per-segment path choice still belongs to the implementation (see the default note
-    /// below); the contract is that finer subdivision converges to the true parallel transport
-    /// along the polyline as segment lengths shrink.
-    ///
-    /// Edge cases:
-    /// - `path.len() < 2`: returns `v` unchanged.
-    /// - Consecutive duplicate points contribute identity transports.
-    ///
-    /// The default implementation chains [`Self::parallel_transport`] over consecutive pairs,
-    /// which inherits each Space's per-segment path choice. Variable-metric Spaces with expensive
-    /// geodesic construction may override this to integrate the polyline directly without
-    /// rebuilding per-segment geodesics.
+    /// The path-aware primitive: pinning the macro path makes the integrated
+    /// result independent of how the caller batched the journey. Contract: finer
+    /// subdivision converges to true parallel transport along the polyline.
+    /// `path.len() < 2` returns `v` unchanged. The default chains
+    /// [`Self::parallel_transport`] over consecutive pairs.
     fn parallel_transport_along(&self, path: &[Self::Point], v: Self::Vector) -> Self::Vector {
         let mut current = v;
         for w in path.windows(2) {
@@ -122,18 +86,15 @@ pub trait Space {
     fn iso_transport(&self, iso: Self::Iso, at: Self::Point, v: Self::Vector) -> Self::Vector;
 }
 
-/// A [`Space`] that additionally exposes its primitives as WGSL, for inlining into shaders by
-/// `rye-shader`.
+/// A [`Space`] that additionally exposes its primitives as WGSL for inlining
+/// into shaders by `rye-shader`.
 ///
-/// Split from [`Space`] deliberately. The math trait is the most stable surface in the engine;
-/// the shader ABI is the least, it will evolve with every render-graph revision. Coupling them
-/// would marry their release cadences and break Rye's stability-discipline goal.
-///
-/// Splitting also lets CPU-only consumers (determinism validators, dedicated servers, offline
-/// tools) depend on `rye-math` without being forced to know anything about WGSL.
+/// Split from [`Space`] so the stable math trait and the volatile shader ABI do
+/// not share a release cadence, and so CPU-only consumers can depend on
+/// `rye-math` without WGSL.
 pub trait WgslSpace: Space {
-    /// WGSL source providing this space's primitives, for inlining into shaders by
-    /// `rye-shader`. The v0 shader ABI is deliberately tiny and single-space:
+    /// WGSL source providing this space's primitives. The v0 ABI is tiny and
+    /// single-space (`vec3<f32>` point/vector only):
     ///
     /// ```wgsl
     /// fn rye_distance(a: vec3<f32>, b: vec3<f32>) -> f32
@@ -142,23 +103,15 @@ pub trait WgslSpace: Space {
     /// fn rye_parallel_transport(p_from: vec3<f32>, p_to: vec3<f32>, v: vec3<f32>) -> vec3<f32>
     /// ```
     ///
-    /// This ABI intentionally covers only spaces whose point/vector shader representation is
-    /// `vec3<f32>`. `Iso` layout and multi-space name mangling are left out until a render path
-    /// actually needs them.
-    ///
-    /// Stateless geometries return `Cow::Borrowed`; parametric ones may `format!` constants in and
-    /// return `Cow::Owned`.
+    /// Stateless geometries return `Cow::Borrowed`; parametric ones `format!`
+    /// constants in and return `Cow::Owned`.
     fn wgsl_impl(&self) -> Cow<'static, str>;
 
-    /// Whether this Space's chart is globally flat: chart-coord arithmetic (raw
-    /// `dot(p, n) - offset`, axis-aligned `abs(p) - b`, etc.) computes the correct geometry
-    /// without going through the Riemannian `rye_*` machinery. False for curved Spaces (Poincaré
-    /// ball H³, stereographic S³, `BlendedSpace`) where chart arithmetic and geodesic distance
-    /// diverge visibly.
-    ///
-    /// Defaults to `false` so a new Space implementor must explicitly opt in to chart-coord SDF
-    /// fast paths. Consumers of this flag (e.g. `rye_scene::Primitive::HalfSpace`'s emission)
-    /// emit the chart-coord formula when `true`, sentinel otherwise.
+    /// Whether the chart is globally flat: chart-coord arithmetic computes the
+    /// correct geometry without the Riemannian `rye_*` machinery. False for
+    /// curved Spaces (Poincaré ball H³, stereographic S³, `BlendedSpace`).
+    /// Defaults to `false` so a new Space must opt in to chart-coord SDF fast
+    /// paths.
     fn is_chart_flat(&self) -> bool {
         false
     }

@@ -1,22 +1,10 @@
 //! Typed protocol for postMessage traffic between main thread and worker.
 //!
-//! Main thread builds `{kind: "...", ...}` JS objects in
-//! `wasm/main_launcher.rs::install_dom_input_forwarders`; the worker
-//! receives them in its `message` event listener and dispatches by
-//! `kind` string. Non-init messages are parsed via
-//! [`parse_non_init`] into typed `InputMessage` variants and pushed
-//! onto a per-worker thread_local queue, drained at the top of each
-//! frame by `WorkerRunner::frame`.
-//!
-//! The `init` kind is special-cased by the worker entry: it carries
-//! an `OffscreenCanvas` transferable + initial dimensions and triggers
-//! the one-time async wgpu+App setup. The other kinds are pure data.
-//!
-//! Allocation note: the `Key` variant holds two `String`s (`code` and
-//! `key`). Keyboard events are bursty but rare relative to mouse-move
-//! events, so the string allocation cost is acceptable. Mouse-move
-//! events take a fixed-size payload (three numbers) so they're
-//! allocation-free.
+//! Main thread builds `{kind: "...", ...}` JS objects; the worker parses
+//! non-init messages via [`parse_non_init`] into [`InputMessage`] and
+//! queues them for `WorkerRunner::frame`. The `init` kind is handled by
+//! the worker entry (it carries an `OffscreenCanvas` transferable and
+//! triggers the one-time async wgpu+App setup).
 
 use anyhow::Result;
 use std::cell::RefCell;
@@ -24,25 +12,18 @@ use std::collections::VecDeque;
 use wasm_bindgen::JsValue;
 
 /// Per-frame inputs the main thread forwards to the worker. Each variant
-/// corresponds to a `kind` string in the postMessage JS object payload.
-/// The worker-side dispatcher parses these and pushes them onto a
-/// thread_local queue; `WorkerRunner::frame` drains the queue at the
-/// top of each frame and applies the events.
+/// corresponds to a `kind` string in the postMessage payload.
 #[derive(Debug)]
 pub enum InputMessage {
-    /// New canvas pixel dimensions. Sent by main thread on window resize
-    /// (DPR-multiplied to physical pixels). Triggers a wgpu surface
-    /// reconfigure on the next frame.
+    /// New canvas pixel dimensions (DPR-multiplied to physical pixels).
+    /// Triggers a wgpu surface reconfigure on the next frame.
     Resize { width: u32, height: u32 },
 
     /// Pointer moved to (x, y) in canvas-local CSS pixels. `buttons` is
-    /// the standard `MouseEvent.buttons` bitmask (1=primary, 2=secondary,
-    /// 4=middle). `dx`/`dy` are the raw motion delta this event carries
-    /// (`MouseEvent.movementX/Y`), used for FPS mouse-look so the camera
-    /// receives correct deltas both before Pointer Lock engages (against
-    /// arbitrary positions) and while it's engaged (against the locked
-    /// center). When the main thread coalesces moves to one per RAF the
-    /// deltas of the dropped intermediate events are summed in.
+    /// the `MouseEvent.buttons` bitmask. `dx`/`dy` are raw
+    /// `movementX/Y` deltas for FPS mouse-look, valid both before and
+    /// after Pointer Lock engages; coalesced moves sum the dropped
+    /// intermediate deltas.
     MouseMove {
         x: f32,
         y: f32,
@@ -51,8 +32,8 @@ pub enum InputMessage {
         dy: f32,
     },
 
-    /// Pointer button transitioned. `button` is the standard
-    /// `MouseEvent.button` (0=primary, 1=middle, 2=secondary).
+    /// Pointer button transitioned. `button` is `MouseEvent.button`
+    /// (0=primary, 1=middle, 2=secondary).
     MouseButton {
         x: f32,
         y: f32,
@@ -60,15 +41,13 @@ pub enum InputMessage {
         pressed: bool,
     },
 
-    /// Wheel delta in lines (after the browser's pixel/line normalization
-    /// on main thread). `dx`/`dy` follow DOM convention: positive =
-    /// right/down.
+    /// Wheel delta in lines (normalized on main thread). DOM convention:
+    /// positive = right/down.
     MouseWheel { dx: f32, dy: f32 },
 
-    /// Keyboard key transitioned. `code` is the physical-key code (e.g.
-    /// "KeyT", "Space"); `key` is the logical key (e.g. "t", " ").
-    /// `code` is used for hotkey routing via `keymap::keycode_*`; `key`
-    /// is used for text-input fan-out to egui.
+    /// Keyboard key transitioned. `code` is the physical-key code (for
+    /// hotkey routing via `keymap::keycode_*`); `key` is the logical key
+    /// (for text-input fan-out to egui).
     Key {
         code: String,
         key: String,
@@ -86,57 +65,41 @@ pub enum InputMessage {
     /// Page visibility (tab-in-foreground) state changed.
     Visibility(bool),
 
-    /// Begin the continuous RAF loop. Sent by main thread after the
-    /// user clicks the launch overlay. Before this arrives, the worker
-    /// has already initialized + rendered ONE preview frame (so the
-    /// launch overlay can blur the demo's actual first frame instead
-    /// of a gradient placeholder); the RAF loop only starts once
-    /// `Start` lands.
+    /// Begin the continuous RAF loop. Sent after the user clicks the
+    /// launch overlay; before it arrives the worker has rendered one
+    /// preview frame for the overlay to blur.
     Start,
 
-    /// Pointer Lock state mirror from the main thread. Fired whenever
-    /// the main thread's `pointerlockchange` event observes the lock
-    /// either engaging or releasing (user pressed Esc, switched tabs,
-    /// etc.). The worker updates [`crate::cursor::mark_applied`] so
-    /// `current_state()` stays in sync with what the browser actually
-    /// has and demos that read the cursor flag see the truth.
+    /// Pointer Lock state mirror from the main thread's
+    /// `pointerlockchange` event. The worker calls
+    /// [`crate::cursor::mark_applied`] so `current_state()` tracks what
+    /// the browser actually has.
     PointerLockChanged(bool),
 }
 
 thread_local! {
-    /// Per-worker queue of inbound input messages. Drained at the top
-    /// of every frame by `WorkerRunner::frame`. A `thread_local` because
-    /// the message handler closure doesn't have direct access to the
-    /// runner (the runner is constructed asynchronously, after the
-    /// first init message arrives).
+    /// Per-worker inbound queue, drained each frame by
+    /// `WorkerRunner::frame`. `thread_local` because the message handler
+    /// closure has no handle to the asynchronously-constructed runner.
     static MESSAGE_QUEUE: RefCell<VecDeque<InputMessage>> = RefCell::new(VecDeque::new());
 }
 
-/// Push a message onto the per-worker queue. Called from the worker's
-/// `message` event listener after parsing.
+/// Push a parsed message onto the per-worker queue.
 pub fn enqueue(msg: InputMessage) {
     MESSAGE_QUEUE.with(|q| q.borrow_mut().push_back(msg));
 }
 
-/// Drain all queued messages. Returns them in arrival order so the
-/// runner can apply them sequentially. Called once per frame.
+/// Drain all queued messages in arrival order. Called once per frame.
 pub fn drain_messages() -> Vec<InputMessage> {
     MESSAGE_QUEUE.with(|q| q.borrow_mut().drain(..).collect())
 }
 
-/// Parse a non-init postMessage payload into an `InputMessage`.
+/// Parse a non-init postMessage payload into an [`InputMessage`].
 ///
-/// Returns:
-/// - `Ok(Some(msg))`: parsed successfully
-/// - `Ok(None)`: message kind is "init" (caller handles specially) OR
-///   the kind is unrecognized (we don't error on unknown kinds; the
-///   worker just logs and drops them)
-/// - `Err(_)`: the payload itself is malformed (missing `kind` field)
-///
-/// The `init` kind is intentionally NOT handled here because parsing it
-/// requires extracting an `OffscreenCanvas` transferable + triggering
-/// the async wgpu setup, both of which depend on type-parameter `A`
-/// (the App type) that this non-generic module doesn't have.
+/// `Ok(None)` covers both the "init" kind (caller handles) and unknown
+/// kinds (logged and dropped). `Err` means a malformed payload (no
+/// `kind` field). "init" is excluded here because its parse depends on
+/// the App type parameter this non-generic module lacks.
 pub fn parse_non_init(data: &JsValue) -> Result<Option<InputMessage>> {
     let kind = js_sys::Reflect::get(data, &JsValue::from_str("kind"))
         .ok()
@@ -145,7 +108,7 @@ pub fn parse_non_init(data: &JsValue) -> Result<Option<InputMessage>> {
     let kind = kind.ok_or_else(|| anyhow::anyhow!("postMessage missing 'kind' field"))?;
 
     let msg = match kind.as_str() {
-        "init" => return Ok(None), // caller (worker.rs) handles
+        "init" => return Ok(None),
         "resize" => InputMessage::Resize {
             width: read_u32_field(data, "width").unwrap_or(0),
             height: read_u32_field(data, "height").unwrap_or(0),
@@ -183,7 +146,7 @@ pub fn parse_non_init(data: &JsValue) -> Result<Option<InputMessage>> {
         "pointer_lock_changed" => {
             InputMessage::PointerLockChanged(read_bool_field(data, "locked").unwrap_or(false))
         }
-        _ => return Ok(None), // unknown kind; caller decides to warn or ignore
+        _ => return Ok(None), // unknown kind; logged and dropped by caller
     };
 
     Ok(Some(msg))

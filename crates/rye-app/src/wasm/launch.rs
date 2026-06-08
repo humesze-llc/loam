@@ -1,6 +1,5 @@
 //! Wasm32-only helpers for the browser embedding lifecycle. Demos opt into
-//! click-to-start (so the page doesn't spin up a wgpu device + render loop until the
-//! user actually wants the demo) by marking the host element in `index.html`:
+//! click-to-start by marking the host element in `index.html`:
 //!
 //! ```html
 //! <div id="rye-canvas-host" data-mode="manual">
@@ -8,51 +7,28 @@
 //! </div>
 //! ```
 //!
-//! [`inject_launch_overlay`] runs from the engine on startup and creates the
-//! `#rye-launch` button as a sibling of the canvas, along with a `<style>`
-//! element in `<head>` carrying [`LAUNCH_OVERLAY_CSS`]. Demos no longer ship
-//! the button markup or CSS themselves; one line of HTML wires up the entire
-//! click-to-start container.
+//! [`inject_launch_overlay`] creates the launch button as a sibling of the
+//! canvas plus a `<style>` carrying [`LAUNCH_OVERLAY_CSS`], so demos ship one
+//! line of HTML instead of the button markup + CSS. The wasm download happens
+//! regardless; click-to-start only defers the per-frame wgpu work.
 //!
-//! The wasm module still loads on page navigation (the bytes are downloaded and
-//! `init()` runs), but `run_with_config` doesn't fire until the click event. The
-//! browser pays the wasm download cost regardless of click-to-start; what it AVOIDS
-//! is the per-frame wgpu work + the visible canvas eating GPU + RAF cycles.
+//! The `<style>` is keyed on a fixed id so multiple demos insert the CSS once;
+//! v1 ships single-demo embedding only. Demos theme by shipping a
+//! later-cascade stylesheet or pre-creating their own `<button id="...">`,
+//! which [`inject_launch_overlay`] reuses.
 //!
-//! ## Multi-demo per page
-//!
-//! Each demo has its own host element id; the injected `<style>` element is
-//! keyed on a fixed id so multiple demos on one page only insert the CSS once.
-//! v1 ships single-demo embedding only (one wasm bundle per page); multi-demo
-//! lands once the per-bundle JS surface is decided.
-//!
-//! ## Theming
-//!
-//! Demos that want a custom look can either ship a stylesheet that comes later
-//! in the cascade and overrides the engine's `.rye-demo-launch` rules, or pre-
-//! create a `<button id="...">` with their own classes inside the host element;
-//! [`inject_launch_overlay`] reuses an existing element rather than duplicating
-//! it when one is already in the DOM.
-//!
-//! ## Non-goals
-//!
-//! - **Pause / resume on scroll-out.** When a demo scrolls out of view in a
-//!   blog embed, the ideal behavior is to pause its RAF loop and reclaim GPU
-//!   resources. That belongs in the JS embed wrapper (an `IntersectionObserver`
-//!   that posts a `pause` message to the worker), not in this engine path; the
-//!   worker already has the lifecycle hooks a wrapper would drive.
+//! Pause-on-scroll-out is a non-goal here: it belongs in a JS embed wrapper
+//! (an `IntersectionObserver` posting `pause` to the worker), which the
+//! worker's lifecycle hooks already support.
 
 use anyhow::{anyhow, Context, Result};
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{HtmlButtonElement, HtmlStyleElement};
 
-/// Default CSS for the click-to-start overlay. Injected by
-/// [`inject_launch_overlay`] into `<head>` once per page; demos that want
-/// to theme the overlay can ship a stylesheet that comes later in the
-/// cascade (or use higher-specificity selectors) to override. The blur
-/// reads the canvas underneath, so the worker's preview frame appears as
-/// a softened thumbnail until the viewer clicks.
+/// Default CSS for the click-to-start overlay, injected once per page by
+/// [`inject_launch_overlay`]. The blur reads the canvas underneath, so the
+/// worker's preview frame shows as a softened thumbnail until the click.
 const LAUNCH_OVERLAY_CSS: &str = r#"
 /* Base: shared chrome (positioning, blur, font, transitions). The
    overlay is injected with no state class, so the chip is hidden and
@@ -114,16 +90,10 @@ const LAUNCH_OVERLAY_CSS: &str = r#"
 
 const OVERLAY_STYLE_ID: &str = "rye-launch-overlay-styles";
 
-/// Inject a launch-overlay `<button>` as a child of `host_id` plus a
-/// `<style>` element carrying [`LAUNCH_OVERLAY_CSS`] into `<head>`. The
-/// style element is idempotent (keyed on a fixed id), so calling this
-/// for multiple demos on one page only inserts the CSS once.
-///
-/// Returns the freshly-created button so the caller can wire its click
-/// handler. If an element with `button_id` already exists in the DOM
-/// (because the demo's `index.html` ships a static button for legacy
-/// reasons or for theming reasons), this function reuses it instead of
-/// creating a duplicate.
+/// Inject a launch-overlay `<button>` under `host_id` plus a `<style>`
+/// carrying [`LAUNCH_OVERLAY_CSS`] into `<head>` (the style is idempotent,
+/// keyed on a fixed id). Returns the button for the caller to wire; reuses
+/// an existing `button_id` element if the demo shipped its own.
 pub fn inject_launch_overlay(host_id: &str, button_id: &str) -> Result<HtmlButtonElement> {
     let window = web_sys::window().ok_or_else(|| anyhow!("no global window"))?;
     let document = window
@@ -160,13 +130,9 @@ pub fn inject_launch_overlay(host_id: &str, button_id: &str) -> Result<HtmlButto
         .dyn_into::<HtmlButtonElement>()
         .map_err(|_| anyhow!("created element is not HtmlButtonElement"))?;
     button.set_id(button_id);
-    // Starts with no state class -> CSS defaults hide the chip + spinner
-    // (only the blurred background + base layout apply). The static
-    // `#rye-page-loader` element in the demo's `index.html` carries the
-    // visible spinner from page load until the worker posts
-    // `preview_ready`; at that point the static loader is removed and
-    // this overlay gets the `.ready` class to show the click affordance.
-    // Click then removes the overlay entirely.
+    // No state class: CSS shows only the blurred backdrop until the worker's
+    // `preview_ready` adds `.ready` and reveals the click affordance. The
+    // `#rye-page-loader` element carries the spinner until then.
     button.set_class_name("rye-demo-launch");
     button.set_type("button");
     button
@@ -177,9 +143,8 @@ pub fn inject_launch_overlay(host_id: &str, button_id: &str) -> Result<HtmlButto
     Ok(button)
 }
 
-/// Returns true if the page opted into click-to-start by setting
-/// `data-mode="manual"` on the host element with the given id. Returns false on
-/// missing element, missing attribute, or any other value (default = auto-launch).
+/// True if the host element has `data-mode="manual"`. False on missing
+/// element / attribute / any other value (default = auto-launch).
 pub fn is_manual_mode(host_id: &str) -> bool {
     let Some(window) = web_sys::window() else {
         return false;
@@ -195,13 +160,9 @@ pub fn is_manual_mode(host_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Attach a one-shot click handler to the button with the given id. When clicked,
-/// the button removes itself from the DOM (so a frantic double-click can't fire the
-/// closure twice) and then invokes `on_click`. Returns Ok(()) as soon as the
-/// listener is wired; the actual click might happen seconds or minutes later.
-///
-/// The closure is a `FnOnce` because launching the app is a one-time operation. The
-/// `Closure::once` wrapper ensures the JS side runs the callback exactly once.
+/// Attach a one-shot click handler to the button. On click the button
+/// removes itself (so a double-click can't fire twice) and invokes
+/// `on_click`. `FnOnce` because launching is one-time.
 pub fn wait_for_launch(button_id: &str, on_click: impl FnOnce() + 'static) -> Result<()> {
     let window = web_sys::window().ok_or_else(|| anyhow!("no global window"))?;
     let document = window
@@ -213,8 +174,8 @@ pub fn wait_for_launch(button_id: &str, on_click: impl FnOnce() + 'static) -> Re
     let button_for_click = button.clone();
 
     let cb = Closure::once(Box::new(move || {
-        // Remove the button before invoking the closure so any RAF / event loop the
-        // closure spins up doesn't have to fight with the DOM node.
+        // Remove the button before the closure so any RAF / event loop it
+        // spins up doesn't fight the DOM node.
         button_for_click.remove();
         on_click();
     }) as Box<dyn FnOnce()>);
@@ -223,27 +184,18 @@ pub fn wait_for_launch(button_id: &str, on_click: impl FnOnce() + 'static) -> Re
         .add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
         .map_err(|e| anyhow!("add_event_listener: {e:?}"))
         .context("wait_for_launch: attach click listener")?;
-    // The closure must outlive its registration; `forget` leaks it intentionally,
-    // which is fine because click-to-start happens at most once per page load.
     cb.forget();
     Ok(())
 }
 
-/// Sample the V8 JS heap size in bytes, or `None` if the runtime doesn't expose
-/// `performance.memory.usedJSHeapSize`. Chromium browsers (Chrome / Edge) expose
-/// it as a non-standard extension; Firefox + Safari do not, and there the
-/// returned value is `None` so the caller can fall back to "no heap signal."
+/// Sample the V8 JS heap in bytes, or `None` where
+/// `performance.memory.usedJSHeapSize` is absent (Chromium exposes it as a
+/// non-standard extension; Firefox + Safari do not).
 ///
-/// Intended to be registered into `rye_time::frame_trace::set_heap_sampler` at
-/// startup so each frame gets a heap delta attached for spike correlation. The
-/// underlying property is bucketed by V8 to a ~25-100ms resolution; this is
-/// fine for catching multi-MB jumps that correlate with major GC pauses, less
-/// fine for spotting single-object allocations. Don't read short-term changes
-/// here as authoritative.
-///
-/// Architectural note: `js_sys::Reflect` is the right tool because `web-sys`
-/// doesn't surface `Performance::memory` (it's not in the standard). Reflect
-/// gracefully degrades to `None` on Firefox via the `is_undefined` check.
+/// Registered into `rye_time::frame_trace::set_heap_sampler` for per-frame
+/// heap deltas. V8 buckets the value to ~25-100ms, fine for multi-MB GC
+/// jumps, not for single allocations. Uses `js_sys::Reflect` because
+/// `web-sys` doesn't surface the non-standard `Performance::memory`.
 pub fn js_heap_sampler() -> Option<u64> {
     let window = web_sys::window()?;
     let performance = window.performance()?;

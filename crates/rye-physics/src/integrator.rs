@@ -1,9 +1,9 @@
 //! The [`PhysicsSpace`] trait and the generic integration function.
 //!
-//! `PhysicsSpace` extends [`rye_math::Space`] with what physics needs on top of kinematics: an
-//! angular-velocity type, an inertia type, and an orientation-integration rule. Everything else,
-//! position integration, velocity transport, gravity, collision, is written against the `Space`
-//! trait and works unchanged across E², E³, H³, S³, etc.
+//! `PhysicsSpace` extends [`rye_math::Space`] with the rotation dynamics physics
+//! needs: an angular-velocity type, an inertia type, and an orientation-
+//! integration rule. Everything else is written against `Space` and works
+//! unchanged across E², E³, H³, S³, etc.
 
 use std::ops::Mul;
 
@@ -11,20 +11,19 @@ use rye_math::{Bivector, Space};
 
 use crate::body::RigidBody;
 
-/// A [`Space`] equipped with the rotation-dynamics machinery physics needs: angular velocity,
-/// inertia, and a way to integrate orientation over a timestep.
+/// A [`Space`] equipped with rotation dynamics: angular velocity, inertia, and
+/// orientation integration.
 ///
-/// New spaces opt into physics by implementing this trait. Sphere-sphere collision works
-/// immediately via [`rye_math::Space::distance`] and [`rye_math::Space::log`];
-/// polygon/polyhedron collision requires per-space narrowphase functions registered in
-/// [`crate::Narrowphase`].
+/// New spaces opt into physics by implementing this. Sphere-sphere collision
+/// works immediately via [`rye_math::Space::distance`] and
+/// [`rye_math::Space::log`]; polygon/polyhedron collision needs per-space
+/// narrowphase functions registered in [`crate::Narrowphase`].
 pub trait PhysicsSpace: Space {
-    /// Bivector representing angular velocity (e.g. [`rye_math::Bivector2`] for 2D,
-    /// [`rye_math::Bivector3`] for 3D).
+    /// Angular-velocity bivector (e.g. [`rye_math::Bivector2`],
+    /// [`rye_math::Bivector3`]).
     type AngVel: Bivector;
 
-    /// Inertia representation. Scalar in 2D; a 3×3 symmetric matrix in 3D; a 6×6
-    /// bivector-to-bivector map in 4D. Kept opaque here, the implementor decides the layout.
+    /// Inertia: scalar in 2D, 3×3 in 3D, 6×6 bivector map in 4D. Layout opaque.
     type Inertia: Copy;
 
     /// Integrate orientation by angular velocity over a timestep. Returns the new orientation.
@@ -33,16 +32,15 @@ pub trait PhysicsSpace: Space {
     /// Apply the inverse inertia to a torque-bivector. Used by the solver for `ω += I⁻¹τ dt`.
     fn apply_inv_inertia(&self, inertia: Self::Inertia, torque: Self::AngVel) -> Self::AngVel;
 
-    /// World-space velocity of `body` at world point `p`, accounting for both linear velocity
-    /// and the angular contribution `ω × (p − body.position)` (the latter expressed via the
-    /// bivector-acting-on-vector operation appropriate to the space).
+    /// World-space velocity of `body` at world point `p`: linear plus the
+    /// angular contribution `ω × (p − body.position)`.
     fn velocity_at_point(&self, body: &RigidBody<Self>, p: Self::Point) -> Self::Vector
     where
         Self: Sized;
 
-    /// Inverse effective mass for a unit-direction impulse `direction` applied at world point
-    /// `contact_point` between `a` and `b`. The PGS solver divides by this to convert a
-    /// velocity constraint to an impulse magnitude:
+    /// Inverse effective mass for a unit-direction impulse at `contact_point`
+    /// between `a` and `b`. The PGS solver divides by this to turn a velocity
+    /// constraint into an impulse magnitude:
     ///
     /// ```text
     /// K = inv_m_a + inv_m_b
@@ -75,19 +73,17 @@ pub trait PhysicsSpace: Space {
         Self: Sized;
 }
 
-/// Default integration step: advance position along the geodesic, parallel-transport velocity
-/// to the new tangent space, and integrate orientation.
-///
-/// This is the Space-generic integration loop, it calls only [`rye_math::Space::exp`],
-/// [`rye_math::Space::parallel_transport`], and [`PhysicsSpace::integrate_orientation`].
+/// Space-generic integration step: advance position along the geodesic,
+/// parallel-transport velocity to the new tangent space, integrate orientation.
+/// Calls only [`rye_math::Space::exp`], [`rye_math::Space::parallel_transport`],
+/// and [`PhysicsSpace::integrate_orientation`].
 pub fn integrate_body<S>(space: &S, body: &mut RigidBody<S>, dt: f32)
 where
     S: PhysicsSpace,
     S::Vector: Mul<f32, Output = S::Vector>,
 {
     if body.inv_mass == 0.0 {
-        // Static body. Zero velocity, don't integrate.
-        return;
+        return; // static
     }
 
     let p_old = body.position;
@@ -105,9 +101,8 @@ mod tests {
     use glam::Vec3;
     use rye_math::EuclideanR3;
 
-    /// `inv_mass == 0` means static; the integrator must not advance position even when velocity
-    /// is non-zero (the solver may have written velocity into a static slot intentionally for
-    /// diagnostic reasons; integration ignoring it is the canonical guarantee).
+    /// Static (`inv_mass == 0`) bodies never advance, even with non-zero
+    /// velocity.
     #[test]
     fn static_body_skips_integration() {
         let mut body = RigidBody::<EuclideanR3>::fixed(
@@ -121,8 +116,8 @@ mod tests {
         assert_eq!(body.position, Vec3::ZERO);
     }
 
-    /// Dynamic body in flat E³: position advances by `velocity * dt` and the velocity vector is
-    /// unchanged (parallel transport is the identity in Euclidean space).
+    /// In flat E³, position advances by `velocity * dt` and velocity is
+    /// unchanged (parallel transport is the identity).
     #[test]
     fn dynamic_body_in_e3_moves_linearly() {
         let mut body = RigidBody::<EuclideanR3>::new(
@@ -138,8 +133,7 @@ mod tests {
         assert_eq!(body.velocity, Vec3::new(1.0, 2.0, -3.0));
     }
 
-    /// Zero `dt` is a no-op for both position and velocity. Catches the failure mode where a
-    /// bug in `space.exp` returns garbage for a zero tangent vector.
+    /// Zero `dt` is a no-op; catches `space.exp` mishandling a zero tangent.
     #[test]
     fn zero_dt_does_not_advance_state() {
         let mut body = RigidBody::<EuclideanR3>::new(

@@ -1,37 +1,20 @@
-//! Console command that surfaces [`rye_time::frame_trace`] aggregates into the dev
-//! console. The trace module silently collects per-frame section timings on every
-//! redraw; `trace` is the bridge that lets a human read them.
+//! Console command that surfaces [`rye_time::frame_trace`] aggregates into
+//! the dev console. Collection is already wired into `Runner::redraw`; this
+//! is the read side.
 //!
-//! ## Subcommands
-//!
-//! - `trace` / `trace summary`: print the aggregate p50 / p95 / p99 / max for every
-//!   section in the rolling window (sorted by p95 descending). Sane default for "what
-//!   is the slowest part of a frame right now."
-//! - `trace last`: print the most recently completed frame's per-section breakdown.
-//!   Useful for catching a one-off spike: hit it right after the visible stutter.
-//! - `trace clear`: drop the rolling history. The next `trace summary` reflects only
-//!   frames recorded after the clear.
-//! - `trace cap <N>`: set the rolling-window size to N frames. Default is 120
-//!   (~2 seconds at 60fps). Larger windows smooth out short-term variance but
-//!   take longer to react to changes in the hot path.
-//!
-//! ## Wiring (per demo)
+//! Subcommands: `trace`/`trace summary` (aggregate p50/p95/p99/max, p95
+//! desc), `trace last` (most recent frame breakdown), `trace clear`,
+//! `trace cap <N>` (rolling-window size).
 //!
 //! ```ignore
-//! // In build_console:
 //! rye_app::trace::register_command(&mut c);
 //! ```
-//!
-//! The actual collection is already wired into `rye-app::Runner::redraw`; the demo
-//! only needs to register the console command if it wants users to surface the data.
 
 use rye_egui::{cmd, Console};
 use rye_time::frame_trace;
 use std::time::Duration;
 
-/// Format a duration into a compact human-readable string. us if < 1ms, ms if < 1s,
-/// s otherwise. Used by the trace command's output rows so the scrollback stays
-/// readable instead of dumping nanosecond ints.
+/// Compact duration string: ns < 1us, us < 1ms, ms < 1s, s otherwise.
 fn fmt_dur(d: std::time::Duration) -> String {
     let ns = d.as_nanos();
     if ns < 1_000 {
@@ -45,8 +28,7 @@ fn fmt_dur(d: std::time::Duration) -> String {
     }
 }
 
-/// Print the rolling-window aggregate to the console: one row per section, sorted by
-/// p95 descending. Slowest hot-path sections naturally sort to the top.
+/// Print the rolling-window aggregate: one row per section, p95 descending.
 fn print_summary(out: &mut rye_egui::ConsoleWriter) {
     let stats = frame_trace::aggregate();
     if stats.is_empty() {
@@ -57,9 +39,6 @@ fn print_summary(out: &mut rye_egui::ConsoleWriter) {
     out.line(format!(
         "trace summary ({history_len} frames, sorted by p95 desc):"
     ));
-    // Header. Column widths picked to fit common section names + reasonable us/ms
-    // values. Names beyond 16 chars get truncated which is fine; if it becomes a
-    // problem we can widen the field.
     out.line(format!(
         "  {:<18} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "section", "n", "mean", "p50", "p95", "p99", "max",
@@ -86,9 +65,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Print the most recent completed frame's section breakdown. Order preserved from
-/// the order scopes opened, so the reader gets a natural top-to-bottom timeline of
-/// the frame.
+/// Print the most recent frame's section breakdown, in scope-open order.
 fn print_last(out: &mut rye_egui::ConsoleWriter) {
     let Some(frame) = frame_trace::last_frame() else {
         out.line("trace: no frames in window yet");
@@ -115,10 +92,9 @@ fn print_last(out: &mut rye_egui::ConsoleWriter) {
     }
 }
 
-/// Format the summary as multi-line text. Used by both the console output path AND
-/// the `dump` subcommand that emits via `tracing::info!` so the same data is reachable
-/// from both the in-canvas console (not browser-selectable) and the browser dev tools
-/// console (selectable + copyable).
+/// Multi-line summary text. Used by the `dump` subcommand so the same data
+/// reaches the browser DevTools console (selectable/copyable), which the
+/// pixel-rendered in-canvas console is not.
 fn format_summary() -> String {
     let stats = frame_trace::aggregate();
     if stats.is_empty() {
@@ -159,15 +135,10 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
                     None | Some("summary") => print_summary(out),
                     Some("last") => print_last(out),
                     Some("dump") => {
-                        // Emit via tracing::info! so the same data lands in the browser
-                        // DevTools console (selectable + copyable) on wasm, and in
-                        // stdout on native. The in-canvas console renders text as
-                        // pixels so the in-app `trace summary` text isn't browser-
-                        // selectable; `trace dump` is the workaround.
+                        // tracing::info! so the block lands in the browser
+                        // DevTools console (copyable) on wasm and stdout on
+                        // native; one event keeps the newlines grouped.
                         let summary = format_summary();
-                        // Multi-line tracing event: the receiving subscriber (tracing-
-                        // wasm or fmt) writes the whole block as one event so the
-                        // newlines stay grouped in the browser console output.
                         tracing::info!("\n{summary}");
                         out.line("trace: dumped to browser console (open DevTools to copy)");
                     }
@@ -208,35 +179,19 @@ pub fn register_command<Ctx: 'static>(console: &mut Console<Ctx>) {
 // PerfOverlay: F3-style always-on perf readout
 // ---------------------------------------------------------------------------
 
-/// Live FPS / frame-time overlay, Minecraft-F3 style. Reads from `frame_trace`'s
-/// rolling history and renders a compact corner panel with:
+/// Live FPS / frame-time overlay, F3-toggled. Reads `frame_trace`'s rolling
+/// history and paints FPS, between-frames cadence, frame CPU work, and a
+/// sparkline. Opt in by calling [`PerfOverlay::show`] from `App::ui`.
 ///
-/// - **FPS**: 1 / mean(`between-frames`) over the recent window.
-/// - **gap**: mean / p99 / max of `between-frames` (browser-side RAF cadence;
-///   the slow source per the 2026-05-22 wasm investigation).
-/// - **frm**: mean / p99 of `frame` (our CPU work; usually tiny).
-/// - **sparkline**: last N `between-frames` durations as a bar chart with
-///   reference lines at 16.7ms (60fps) and 33.3ms (30fps). Bars color-code by
-///   severity: green = under 20ms, amber = 20-33ms, red = over 33ms (dropped
-///   frame).
-///
-/// Toggle visibility with `F3` (matches the Minecraft convention). The toggle
-/// is checked every call to [`PerfOverlay::show`]; the demo opts in by calling
-/// `self.perf.show(ctx)` from its `App::ui`.
-///
-/// ## Why this isn't the egui `Plot` widget
-///
-/// `Plot` is a heavy widget that pulls in axis labels, legends, zoom, drag
-/// interaction. A perf sparkline doesn't need any of that and the Plot
-/// pipeline state would add to egui's compile-time pipeline count (the thing
-/// we suspect contributes to stutters). Direct `ui.painter()` calls keep this
-/// to one rect + a few line segments per frame.
+/// Hand-painted rather than the egui `Plot` widget: `Plot` adds pipeline
+/// state to egui's compile-time pipeline count (a suspected stutter source);
+/// direct `ui.painter()` calls cost one rect plus a few segments per frame.
 pub struct PerfOverlay {
     visible: bool,
     /// Toggle hotkey. `F3` by default; change with [`Self::with_toggle_key`].
     toggle_key: rye_egui::egui::Key,
-    /// Number of recent frames the readout summarizes over. Defaults to 60
-    /// (one second at 60fps). Larger = smoother numbers, slower reaction.
+    /// Recent frames the readout summarizes over. Larger = smoother numbers,
+    /// slower reaction.
     window: usize,
 }
 
@@ -255,29 +210,25 @@ impl PerfOverlay {
         Self::default()
     }
 
-    /// Override the toggle key. Useful for demos where F3 is taken (or for
-    /// "always visible" by setting to a key the user will never press).
+    /// Override the toggle key (for demos where F3 is taken).
     pub fn with_toggle_key(mut self, key: rye_egui::egui::Key) -> Self {
         self.toggle_key = key;
         self
     }
 
-    /// Force the overlay visible regardless of toggle state. For embedded
-    /// demos where the perf data should always show.
+    /// Force the overlay visible regardless of toggle state.
     pub fn always_visible(mut self) -> Self {
         self.visible = true;
         self
     }
 
-    /// Render the overlay. Call once per frame from `App::ui`. Handles the
-    /// toggle key internally so the demo doesn't need to forward F3.
+    /// Render the overlay once per frame from `App::ui`; handles the toggle
+    /// key internally.
     ///
-    /// Zero-alloc per call: history is read via [`frame_trace::with_history`]
-    /// borrow, samples are accumulated into a fixed-size stack buffer
-    /// ([`MAX_WINDOW`] cap), and percentile sorting happens in-place. The
-    /// previous `Vec<FrameTrace>::clone` per frame was ~120-130 allocations on
-    /// its own and was swamping the NH3 alloc telemetry. Now the overlay
-    /// contributes zero allocations to the steady-state alloc count.
+    /// Zero-alloc per call: history read via [`frame_trace::with_history`],
+    /// samples into a fixed-size stack buffer ([`MAX_WINDOW`] cap),
+    /// percentile sort in place. The prior per-frame `Vec` clone was ~120
+    /// allocations and dominated the alloc telemetry.
     pub fn show(&mut self, ctx: &rye_egui::egui::Context) {
         use rye_egui::egui;
 
@@ -289,9 +240,7 @@ impl PerfOverlay {
             return;
         }
 
-        // Single pass over the rolling history through `with_history`'s borrow.
-        // Stack-bound accumulators only. Cap the window at MAX_WINDOW so the
-        // stack buffer below never overflows.
+        // Cap the window at MAX_WINDOW so the stack buffers can't overflow.
         let window = self.window.min(MAX_WINDOW);
         let mut cadence = StackBuf::new();
         let mut frames_buf = StackBuf::new();
@@ -339,10 +288,6 @@ impl PerfOverlay {
             return;
         }
 
-        // Reductions on the stack buffers. `.percentile` mutates the buffer
-        // (sorts in-place); subsequent reads must use `.mean` BEFORE the sort
-        // if they want unsorted-order semantics. Mean doesn't care about
-        // order so it's order-independent; we call it first to be explicit.
         let cadence_mean = cadence.mean();
         let cadence_p99 = cadence.percentile(0.99);
         let frame_mean = frames_buf.mean();
@@ -350,11 +295,8 @@ impl PerfOverlay {
         let idle_mean = idles.mean();
         let idle_p99 = idles.percentile(0.99);
 
-        // Session-lifetime maxima. Distinct from `max_dur(&cadence)` which is
-        // bounded by the rolling window's contents: a 1-second freeze that
-        // happened 5 seconds ago has already aged out of the window's 120
-        // frames, so a window-only "max" lies. `max_ever` survives the entire
-        // session and is the answer to "what's the worst this has ever been?"
+        // Session-lifetime maxima: a freeze that aged out of the rolling
+        // window still shows here, where a window-bounded max would lie.
         let cadence_max_ever = frame_trace::max_ever("between-frames");
         let idle_max_ever = frame_trace::max_ever("idle");
         let frame_max_ever = frame_trace::max_ever("frame");
@@ -365,12 +307,8 @@ impl PerfOverlay {
             0.0
         };
 
-        // Position: top-right by default, but `.movable(true)` lets the user
-        // drag it anywhere. egui persists the resulting offset by `Id` so the
-        // overlay re-opens where the user last left it (within the session).
-        // `Area::default_pos` is honored once; subsequent frames read the
-        // persisted position from `ctx.memory`. Use `default_pos` instead of
-        // `anchor` because anchored areas ignore drag.
+        // Top-right by default; `default_pos` (not `anchor`, which ignores
+        // drag) so `.movable` works and egui persists the dragged offset.
         let screen = ctx.content_rect();
         let default_x = (screen.right() - 12.0 - 260.0).max(0.0);
         egui::Area::new(egui::Id::new("rye-perf-overlay"))
@@ -389,17 +327,8 @@ impl PerfOverlay {
                                 .font(mono.clone())
                                 .color(egui::Color32::from_rgb(220, 230, 240)),
                         );
-                        // Three rows: total cadence (between-frames), our CPU
-                        // work (frame), and the browser/RAF gap (idle). The
-                        // first should equal the sum of the latter two in the
-                        // long run; differences = scope-uncovered work in
-                        // redraw (FPS bookkeeping, capture, etc.).
-                        //
-                        // The `worst` column is session-lifetime; survives the
-                        // rolling window so multi-second spikes that happened
-                        // minutes ago are still visible. Colored red when it's
-                        // pathological (>= 100ms = ~6 vsync) so the user's eye
-                        // catches "this has been bad" at a glance.
+                        // total (between-frames) should equal frame + idle in
+                        // the long run; the gap is scope-uncovered redraw work.
                         ui.label(
                             egui::RichText::new(format!(
                                 "total  {:>5.1}  p99 {:>5.1}  ms",
@@ -467,15 +396,10 @@ impl PerfOverlay {
                             .font(mono.clone())
                             .color(worst_color(frame_max_ever)),
                         );
-                        // Alloc section. Visible when the demo opted in via
-                        // CountingAllocator. Three rows: mean allocs/frame
-                        // (steady-state allocation rate; target = 0), peak
-                        // bytes per frame (worst spike), and net bytes
-                        // across the window (catches steady leaks the per-
-                        // frame mean might smear into the noise). All three
-                        // matter: a frame with 200 1-byte allocs vs. 1
-                        // 200-byte alloc looks identical in byte-count but
-                        // very different in JS-interop cost on wasm.
+                        // Alloc section (demo opted into CountingAllocator).
+                        // alloc count is tracked separately from bytes because
+                        // many tiny allocs cost more in wasm JS-interop than
+                        // one large alloc of the same total size.
                         if alloc_frames > 0 {
                             ui.separator();
                             ui.label(
@@ -527,13 +451,9 @@ impl PerfOverlay {
                                 .color(byte_color(alloc_net_bytes)),
                             );
                         }
-                        // Heap section (Chromium only). When no samples are
-                        // present (Firefox / native) we skip it entirely
-                        // rather than showing zeroes the reader might
-                        // misread as "no allocations." Two rows: peak
-                        // per-frame growth (correlates with the spike-warn
-                        // log lines) and net growth across the window
-                        // (catches steady-state per-frame leaks).
+                        // Heap section (Chromium only). Skipped when no
+                        // samples (Firefox/native) rather than showing zeroes
+                        // a reader might misread as "no allocations."
                         if heap_count > 0 {
                             ui.separator();
                             ui.label(
@@ -575,24 +495,16 @@ impl PerfOverlay {
     }
 }
 
-/// Maximum window size the PerfOverlay supports for percentile statistics.
-/// Drives the inline stack array in `StackBuf`; oversized windows are
-/// clamped to this value. 256 × 16 B/Duration = 4 KB on stack per buffer;
-/// three buffers (cadence, frame, idle) = 12 KB. Comfortably inside the
-/// 1 MB main-thread stack on every supported target.
-///
-/// Architectural note: the cap exists ONLY to keep the stack buffer fixed-
-/// size; the actual rolling-window capacity in `frame_trace` is independent
-/// and can be larger. If a user configures `with_window(>MAX_WINDOW)` we
-/// silently use the cap; the alternative (heap-allocating to match the
-/// requested window) defeats the zero-alloc property the overlay exists to
-/// enable.
+/// Max window size for the overlay's percentile stats; sizes the inline
+/// stack array in `StackBuf`. 256 x 16 B/Duration = 4 KB per buffer, three
+/// buffers = 12 KB, well inside the 1 MB main-thread stack. The cap keeps
+/// the buffer fixed-size; `frame_trace`'s own capacity is independent and
+/// may be larger, in which case the overlay silently uses this cap to
+/// preserve its zero-alloc property.
 pub const MAX_WINDOW: usize = 256;
 
-/// Fixed-capacity stack-allocated sample buffer. Zero-allocation alternative
-/// to `Vec<Duration>` for per-frame UI use. Push silently drops samples once
-/// `len` reaches `MAX_WINDOW`; the caller is expected to cap its iteration
-/// window to match.
+/// Fixed-capacity stack sample buffer; zero-alloc replacement for a
+/// per-frame `Vec<Duration>`. Push drops silently at [`MAX_WINDOW`].
 #[derive(Clone)]
 struct StackBuf {
     samples: [Duration; MAX_WINDOW],
@@ -626,10 +538,8 @@ impl StackBuf {
         sum / self.len as u32
     }
 
-    /// `q`-percentile over the window. Order-preserving on `self`: clones the
-    /// sample range into a stack-local array and sorts THAT, leaving the
-    /// caller's buffer in its original (time-ordered) state. The sparkline
-    /// downstream needs the original order; the percentile readout doesn't.
+    /// `q`-percentile (nearest-rank). Order-preserving on `self`: sorts a
+    /// stack-local copy so the sparkline downstream keeps its time order.
     fn percentile(&self, q: f32) -> Duration {
         if self.len == 0 {
             return Duration::ZERO;
@@ -650,16 +560,14 @@ fn draw_sparkline(ui: &mut rye_egui::egui::Ui, gaps: &[Duration]) {
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(18, 18, 24));
 
-    // Y-scale: clamp the top at 50ms so 30-50ms bars are still visible without
-    // a single 200ms outlier squashing the baseline to invisibility. Outliers
-    // beyond that draw to the top of the rect with their full color.
+    // Clamp the top at 50ms so a single 200ms outlier doesn't squash the
+    // baseline; outliers draw to the top of the rect at full color.
     let y_max_ms = 50.0_f32;
     let y_for_ms = |ms: f32| {
         let clamped = ms.min(y_max_ms);
         rect.bottom() - (clamped / y_max_ms) * rect.height()
     };
-    // Reference lines: 60fps (16.7ms) and 30fps (33.3ms). Faint so they don't
-    // dominate the bars; helps the eye locate the "good" vs "dropped frame" zones.
+    // Reference lines: 60fps (16.7ms) and 30fps (33.3ms).
     let ref_60 = y_for_ms(16.67);
     let ref_30 = y_for_ms(33.33);
     painter.line_segment(
@@ -702,10 +610,7 @@ fn draw_sparkline(ui: &mut rye_egui::egui::Ui, gaps: &[Duration]) {
 mod tests {
     use super::*;
 
-    // `fmt_dur` is the primary string emitter the trace command uses;
-    // verifying the unit boundary picks (ns / us / ms / s) catches drift
-    // if anyone changes the thresholds. Lower bound at each boundary is
-    // the "just-crossed" sample.
+    // Pins the ns/us/ms/s unit boundaries against threshold drift.
 
     #[test]
     fn fmt_dur_emits_ns_under_microsecond() {
@@ -735,9 +640,7 @@ mod tests {
     #[test]
     fn truncate_preserves_short_names_and_marks_long_ones() {
         assert_eq!(truncate("frame", 18), "frame");
-        // A name at the cap fits verbatim.
         assert_eq!(truncate("abcdefghijklmnopqr", 18).len(), 18);
-        // A name PAST the cap collapses to `cap-1` chars plus a `~` mark.
         let long = "supercalifragilisticexpialidocious";
         let t = truncate(long, 18);
         assert_eq!(t.len(), 18);
@@ -790,25 +693,21 @@ mod tests {
 
     #[test]
     fn stackbuf_percentile_picks_nearest_rank() {
-        // 10 samples: 1ms, 2ms, ..., 10ms.
         let mut buf = StackBuf::new();
         for ms in 1..=10u64 {
             buf.push(Duration::from_millis(ms));
         }
-        // p50 with nearest-rank: floor(10 * 0.5) = 5 -> samples[5] = 6ms.
+        // floor(10 * 0.5) = 5 -> samples[5] = 6ms.
         assert_eq!(buf.percentile(0.5), Duration::from_millis(6));
-        // p95: floor(10 * 0.95) = 9 -> samples[9] = 10ms (the max).
         assert_eq!(buf.percentile(0.95), Duration::from_millis(10));
-        // p99 same range: clamped to len-1 = 9 -> 10ms.
+        // p99 clamps to len-1.
         assert_eq!(buf.percentile(0.99), Duration::from_millis(10));
     }
 
     #[test]
     fn stackbuf_percentile_is_order_preserving_on_self() {
-        // The implementation sorts into a stack-local copy and leaves `self`
-        // untouched. The sparkline downstream relies on insertion order; if
-        // a refactor moved the sort onto `self.samples`, the sparkline would
-        // show sorted bars instead of time-ordered ones.
+        // Guards the sparkline's reliance on insertion order: a refactor that
+        // sorted `self.samples` would show sorted bars, not time-ordered ones.
         let mut buf = StackBuf::new();
         for ms in [30u64, 5, 25, 10, 20] {
             buf.push(Duration::from_millis(ms));

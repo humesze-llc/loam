@@ -1,52 +1,34 @@
-//! Process-global frame pacing state (target framerate, vsync toggle, precise
-//! sleep utility), read by `Runner::redraw` at the top of every
-//! redraw to gate this frame's work.
+//! Process-global frame pacing state (target framerate, vsync toggle,
+//! precise sleep), read by `Runner::redraw` to gate each frame's work.
 //!
-//! ## Why a process-global atomic instead of a `Runner` field
-//!
-//! The `fps` / `vsync` console commands live behind the `Console` handler,
-//! which gets a `&mut Ctx` (the app's own context), not the `Runner`. The
-//! cleanest way to let the handler change a runner setting without threading
-//! state through every demo's `Ctx` is a static the runner reads each frame.
-//! The same pattern is used for [`rye_time::frame_trace::set_capacity`].
-//!
-//! Cost: a couple of relaxed atomic loads per redraw. Negligible.
+//! Global atomics rather than `Runner` fields because the `fps` / `vsync`
+//! console commands get `&mut Ctx`, not the `Runner`; same pattern as
+//! [`rye_time::frame_trace::set_capacity`].
 //!
 //! ## Native vs. wasm semantics
 //!
-//! - **Native**: the runner [`precise_sleep_until`]s the deadline at the start
-//!   of each redraw. With `target_fps = 0` the cap is removed and the
-//!   surface's `PresentMode` decides the cadence; `Fifo` (default) blocks
-//!   at vsync. `vsync off` swaps the surface to `Mailbox` (or `Immediate` as
-//!   fallback) so the cap can drive cadence above the display refresh rate.
-//! - **Wasm**: the browser's `requestAnimationFrame` is the upper bound
-//!   (typically display refresh rate). The runner can only cap *lower* than
-//!   that by skipping RAF callbacks that arrive too early. Setting fps higher
-//!   than 60 on wasm is accepted but won't produce more frames than the
-//!   browser provides; the `vsync` command is effectively a no-op there
-//!   (browser surfaces typically advertise only `Fifo`).
+//! - **Native**: the runner [`precise_sleep_until`]s each redraw's deadline.
+//!   `target_fps = 0` removes the cap and the surface `PresentMode` drives
+//!   cadence (`Fifo` blocks at vsync); `vsync off` swaps to `Mailbox` /
+//!   `Immediate` so the cap can exceed the refresh rate.
+//! - **Wasm**: `requestAnimationFrame` is the upper bound; the runner can
+//!   only cap *lower* by skipping early RAF callbacks. `vsync` is a no-op
+//!   (browser surfaces advertise only `Fifo`).
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
-// `web_time::Instant` is the workspace's cross-target wall-clock type (aliases
-// `std::time::Instant` on native, shims to `performance.now()` on wasm32).
-// `std::time::Instant::now` panics on wasm32, so the swap is mandatory.
+// `web_time::Instant`: cross-target wall clock (native `std`, wasm
+// `performance.now()`). `std::time::Instant::now` panics on wasm32.
 use web_time::Instant;
 
-/// Initial value the runner uses unless a console command changes it. `0`
-/// means "uncapped": native uses the surface's PresentMode (typically vsync
-/// at the display refresh rate) and wasm uses the browser RAF cadence. We
-/// previously defaulted to 60 fps (~16.667 ms) on the assumption that "most
-/// displays are 60 Hz so the cap is a no-op," but that assumption breaks on
-/// 120/144/240 Hz displays where the cap actively suppresses the native
-/// rate AND introduces RAF-jitter alternating-skip in the worker. Defaulting
-/// to uncapped means `fps <N>` is the only way to introduce a cap, which
-/// matches the principle of least surprise.
+/// Initial period. `0` = uncapped (native uses the surface PresentMode,
+/// wasm uses RAF cadence). Defaulting uncapped avoids the prior 60 fps
+/// default suppressing the native rate on 120/144/240 Hz displays and
+/// introducing RAF alternating-skip jitter; `fps <N>` is the only way in.
 const DEFAULT_PERIOD_NS: u64 = 0;
 
-/// Target frame period in nanoseconds. `0` means "uncapped"; the runner will
-/// not sleep / skip and lets the display refresh rate or browser RAF be the
-/// pacing source.
+/// Target frame period in ns. `0` = uncapped; the runner neither sleeps nor
+/// skips and lets the refresh rate or RAF pace.
 static TARGET_PERIOD_NS: AtomicU64 = AtomicU64::new(DEFAULT_PERIOD_NS);
 
 /// Set the target frame period from a desired fps. `fps <= 0.0` removes the cap
@@ -84,10 +66,8 @@ pub fn target_fps() -> f32 {
 // Vsync request channel
 // ---------------------------------------------------------------------------
 
-// Encodes a pending vsync request between the console command (writer) and the
-// runner (reader, once per redraw). `0` = no request pending; `1` = "on";
-// `2` = "off". The runner swaps it back to 0 after applying so subsequent
-// frames don't re-reconfigure the surface every tick.
+// Pending vsync request; `0` = none. Runner swaps back to 0 after applying
+// so the surface isn't reconfigured every tick.
 const VSYNC_NONE: u8 = 0;
 const VSYNC_REQ_ON: u8 = 1;
 const VSYNC_REQ_OFF: u8 = 2;
@@ -99,18 +79,15 @@ pub fn request_vsync_on() {
     PENDING_VSYNC.store(VSYNC_REQ_ON, Ordering::Release);
 }
 
-/// Request that the runner switch the surface to vsync-off on its next redraw.
-/// The runner picks the best available off-mode (`Mailbox` if advertised,
-/// otherwise `Immediate`, otherwise leaves the mode alone since the adapter
-/// has nothing better than `Fifo` to offer; this is the typical browser case).
+/// Request the runner switch the surface to vsync-off on its next redraw.
+/// The runner picks `Mailbox`, else `Immediate`, else leaves `Fifo` (the
+/// typical browser case).
 pub fn request_vsync_off() {
     PENDING_VSYNC.store(VSYNC_REQ_OFF, Ordering::Release);
 }
 
-/// Pending vsync transitions for the runner to apply. `Some(true)` = caller
-/// asked for vsync-on; `Some(false)` = vsync-off; `None` = no pending change.
-/// Reading clears the pending request so the runner re-applies only when the
-/// user pokes the console.
+/// Read + clear the pending vsync transition. `Some(true)` = on,
+/// `Some(false)` = off, `None` = no change.
 pub fn take_pending_vsync() -> Option<bool> {
     match PENDING_VSYNC.swap(VSYNC_NONE, Ordering::AcqRel) {
         VSYNC_REQ_ON => Some(true),
@@ -123,28 +100,16 @@ pub fn take_pending_vsync() -> Option<bool> {
 // Precise sleep
 // ---------------------------------------------------------------------------
 
-/// Spin-tail length: the runner coarse-sleeps the bulk of the wait, then
-/// busy-waits the last `SPIN_TAIL` so the wake-up lands inside ~100 µs of the
-/// deadline regardless of the OS timer's nominal precision. Tuned to be wider
-/// than Windows' default 15.625 ms timer tick is *imprecise*, not wider than
-/// the *whole* tick: `std::thread::sleep` rounds DOWN sometimes and UP others,
-/// and 2 ms of spin covers the worst-case overshoot we've seen on Win11.
-///
-/// Native-only: the sole consumer is [`sleep_until`], which is cfg'd out on
-/// wasm32 (the worker takes the skip-and-rerequest path instead of sleeping).
+/// Busy-wait tail after the coarse sleep. 2 ms covers the worst-case
+/// `std::thread::sleep` overshoot seen on Win11's 15.625 ms timer tick;
+/// native-only since wasm skips-and-rerequests instead of sleeping.
 #[cfg(not(target_arch = "wasm32"))]
 const SPIN_TAIL: Duration = Duration::from_millis(2);
 
-/// Sleep until `deadline`, hybrid coarse-sleep + spin-wait for sub-millisecond
-/// precision. The naive `std::thread::sleep` rounds to the system timer
-/// granularity (default ~15.6 ms on Windows), which makes any fps cap below
-/// the vsync rate land far off the intended period. We coarse-sleep until
-/// `SPIN_TAIL` before the deadline, then `Instant::now()`-spin the tail.
-///
-/// The spin section saturates one core at 100% but only for ≤2 ms per frame;
-/// at a 60 fps cap that's <13% of one logical core, well inside the noise of
-/// any real workload. On wasm32 this collapses to "do nothing" since the
-/// runner takes the skip-and-rerequest path before reaching this code.
+/// Sleep until `deadline` with sub-millisecond precision: coarse-sleep
+/// until `SPIN_TAIL` before, then spin. Plain `std::thread::sleep` rounds
+/// to the timer granularity (~15.6 ms on Windows), missing sub-vsync caps.
+/// The spin saturates one core for <=2 ms/frame (<13% at a 60 fps cap).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn precise_sleep_until(deadline: Instant) {
     let now = Instant::now();
@@ -155,28 +120,21 @@ pub fn precise_sleep_until(deadline: Instant) {
     if total > SPIN_TAIL {
         std::thread::sleep(total - SPIN_TAIL);
     }
-    // Busy-wait the tail. `Instant::now()` is monotonic so this loop must
-    // terminate as long as the deadline is a valid future instant.
+    // `Instant::now()` is monotonic, so the spin terminates for any valid
+    // future deadline.
     while Instant::now() < deadline {
         std::hint::spin_loop();
     }
 }
 
-/// Stub on wasm32 (the runner takes the skip-and-rerequest path before
-/// reaching the precise-sleep code; this exists only so the call site doesn't
-/// need a `cfg`).
+/// Stub on wasm32 (the runner skips-and-rerequests instead); exists so the
+/// call site needs no `cfg`.
 #[cfg(target_arch = "wasm32")]
 pub fn precise_sleep_until(_deadline: Instant) {}
 
-// Test-only shared lock. Every test in this crate that touches the
-// process-global pacing atomics (`TARGET_PERIOD_NS`, `PENDING_VSYNC`) must
-// hold this lock for the duration of its observations. Without it, cargo's
-// default parallel test runner interleaves writes and reads across modules
-// (`fps::tests`, `vsync::tests`, this module) and produces flaky assertions.
-//
-// `unwrap_or_else(|e| e.into_inner())` keeps the suite robust against a
-// poisoned lock from a panicking sibling test; the data inside is just unit,
-// so there's nothing to recover from.
+// Shared lock serializing tests that touch the global pacing atomics;
+// without it cargo's parallel runner interleaves reads/writes and flakes.
+// `unwrap_or_else(|e| e.into_inner())` ignores poison (the data is unit).
 #[cfg(test)]
 pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -187,8 +145,7 @@ mod tests {
     #[test]
     fn default_is_60fps() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Reset to the canonical default in case a sibling test (or a
-        // previous run) left the atomic in another state.
+        // Reset in case a sibling test left the atomic elsewhere.
         set_target_fps(60.0);
         assert!((target_fps() - 60.0).abs() < 0.01);
         assert!(target_period().is_some());
@@ -226,9 +183,8 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn precise_sleep_lands_close_to_deadline() {
-        // 50 ms is well above any reasonable OS timer granularity (Windows
-        // default is ~15.625 ms); the hybrid should wake within ~SPIN_TAIL of
-        // the deadline.
+        // 50 ms is well above the ~15.625 ms Windows timer tick; the hybrid
+        // should wake within ~SPIN_TAIL of the deadline.
         let start = Instant::now();
         let deadline = start + Duration::from_millis(50);
         precise_sleep_until(deadline);
@@ -246,9 +202,8 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn precise_sleep_steady_cadence() {
-        // Five 20-ms periods chained back-to-back should land within ±5 ms of
-        // the ideal 100 ms total. Catches drift from the system timer rounding
-        // each individual sleep call.
+        // Five chained 20-ms periods should land within +/-5 ms of 100 ms;
+        // catches per-call timer-rounding drift.
         let period = Duration::from_millis(20);
         let start = Instant::now();
         let mut deadline = start;
@@ -268,7 +223,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn precise_sleep_past_deadline_returns_immediately() {
-        // Deadline already in the past shouldn't deadlock the spin loop.
+        // A past deadline must not deadlock the spin loop.
         let start = Instant::now();
         let deadline = start - Duration::from_millis(10);
         precise_sleep_until(deadline);
