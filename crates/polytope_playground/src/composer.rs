@@ -1,22 +1,11 @@
 //! Composer mode: typed-formula parser + sequence-of-terms UI.
 //!
-//! The composer lets the user build a `Vec<RotorTerm>` either by
-//! typing a single-term expression (`90° (xy + zw)`) or by appending
-//! basis-plane chips into a draft. Terms render as draggable cards
-//! that reorder via DnD, with cross-term plane migration via plane
-//! pills inside cards. A "scrub slider" projects `log(rot_state)`
-//! onto the seq's net bivector direction so the user can scrub
-//! through the seq's effect on orientation while preserving any
-//! perpendicular rotation already applied.
-//!
-//! This module owns:
-//!
-//! - The formula parser (`parse_formula_term` + helpers): degrees-
-//!   default angle, optional `rad` suffix, optional `*` / `·`
-//!   between scalar and bivector, optional outer parens.
-//! - The composer-mode rendering methods on [`Demo`]:
-//!   `render_composer_mode`, `render_composer_seq_cards`,
-//!   `render_composer_scrub_slider`.
+//! The user builds a `Vec<RotorTerm>` by typing a single-term
+//! expression (`90° (xy + zw)`) or appending basis-plane chips into a
+//! draft. Terms render as draggable cards that reorder via DnD, with
+//! cross-term plane migration via plane pills. The scrub slider
+//! projects `log(rot_state)` onto the seq's net bivector direction so
+//! scrubbing preserves any perpendicular rotation already applied.
 
 use rye_app::egui;
 use rye_egui::{
@@ -36,15 +25,10 @@ use crate::state::{render_plane_sum, DeferredAction, Demo, DragPayload, RotorTer
 // Formula parser
 // ---------------------------------------------------------------------------
 
-/// Parse a single term written like `90° (xy + zw)`, `xy + xz`,
-/// `90 xy`, `0.5 rad xy`, into a [`RotorTerm`]. Degrees are the
-/// default unit for the scalar; `rad` suffix overrides. The `*`
-/// or `·` between scalar and bivector is optional. Outer parens
-/// around the bivector sum are optional.
-///
-/// Single expression per call: chained terms (`exp(A) * exp(B)`)
-/// are not parsed here, since the user submits each term separately
-/// via the input bar; rotor multiplication lives in the seq.
+/// Parse one term like `90° (xy + zw)`, `90 xy`, `0.5 rad xy` into a
+/// [`RotorTerm`]. Degrees default; `rad` overrides. The `*` / `·`
+/// separator and outer parens are optional. One expression per call;
+/// rotor multiplication across terms lives in the seq.
 pub(crate) fn parse_formula_term(input: &str) -> Result<RotorTerm, String> {
     let normalized = input.trim().replace('·', "*").replace('°', "deg ");
     let s = normalized.trim();
@@ -125,10 +109,8 @@ impl Demo {
     pub(crate) fn render_composer_mode(&mut self, ui: &mut egui::Ui) {
         ui.separator();
 
-        // Typed-formula bar + single-plane chip row on the same
-        // line. Layout: `f: [text input] [Add] [+xy] ... [+zw]`.
-        // The chips append to the draft (fast path for single-
-        // plane terms); the text input takes a full expression.
+        // `f: [text input] [Add] [+xy] ... [+zw]`. Chips append to the
+        // draft; the text input takes a full expression.
         ui.horizontal_wrapped(|ui| {
             ui.label("f:");
             let resp = ui.add(
@@ -163,7 +145,6 @@ impl Demo {
                     self.pending_actions.push(DeferredAction::DraftPush(*plane));
                 }
             }
-            // Clear at the right end of the chips row.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(!self.seq.is_empty(), egui::Button::new("Clear"))
@@ -181,8 +162,7 @@ impl Demo {
             );
         }
 
-        // Draft preview rendered as a card matching the committed-
-        // term style. Add commits to seq; Discard scraps the draft.
+        // Draft preview as a card; Add commits to seq, × discards.
         if !self.draft.is_empty() {
             egui::Frame::group(ui.style())
                 .inner_margin(4.0)
@@ -218,18 +198,11 @@ impl Demo {
         self.render_composer_scrub_slider(ui);
     }
 
-    /// "Slide-to-rotate" slider for the composer: a full-width
-    /// row sized like the w/t sliders. Drives a rotation along
-    /// the seq's net bivector direction.
-    ///
-    /// Math: let `D = compose_omega() / |compose_omega()|` (the
-    /// seq's unit-bivector direction). The slider value is the
-    /// projection of `log(rot_state)` onto `D`, in degrees. On
-    /// drag, the projection is updated; the perpendicular
-    /// component of `log(rot_state)` is preserved, so adjusting
-    /// the slider rotates ALONG the seq's direction without
-    /// disturbing other rotations. Hidden when the seq is empty
-    /// or its net bivector is zero (terms cancel out).
+    /// Slide-to-rotate slider along the seq's net bivector direction.
+    /// Slider value is the projection of `log(rot_state)` onto unit
+    /// `D = compose_omega()/|compose_omega()|`, in degrees; the
+    /// perpendicular component is preserved on drag so other rotations
+    /// stay put. Hidden when the seq's net bivector is zero.
     pub(crate) fn render_composer_scrub_slider(&mut self, ui: &mut egui::Ui) {
         let omega = self.compose_omega();
         let mag_sq = omega.magnitude_squared();
@@ -249,10 +222,8 @@ impl Demo {
         let row_size = egui::vec2(avail, CONTROL_H);
         let row_layout = egui::Layout::left_to_right(egui::Align::Center);
 
-        // Same -360..360 range as the per-plane sliders, for the
-        // same Spin(4) double-cover reason: a 360° projection
-        // along the seq's direction lands at the negative-rotor
-        // -1, and 720° returns to identity.
+        // -360..360 for the Spin(4) double cover: 360° lands at the
+        // negative rotor -1, 720° returns to identity.
         let formatted = format!("f {proj_deg:>+6.1}°");
         ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
             let interaction = slider_with_edit(
@@ -274,17 +245,11 @@ impl Demo {
         });
     }
 
-    /// Composer's seq-card row: each [`RotorTerm`] renders as a
-    /// single-row card. The whole card is its own drag source
-    /// (Term payload, reorders the seq) and also a drop zone for
-    /// `Entry` payloads (cross-term plane migration). Insertion-
-    /// pipe gaps between cards give precise drop indication for
-    /// the Term-reorder path. State mutations gathered during
-    /// card rendering (`term_moves`, `entry_moves`,
-    /// `remove_term`, `remove_scalar`, `add_scalar`,
-    /// `edit_scalar`) are all applied at the end of this
-    /// function so the card-rendering loop can borrow `self.seq`
-    /// immutably while in flight.
+    /// Composer's seq-card row. Each [`RotorTerm`] card is both a drag
+    /// source (Term payload, reorders the seq) and a drop zone (Entry
+    /// payload, cross-term plane migration). Mutations are gathered
+    /// during rendering and applied at the end so the loop can borrow
+    /// `self.seq` immutably in flight.
     pub(crate) fn render_composer_seq_cards(&mut self, ui: &mut egui::Ui) {
         let mut entry_moves: Vec<(usize, usize, usize)> = Vec::new();
         let mut remove_term: Option<usize> = None;
@@ -375,14 +340,8 @@ impl Demo {
                                     ui.horizontal(|ui| {
                                         let term = &self.seq[term_idx];
                                         if let Some(phi) = term.scalar {
-                                            // Inline editor: a DragValue
-                                            // sized + colored to match the
-                                            // previous read-only label. Drag
-                                            // the value to adjust; click to
-                                            // enter text-edit mode. The old
-                                            // right-click->menu->menu->DragValue
-                                            // chain stayed defocused on click
-                                            // so the value never committed.
+                                            // Inline DragValue: drag to adjust,
+                                            // click to type.
                                             let phi_color = egui::Color32::from_rgb(255, 150, 150);
                                             let mut deg = phi.to_degrees();
                                             let drag_resp = ui
@@ -458,10 +417,8 @@ impl Demo {
                     let scalar_now = self.seq[term_idx].scalar;
                     let menu_resp = card_resp.interact(egui::Sense::click());
                     menu_resp.context_menu(|ui| {
-                        // Editing the scalar is now inline on the card itself
-                        // (the colored DragValue above), so the context menu
-                        // only owns the irreversible actions: add/remove the
-                        // scalar field, delete the whole term.
+                        // Scalar editing is inline above; the menu owns only
+                        // add/remove-scalar and delete-term.
                         if scalar_now.is_some() {
                             if ui.button("Remove scalar (φ)").clicked() {
                                 remove_scalar = Some(term_idx);
@@ -518,8 +475,8 @@ impl Demo {
                 }
             }
         }
-        // Cross-term entry migrations. Sort by (source term, plane idx
-        // descending) so removals don't shift earlier indices.
+        // Sort by (source term, plane idx descending) so removals don't
+        // shift earlier indices.
         entry_moves.sort_by_key(|(from, idx, _)| (*from, std::cmp::Reverse(*idx)));
         for (from_t, idx, to_t) in entry_moves {
             if let Some(src) = self.seq.get_mut(from_t) {

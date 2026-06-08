@@ -1,35 +1,15 @@
-//! Active-set rotation mode: six basis-plane checkboxes + per-plane angle
-//! sliders.
+//! Active-set rotation mode: six basis-plane checkboxes + per-plane
+//! angle sliders.
 //!
-//! ## Source of truth
-//!
-//! Active mode's orientation is NOT stored in `rot_state` directly; it is
-//! DERIVED each frame. The truth is `Demo::base_angles[6]` (the user's set
-//! angle per plane) plus `Demo::rot_time` (the spin clock). The displayed
-//! angle of plane `i` is `base_angles[i] + (rot_time * rate if active[i])`,
-//! and the rotor is the ORDERED PRODUCT `∏ᵢ exp(planeᵢ · displayed_angle[i])`
-//! (see `Demo::active_rotor` / `Demo::active_rotor_at`). `rot_state` is
-//! recomputed from that product every frame.
-//!
-//! This is a product, not a sum: `exp(a·xy) · exp(b·xz) ≠ exp(a·xy + b·xz)`
-//! when the planes don't commute (Baker-Campbell-Hausdorff). The product form
-//! is what makes each slider an independent factor, so dragging one slider
-//! doesn't redistribute the others. The cost is that the rotor is BCH-coupled
-//! internally and `log(rot_state)` will NOT return the user-set angles -- so
-//! Active mode never reads back through `log`; the sliders are the source of
-//! truth. Composer mode, by contrast, keeps the sum-of-bivectors model
-//! throughout. Every t-scrub / filmstrip site routes through
-//! `Demo::rotor_at_time`, which dispatches between the two so the scrub
-//! matches the spin path's math in either mode.
-//!
-//! This module owns:
-//!
-//! - [`combo_name`]: pretty-name for recognizable active-set
-//!   combinations (single planes, isoclinics, all-w, etc.). Used by
-//!   the formula popup in `ui.rs` to give a readable name to the
-//!   current rotation when in Active mode.
-//! - The active-mode rendering methods on [`Demo`]:
-//!   `render_active_mode` and `render_plane_slider_cell`.
+//! Orientation is derived each frame, not stored: the truth is
+//! `base_angles[6]` plus `rot_time`, giving displayed angle
+//! `base_angles[i] + (rot_time * rate if active[i])`. The rotor is
+//! the ordered product `∏ᵢ exp(planeᵢ · displayed_angle[i])`. Because
+//! non-commuting planes make this a product, not a sum (Baker-
+//! Campbell-Hausdorff), each slider stays an independent factor; the
+//! cost is `log(rot_state)` does NOT recover the set angles, so Active
+//! mode never reads back through `log`. Composer mode keeps the sum-of-
+//! bivectors model instead.
 
 use rye_app::egui;
 use rye_math::Plane4;
@@ -37,10 +17,8 @@ use rye_math::Plane4;
 use crate::consts::CONTROL_H;
 
 /// Wrap a degree value into `(-720, 720]` so the slider handle stays
-/// inside the widget's clamping range while continuous spin advances
-/// the raw angle past one period. `1440` is the full two-cycle range
-/// (`+720` minus `-720`); `rem_euclid` keeps the result non-negative,
-/// then we re-center.
+/// in range while continuous spin advances the raw angle past one
+/// period. `1440` is the two-cycle span.
 fn wrap_slider_deg(d: f32) -> f32 {
     let m = d.rem_euclid(1440.0);
     if m > 720.0 {
@@ -52,15 +30,8 @@ fn wrap_slider_deg(d: f32) -> f32 {
 use crate::state::Demo;
 
 /// Name a recognizable combination of active planes. Indices match
-/// `Plane4::ALL`: `0=xy 1=xz 2=xw 3=yz 4=yw 5=zw`. Order-independent,
-/// only the active *set* matters.
-///
-/// Curated entries cover common 4D-geometry classics: single
-/// stretches, the three perpendicular-pair isoclinics (the only
-/// commuting bivector pairs in 4D, related to left/right Hopf
-/// maps), pure-3D rotations, and the famous "all w-planes"
-/// composition that drives the cross-section through its main-
-/// diagonal extreme.
+/// `Plane4::ALL`: `0=xy 1=xz 2=xw 3=yz 4=yw 5=zw`. Only the active
+/// set matters; order-independent.
 pub(crate) fn combo_name(active: &[bool; 6]) -> Option<&'static str> {
     let mut mask = 0u8;
     for (i, &on) in active.iter().enumerate() {
@@ -94,10 +65,8 @@ pub(crate) fn combo_name(active: &[bool; 6]) -> Option<&'static str> {
 }
 
 impl Demo {
-    /// Active body: 3-per-row 2-row grid of
-    /// `[checkbox][label][slider][value]`. Pinned widths so
-    /// columns align across rows. Each value cell is right-click
-    /// editable via the shared `slider_with_edit` helper.
+    /// Active body: 2x3 grid of `[checkbox][label][slider][value]`
+    /// cells with pinned widths so columns align across rows.
     pub(crate) fn render_active_mode(&mut self, ui: &mut egui::Ui) {
         const TOP_ROW: [usize; 3] = [0, 1, 3]; // xy, xz, yz
         const BOTTOM_ROW: [usize; 3] = [2, 4, 5]; // xw, yw, zw
@@ -133,15 +102,10 @@ impl Demo {
         }
     }
 
-    /// One plane cell. All component widths pinned by the caller
-    /// so the cell renders identically regardless of which row
-    /// or column it's in.
-    ///
-    /// The slider reads/writes `base_angles[plane_idx]` via the
-    /// displayed-angle formula (`base + spin_contribution`), so each
-    /// slider only mutates its own plane's factor in the active-mode
-    /// rotor product. Independent sliders, no log/exp round-trips,
-    /// no cross-slider redistribution.
+    /// One plane cell, all widths pinned by the caller. The slider
+    /// reads/writes `base_angles[plane_idx]` via `base +
+    /// spin_contribution`, keeping each slider an independent factor
+    /// in the rotor product (no log/exp round-trips).
     pub(crate) fn render_plane_slider_cell(
         &mut self,
         ui: &mut egui::Ui,
@@ -152,36 +116,19 @@ impl Demo {
         value_w: f32,
     ) {
         let plane = Plane4::ALL[plane_idx];
-        // Displayed angle BEFORE any widget in this cell mutates state this
-        // frame. The checkbox below flips `active[plane_idx]`, which changes
-        // whether the spin contribution counts toward the displayed angle, so
-        // we capture the pre-toggle displayed angle here to absorb that step.
+        // Captured before the checkbox below flips `active[plane_idx]`,
+        // so the toggle can be absorbed without teleporting the body.
         let displayed_before = self.active_displayed_angle(plane_idx);
-        // Slider value is the *displayed* angle (base + spin contribution),
-        // wrapped into (-720°, 720°]. The wrap is purely for the slider
-        // handle: during continuous spin the raw displayed angle grows
-        // unboundedly, which would pin the slider against its 720° clamp
-        // and stop showing motion. Wrapping into the period keeps the
-        // handle moving cyclically. `active_rotor()` uses the RAW
-        // displayed angle (no wrap), so the rotor itself is identical
-        // regardless of how this value is normalized for display --
-        // `exp(plane * (x + 2π·k))` is the same rotor for any integer k
-        // when the plane is a simple unit bivector.
+        // Wrap is display-only: `active_rotor()` uses the raw angle, and
+        // `exp(plane * (x + 2π·k))` is the same rotor for a unit bivector.
         let mut deg = wrap_slider_deg(displayed_before.to_degrees());
         let checkbox_resp = ui.add_sized(
             [checkbox_w, 18.0],
             egui::Checkbox::new(&mut self.active[plane_idx], ""),
         );
         if checkbox_resp.changed() {
-            // Toggling a plane must not teleport the body: the displayed angle
-            // is `base + spin_contribution(active)`, and flipping `active`
-            // adds or removes the `rot_time * RATE` spin term in one step.
-            // Re-solve `base` so the displayed angle is continuous across the
-            // toggle (freeze the accumulated spin into `base` when switching
-            // off, subtract it back out when switching on):
-            //     base = displayed_before - spin_contribution(active_after)
-            // This keeps the checkbox decoupled from the live orientation, the
-            // same invariant the slider write-back below preserves for drags.
+            // Re-solve base so the displayed angle is continuous across the
+            // toggle: base = displayed_before - spin_contribution(active_after).
             let spin_contribution = if self.active[plane_idx] {
                 self.rot_time * crate::consts::BASE_ROTATION_RATE
             } else {
@@ -228,10 +175,8 @@ impl Demo {
             },
         );
         if slider_resp.changed() || popup_changed {
-            // Solve for base_angles so the displayed angle matches the
-            // slider's new position:
-            //     displayed = base + spin_contribution
-            //  => base = displayed - spin_contribution
+            // base = displayed - spin_contribution, so the displayed angle
+            // matches the slider's new position.
             let target_rad = deg.to_radians();
             let spin_contribution = if self.active[plane_idx] {
                 self.rot_time * crate::consts::BASE_ROTATION_RATE
@@ -251,7 +196,6 @@ mod tests {
 
     #[test]
     fn wrap_is_identity_inside_range() {
-        // Values already in (-720, 720] pass through unchanged.
         for d in [0.0_f32, 359.0, -359.0, 720.0, -719.0, 123.456] {
             assert_eq!(wrap_slider_deg(d), d, "in-range value {d} changed");
         }
@@ -259,21 +203,17 @@ mod tests {
 
     #[test]
     fn wrap_folds_one_period_past_the_top() {
-        // 721 is one degree past the +720 top; folds to -719.
         assert_eq!(wrap_slider_deg(721.0), -719.0);
-        // 1080 (1.5 periods) folds to -360.
         assert_eq!(wrap_slider_deg(1080.0), -360.0);
     }
 
     #[test]
     fn wrap_folds_below_the_bottom() {
-        // -721 is one degree below the -720 bottom; folds to +719.
         assert_eq!(wrap_slider_deg(-721.0), 719.0);
     }
 
     #[test]
     fn wrap_period_multiples_land_on_zero() {
-        // Exact multiples of the 1440 two-cycle period map to 0.
         assert_eq!(wrap_slider_deg(1440.0), 0.0);
         assert_eq!(wrap_slider_deg(-1440.0), 0.0);
         assert_eq!(wrap_slider_deg(2880.0), 0.0);
@@ -281,8 +221,6 @@ mod tests {
 
     #[test]
     fn wrap_result_always_in_range() {
-        // Sweep a wide span (continuous spin pushes the raw angle far past
-        // one period) and confirm every result lands in (-720, 720].
         let mut d = -5000.0_f32;
         while d <= 5000.0 {
             let w = wrap_slider_deg(d);

@@ -1,25 +1,17 @@
-//! 4D shape catalog: per-polytope metadata, the default startup row,
-//! the full catalog with categories, the `+`-button menu helper, and
-//! the CLI `--shapes` parser.
-//!
-//! The catalog is the single source of truth for shape names, colors,
-//! and tooltips used throughout the demo (`+` shape menu, filmstrip
-//! subject combo, CLI parser, card labels). Keeping it in one file
-//! means adding a new shape touches one place.
+//! 4D shape catalog: the single source of truth for shape names,
+//! colors, and tooltips. Holds per-polytope metadata, the default
+//! startup row, the categorized catalog, the `+`-menu helper, and the
+//! CLI `--shapes` parser.
 
 use anyhow::{anyhow, Result};
 use rye_app::egui;
 use rye_physics::polytope::Polytope4;
 use rye_render::raymarch::RaymarchShape;
 
-/// One polytope's metadata: typed shape identifier ([`RaymarchShape`], unifying the GPU
-/// SDF shape ID with the optional polytope topology), per-body fragment color (driven
-/// into `BodyUniform.color` on the GPU side, NOT the panel's card color; those are
-/// uniformly grey in the redesigned UI), short display label, and long mathematical name
-/// shown in card tooltips. The long name uses the `pentachoron` / `tesseract` /
-/// `hexadecachoron` family; the `*-plex` aliases (pentaplex, dodecaplex, ...) are
-/// deliberately avoided since "plex" is dimension-generalized rather than being the
-/// actual 4D name.
+/// One polytope's metadata. `body_color` drives `BodyUniform.color`
+/// on the GPU, not the (uniformly grey) card color. `long_name` uses
+/// the `pentachoron`/`tesseract`/`hexadecachoron` family, not the
+/// dimension-generalized `*-plex` aliases.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub(crate) struct ShapeEntry {
     pub(crate) shape: RaymarchShape,
@@ -28,9 +20,8 @@ pub(crate) struct ShapeEntry {
     pub(crate) long_name: &'static str,
 }
 
-/// Default row when no `--shapes` argument is given. Ordered to put the 24-cell first
-/// (most "4D-distinct" cross-section), then the pentachoron / 16-cell / tesseract
-/// triple; visually contrasting shapes left-to-right.
+/// Default row when no `--shapes` is given. 24-cell first (most
+/// 4D-distinct cross-section), then visually contrasting shapes.
 pub(crate) const DEFAULT_ROW: &[ShapeEntry] = &[
     ShapeEntry {
         shape: RaymarchShape::Polytope(Polytope4::Cell24),
@@ -58,11 +49,9 @@ pub(crate) const DEFAULT_ROW: &[ShapeEntry] = &[
     },
 ];
 
-/// Catalog of every shipped 4D shape: the six convex regular polychora plus four
-/// non-polychoral SDF-trivial shapes (3-sphere, duocylinder, Clifford torus, spherinder).
-/// Used by the filmstrip subject picker and the `+` shape menu. Colours are RGB float
-/// channels passed straight to the WGSL kernel (engine doesn't constrain the colour
-/// space).
+/// Every shipped 4D shape: the six convex regular polychora plus four
+/// smooth solids (3-sphere, duocylinder, Clifford torus, spherinder).
+/// `body_color` channels pass straight to the WGSL kernel.
 pub(crate) const SHAPE_CATALOG: &[ShapeEntry] = &[
     ShapeEntry {
         shape: RaymarchShape::Polytope(Polytope4::Pentatope),
@@ -126,11 +115,9 @@ pub(crate) const SHAPE_CATALOG: &[ShapeEntry] = &[
     },
 ];
 
-/// Render a category-grouped shape menu into the current ui. Both call sites (the `+`
-/// shape menu and the filmstrip subject combo) use this so the layout stays consistent:
-/// top level lists the [`SHAPE_CATEGORIES`] entries, each opens a nested submenu of the
-/// shapes in that category, every entry carries a `long_name` hover tooltip. `on_select`
-/// fires when the user clicks an entry; the helper closes the menu.
+/// Category-grouped shape menu: top level lists [`SHAPE_CATEGORIES`],
+/// each a submenu of shapes with a `long_name` hover tooltip.
+/// `on_select` fires on click; the helper closes the menu.
 pub(crate) fn render_shape_catalog_menu(ui: &mut egui::Ui, mut on_select: impl FnMut(ShapeEntry)) {
     for cat in SHAPE_CATEGORIES {
         ui.menu_button(cat.name, |ui| {
@@ -148,11 +135,9 @@ pub(crate) fn render_shape_catalog_menu(ui: &mut egui::Ui, mut on_select: impl F
     }
 }
 
-/// Subcategories of [`SHAPE_CATALOG`], expressed as half-open index ranges into the
-/// catalog. Used by the shape menus (`+` button and filmstrip subject combo) to group
-/// entries with a header label and separator. Keeping the categories as ranges (rather
-/// than nested slices) lets `parse_shape_name` and direct `SHAPE_CATALOG[i]` lookups
-/// stay flat.
+/// Half-open index ranges into [`SHAPE_CATALOG`] that group menu
+/// entries under a header. Ranges (not nested slices) keep flat
+/// `SHAPE_CATALOG[i]` lookups working.
 struct ShapeCategory {
     name: &'static str,
     start: usize,
@@ -172,9 +157,8 @@ const SHAPE_CATEGORIES: &[ShapeCategory] = &[
     },
 ];
 
-/// Catalog of named shapes. Both common math-name aliases (the `n-cell` form) and
-/// Platonic-slice aliases (the `tetrahedron` / `cube` / etc. form) resolve to the same
-/// shape index.
+/// Resolve a shape name. Both `n-cell` math names and Platonic-slice
+/// aliases (`tetrahedron`, `cube`, ...) map to the same shape.
 pub(crate) fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
     let n = name.to_lowercase();
     let needle: &str = n.as_str();
@@ -207,8 +191,8 @@ pub(crate) fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
     })
 }
 
-/// Parse the row from CLI arguments. Looks for `--shapes name1 name2 ...` (consumes
-/// everything after the flag). Returns [`DEFAULT_ROW`] if the flag isn't present.
+/// Parse `--shapes name1 name2 ...` from CLI args (consumes the rest).
+/// Returns [`DEFAULT_ROW`] if the flag is absent.
 pub(crate) fn parse_row_from_args() -> Result<Vec<ShapeEntry>> {
     let args: Vec<String> = std::env::args().collect();
     let Some(idx) = args.iter().position(|a| a == "--shapes") else {
