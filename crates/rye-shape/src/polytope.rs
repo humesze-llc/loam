@@ -1,12 +1,12 @@
 //! Topology of the six convex regular 4-polytopes: cached unit-circumradius
 //! vertex / edge / cell incidence data, addressable by a [`Polytope4`] enum
 //! whose discriminants mirror the renderer's `SHAPE_*` constants. Vertices wrap
-//! the [`crate::euclidean_r4`] generators; edges and cells are derived on first
+//! the [`crate::polytope_geom`] generators; edges and cells are derived on first
 //! access and cached for process lifetime. CPU-only; the SDF/WGSL kernel data
 //! lives in `rye_render::raymarch`.
 //!
 //! ```
-//! use rye_physics::polytope::Polytope4;
+//! use rye_shape::polytope::Polytope4;
 //!
 //! let topo = Polytope4::Tesseract.topology();
 //! assert_eq!(topo.vertices.len(), 16);
@@ -18,7 +18,7 @@ use std::sync::LazyLock;
 
 use glam::{Vec3, Vec4};
 
-use crate::euclidean_r4::{
+use crate::polytope_geom::{
     cell120_vertices, cell16_vertices, cell24_vertices, cell600_vertices, pentatope_vertices,
     tesseract_vertices,
 };
@@ -113,8 +113,8 @@ impl Polytope4 {
 
     /// Face hyperplanes derived from cell topology, as `(normals, inradius)`
     /// matching the shape of `cell120_face_planes` / `cell600_face_planes` in
-    /// [`crate::euclidean_r4`]. Pair with
-    /// [`crate::euclidean_r4::polytope_sdf_wolfe`] for an exact SDF.
+    /// [`crate::polytope_geom`]. Pair with
+    /// [`crate::polytope_geom::polytope_sdf_wolfe`] for an exact SDF.
     ///
     /// Unlike those dual-vertex helpers (exact on the axial + tesseract-corner
     /// orbits, approximate on the 96 golden-ratio orbits; the documented BUG),
@@ -150,10 +150,10 @@ impl Polytope4 {
 const DEFAULT_LINE_COLOR: [f32; 4] = [0.9, 0.9, 0.9, 1.0];
 const DEFAULT_LINE_WIDTH: f32 = 1.5;
 
-impl rye_shape::Visualizable<4> for Polytope4 {
-    fn to_lines(&self) -> Result<rye_shape::LineMesh<4>, rye_shape::NotVisualizable> {
+impl crate::Visualizable<4> for Polytope4 {
+    fn to_lines(&self) -> Result<crate::LineMesh<4>, crate::NotVisualizable> {
         let topo = self.topology();
-        let mut mesh = rye_shape::LineMesh::<4>::default();
+        let mut mesh = crate::LineMesh::<4>::default();
         mesh.segments.reserve(topo.edges.len());
         mesh.colors.reserve(topo.edges.len());
         mesh.widths.reserve(topo.edges.len());
@@ -167,14 +167,14 @@ impl rye_shape::Visualizable<4> for Polytope4 {
         Ok(mesh)
     }
 
-    fn to_triangles(&self) -> Result<rye_shape::TriangleMesh<4>, rye_shape::NotVisualizable> {
+    fn to_triangles(&self) -> Result<crate::TriangleMesh<4>, crate::NotVisualizable> {
         // No 2-face incidence data is shipped, so there is nothing to fill.
-        Err(rye_shape::NotVisualizable::Degenerate)
+        Err(crate::NotVisualizable::Degenerate)
     }
 
-    fn to_points(&self) -> Result<rye_shape::PointMesh<4>, rye_shape::NotVisualizable> {
+    fn to_points(&self) -> Result<crate::PointMesh<4>, crate::NotVisualizable> {
         let topo = self.topology();
-        let mut mesh = rye_shape::PointMesh::<4>::default();
+        let mut mesh = crate::PointMesh::<4>::default();
         mesh.positions.reserve(topo.vertices.len());
         mesh.colors.reserve(topo.vertices.len());
         mesh.sizes.reserve(topo.vertices.len());
@@ -190,9 +190,9 @@ impl rye_shape::Visualizable<4> for Polytope4 {
 impl Polytope4 {
     /// Color each edge by the lowest-index cell its endpoints share, indexing
     /// `palette` modulo its length. Width stays at the default.
-    pub fn lines_colored_by_cell(self, palette: &[[f32; 4]]) -> rye_shape::LineMesh<4> {
+    pub fn lines_colored_by_cell(self, palette: &[[f32; 4]]) -> crate::LineMesh<4> {
         let topo = self.topology();
-        let mut mesh = rye_shape::LineMesh::<4>::default();
+        let mut mesh = crate::LineMesh::<4>::default();
         let n_palette = palette.len().max(1);
         for &[i, j] in topo.edges {
             let cell_idx = topo
@@ -214,9 +214,9 @@ impl Polytope4 {
     /// Color each edge endpoint by its 4D position via [`vertex_color_by_position`],
     /// giving a continuous color field across the edge graph. Useful for dense
     /// wireframes like the 600-cell where uniform white reads as a tangle.
-    pub fn lines_colored_by_position(self) -> rye_shape::LineMesh<4> {
+    pub fn lines_colored_by_position(self) -> crate::LineMesh<4> {
         let topo = self.topology();
-        let mut mesh = rye_shape::LineMesh::<4>::default();
+        let mut mesh = crate::LineMesh::<4>::default();
         mesh.segments.reserve(topo.edges.len());
         mesh.colors.reserve(topo.edges.len());
         mesh.widths.reserve(topo.edges.len());
@@ -259,13 +259,13 @@ const SECTION_EDGE_WIDTH: f32 = 2.0;
 /// edges)`, for rendering on top of an existing surface (SDF raymarch, parent
 /// wireframe). For replacing the SDF surface with opaque rasterized geometry,
 /// use [`polytope4_section_faces`]. The algorithm lives in
-/// [`for_each_section_cap`]; it reproduces the classical sections (5-cell
+/// `for_each_section_cap`; it reproduces the classical sections (5-cell
 /// midpoint -> tetrahedron, tesseract -> cube, etc.) with no special-casing.
 /// Either returned mesh may be empty if the slice misses the polytope.
 pub fn polytope4_section_overlay(
     polytope: Polytope4,
     slice: rye_math::WPlane,
-) -> (rye_shape::TriangleMesh<3>, rye_shape::LineMesh<3>) {
+) -> (crate::TriangleMesh<3>, crate::LineMesh<3>) {
     let topo = polytope.topology();
     polytope_section_overlay_with_vertices(topo.edges, topo.cells, topo.vertices, slice)
 }
@@ -280,9 +280,9 @@ pub fn polytope_section_overlay_with_vertices(
     cells: &[&[u32]],
     vertices: &[Vec4],
     slice: rye_math::WPlane,
-) -> (rye_shape::TriangleMesh<3>, rye_shape::LineMesh<3>) {
-    let mut tri_mesh = rye_shape::TriangleMesh::<3>::default();
-    let mut edge_mesh = rye_shape::LineMesh::<3>::default();
+) -> (crate::TriangleMesh<3>, crate::LineMesh<3>) {
+    let mut tri_mesh = crate::TriangleMesh::<3>::default();
+    let mut edge_mesh = crate::LineMesh::<3>::default();
 
     for_each_section_cap(edges, cells, vertices, slice, |ordered, centroid| {
         let cv_base = tri_mesh.vertices.len() as u32;
@@ -328,8 +328,8 @@ pub fn polytope_section_faces_with_vertices(
     vertices: &[Vec4],
     slice: rye_math::WPlane,
     color: [f32; 4],
-) -> rye_shape::TriangleMesh<3> {
-    let mut tri_mesh = rye_shape::TriangleMesh::<3>::default();
+) -> crate::TriangleMesh<3> {
+    let mut tri_mesh = crate::TriangleMesh::<3>::default();
     polytope_section_faces_append(edges, cells, vertices, slice, color, &mut tri_mesh);
     tri_mesh
 }
@@ -344,7 +344,7 @@ pub fn polytope_section_faces_append(
     vertices: &[Vec4],
     slice: rye_math::WPlane,
     color: [f32; 4],
-    out: &mut rye_shape::TriangleMesh<3>,
+    out: &mut crate::TriangleMesh<3>,
 ) {
     for_each_section_cap(edges, cells, vertices, slice, |ordered, centroid| {
         let cv_base = out.vertices.len() as u32;
@@ -370,7 +370,7 @@ pub fn polytope4_section_faces(
     polytope: Polytope4,
     slice: rye_math::WPlane,
     color: [f32; 4],
-) -> rye_shape::TriangleMesh<3> {
+) -> crate::TriangleMesh<3> {
     let topo = polytope.topology();
     polytope_section_faces_with_vertices(topo.edges, topo.cells, topo.vertices, slice, color)
 }
@@ -560,7 +560,7 @@ static CELL600_VERTICES: LazyLock<&'static [Vec4]> =
 /// distance.
 ///
 /// The 120-cell value is non-obvious: Wikipedia's `3 − √5` is at circumradius
-/// `2√2` (the convention of [`crate::euclidean_r4::cell120_vertices`]), so unit
+/// `2√2` (the convention of [`crate::polytope_geom::cell120_vertices`]), so unit
 /// circumradius gives `(3 − √5)/(2√2) = 1/(φ²·√2)`. Dropping the `√2` is the
 /// 600-cell dual's identity, not the 120-cell's.
 fn canonical_edge_length(p: Polytope4) -> f32 {
@@ -627,7 +627,7 @@ static CELL600_EDGES: LazyLock<&'static [[u32; 2]]> =
 // ---------------------------------------------------------------------------
 //
 // Cells are fit against the polytope's own edge graph, not an external dual:
-// the 120-cell and 600-cell generators in [`crate::euclidean_r4`] are not in
+// the 120-cell and 600-cell generators in [`crate::polytope_geom`] are not in
 // mutually-dual orientation (their 96 golden-ratio vertices differ), so a
 // dual's vertices are not the other's face normals.
 
@@ -1118,7 +1118,7 @@ mod tests {
     /// [`Visualizable<4>::to_lines`] returns one segment per topology edge.
     #[test]
     fn visualizable_line_count_matches_edge_count() {
-        use rye_shape::Visualizable;
+        use crate::Visualizable;
         for p in Polytope4::ALL {
             let mesh = <Polytope4 as Visualizable<4>>::to_lines(&p)
                 .expect("polytopes always produce line meshes");
@@ -1138,7 +1138,7 @@ mod tests {
     /// coordinates directly.
     #[test]
     fn visualizable_line_endpoints_are_polytope_vertices() {
-        use rye_shape::Visualizable;
+        use crate::Visualizable;
         let topo = Polytope4::Tesseract.topology();
         let mesh = <Polytope4 as Visualizable<4>>::to_lines(&Polytope4::Tesseract).unwrap();
         for (i, &[vi, vj]) in topo.edges.iter().enumerate() {
@@ -1151,7 +1151,7 @@ mod tests {
     /// [`Visualizable<4>::to_points`] returns one point per topology vertex.
     #[test]
     fn visualizable_point_count_matches_vertex_count() {
-        use rye_shape::Visualizable;
+        use crate::Visualizable;
         for p in Polytope4::ALL {
             let mesh = <Polytope4 as Visualizable<4>>::to_points(&p)
                 .expect("polytopes always produce point meshes");
@@ -1165,13 +1165,10 @@ mod tests {
     /// topology is shipped.
     #[test]
     fn visualizable_triangles_currently_not_visualizable() {
-        use rye_shape::Visualizable;
+        use crate::Visualizable;
         for p in Polytope4::ALL {
             let result = <Polytope4 as Visualizable<4>>::to_triangles(&p);
-            assert!(matches!(
-                result,
-                Err(rye_shape::NotVisualizable::Degenerate)
-            ));
+            assert!(matches!(result, Err(crate::NotVisualizable::Degenerate)));
         }
     }
 
@@ -1311,14 +1308,14 @@ mod tests {
     //
     // Every section-perimeter vertex sits on the parent's true surface by
     // construction, so a correct SDF returns ~0 there. The 120/600-cell SDFs in
-    // [`crate::euclidean_r4`] use dual-polytope vertices as face normals (the
+    // [`crate::polytope_geom`] use dual-polytope vertices as face normals (the
     // documented BUG on `cell120_face_planes` / `cell600_face_planes`), exact on
     // the axial + tesseract-corner orbits but approximate on the 96 golden-ratio
     // orbits; the tests below pin that divergence so a future BUG fix fires here.
 
     /// Lift the R³ perimeter back to 4D: each perimeter vertex sits on the slice
     /// hyperplane, so its w is exactly `slice.w_slice`.
-    fn perimeter_vertices_4d(perim: &rye_shape::LineMesh<3>, w: f32) -> Vec<Vec4> {
+    fn perimeter_vertices_4d(perim: &crate::LineMesh<3>, w: f32) -> Vec<Vec4> {
         let mut out = Vec::with_capacity(perim.segments.len() * 2);
         for (a, b) in &perim.segments {
             out.push(Vec4::new(a[0], a[1], a[2], w));
@@ -1333,7 +1330,7 @@ mod tests {
     /// widens it).
     #[test]
     fn cell120_section_perimeter_diverges_from_sdf_documenting_bug() {
-        use crate::euclidean_r4::{cell120_face_planes, polytope_sdf_wolfe};
+        use crate::polytope_geom::{cell120_face_planes, polytope_sdf_wolfe};
         let slice = rye_math::WPlane::new(0.0);
         let (_, perim) = polytope4_section_overlay(Polytope4::Cell120, slice);
         let (normals, inradius) = cell120_face_planes();
@@ -1370,7 +1367,7 @@ mod tests {
     /// the `*_documenting_bug` tests below.
     #[test]
     fn five_eight_sixteen_twentyfour_cell_section_perimeter_on_sdf_surface() {
-        use crate::euclidean_r4::polytope_sdf_wolfe;
+        use crate::polytope_geom::polytope_sdf_wolfe;
         let cases = [
             Polytope4::Pentatope,
             Polytope4::Tesseract,
@@ -1405,7 +1402,7 @@ mod tests {
     /// the 120-cell's vertex set instead.
     #[test]
     fn cell600_section_perimeter_diverges_from_sdf_documenting_bug() {
-        use crate::euclidean_r4::{cell600_face_planes, polytope_sdf_wolfe};
+        use crate::polytope_geom::{cell600_face_planes, polytope_sdf_wolfe};
         let slice = rye_math::WPlane::new(0.0);
         let (_, perim) = polytope4_section_overlay(Polytope4::Cell600, slice);
         let (normals, inradius) = cell600_face_planes();

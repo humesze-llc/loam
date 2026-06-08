@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Rye canonical geometric primitives: single Shape enum used by both rye-scene (rendering) and rye-physics (collision)."
 
 [dependencies]
+rye-math = { path = "../rye-math" }
 glam = { workspace = true }
 serde = { workspace = true }
 
