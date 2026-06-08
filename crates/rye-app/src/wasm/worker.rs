@@ -25,7 +25,7 @@ use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, OffscreenCanvas};
 
 use super::messages::{self, InputMessage};
 use super::worker_ui::WorkerUi;
-use crate::{App, FrameCtx, RenderCtx, SetupCtx, TickCtx};
+use crate::{App, FrameCtx, RenderCtx, SetupCtx};
 use rye_asset::AssetWatcher;
 use rye_input::InputState;
 use rye_render::device::RenderDevice;
@@ -599,24 +599,17 @@ where
         };
         self.last_update_at = Some(now);
 
-        // Fixed-timestep ticks, mirroring the windowed runner so demos
-        // reading `FrameCtx::n_ticks` behave the same in browser and native.
-        let n_capped;
-        {
-            let _scope = rye_time::frame_trace::scope("sim-ticks");
-            let ticks = self.timestep.advance(now);
-            let n_ticks = ticks.count();
-            n_capped = n_ticks.min(self.max_ticks_per_frame);
-            let tick_dt = 1.0 / 60.0;
-            for _ in 0..n_capped {
-                let mut tctx = TickCtx {
-                    time: self.start.elapsed().as_secs_f32(),
-                    tick: self.tick_index,
-                };
-                self.app.tick(tick_dt, &mut tctx);
-                self.tick_index = self.tick_index.wrapping_add(1);
-            }
-        }
+        // Fixed-timestep ticks via the shared `drive_fixed_ticks`, so the sim
+        // cadence is identical to the windowed runner (60Hz here).
+        let n_capped = crate::drive_fixed_ticks(
+            &mut self.app,
+            &mut self.timestep,
+            &mut self.tick_index,
+            self.start,
+            now,
+            60,
+            self.max_ticks_per_frame,
+        );
 
         // `take_frame` drains the accumulated FrameInput and resets per-tick
         // deltas (mouse motion + scroll).
