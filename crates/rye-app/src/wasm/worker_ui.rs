@@ -2,45 +2,33 @@
 //!
 //! Parallel to [`rye_egui::UiIntegration`] but without `egui_winit`
 //! (winit's web backend assumes a `web_sys::Window`, which panics in
-//! `WorkerGlobalScope`). Translates the worker's [`super::messages::InputMessage`]
-//! events directly into `egui::RawInput::events`.
-//!
-//! Mirrors `UiIntegration`'s `begin_frame` + `paint` lifecycle so the
-//! `App::ui` method works unchanged. The differences are internal:
-//!
-//! - No cursor / clipboard / IME platform-output handling (those go
-//!   through `egui_winit::State::handle_platform_output` in the
-//!   windowed path; not load-bearing for the demos we ship).
-//! - No `winit_state.take_egui_input` step (we build `RawInput` ourselves
-//!   from accumulated events).
-//! - No worker-side egui pipeline warmup yet; first egui-touching frame
-//!   pays compile cost (future work to mirror the windowed warmup path).
+//! `WorkerGlobalScope`). Translates [`super::messages::InputMessage`]
+//! directly into `egui::RawInput::events` and mirrors the `begin_frame` +
+//! `paint` lifecycle so `App::ui` works unchanged. No cursor / clipboard
+//! / IME platform-output handling, and no egui pipeline warmup.
 
 use rye_egui::egui;
 
 use super::messages::InputMessage;
 
-/// Owns the egui-wgpu `Renderer`, an `egui::Context`, and a per-frame
-/// `RawInput` accumulator. Constructed once per worker session;
-/// reused frame-to-frame.
+/// Owns the egui-wgpu `Renderer`, `egui::Context`, and a per-frame
+/// `RawInput` accumulator. Constructed once per worker session.
 pub struct WorkerUi {
     ctx: egui::Context,
     renderer: egui_wgpu::Renderer,
-    /// Accumulates events between frames. Drained into `begin_pass` at
-    /// the start of each frame; populated by [`Self::record_input`]
-    /// whenever an `InputMessage` arrives from main.
+    /// Events accumulated between frames; drained into `begin_pass` by
+    /// [`Self::begin_frame`], populated by [`Self::record_input`].
     raw_events: Vec<egui::Event>,
-    /// Current modifier state. Updated on each key event so subsequent
-    /// pointer/key events carry the right `Modifiers`.
+    /// Modifier state, updated on each key event so subsequent events
+    /// carry the right `Modifiers`.
     modifiers: egui::Modifiers,
-    /// Canvas pixel dimensions + DPR. Egui works in "points" (CSS-pixel
-    /// equivalents), wgpu in pixels; `pixels_per_point` is the conversion.
+    /// `pixels_per_point` converts egui points (CSS-pixel equivalents)
+    /// to wgpu pixels.
     width_px: u32,
     height_px: u32,
     pixels_per_point: f32,
-    /// `wants_pointer_input || wants_keyboard_input` from the last
-    /// completed frame. Fed back to the App via `FrameCtx::ui_has_focus`
-    /// so gameplay code (camera, hotkeys) can avoid double-handling
+    /// `wants_pointer_input || wants_keyboard_input` from the last frame.
+    /// Fed to the App via `FrameCtx::ui_has_focus` so gameplay code skips
     /// events egui consumed.
     pub wants_input: bool,
 }
@@ -100,8 +88,6 @@ impl WorkerUi {
                 }
             }
             InputMessage::MouseWheel { dx, dy } => {
-                // egui's MouseWheel unit is points (its "lines"-equivalent).
-                // The DOM->lines conversion already happened on main thread.
                 self.raw_events.push(egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Line,
                     delta: egui::vec2(-*dx, -*dy), // egui convention: up = +y
@@ -118,8 +104,6 @@ impl WorkerUi {
                 alt,
                 meta,
             } => {
-                // Update modifier state. Egui's Modifiers carries each
-                // boolean independently; we keep them current here.
                 self.modifiers = egui::Modifiers {
                     alt: *alt,
                     ctrl: *ctrl,
@@ -127,9 +111,8 @@ impl WorkerUi {
                     mac_cmd: *meta,
                     command: *ctrl || *meta,
                 };
-                // Emit a Key event when the physical code maps to an
-                // egui::Key. Unknown codes are silently dropped (the
-                // App's hotkey routing covers them via InputState).
+                // Unknown codes drop here; the App's hotkey routing covers
+                // them via InputState.
                 if let Some(egui_key) = crate::keymap::keycode_egui(code) {
                     self.raw_events.push(egui::Event::Key {
                         key: egui_key,
@@ -139,12 +122,8 @@ impl WorkerUi {
                         modifiers: self.modifiers,
                     });
                 }
-                // Emit a Text event for printable keys on press. Filters
-                // modifier-only chords (Ctrl+C etc.) so they don't
-                // accidentally insert text. `key.len() == 1` is a rough
-                // "is this a single printable character" check that
-                // works for ASCII + common Latin codepoints; multi-codepoint
-                // logical keys ("ArrowUp", "Shift") are filtered out.
+                // Text event for printable keys only: skip modifier chords
+                // (Ctrl+C) and multi-codepoint logical keys ("ArrowUp").
                 if *pressed
                     && !*ctrl
                     && !*alt
@@ -158,11 +137,8 @@ impl WorkerUi {
             InputMessage::Focus(focused) => {
                 self.raw_events.push(egui::Event::WindowFocused(*focused));
             }
-            // Non-egui-relevant variants: Resize is handled by the
-            // runner; Visibility hasn't been wired up; Start fires
-            // outside the frame loop entirely (handled in handle_message);
-            // PointerLockChanged is consumed by the worker's cursor state
-            // mirror, not egui.
+            // Handled outside egui (runner, cursor mirror, frame-loop
+            // entry).
             InputMessage::Resize { .. }
             | InputMessage::Visibility(_)
             | InputMessage::Start
@@ -170,17 +146,15 @@ impl WorkerUi {
         }
     }
 
-    /// Convert canvas-relative CSS pixels to egui points. Egui works in
-    /// logical (DPI-independent) coordinates, so callers downstream
-    /// divide by `pixels_per_point` where needed. The InputMessage
-    /// carries CSS pixels already (DOM `MouseEvent.offsetX/Y` are in
-    /// CSS pixels), so we pass them straight through.
+    /// Canvas-relative CSS pixels to egui points. The InputMessage
+    /// already carries CSS pixels, which egui treats as points, so this
+    /// passes through.
     fn point(&self, x: f32, y: f32) -> egui::Pos2 {
         egui::pos2(x, y)
     }
 
-    /// Begin a frame: take the accumulated raw input, set screen rect +
-    /// pixels-per-point, return the Context for the App's `ui` method.
+    /// Begin a frame from accumulated raw input; returns the Context for
+    /// the App's `ui` method.
     pub fn begin_frame(&mut self) -> &egui::Context {
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -200,9 +174,9 @@ impl WorkerUi {
         &self.ctx
     }
 
-    /// Finish the frame + paint into `view` via the supplied encoder.
-    /// Mirrors `UiIntegration::paint` but without the winit
-    /// `handle_platform_output` step (no cursor / clipboard routing yet).
+    /// Finish the frame and paint into `view`. Mirrors
+    /// `UiIntegration::paint` without the winit `handle_platform_output`
+    /// step.
     pub fn paint(
         &mut self,
         device: &wgpu::Device,
@@ -245,8 +219,7 @@ impl WorkerUi {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // egui-wgpu requires a `'static` lifetime on the pass; this
-            // is the standard wasm-bindgen / egui-wgpu idiom.
+            // egui-wgpu requires a `'static` pass; standard idiom.
             self.renderer
                 .render(&mut pass.forget_lifetime(), &primitives, &screen);
         }

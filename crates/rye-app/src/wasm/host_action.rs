@@ -1,83 +1,33 @@
 //! Worker -> main-thread channel for DOM-touching actions.
 //!
-//! ## Why this module exists
+//! The OffscreenCanvas-in-Worker architecture has no DOM access; browser
+//! APIs that require it (Pointer Lock, Fullscreen, Clipboard, ...) must
+//! round-trip to the main thread. Demos queue a [`HostAction`]; the
+//! worker frame loop drains them via [`post_pending_actions`] and posts
+//! one batched message that `main_launcher` dispatches to the DOM call.
 //!
-//! The OffscreenCanvas-in-Worker architecture trades DOM access for GC
-//! isolation. The worker can't touch `document`, the canvas DOM element,
-//! `navigator`, or anything else that synchronously reads or mutates the
-//! page; those calls panic with a `ReferenceError`. Every browser API
-//! that requires DOM access -- Pointer Lock, Fullscreen, the Clipboard,
-//! Wake Lock, Audio focus resumption, the File System Access pickers --
-//! has to round-trip to the main thread.
-//!
-//! This module is the engine-side primitive for that round-trip. Demos call
-//! high-level APIs (`rye_app::cursor::request_grab`, a future
-//! `rye_app::fullscreen::request_enter`, etc.); those APIs queue a
-//! [`HostAction`]; the worker's frame loop drains pending actions once per
-//! frame and posts them to the main thread via [`post_pending_actions`]. The
-//! main thread's listener in `main_launcher::install_host_action_handler`
-//! dispatches each one to the matching DOM call and (for stateful actions)
-//! listens for the browser's state-change event to ping the worker back.
-//!
-//! ## Why not synchronous RPC
-//!
-//! `Atomics.wait` + `SharedArrayBuffer` could give the worker a blocking
-//! call into the main thread, but it would stall the worker's RAF loop
-//! while the main thread schedules the DOM call. The browser also
-//! gates `SharedArrayBuffer` behind COOP/COEP headers that complicate
-//! self-hosted demos. Async postMessage trades a millisecond of latency
-//! (well within Pointer Lock's transient-activation window) for never
-//! blocking either thread.
-//!
-//! ## Cadence
-//!
-//! Actions are batched per frame: the worker drains its pending list at
-//! the end of each frame (after `App::update`/`App::record`), constructs
-//! one `{kind: "host_action", actions: [...]}` message, and posts it.
-//! Empty drains skip the post. Per-frame batching means a console
-//! command that flips cursor grab + visibility + fullscreen all in one
-//! tick produces one postMessage, not three.
-//!
-//! ## Extending
-//!
-//! Adding a new DOM-action capability is:
-//! 1. New variant on [`HostAction`].
-//! 2. Drain-and-encode case in [`encode_actions`].
-//! 3. Main thread `host_action` dispatch arm in `main_launcher`.
-//! 4. If the action has observable state (Pointer Lock did/didn't
-//!    engage; Fullscreen did/didn't accept), wire the corresponding DOM
-//!    event listener on main thread to ping back via the existing
-//!    inbound `InputMessage` channel. Define a new `InputMessage`
-//!    variant if needed.
-//!
-//! No coupling between actions; each one's plumbing is local.
+//! Async postMessage over `Atomics.wait` + `SharedArrayBuffer`: never
+//! blocks either thread, and avoids the COOP/COEP header requirement.
 
 use std::cell::RefCell;
 
 use wasm_bindgen::JsValue;
 
-/// One worker -> main DOM action. Variants name *intent*; the main
-/// thread translates each to the matching DOM call.
+/// One worker -> main DOM action. Variants name intent; the main thread
+/// translates each to the matching DOM call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostAction {
-    /// Engage Pointer Lock on the canvas. Locks the cursor to the canvas
-    /// center and reports raw motion deltas via `MouseEvent.movementX/Y`. The
-    /// main thread calls `canvas.requestPointerLock()`; the actual transition
-    /// fires a `pointerlockchange` event the main thread relays back via
-    /// `InputMessage::PointerLockChanged(true)`.
+    /// Engage Pointer Lock on the canvas. The transition is confirmed
+    /// asynchronously via `InputMessage::PointerLockChanged(true)`.
     PointerLockRequest,
-    /// Release Pointer Lock. Main thread calls `document.exitPointerLock()`.
-    /// The browser also auto-releases on Esc or tab switch; either path
-    /// produces the same `pointerlockchange` round-trip back to the worker.
+    /// Release Pointer Lock. The browser also auto-releases on Esc or tab
+    /// switch; both paths round-trip back via `PointerLockChanged`.
     PointerLockRelease,
 }
 
 impl HostAction {
-    /// The `kind` string this action serializes to on the wire. Single
-    /// source of truth for the contract: `encode_actions` writes it into
-    /// the per-action JS object, and `main_launcher`'s `host_action`
-    /// dispatch matches the same literals. Keep the two in lockstep when
-    /// adding a variant.
+    /// The `kind` string this action serializes to on the wire. Source of
+    /// truth; `main_launcher`'s dispatch matches the same literals.
     const fn kind_str(self) -> &'static str {
         match self {
             HostAction::PointerLockRequest => "pointer_lock_request",
@@ -87,30 +37,23 @@ impl HostAction {
 }
 
 thread_local! {
-    /// Per-worker pending action queue. Drained at the end of each frame by
-    /// [`post_pending_actions`]. A `thread_local` because the engine APIs that
-    /// produce these (`rye_app::cursor`, a future `rye_app::fullscreen`) have
-    /// no direct handle to the worker runner; they push into this static and
-    /// the runner reads it.
+    /// Per-worker pending action queue, drained each frame by
+    /// [`post_pending_actions`]. `thread_local` because the producing
+    /// engine APIs have no direct handle to the worker runner.
     static PENDING: RefCell<Vec<HostAction>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Queue a host action for the next frame's drain. Cheap (one push to a
-/// per-worker `Vec`). Safe to call from anywhere on the worker thread;
-/// engine modules wrap this in their own typed APIs.
+/// Queue a host action for the next frame's drain. Engine modules wrap
+/// this in their own typed APIs.
 pub fn queue(action: HostAction) {
     PENDING.with(|p| p.borrow_mut().push(action));
 }
 
 /// Drain pending actions and post them to the main thread as one
-/// `{kind: "host_action", actions: [...]}` message. No-op if the queue
-/// is empty. Called once per frame from the worker's frame loop.
+/// `{kind: "host_action", actions: [...]}` message. No-op if empty.
 ///
-/// Wrapped in a `Result` even though `post_message` on a worker's
-/// global scope rarely fails -- if it does (Firefox during teardown,
-/// rate-limited contexts), the caller logs it and we drop the actions
-/// for that frame. Re-queuing on failure would risk spinning if the
-/// transport is permanently down.
+/// On `post_message` failure the caller logs and drops the batch; we do
+/// not re-queue, to avoid spinning if the transport is permanently down.
 pub fn post_pending_actions(scope: &web_sys::DedicatedWorkerGlobalScope) -> anyhow::Result<()> {
     let actions = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
     if actions.is_empty() {
@@ -123,13 +66,7 @@ pub fn post_pending_actions(scope: &web_sys::DedicatedWorkerGlobalScope) -> anyh
 }
 
 /// Build the `{kind: "host_action", actions: [...]}` JS object for a
-/// drained action list. Each action is encoded as `{kind: <action.kind_str()>}`;
-/// per-variant fields (none today) would be tacked onto `item` here. Split
-/// out from `post_pending_actions` so the encoding is exercisable in
-/// isolation (the natural home is a `wasm-bindgen-test`, since the `js_sys`
-/// / `JsValue` types only exist on the wasm target; that test harness is not
-/// yet wired into CI, so the encoding is currently covered only by the demos
-/// running without a malformed-message panic).
+/// drained action list. Each action encodes as `{kind: <kind_str()>}`.
 fn encode_actions(actions: &[HostAction]) -> anyhow::Result<JsValue> {
     let msg = js_sys::Object::new();
     js_sys::Reflect::set(
