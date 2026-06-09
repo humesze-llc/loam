@@ -40,10 +40,10 @@ A geometry is anything that implements `Space` (the smooth-Riemannian core:
 `exp`, `log`, `distance`, parallel transport). Everything a geometry can *do*
 downstream is an opt-in capability trait, not a hard-coded geometry case:
 
-- `WgslSpace` — emit the WGSL prelude to raymarch this space on the GPU.
-- `RasterizableSpace` — project and tessellate edges/sections for the rasterizer.
-- `SectionableSpace` — cross-section algorithm support.
-- `PhysicsSpace` — rigid-body simulation in this space.
+- `WgslSpace`: emit the WGSL prelude to raymarch this space on the GPU.
+- `RasterizableSpace`: project and tessellate edges/sections for the rasterizer.
+- `SectionableSpace`: cross-section algorithm support.
+- `PhysicsSpace`: rigid-body simulation in this space.
 
 A new geometry is wired through the engine by implementing the capabilities it
 actually supports, each with its own tests, rather than editing every renderer
