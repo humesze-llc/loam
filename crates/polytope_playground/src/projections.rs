@@ -23,8 +23,8 @@ pub(crate) enum WireframeProjection {
     /// order, clamped at resolve time. The normal, basis, and distances are
     /// resolved from topology via [`Polytope4::face_planes`] (the CORRECT path,
     /// NOT the buggy dual-vertex `cell{120,600}_face_planes`) and cached on
-    /// [`Demo::schlegel_params`]. See [`resolve_schlegel_params`] and
-    /// [`Demo::resolved_wireframe_projection`].
+    /// `Demo::schlegel_params`. See [`resolve_schlegel_params`] and
+    /// `Demo::resolved_wireframe_projection`.
     ///
     /// NOT WIRED into the playground: deliberately absent from [`Self::ALL`] and
     /// [`Self::from_token`]. A faithful Schlegel diagram needs its own framing and
@@ -39,7 +39,7 @@ pub(crate) enum WireframeProjection {
     },
     /// Conformal stereographic projection from S³ (unit-circumradius vertices) to
     /// R³, casting away from a configurable pole (default
-    /// [`STEREOGRAPHIC_DEFAULT_POLE`]; live value [`Demo::stereographic_pole`]).
+    /// [`STEREOGRAPHIC_DEFAULT_POLE`]; live value `Demo::stereographic_pole`).
     /// Edges render as S³ great-circle arcs (see [`default_edge_blend`]).
     /// Angle-preserving, distance-distorting: the pole-facing cell balloons
     /// outward. `EuclideanR4` normalizes each vertex onto S³ first, so the
@@ -51,17 +51,17 @@ pub(crate) enum WireframeProjection {
     /// edge-level) so a kept edge agrees with the active-edge coloring and the
     /// cross-section. The projection stays drop-w
     /// ([`rye_math::Projection::Identity`]); the cull does the slicing. Slab width
-    /// is [`Demo::wireframe_hyperslice_thickness`].
+    /// is `Demo::wireframe_hyperslice_thickness`.
     Hyperslice,
 }
 
 /// Canonical (unit-circumradius) Schlegel parameters for one
-/// `(polytope, cell_index)`. Cached on [`Demo::schlegel_params`] so the O(V·D³)
+/// `(polytope, cell_index)`. Cached on `Demo::schlegel_params` so the O(V·D³)
 /// `LazyLock` cell-table fit behind [`Polytope4::face_planes`] runs once per
 /// selection, not per frame.
 ///
-/// Stored in CANONICAL coords: [`Demo::resolved_wireframe_projection`] scales
-/// the offsets by [`Demo::effective_body_size`] and rotates the normal/basis by
+/// Stored in CANONICAL coords: `Demo::resolved_wireframe_projection` scales
+/// the offsets by `Demo::effective_body_size` and rotates the normal/basis by
 /// `rot_state` each frame. Canonical caching stays valid across `surface scale`
 /// and keeps the chosen cell the outer boundary as the polytope spins.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -189,7 +189,7 @@ pub(crate) fn resolve_schlegel_params(polytope: Polytope4, cell_index: u32) -> S
 /// and clears the cache.
 ///
 /// Pure so the index-sync invariant is unit-testable without a GPU-backed
-/// [`Demo`]; [`Demo::resolve_schlegel_cache`] is the one caller.
+/// `Demo`; `Demo::resolve_schlegel_cache` is the one caller.
 pub(crate) fn synced_schlegel_projection(
     projection: WireframeProjection,
     subject: Option<Polytope4>,
@@ -210,7 +210,7 @@ pub(crate) fn synced_schlegel_projection(
 /// Stereographic (a conformal-map edge is a circular arc, not a chord), flat R4
 /// chords (`blend == 0`) otherwise. Derived from the projection, not a separate
 /// control, so it can never disagree with the map. Read per frame by the
-/// wireframe builder ([`Demo::render_wireframe_overlay`]).
+/// wireframe builder (`Demo::render_wireframe_overlay`).
 pub(crate) fn default_edge_blend(projection: WireframeProjection) -> f32 {
     match projection {
         WireframeProjection::Stereographic => 1.0,
@@ -232,7 +232,7 @@ pub(crate) fn apply_projection_selection_defaults(
 
 /// Short educational annotation for the active projection: a callout `title`
 /// plus a one-to-three-sentence `body`. Surfaced via `rye_egui::callout` (see
-/// [`Demo::render_mode_annotation`]).
+/// `Demo::render_mode_annotation`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModeAnnotation {
     /// Callout window title: the mode's short name.
@@ -246,7 +246,7 @@ pub(crate) struct ModeAnnotation {
 /// distinct, non-empty copy.
 ///
 /// Pure so the `(mode) -> copy` mapping is unit-testable without a GPU-backed
-/// [`Demo`]; [`Demo::render_mode_annotation`] is the one caller. Explanations
+/// `Demo`; `Demo::render_mode_annotation` is the one caller. Explanations
 /// follow Coxeter, *Regular Polytopes*, ch. 13 (Schlegel) and the conformal map
 /// `(x, y, z) / (1 - w)` (Wikipedia, "Stereographic projection").
 pub(crate) fn mode_annotation(projection: WireframeProjection) -> Option<ModeAnnotation> {
@@ -305,7 +305,7 @@ pub(crate) fn mode_annotation(projection: WireframeProjection) -> Option<ModeAnn
 /// Tradeoff: `+w` is a 16-cell vertex (`+e_w`, Coxeter, *Regular Polytopes*,
 /// §8.2), so a vertex sweeping through the pole under an `xw` rotation flicks to
 /// infinity (the standard stereographic singularity), accepted for the centered
-/// image. Configurable via [`Demo::stereographic_pole`]. Exactly unit, so no
+/// image. Configurable via `Demo::stereographic_pole`. Exactly unit, so no
 /// runtime `normalize` and the constant is bit-reproducible.
 pub(crate) const STEREOGRAPHIC_DEFAULT_POLE: glam::Vec4 = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
 
@@ -355,12 +355,12 @@ impl WireframeProjection {
     /// - `WPinhole` -> `Perspective4D { focal_distance: 2.0 }` (focal clears the
     ///   `BODY_SIZE`-scaled w-extent so the denominator never nears zero),
     /// - `Stereographic` -> `Stereographic { pole: STEREOGRAPHIC_DEFAULT_POLE }`
-    ///   (the default pole; [`Demo::resolved_wireframe_projection`] substitutes
-    ///   the live [`Demo::stereographic_pole`] per frame).
+    ///   (the default pole; `Demo::resolved_wireframe_projection` substitutes
+    ///   the live `Demo::stereographic_pole` per frame).
     ///
     /// `Schlegel` returns `Identity` as a SAFE FALLBACK only: the real projection
     /// needs the cached [`SchlegelParams`] plus the live `rot_state`, built by
-    /// [`Demo::resolved_wireframe_projection`] (the four render sites call it).
+    /// `Demo::resolved_wireframe_projection` (the four render sites call it).
     pub(crate) fn to_projection(self) -> rye_math::Projection<4> {
         match self {
             WireframeProjection::Shadow | WireframeProjection::Hyperslice => {
@@ -380,7 +380,7 @@ impl WireframeProjection {
 }
 
 /// Whether the wireframe Hyperslice cull is active: the
-/// [`Demo::wireframe_hyperslice`] toggle is on OR the projection is
+/// `Demo::wireframe_hyperslice` toggle is on OR the projection is
 /// [`WireframeProjection::Hyperslice`]. Both the wireframe builder's `continue`
 /// and the Render-modal slab-width gate share this predicate so the thickness
 /// stepper is reachable in exactly the frames the cull runs.

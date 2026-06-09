@@ -71,6 +71,7 @@ mod consts;
 mod filmstrip;
 mod projections;
 mod render;
+mod sections;
 mod shapes;
 mod state;
 mod ui;
