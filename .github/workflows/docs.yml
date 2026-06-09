@@ -1,0 +1,50 @@
+name: docs
+
+# Build the workspace rustdoc and publish it to GitHub Pages on every push to
+# main. Enable once under Settings -> Pages -> Source: GitHub Actions.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages deploy at a time; a newer push supersedes an in-flight one.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux deps for wgpu/winit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
+            pkg-config
+      # Mirror the `doc` gate: broken intra-doc links fail the build.
+      - name: cargo doc --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace
+      # cargo doc emits no root index; redirect to the base crate's docs.
+      - name: root index redirect
+        run: echo '<meta http-equiv="refresh" content="0; url=rye_math/index.html">' > target/doc/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+      - id: deployment
+        uses: actions/deploy-pages@v4

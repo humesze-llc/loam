@@ -205,6 +205,34 @@ pub trait App: Sized + 'static {
 // ---------------------------------------------------------------------------
 
 /// Setup-phase context. Available during [`App::setup`] and [`App::on_shader_reload`].
+/// Run one frame's fixed-timestep ticks: advance the accumulator, cap the
+/// catch-up at `max_ticks`, and call `App::tick` for each, bumping `tick_index`.
+/// Shared by the native runner and the wasm worker so the determinism-critical
+/// sim cadence has a single definition and cannot drift between platforms.
+/// Returns the capped tick count (for `FrameCtx::n_ticks`).
+pub(crate) fn drive_fixed_ticks<A: App>(
+    app: &mut A,
+    timestep: &mut FixedTimestep,
+    tick_index: &mut u64,
+    start: Instant,
+    now: Instant,
+    fixed_hz: u32,
+    max_ticks: usize,
+) -> usize {
+    let _scope = rye_time::frame_trace::scope("sim-ticks");
+    let n_capped = timestep.advance(now).count().min(max_ticks);
+    let dt = 1.0 / fixed_hz as f32;
+    for _ in 0..n_capped {
+        let mut tctx = TickCtx {
+            time: start.elapsed().as_secs_f32(),
+            tick: *tick_index,
+        };
+        app.tick(dt, &mut tctx);
+        *tick_index = tick_index.wrapping_add(1);
+    }
+    n_capped
+}
+
 pub struct SetupCtx<'a> {
     pub rd: &'a RenderDevice,
     pub shader_db: &'a mut ShaderDb,
@@ -1236,25 +1264,21 @@ impl<A: App> Runner<A> {
         // CPU work this frame" vs. "what's the dominant section."
         let _frame_scope = rye_time::frame_trace::scope("frame");
 
-        // 1. Fixed-timestep ticks.
-        let n_capped;
-        {
-            let _scope = rye_time::frame_trace::scope("sim-ticks");
-            let ticks = self.timestep.advance(Instant::now());
-            let n_ticks = ticks.count();
-            n_capped = n_ticks.min(self.config.max_ticks_per_frame);
-            let dt = 1.0 / self.config.fixed_hz as f32;
-            if let Some(app) = self.app.as_mut() {
-                for _ in 0..n_capped {
-                    let mut tctx = TickCtx {
-                        time: self.start.elapsed().as_secs_f32(),
-                        tick: self.tick_index,
-                    };
-                    app.tick(dt, &mut tctx);
-                    self.tick_index = self.tick_index.wrapping_add(1);
-                }
-            }
-        }
+        // 1. Fixed-timestep ticks (shared with the wasm worker via
+        // `drive_fixed_ticks` so the sim cadence stays identical across platforms).
+        let n_capped = if let Some(app) = self.app.as_mut() {
+            drive_fixed_ticks(
+                app,
+                &mut self.timestep,
+                &mut self.tick_index,
+                self.start,
+                Instant::now(),
+                self.config.fixed_hz,
+                self.config.max_ticks_per_frame,
+            )
+        } else {
+            0
+        };
 
         // 2. Per-frame update with drained input + UI build.
         // egui's focus reading reflects the *previous* frame's state

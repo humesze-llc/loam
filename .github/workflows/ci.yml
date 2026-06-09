@@ -111,3 +111,15 @@ jobs:
       # native encoder crates stay out of the wasm dep tree, matching
       # `index.html`'s `data-cargo-no-default-features` directive.
       - run: cargo build --target wasm32-unknown-unknown -p polytope_playground --no-default-features
+
+  determinism:
+    name: determinism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The reproducibility contract: a fixed scenario replays bit-identically
+      # (single-threaded f32 fixed-step). rye-physics is CPU-only, so this needs
+      # no GPU/windowing deps and runs fast as its own visible gate.
+      - run: cargo test -p rye-physics determinism
