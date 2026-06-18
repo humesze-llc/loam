@@ -46,7 +46,7 @@ pub use euclidean_r4::{EuclideanR4, Iso4Flat};
 pub use hyperbolic::{HyperbolicH3, Iso3H};
 pub use rasterizable::{Projection, RasterizableSpace, STEREOGRAPHIC_POLE_EPSILON};
 pub use sectionable::{
-    SectionableSpace, WPlane, EDGE_PARALLEL_EPSILON, SLICE_PERTURBATION_EPSILON,
+    SectionableSpace, WPlane, ZPlane, EDGE_PARALLEL_EPSILON, SLICE_PERTURBATION_EPSILON,
 };
 pub use space::{Space, WgslSpace};
 pub use spherical::{Iso4, SphericalS3};

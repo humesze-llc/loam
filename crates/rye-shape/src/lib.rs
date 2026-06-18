@@ -27,9 +27,11 @@
 
 pub mod polytope;
 pub mod polytope_geom;
+pub mod section;
 pub mod solid3;
 pub mod visualizable;
 
+pub use section::convex_section_polygon;
 pub use solid3::Solid3;
 pub use visualizable::{LineMesh, NotVisualizable, PointMesh, TriangleMesh, Visualizable};
 
