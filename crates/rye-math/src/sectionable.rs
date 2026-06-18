@@ -13,10 +13,10 @@
 //! sits that close; one perturbation kills three degeneracies (vertex on slice,
 //! edge in slice plane, slice grazes a face).
 
-use glam::{Vec3, Vec4};
+use glam::{Vec2, Vec3, Vec4};
 
 use crate::space::Space;
-use crate::EuclideanR4;
+use crate::{EuclideanR3, EuclideanR4};
 
 /// Smallest `|dw|` for which [`SectionableSpace::edge_section`] returns an
 /// intersection; below it the edge is treated as parallel to the slice (whole
@@ -41,6 +41,20 @@ pub struct WPlane {
 impl WPlane {
     pub const fn new(w_slice: f32) -> Self {
         Self { w_slice }
+    }
+}
+
+/// Axis-aligned z-slice hyperplane for R³: the 2-flat where `z = z_slice`. The
+/// R³ analogue of [`WPlane`]; a 3D object's section here is the 2D shape a
+/// Flatland inhabitant living at `z = z_slice` would perceive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ZPlane {
+    pub z_slice: f32,
+}
+
+impl ZPlane {
+    pub const fn new(z_slice: f32) -> Self {
+        Self { z_slice }
     }
 }
 
@@ -89,6 +103,24 @@ impl SectionableSpace<4> for EuclideanR4 {
         // `(1 - t)·p0 + t·p1`.
         let p = p0 + t * (p1 - p0);
         Some((t, Vec3::new(p.x, p.y, p.z)))
+    }
+}
+
+impl SectionableSpace<3> for EuclideanR3 {
+    type SectionSpace = crate::EuclideanR2;
+    type Hyperplane = ZPlane;
+
+    fn edge_section(slice: &ZPlane, p0: Vec3, p1: Vec3) -> Option<(f32, Vec2)> {
+        let dz = p1.z - p0.z;
+        if dz.abs() < EDGE_PARALLEL_EPSILON {
+            return None;
+        }
+        let t = (slice.z_slice - p0.z) / dz;
+        if !(0.0..=1.0).contains(&t) {
+            return None;
+        }
+        let p = p0 + t * (p1 - p0);
+        Some((t, Vec2::new(p.x, p.y)))
     }
 }
 
@@ -154,5 +186,59 @@ mod tests {
         assert!((p3.x - expected).abs() < 1e-5);
         assert!((p3.y - expected).abs() < 1e-5);
         assert!((p3.z - expected).abs() < 1e-5);
+    }
+
+    /// R³ -> R²: edge straddling z = 0 with equal-magnitude opposite z yields the
+    /// midpoint, dropping z. The Flatland analogue of the R⁴ midpoint case.
+    #[test]
+    fn r3_edge_section_midpoint() {
+        let slice = ZPlane::new(0.0);
+        let p0 = Vec3::new(1.0, 2.0, -1.0);
+        let p1 = Vec3::new(5.0, 6.0, 1.0);
+        let (t, p2) = <EuclideanR3 as SectionableSpace<3>>::edge_section(&slice, p0, p1).unwrap();
+        assert!((t - 0.5).abs() < 1e-6);
+        assert_eq!(p2, Vec2::new(3.0, 4.0));
+    }
+
+    #[test]
+    fn r3_edge_section_no_crossing_returns_none() {
+        let slice = ZPlane::new(0.0);
+        let p0 = Vec3::new(0.0, 0.0, 0.5);
+        let p1 = Vec3::new(0.0, 0.0, 1.5);
+        assert!(<EuclideanR3 as SectionableSpace<3>>::edge_section(&slice, p0, p1).is_none());
+    }
+
+    #[test]
+    fn r3_edge_section_parallel_edge_returns_none() {
+        let slice = ZPlane::new(0.0);
+        let p0 = Vec3::new(0.0, 0.0, 0.0);
+        let p1 = Vec3::new(1.0, 1.0, 1e-7);
+        assert!(<EuclideanR3 as SectionableSpace<3>>::edge_section(&slice, p0, p1).is_none());
+    }
+
+    #[test]
+    fn r3_edge_section_endpoint_on_slice_returns_t_zero() {
+        let slice = ZPlane::new(0.0);
+        let p0 = Vec3::new(2.0, 2.0, 0.0);
+        let p1 = Vec3::new(5.0, 5.0, 1.0);
+        let (t, p2) = <EuclideanR3 as SectionableSpace<3>>::edge_section(&slice, p0, p1).unwrap();
+        assert!(t.abs() < 1e-6);
+        assert_eq!(p2, Vec2::new(2.0, 2.0));
+    }
+
+    /// Tetrahedron apex edge: apex at z = 1, base vertex at z = -0.25, so the edge
+    /// crosses z = 0 at t = 0.8 and the R² point lands at 0.8·(base xy). The R³
+    /// analogue of the pentatope worked example.
+    #[test]
+    fn r3_edge_section_matches_tetrahedron_worked_example() {
+        let slice = ZPlane::new(0.0);
+        let apex = Vec3::new(0.0, 0.0, 1.0);
+        let base = Vec3::new(0.5, 0.3, -0.25);
+        let (t, p2) = <EuclideanR3 as SectionableSpace<3>>::edge_section(&slice, apex, base)
+            .expect("apex edge straddles z = 0");
+        // 1 + t·(-1.25) = 0 -> t = 0.8.
+        assert!((t - 0.8).abs() < 1e-6);
+        assert!((p2.x - 0.8 * 0.5).abs() < 1e-5);
+        assert!((p2.y - 0.8 * 0.3).abs() < 1e-5);
     }
 }
