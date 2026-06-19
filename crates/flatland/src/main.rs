@@ -16,6 +16,8 @@ use rye_shape::{convex_section_polygon, fill_convex_polygon, icosphere, LineMesh
 use std::collections::BTreeSet;
 use winit::window::WindowAttributes;
 
+mod character;
+
 const SPHERE_RADIUS: f32 = 1.3;
 const SPHERE_SUBDIVISIONS: u32 = 3;
 const SPHERE_TOP: f32 = 2.6;
@@ -27,7 +29,7 @@ const FLATLAND_HALF_EXTENT: f32 = 3.5;
 const FLATLAND_GRID_LINES: usize = 10;
 const SQUARE_X: f32 = -3.0;
 const SQUARE_Y: f32 = 0.0;
-const SQUARE_HALF: f32 = 0.22;
+const SQUARE_HALF: f32 = 0.30;
 const FOV_HALF_ANGLE: f32 = 0.55;
 const RETINA_DISTANCE: f32 = 0.8;
 
@@ -107,6 +109,9 @@ struct FlatlandApp {
     split: Animated,
     sphere_z: Animated,
     section_sides: usize,
+    gaze_target: Vec2,
+    surprise: Animated,
+    surprised: bool,
 }
 
 fn v3(x: f32, y: f32) -> Vec3 {
@@ -225,26 +230,26 @@ impl FlatlandApp {
             s + Vec2::new(h, h),
             s + Vec2::new(-h, h),
         ];
+        // 3D pane: a plain square sitting on the plane. 2D pane: the character.
         for i in 0..4 {
             let a = corners[i];
             let b = corners[(i + 1) % 4];
-            push_both(
-                &mut m3_lines,
-                &mut m2_lines,
-                v3(a.x, a.y),
-                v3(b.x, b.y),
-                COLOR_SQUARE,
-                2.0,
-            );
+            push(&mut m3_lines, v3(a.x, a.y), v3(b.x, b.y), COLOR_SQUARE, 2.0);
         }
-        let tick = s + facing * 0.4;
-        push_both(
-            &mut m3_lines,
+        let gaze = if self.beat >= BEAT_SPHERE && sphere_z < SPHERE_TOP + 1.0 {
+            Vec2::ZERO
+        } else {
+            self.gaze_target
+        };
+        character::push_face(
             &mut m2_lines,
-            v3(s.x, s.y),
-            v3(tick.x, tick.y),
-            COLOR_SQUARE,
-            2.0,
+            &mut m2_tris,
+            &character::Face {
+                pos: s,
+                half: h,
+                gaze,
+                surprise: self.surprise.value(),
+            },
         );
 
         let facing_angle = facing.y.atan2(facing.x);
@@ -363,6 +368,9 @@ impl App for FlatlandApp {
             split: Animated::new(0.0),
             sphere_z: Animated::new(SPHERE_HIDDEN),
             section_sides: 0,
+            gaze_target: Vec2::new(0.0, 0.0),
+            surprise: Animated::new(0.0),
+            surprised: false,
         };
         app.enter_beat(0);
         Ok(app)
@@ -376,6 +384,18 @@ impl App for FlatlandApp {
         let dt = ctx.dt.min(0.1);
         self.split.advance(dt);
         self.sphere_z.advance(dt);
+
+        // Surprise when A Sphere is actually intersecting the plane (a section
+        // exists). Retrigger only on the edge, or animate_to would restart each
+        // frame and never settle.
+        let crossing = self.sphere_z.value().abs() < SPHERE_RADIUS;
+        if crossing != self.surprised {
+            self.surprised = crossing;
+            self.surprise
+                .animate_to(if crossing { 1.0 } else { 0.0 }, 0.3, ease_out_cubic);
+        }
+        self.surprise.advance(dt);
+
         if self.split.value() > 0.5 && !ctx.ui_has_focus {
             self.orbit
                 .advance(ctx.input, &mut self.camera, &EuclideanR3, dt);
@@ -489,6 +509,21 @@ impl App for FlatlandApp {
     }
 
     fn ui(&mut self, ctx: &egui::Context, _frame: &mut FrameCtx<'_>) {
+        // A Square's idle gaze follows the cursor when it is over the 2D pane,
+        // mapped from egui points to Flatland world coordinates. The narrative
+        // overrides this to look at A Sphere during the relevant beats (in build).
+        if let Some(p) = ctx.pointer_latest_pos() {
+            let screen = ctx.content_rect();
+            let pane_w = screen.width() * (1.0 - 0.5 * self.split.value());
+            if p.x <= pane_w && pane_w > 1.0 {
+                let ext_x = FLATLAND_HALF_EXTENT + 1.0;
+                let ext_y = ext_x * screen.height() / pane_w;
+                let wx = -ext_x + 2.0 * ext_x * (p.x / pane_w);
+                let wy = ext_y - 2.0 * ext_y * (p.y / screen.height());
+                self.gaze_target = Vec2::new(wx, wy);
+            }
+        }
+
         let mut jump_to: Option<usize> = None;
         let mut scrub: Option<f32> = None;
 
