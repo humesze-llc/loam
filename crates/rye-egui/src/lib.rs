@@ -34,6 +34,7 @@ mod linear_indicator;
 pub mod media;
 mod overlay;
 mod slider_edit;
+pub mod tween;
 mod world;
 
 pub use bivector_matrix::{bivector_matrix, cell_text as bivector_matrix_cell_text};
@@ -49,6 +50,7 @@ pub use integration::UiIntegration;
 pub use linear_indicator::LinearIndicator;
 pub use overlay::BottomOverlay;
 pub use slider_edit::{slider_with_edit, SliderInteraction};
+pub use tween::{ease_in_out_cubic, ease_out_cubic, Animated};
 pub use world::world_to_screen;
 
 // Re-export egui so the version pin lives in one place.
