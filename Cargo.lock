@@ -699,6 +699,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "flatland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "rye-app",
+ "rye-camera",
+ "rye-math",
+ "rye-render",
+ "rye-shape",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
