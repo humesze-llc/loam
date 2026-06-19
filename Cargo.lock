@@ -706,6 +706,7 @@ dependencies = [
  "glam",
  "rye-app",
  "rye-camera",
+ "rye-egui",
  "rye-math",
  "rye-render",
  "rye-shape",

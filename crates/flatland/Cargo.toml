@@ -15,6 +15,7 @@ winit.workspace = true
 
 rye-app    = { path = "../rye-app", default-features = false }
 rye-camera = { path = "../rye-camera" }
+rye-egui   = { path = "../rye-egui" }
 rye-math   = { path = "../rye-math" }
 rye-render = { path = "../rye-render" }
 rye-shape  = { path = "../rye-shape" }
