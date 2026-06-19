@@ -260,23 +260,62 @@ impl FlatlandApp {
             }
         }
 
+        character::push_face(&mut lines, &mut tris, &self.face(sphere_z));
+
+        Frame { lines, tris, sides }
+    }
+
+    /// A Square's expression this frame: asleep (closed eyes, deep breathing)
+    /// until he wakes, then resting semicircle eyes that lean and open toward
+    /// whatever he is watching, blinking periodically and going wide in surprise.
+    fn face(&self, sphere_z: f32) -> character::Face {
+        let pos = square_pos();
+        let awake = self.beat >= 1;
+        let breathe = if awake {
+            (self.time * 1.3).sin() * 0.012
+        } else {
+            0.03 + (self.time * 0.9).sin() * 0.05
+        };
+        let bp = self.time % 3.4;
+        let blink = if awake && bp < 0.16 {
+            (bp / 0.08 - 1.0).abs().min(1.0)
+        } else {
+            1.0
+        };
         let gaze = if self.beat >= BEAT_SPHERE && sphere_z < SPHERE_TOP + 1.0 {
             Vec2::ZERO
         } else {
             self.gaze_target
         };
-        character::push_face(
-            &mut lines,
-            &mut tris,
-            &character::Face {
-                pos: square_pos(),
-                half: SQUARE_HALF,
-                gaze,
-                surprise: self.surprise.value(),
-            },
-        );
-
-        Frame { lines, tris, sides }
+        let surprise = self.surprise.value();
+        let lean = if awake {
+            ((gaze.x - pos.x) * 0.10).clamp(-0.28, 0.28)
+        } else {
+            0.0
+        };
+        let base = if awake { lerp(0.5, 1.0, surprise) } else { 0.0 };
+        let left_more = if awake && gaze.x < pos.x {
+            0.5 * (1.0 - surprise)
+        } else {
+            0.0
+        };
+        let right_more = if awake && gaze.x > pos.x {
+            0.5 * (1.0 - surprise)
+        } else {
+            0.0
+        };
+        let eye_open = [
+            ((base + left_more) * blink).min(1.0),
+            ((base + right_more) * blink).min(1.0),
+        ];
+        character::Face {
+            pos,
+            half: SQUARE_HALF,
+            lean,
+            breathe,
+            eye_open,
+            look: gaze - pos,
+        }
     }
 }
 
