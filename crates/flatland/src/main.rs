@@ -3,19 +3,16 @@
 //! only as a circle that appears, swells, and vanishes. A guided sequence of
 //! beats drives a tweened reveal: Flatland alone, then Flatland shown as a slice
 //! of the 3D space it lives in.
-//!
-//! Phase A skeleton: beat-spine + tweened layout + bottom story bar + daylight
-//! palette. A Square's face, filled sections, depth, the 1D vision strip, the
-//! dialogue, and Act 2 land in later phases.
 
 use anyhow::Result;
 use glam::{Mat4, Vec2, Vec3};
-use rye_app::{egui, run, App, FrameCtx, RenderCtx, RunConfig, SetupCtx};
+use rye_app::{egui, run, App, FrameCtx, RunConfig, SetupCtx};
 use rye_camera::{Camera, CameraController, OrbitController};
 use rye_egui::{ease_in_out_cubic, ease_out_cubic, Animated};
 use rye_math::{EuclideanR3, Projection, ZPlane};
-use rye_render::{DepthMode, LineRasterNode, Viewport};
-use rye_shape::{convex_section_polygon, icosphere, LineMesh};
+use rye_render::device::RenderDevice;
+use rye_render::{DepthMode, FragmentShading, LineRasterNode, TriangleRasterNode, Viewport};
+use rye_shape::{convex_section_polygon, fill_convex_polygon, icosphere, LineMesh, TriangleMesh};
 use std::collections::BTreeSet;
 use winit::window::WindowAttributes;
 
@@ -42,7 +39,9 @@ const CLEAR: wgpu::Color = wgpu::Color {
 };
 const COLOR_SPHERE: [f32; 4] = [0.24, 0.30, 0.46, 1.0];
 const COLOR_GRID: [f32; 4] = [0.62, 0.66, 0.66, 0.8];
-const COLOR_SECTION: [f32; 4] = [0.93, 0.52, 0.10, 1.0];
+const COLOR_SHEET: [f32; 4] = [0.52, 0.60, 0.80, 0.16];
+const COLOR_SECTION: [f32; 4] = [0.90, 0.46, 0.07, 1.0];
+const COLOR_SECTION_FILL: [f32; 4] = [0.95, 0.62, 0.18, 0.50];
 const COLOR_SQUARE: [f32; 4] = [0.14, 0.44, 0.40, 1.0];
 const COLOR_FOV: [f32; 4] = [0.40, 0.50, 0.78, 0.5];
 const COLOR_RETINA: [f32; 4] = [0.40, 0.40, 0.46, 0.85];
@@ -87,9 +86,19 @@ const BEAT_REVEAL: usize = 2;
 const BEAT_SPHERE: usize = 3;
 const BEAT_PASSAGE: usize = 4;
 
+struct Frame {
+    m3_lines: LineMesh<3>,
+    m3_tris: TriangleMesh<3>,
+    m2_lines: LineMesh<3>,
+    m2_tris: TriangleMesh<3>,
+    sides: usize,
+}
+
 struct FlatlandApp {
-    scene_3d: LineRasterNode,
-    flatland_2d: LineRasterNode,
+    scene_3d_lines: LineRasterNode,
+    scene_3d_tris: TriangleRasterNode,
+    flatland_2d_lines: LineRasterNode,
+    flatland_2d_tris: TriangleRasterNode,
     camera: Camera<EuclideanR3>,
     orbit: OrbitController<EuclideanR3>,
     sphere_verts: Vec<Vec3>,
@@ -122,6 +131,15 @@ fn push_both(
     push(m2, a, b, color, w);
 }
 
+fn append_tris(dst: &mut TriangleMesh<3>, src: &TriangleMesh<3>) {
+    let base = dst.vertices.len() as u32;
+    dst.vertices.extend_from_slice(&src.vertices);
+    dst.colors.extend_from_slice(&src.colors);
+    for t in &src.indices {
+        dst.indices.push([t[0] + base, t[1] + base, t[2] + base]);
+    }
+}
+
 impl FlatlandApp {
     fn enter_beat(&mut self, beat: usize) {
         self.beat = beat.min(BEATS.len() - 1);
@@ -139,16 +157,30 @@ impl FlatlandApp {
         }
     }
 
-    fn build(&self, sphere_z: f32) -> (LineMesh<3>, LineMesh<3>, usize) {
-        let mut m3 = LineMesh::<3>::default();
-        let mut m2 = LineMesh::<3>::default();
+    fn build(&self, sphere_z: f32) -> Frame {
+        let mut m3_lines = LineMesh::<3>::default();
+        let mut m2_lines = LineMesh::<3>::default();
+        let mut m3_tris = TriangleMesh::<3>::default();
+        let mut m2_tris = TriangleMesh::<3>::default();
+
+        let r = FLATLAND_HALF_EXTENT;
+        let sheet = fill_convex_polygon(
+            &[
+                Vec2::new(-r, -r),
+                Vec2::new(r, -r),
+                Vec2::new(r, r),
+                Vec2::new(-r, r),
+            ],
+            COLOR_SHEET,
+        );
+        append_tris(&mut m3_tris, &sheet);
 
         let center = Vec3::new(0.0, 0.0, sphere_z);
         let world: Vec<Vec3> = self.sphere_verts.iter().map(|v| *v + center).collect();
         if sphere_z < SPHERE_TOP + 1.0 {
             for e in &self.sphere_edges {
                 push(
-                    &mut m3,
+                    &mut m3_lines,
                     world[e[0] as usize],
                     world[e[1] as usize],
                     COLOR_SPHERE,
@@ -157,21 +189,25 @@ impl FlatlandApp {
             }
         }
 
-        let r = FLATLAND_HALF_EXTENT;
         for i in 0..=FLATLAND_GRID_LINES {
             let t = -r + 2.0 * r * (i as f32) / (FLATLAND_GRID_LINES as f32);
-            push(&mut m3, v3(t, -r), v3(t, r), COLOR_GRID, 1.0);
-            push(&mut m3, v3(-r, t), v3(r, t), COLOR_GRID, 1.0);
+            push(&mut m3_lines, v3(t, -r), v3(t, r), COLOR_GRID, 1.0);
+            push(&mut m3_lines, v3(-r, t), v3(r, t), COLOR_GRID, 1.0);
         }
 
         let poly = convex_section_polygon(&world, &self.sphere_edges, ZPlane::new(0.0));
-        let n = poly.len();
-        for i in 0..n {
+        let sides = poly.len();
+        if sides >= 3 {
+            let disc = fill_convex_polygon(&poly, COLOR_SECTION_FILL);
+            append_tris(&mut m3_tris, &disc);
+            append_tris(&mut m2_tris, &disc);
+        }
+        for i in 0..sides {
             let a = poly[i];
-            let b = poly[(i + 1) % n];
+            let b = poly[(i + 1) % sides];
             push_both(
-                &mut m3,
-                &mut m2,
+                &mut m3_lines,
+                &mut m2_lines,
                 v3(a.x, a.y),
                 v3(b.x, b.y),
                 COLOR_SECTION,
@@ -193,8 +229,8 @@ impl FlatlandApp {
             let a = corners[i];
             let b = corners[(i + 1) % 4];
             push_both(
-                &mut m3,
-                &mut m2,
+                &mut m3_lines,
+                &mut m2_lines,
                 v3(a.x, a.y),
                 v3(b.x, b.y),
                 COLOR_SQUARE,
@@ -203,8 +239,8 @@ impl FlatlandApp {
         }
         let tick = s + facing * 0.4;
         push_both(
-            &mut m3,
-            &mut m2,
+            &mut m3_lines,
+            &mut m2_lines,
             v3(s.x, s.y),
             v3(tick.x, tick.y),
             COLOR_SQUARE,
@@ -217,8 +253,8 @@ impl FlatlandApp {
             let dir = Vec2::new(a.cos(), a.sin());
             let end = s + dir * (2.0 * r);
             push_both(
-                &mut m3,
-                &mut m2,
+                &mut m3_lines,
+                &mut m2_lines,
                 v3(s.x, s.y),
                 v3(end.x, end.y),
                 COLOR_FOV,
@@ -226,9 +262,15 @@ impl FlatlandApp {
             );
         }
 
-        push_retina(&mut m2, &poly, s, facing, perp);
+        push_retina(&mut m2_lines, &poly, s, facing, perp);
 
-        (m3, m2, n)
+        Frame {
+            m3_lines,
+            m3_tris,
+            m2_lines,
+            m2_tris,
+            sides,
+        }
     }
 }
 
@@ -276,11 +318,20 @@ impl App for FlatlandApp {
     type Space = EuclideanR3;
 
     fn setup(ctx: &mut SetupCtx<'_>) -> Result<Self> {
-        let make = || {
+        let line_node = || {
             LineRasterNode::new(
                 &ctx.rd.device,
                 ctx.rd.target_format(),
                 DepthMode::Off,
+                ctx.rd.sample_count(),
+            )
+        };
+        let tri_node = || {
+            TriangleRasterNode::new(
+                &ctx.rd.device,
+                ctx.rd.target_format(),
+                DepthMode::Off,
+                FragmentShading::Flat,
                 ctx.rd.sample_count(),
             )
         };
@@ -300,8 +351,10 @@ impl App for FlatlandApp {
         orbit.set_orbit(7.5, -0.35);
 
         let mut app = Self {
-            scene_3d: make(),
-            flatland_2d: make(),
+            scene_3d_lines: line_node(),
+            scene_3d_tris: tri_node(),
+            flatland_2d_lines: line_node(),
+            flatland_2d_tris: tri_node(),
             camera,
             orbit,
             sphere_verts,
@@ -329,11 +382,11 @@ impl App for FlatlandApp {
         }
     }
 
-    fn record(&mut self, ctx: &mut RenderCtx<'_>) -> Result<()> {
-        let (m3, m2, sides) = self.build(self.sphere_z.value());
-        self.section_sides = sides;
+    fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
+        let frame = self.build(self.sphere_z.value());
+        self.section_sides = frame.sides;
 
-        let cfg = &ctx.rd.surface_bundle.config;
+        let cfg = &rd.surface_bundle.config;
         let w = cfg.width;
         let h = cfg.height.max(1);
         let split = self.split.value();
@@ -342,51 +395,16 @@ impl App for FlatlandApp {
             .clamp(1.0, w as f32) as u32;
         let threed_w = w.saturating_sub(twod_w);
 
-        self.flatland_2d.upload::<EuclideanR3, 3>(
-            &ctx.rd.device,
-            &ctx.rd.queue,
-            &m2,
-            &Projection::Identity,
-            1,
-        );
-        let ext_x = FLATLAND_HALF_EXTENT + 1.0;
-        let ext_y = ext_x * h as f32 / twod_w as f32;
-        let ortho = Mat4::orthographic_rh(-ext_x, ext_x, -ext_y, ext_y, 0.1, 100.0);
-        let look = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y);
-        self.flatland_2d.set_camera(
-            &ctx.rd.queue,
-            ortho * look,
-            Vec2::new(twod_w as f32, h as f32),
-        );
-
-        if threed_w > 0 {
-            self.scene_3d.upload::<EuclideanR3, 3>(
-                &ctx.rd.device,
-                &ctx.rd.queue,
-                &m3,
-                &Projection::Identity,
-                1,
-            );
-            let view = self.camera.view();
-            let view_m = Mat4::look_to_rh(view.position, view.forward, view.up);
-            let proj = Mat4::perspective_rh(
-                60.0_f32.to_radians(),
-                threed_w as f32 / h as f32,
-                0.05,
-                100.0,
-            );
-            self.scene_3d.set_camera(
-                &ctx.rd.queue,
-                proj * view_m,
-                Vec2::new(threed_w as f32, h as f32),
-            );
-        }
-
         {
-            let _clear = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("flatland::clear"),
+            let mut enc = rd
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("flatland::clear"),
+                });
+            let _clear = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("flatland::clear pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: ctx.view,
+                    view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -398,25 +416,74 @@ impl App for FlatlandApp {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            drop(_clear);
+            rd.queue.submit(Some(enc.finish()));
         }
 
+        let ext_x = FLATLAND_HALF_EXTENT + 1.0;
+        let ext_y = ext_x * h as f32 / twod_w as f32;
+        let vp2 = Mat4::orthographic_rh(-ext_x, ext_x, -ext_y, ext_y, 0.1, 100.0)
+            * Mat4::look_at_rh(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y);
         let left = Viewport {
             x: 0,
             y: 0,
             width: twod_w,
             height: h,
         };
-        self.flatland_2d
-            .record(ctx.encoder, ctx.view, None, Some(&left));
+        self.flatland_2d_tris.set_camera(&rd.queue, vp2);
+        self.flatland_2d_tris.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &frame.m2_tris,
+            &Projection::Identity,
+        );
+        self.flatland_2d_tris.execute(rd, view, None, Some(&left))?;
+        self.flatland_2d_lines
+            .set_camera(&rd.queue, vp2, Vec2::new(twod_w as f32, h as f32));
+        self.flatland_2d_lines.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &frame.m2_lines,
+            &Projection::Identity,
+            1,
+        );
+        self.flatland_2d_lines
+            .execute(rd, view, None, Some(&left))?;
+
         if threed_w > 0 {
+            let view_dir = self.camera.view();
+            let view_m = Mat4::look_to_rh(view_dir.position, view_dir.forward, view_dir.up);
+            let proj = Mat4::perspective_rh(
+                60.0_f32.to_radians(),
+                threed_w as f32 / h as f32,
+                0.05,
+                100.0,
+            );
+            let vp3 = proj * view_m;
             let right = Viewport {
                 x: twod_w,
                 y: 0,
                 width: threed_w,
                 height: h,
             };
-            self.scene_3d
-                .record(ctx.encoder, ctx.view, None, Some(&right));
+            self.scene_3d_tris.set_camera(&rd.queue, vp3);
+            self.scene_3d_tris.upload::<EuclideanR3, 3>(
+                &rd.device,
+                &rd.queue,
+                &frame.m3_tris,
+                &Projection::Identity,
+            );
+            self.scene_3d_tris.execute(rd, view, None, Some(&right))?;
+            self.scene_3d_lines
+                .set_camera(&rd.queue, vp3, Vec2::new(threed_w as f32, h as f32));
+            self.scene_3d_lines.upload::<EuclideanR3, 3>(
+                &rd.device,
+                &rd.queue,
+                &frame.m3_lines,
+                &Projection::Identity,
+                1,
+            );
+            self.scene_3d_lines.execute(rd, view, None, Some(&right))?;
         }
         Ok(())
     }
