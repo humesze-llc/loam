@@ -11,7 +11,9 @@ use rye_app::{egui, run, App, FrameCtx, RunConfig, SetupCtx};
 use rye_egui::{ease_in_out_cubic, ease_out_cubic, Animated};
 use rye_math::{EuclideanR3, Projection, ZPlane};
 use rye_render::device::RenderDevice;
-use rye_render::{DepthBuffer, DepthMode, FragmentShading, LineRasterNode, TriangleRasterNode};
+use rye_render::{
+    DepthBuffer, DepthMode, FragmentShading, LineRasterNode, ShaderEffect, TriangleRasterNode,
+};
 use rye_shape::{convex_section_polygon, icosphere, LineMesh, Solid3, TriangleMesh};
 use std::collections::BTreeSet;
 use std::f32::consts::{PI, TAU};
@@ -44,12 +46,24 @@ fn cam_target() -> Vec3 {
     Vec3::new(0.6, 0.3, 0.0)
 }
 
-const SKY: wgpu::Color = wgpu::Color {
-    r: 0.74,
-    g: 0.82,
-    b: 0.90,
-    a: 1.0,
-};
+const SKY_TOP: [f32; 3] = [0.42, 0.58, 0.82];
+const SKY_HORIZON: [f32; 3] = [0.82, 0.88, 0.93];
+
+const SKY_WGSL: &str = r#"
+struct Sky { top: vec4<f32>, horizon: vec4<f32>, fade: vec4<f32> };
+@group(0) @binding(0) var<uniform> sky: Sky;
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let g = clamp(in.uv.y, 0.0, 1.0);
+    let col = mix(sky.top.rgb, sky.horizon.rgb, g);
+    let dark = vec3<f32>(0.05, 0.05, 0.09);
+    return vec4<f32>(mix(dark, col, sky.fade.x), 1.0);
+}
+"#;
+
+fn f32_le(vals: &[f32]) -> Vec<u8> {
+    vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
 const COLOR_SPHERE: [f32; 4] = [0.86, 0.45, 0.30, 1.0];
 const FLATLAND_A: [f32; 4] = [0.92, 0.92, 0.88, 1.0];
 const FLATLAND_B: [f32; 4] = [0.85, 0.87, 0.84, 1.0];
@@ -212,6 +226,7 @@ struct Frame {
 struct FlatlandApp {
     lines: LineRasterNode,
     tris: TriangleRasterNode,
+    sky: ShaderEffect,
     depth: Option<DepthBuffer>,
     sphere_verts: Vec<Vec3>,
     sphere_edges: Vec<[u32; 2]>,
@@ -549,6 +564,14 @@ impl App for FlatlandApp {
             FragmentShading::Flat,
             ctx.rd.sample_count(),
         );
+        let sky = ShaderEffect::new(
+            &ctx.rd.device,
+            ctx.rd.target_format(),
+            SKY_WGSL,
+            48,
+            wgpu::BlendState::REPLACE,
+            ctx.rd.sample_count(),
+        );
 
         let (raw, faces) = icosphere(SPHERE_SUBDIVISIONS);
         let sphere_verts = raw.iter().map(|v| *v * SPHERE_RADIUS).collect();
@@ -562,6 +585,7 @@ impl App for FlatlandApp {
         let mut app = Self {
             lines: line_node,
             tris: tri_node,
+            sky,
             depth: None,
             sphere_verts,
             sphere_edges: set.into_iter().collect(),
@@ -649,15 +673,6 @@ impl App for FlatlandApp {
         let h = cfg.height.max(1);
         let view_proj = self.camera_view_proj(w as f32 / h as f32);
 
-        let iv = self.intro.value() as f64;
-        let dark = 0.05;
-        let clear = wgpu::Color {
-            r: dark + (SKY.r - dark) * iv,
-            g: dark + (SKY.g - dark) * iv,
-            b: (dark + 0.04) + (SKY.b - dark - 0.04) * iv,
-            a: 1.0,
-        };
-
         DepthBuffer::ensure(
             &mut self.depth,
             &rd.device,
@@ -680,7 +695,7 @@ impl App for FlatlandApp {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -698,6 +713,27 @@ impl App for FlatlandApp {
             drop(_clear);
             rd.queue.submit(Some(enc.finish()));
         }
+
+        // Gradient sky backdrop (opaque), faded in by the intro.
+        let intro = self.intro.value();
+        self.sky.set_uniforms(
+            &rd.queue,
+            &f32_le(&[
+                SKY_TOP[0],
+                SKY_TOP[1],
+                SKY_TOP[2],
+                1.0, //
+                SKY_HORIZON[0],
+                SKY_HORIZON[1],
+                SKY_HORIZON[2],
+                1.0, //
+                intro,
+                0.0,
+                0.0,
+                0.0,
+            ]),
+        );
+        self.sky.execute(rd, view, None)?;
 
         self.tris.set_camera(&rd.queue, view_proj);
         self.tris.upload::<EuclideanR3, 3>(
