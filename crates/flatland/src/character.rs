@@ -1,36 +1,35 @@
-//! A Square as a mouthless character: a square body that leans and breathes, and
-//! two round eyes that go from closed (asleep) through a resting semicircle to a
-//! full interested circle, tracking a gaze point. Expression is carried entirely
-//! by the body's lean/stretch and the eyes, never a mouth. Drawn on the z=0 plane.
+//! A Square as a solid-coloured, mouthless character with white eyes. Expression
+//! comes entirely from the body's lean (horizontal shear) and stretch (vertical
+//! scale) and from the eyes, which go closed (asleep) -> resting semicircle ->
+//! full interested circle and track a gaze point. Drawn on the z=0 plane.
 
 use glam::Vec2;
 use rye_shape::{fill_convex_polygon, LineMesh, TriangleMesh};
 use std::f32::consts::TAU;
 
-const BODY_FILL: [f32; 4] = [0.84, 0.92, 0.89, 1.0];
-const OUTLINE: [f32; 4] = [0.12, 0.40, 0.36, 1.0];
-const EYE: [f32; 4] = [0.10, 0.20, 0.22, 1.0];
-const HIGHLIGHT: [f32; 4] = [0.98, 0.99, 0.97, 1.0];
-const INTERIOR: [f32; 4] = [0.78, 0.30, 0.32, 1.0];
+const BODY: [f32; 4] = [0.20, 0.52, 0.60, 1.0];
+const OUTLINE: [f32; 4] = [0.10, 0.30, 0.36, 1.0];
+const EYE_WHITE: [f32; 4] = [0.98, 0.99, 0.97, 1.0];
+const PUPIL: [f32; 4] = [0.10, 0.16, 0.20, 1.0];
 
 pub struct Face {
     pub pos: Vec2,
     pub half: f32,
     /// Horizontal shear; positive leans toward +x.
     pub lean: f32,
-    /// Vertical stretch delta (breathing): 0 is rest.
-    pub breathe: f32,
+    /// Vertical scale delta (breathing + reaching up): 0 is rest.
+    pub stretch: f32,
     /// Per-eye openness: 0 closed, 0.5 resting semicircle, 1 full circle.
     pub eye_open: [f32; 2],
     /// Gaze direction the pupils shift toward.
     pub look: Vec2,
 }
 
-/// Lean (shear by height) and breathe (vertical stretch) applied to every point,
-/// so body and eyes deform together.
+/// Lean (shear by height) and stretch (vertical scale) applied to every point, so
+/// body and eyes deform together.
 fn xf(face: &Face, p: Vec2) -> Vec2 {
     let rel = p - face.pos;
-    let rel = Vec2::new(rel.x, rel.y * (1.0 + face.breathe));
+    let rel = Vec2::new(rel.x, rel.y * (1.0 + face.stretch));
     face.pos + Vec2::new(rel.x + face.lean * rel.y, rel.y)
 }
 
@@ -58,17 +57,10 @@ pub fn push_face(lines: &mut LineMesh<3>, tris: &mut TriangleMesh<3>, face: &Fac
     .iter()
     .map(|&c| xf(face, p + c))
     .collect();
-    append(tris, &fill_convex_polygon(&body, BODY_FILL));
+    append(tris, &fill_convex_polygon(&body, BODY));
     for i in 0..4 {
         seg(lines, body[i], body[(i + 1) % 4], OUTLINE, 2.0);
     }
-
-    // A visible interior: from outside his plane (our vantage, and A Sphere's) we
-    // see inside A Square, which no fellow Flatlander at his level ever could.
-    append(
-        tris,
-        &fill_convex_polygon(&disc(face, p, h * 0.22, 16), INTERIOR),
-    );
 
     let eye_r = h * 0.30;
     let look = if face.look.length() > 1e-4 {
@@ -77,40 +69,39 @@ pub fn push_face(lines: &mut LineMesh<3>, tris: &mut TriangleMesh<3>, face: &Fac
         Vec2::new(0.0, 1.0)
     };
     for (idx, sx) in [(0usize, -1.0_f32), (1, 1.0)] {
-        let socket = p + Vec2::new(sx * h * 0.42, h * 0.16);
+        let socket = p + Vec2::new(sx * h * 0.40, h * 0.16);
         let open = face.eye_open[idx].clamp(0.0, 1.0);
         if open < 0.12 {
             // Asleep: a small closed curve, no disc.
             let a = xf(face, socket + Vec2::new(-eye_r * 0.85, eye_r * 0.1));
-            let m = xf(face, socket + Vec2::new(0.0, -eye_r * 0.25));
+            let m = xf(face, socket + Vec2::new(0.0, -eye_r * 0.22));
             let b = xf(face, socket + Vec2::new(eye_r * 0.85, eye_r * 0.1));
-            seg(lines, a, m, EYE, 2.5);
-            seg(lines, m, b, EYE, 2.5);
+            seg(lines, a, m, PUPIL, 2.5);
+            seg(lines, m, b, PUPIL, 2.5);
             continue;
         }
-        let center = socket + look * (eye_r * 0.24);
         append(
             tris,
-            &fill_convex_polygon(&disc(face, center, eye_r, 18), EYE),
+            &fill_convex_polygon(&disc(face, socket, eye_r, 18), EYE_WHITE),
         );
-        let glint = center + Vec2::new(eye_r * 0.3, eye_r * 0.3);
+        let pupil = socket + look * (eye_r * 0.42);
         append(
             tris,
-            &fill_convex_polygon(&disc(face, glint, eye_r * 0.2, 8), HIGHLIGHT),
+            &fill_convex_polygon(&disc(face, pupil, eye_r * 0.5, 12), PUPIL),
         );
-        // Body-coloured lid over the top `1 - open` of the eye gives the
-        // semicircle (resting) to circle (interested) range.
+        // Body-coloured lid over the top `1 - open` of the eye: semicircle (rest)
+        // to circle (interested).
         let lid = 1.0 - open;
         if lid > 0.01 {
-            let y_top = center.y + eye_r * 1.05;
-            let y_cut = y_top - 2.1 * eye_r * lid;
+            let y_top = socket.y + eye_r * 1.1;
+            let y_cut = y_top - 2.2 * eye_r * lid;
             let cap = [
-                xf(face, Vec2::new(center.x - eye_r * 1.2, y_cut)),
-                xf(face, Vec2::new(center.x + eye_r * 1.2, y_cut)),
-                xf(face, Vec2::new(center.x + eye_r * 1.2, y_top)),
-                xf(face, Vec2::new(center.x - eye_r * 1.2, y_top)),
+                xf(face, Vec2::new(socket.x - eye_r * 1.2, y_cut)),
+                xf(face, Vec2::new(socket.x + eye_r * 1.2, y_cut)),
+                xf(face, Vec2::new(socket.x + eye_r * 1.2, y_top)),
+                xf(face, Vec2::new(socket.x - eye_r * 1.2, y_top)),
             ];
-            append(tris, &fill_convex_polygon(&cap, BODY_FILL));
+            append(tris, &fill_convex_polygon(&cap, BODY));
         }
     }
 }
