@@ -25,6 +25,7 @@
 //!   [`Shape`]; `rye-physics` for `Collider` and [`Visualizable`] on `Polytope4`). The dep
 //!   graph stays a tree.
 
+pub mod canvas;
 pub mod icosphere;
 pub mod polytope;
 pub mod polytope_geom;
@@ -32,6 +33,7 @@ pub mod section;
 pub mod solid3;
 pub mod visualizable;
 
+pub use canvas::Canvas;
 pub use icosphere::icosphere;
 pub use section::{convex_section_polygon, fill_convex_polygon};
 pub use solid3::Solid3;
