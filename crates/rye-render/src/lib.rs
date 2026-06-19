@@ -22,9 +22,11 @@ pub mod line_raster;
 pub mod line_raster_static_r4;
 pub mod point_raster;
 pub mod raymarch;
+pub mod shader_effect;
 pub mod triangle_raster;
 
 pub use depth::DepthBuffer;
+pub use shader_effect::{ShaderEffect, FULLSCREEN_VERTEX_WGSL};
 pub use lattice::Viewport;
 pub use line_raster::{LineRasterNode, LineRasterUniforms};
 pub use line_raster_static_r4::{LineRasterStaticR4Node, LineRasterStaticR4Uniforms};
