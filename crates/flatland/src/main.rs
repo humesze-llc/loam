@@ -112,6 +112,7 @@ struct FlatlandApp {
     gaze_target: Vec2,
     surprise: Animated,
     surprised: bool,
+    vision_band: Option<(f32, f32)>,
 }
 
 fn v3(x: f32, y: f32) -> Vec3 {
@@ -371,6 +372,7 @@ impl App for FlatlandApp {
             gaze_target: Vec2::new(0.0, 0.0),
             surprise: Animated::new(0.0),
             surprised: false,
+            vision_band: None,
         };
         app.enter_beat(0);
         Ok(app)
@@ -395,6 +397,25 @@ impl App for FlatlandApp {
                 .animate_to(if crossing { 1.0 } else { 0.0 }, 0.3, ease_out_cubic);
         }
         self.surprise.advance(dt);
+
+        // A Square's 1D percept: the angular interval A Sphere's circular section
+        // subtends, normalized across his field of view. Analytic for the sphere
+        // (section center at the origin, radius sqrt(R^2 - z^2)).
+        let z = self.sphere_z.value();
+        self.vision_band = if z.abs() < SPHERE_RADIUS {
+            let rc = (SPHERE_RADIUS * SPHERE_RADIUS - z * z).sqrt();
+            let to_c = Vec2::ZERO - Vec2::new(SQUARE_X, SQUARE_Y);
+            let dist = to_c.length();
+            (dist > rc).then(|| {
+                let base = to_c.y.atan2(to_c.x);
+                let half = (rc / dist).asin();
+                let lo = ((base - half) / FOV_HALF_ANGLE).clamp(-1.0, 1.0);
+                let hi = ((base + half) / FOV_HALF_ANGLE).clamp(-1.0, 1.0);
+                (lo, hi)
+            })
+        } else {
+            None
+        };
 
         if self.split.value() > 0.5 && !ctx.ui_has_focus {
             self.orbit
@@ -523,6 +544,33 @@ impl App for FlatlandApp {
                 self.gaze_target = Vec2::new(wx, wy);
             }
         }
+
+        egui::Area::new(egui::Id::new("vision-strip"))
+            .anchor(egui::Align2::LEFT_BOTTOM, [18.0, -92.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("A Square's eye (1D)")
+                        .size(12.0)
+                        .color(egui::Color32::from_gray(90)),
+                );
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(280.0, 26.0), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(rect, 4.0, egui::Color32::from_gray(70));
+                if let Some((lo, hi)) = self.vision_band {
+                    let x = |n: f32| rect.left() + (n + 1.0) * 0.5 * rect.width();
+                    let band = egui::Rect::from_min_max(
+                        egui::pos2(x(lo), rect.top()),
+                        egui::pos2(x(hi), rect.bottom()),
+                    );
+                    painter.rect_filled(band, 4.0, egui::Color32::from_rgb(235, 150, 40));
+                }
+                let cx = rect.center().x;
+                painter.line_segment(
+                    [egui::pos2(cx, rect.top()), egui::pos2(cx, rect.bottom())],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+                );
+            });
 
         let mut jump_to: Option<usize> = None;
         let mut scrub: Option<f32> = None;
