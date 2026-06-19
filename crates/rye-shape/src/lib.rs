@@ -33,7 +33,7 @@ pub mod solid3;
 pub mod visualizable;
 
 pub use icosphere::icosphere;
-pub use section::convex_section_polygon;
+pub use section::{convex_section_polygon, fill_convex_polygon};
 pub use solid3::Solid3;
 pub use visualizable::{LineMesh, NotVisualizable, PointMesh, TriangleMesh, Visualizable};
 

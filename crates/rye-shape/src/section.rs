@@ -7,6 +7,8 @@
 use glam::{Vec2, Vec3};
 use rye_math::{EuclideanR3, SectionableSpace, ZPlane};
 
+use crate::TriangleMesh;
+
 /// Two section points closer than this (in R²) are the same crossing: a slice
 /// through a shared vertex yields an identical point on every incident edge.
 const SECTION_POINT_MERGE: f32 = 1e-6;
@@ -47,6 +49,22 @@ pub fn convex_section_polygon(vertices: &[Vec3], edges: &[[u32; 2]], slice: ZPla
     pts
 }
 
+/// Fan-triangulate a CCW convex polygon (e.g. [`convex_section_polygon`] output)
+/// into a filled `TriangleMesh<3>` at `z = 0`. Empty if fewer than 3 points.
+pub fn fill_convex_polygon(poly: &[Vec2], color: [f32; 4]) -> TriangleMesh<3> {
+    let vertices: Vec<[f32; 3]> = poly.iter().map(|p| [p.x, p.y, 0.0]).collect();
+    let mut indices = Vec::new();
+    for i in 1..poly.len().saturating_sub(1) {
+        indices.push([0, i as u32, (i + 1) as u32]);
+    }
+    let colors = vec![color; vertices.len()];
+    TriangleMesh {
+        vertices,
+        indices,
+        colors,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +78,30 @@ mod tests {
             a += p.x * q.y - q.x * p.y;
         }
         a * 0.5
+    }
+
+    /// Filling a unit square yields two triangles whose area equals the square.
+    #[test]
+    fn fill_unit_square_area() {
+        let sq = [
+            Vec2::new(-1.0, -1.0),
+            Vec2::new(1.0, -1.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(-1.0, 1.0),
+        ];
+        let mesh = fill_convex_polygon(&sq, [1.0; 4]);
+        assert_eq!(mesh.indices.len(), 2);
+        let area: f32 = mesh
+            .indices
+            .iter()
+            .map(|t| {
+                let a = mesh.vertices[t[0] as usize];
+                let b = mesh.vertices[t[1] as usize];
+                let c = mesh.vertices[t[2] as usize];
+                0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs()
+            })
+            .sum();
+        assert!((area - 4.0).abs() < 1e-5);
     }
 
     /// Cube through its center: a square at the four vertical-edge midpoints, the
