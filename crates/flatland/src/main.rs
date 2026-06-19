@@ -92,7 +92,7 @@ const BEATS: &[Beat] = &[
     },
     Beat {
         title: "You",
-        caption: "A Square could not picture the sphere. Now imagine 4D passing through us.",
+        caption: "From outside his plane we even see A Square's insides, as 4D would see ours. You are A Square.",
         square: None,
         sphere: None,
     },

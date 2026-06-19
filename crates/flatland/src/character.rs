@@ -9,6 +9,7 @@ const BODY_FILL: [f32; 4] = [0.82, 0.91, 0.87, 1.0];
 const OUTLINE: [f32; 4] = [0.12, 0.40, 0.36, 1.0];
 const EYE_WHITE: [f32; 4] = [0.98, 0.99, 0.97, 1.0];
 const PUPIL: [f32; 4] = [0.10, 0.20, 0.22, 1.0];
+const INTERIOR: [f32; 4] = [0.78, 0.30, 0.32, 1.0];
 
 pub struct Face {
     pub pos: Vec2,
@@ -31,6 +32,13 @@ pub fn push_face(lines: &mut LineMesh<3>, tris: &mut TriangleMesh<3>, face: &Fac
     for i in 0..4 {
         seg(lines, corners[i], corners[(i + 1) % 4], OUTLINE, 2.0);
     }
+
+    // A visible interior: from above (A Sphere's vantage, and ours) we see inside
+    // A Square, which no fellow Flatlander at his own level ever could.
+    append(
+        tris,
+        &fill_convex_polygon(&circle(p, h * 0.22, 16), INTERIOR),
+    );
 
     // Eyes sit toward the +x front, the direction A Square watches from.
     let eye_r = h * 0.26;
