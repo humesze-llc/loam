@@ -199,6 +199,7 @@ struct FlatlandApp {
     beat: usize,
     beat_elapsed: f32,
     paused: bool,
+    intro: Animated,
     reveal: Animated,
     sphere_z: Animated,
     surprise: Animated,
@@ -297,7 +298,7 @@ impl FlatlandApp {
         let rv = self.reveal.value();
         let el = lerp(CAM_ELEV_DEG.0, CAM_ELEV_DEG.1, rv).to_radians();
         let az = lerp(CAM_AZIM_DEG.0, CAM_AZIM_DEG.1, rv).to_radians();
-        let dist = lerp(CAM_DIST.0, CAM_DIST.1, rv);
+        let dist = lerp(CAM_DIST.0, CAM_DIST.1, rv) + (1.0 - self.intro.value()) * 9.0;
         let fov = lerp(CAM_FOV_DEG.0, CAM_FOV_DEG.1, rv).to_radians();
         let (se, ce) = el.sin_cos();
         let (sa, ca) = az.sin_cos();
@@ -341,14 +342,16 @@ impl FlatlandApp {
         } else {
             0.0
         };
+        // Eyes ease open as he wakes (alongside the head-shake).
+        let wake_open = (1.0 - self.wake_shake / 0.6).clamp(0.0, 1.0);
         character::Face {
             pos,
             half: SQUARE_HALF,
             lean,
             breathe,
             eye_open: [
-                ((base + left_more) * blink).min(1.0),
-                ((base + right_more) * blink).min(1.0),
+                ((base + left_more) * blink * wake_open).min(1.0),
+                ((base + right_more) * blink * wake_open).min(1.0),
             ],
             look: gaze - pos,
         }
@@ -486,6 +489,7 @@ impl App for FlatlandApp {
             beat: 0,
             beat_elapsed: 0.0,
             paused: false,
+            intro: Animated::new(0.0),
             reveal: Animated::new(0.0),
             sphere_z: Animated::new(SPHERE_HIDDEN),
             surprise: Animated::new(0.0),
@@ -497,6 +501,7 @@ impl App for FlatlandApp {
             vision_bands: Vec::new(),
         };
         app.enter_beat(0);
+        app.intro.animate_to(1.0, 1.8, ease_out_cubic);
         Ok(app)
     }
 
@@ -507,6 +512,7 @@ impl App for FlatlandApp {
     fn update(&mut self, ctx: &mut FrameCtx<'_>) {
         let dt = ctx.dt.min(0.1);
         self.time += dt;
+        self.intro.advance(dt);
         self.reveal.advance(dt);
         self.sphere_z.advance(dt);
         self.wake_shake = (self.wake_shake - dt).max(0.0);
@@ -566,6 +572,16 @@ impl App for FlatlandApp {
         let h = cfg.height.max(1);
         let view_proj = self.camera_view_proj(w as f32 / h as f32);
 
+        // Opening fade from dark to the daylight clear colour.
+        let iv = self.intro.value() as f64;
+        let dark = 0.06;
+        let clear = wgpu::Color {
+            r: dark + (CLEAR.r - dark) * iv,
+            g: dark + (CLEAR.g - dark) * iv,
+            b: (dark + 0.02) + (CLEAR.b - dark - 0.02) * iv,
+            a: 1.0,
+        };
+
         {
             let mut enc = rd
                 .device
@@ -579,7 +595,7 @@ impl App for FlatlandApp {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(CLEAR),
+                        load: wgpu::LoadOp::Clear(clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
