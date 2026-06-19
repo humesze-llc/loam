@@ -53,34 +53,48 @@ const COLOR_TANGENT: [f32; 4] = [0.82, 0.55, 0.30, 0.5];
 struct Beat {
     title: &'static str,
     caption: &'static str,
+    square: Option<&'static str>,
+    sphere: Option<&'static str>,
 }
 
 const BEATS: &[Beat] = &[
     Beat {
         title: "Welcome",
         caption: "Welcome to Flatland. This is A Square, a being of two dimensions.",
+        square: None,
+        sphere: None,
     },
     Beat {
         title: "His sight",
         caption: "A Square cannot look down on his world. He perceives it only as a line.",
+        square: Some("All I see is a line. It is my whole world."),
+        sphere: None,
     },
     Beat {
         title: "A slice",
         caption: "His whole world is a single flat slice of a 3D space he cannot point to.",
+        square: None,
+        sphere: None,
     },
     Beat {
         title: "A Sphere",
         caption:
             "Something arrives from that hidden direction: A Sphere, hovering above the plane.",
+        square: Some("I see only a circle. Reveal yourself!"),
+        sphere: Some("Greetings, Square. I am A Sphere, from a direction you cannot point to."),
     },
     Beat {
         title: "Passage",
         caption:
             "A Sphere descends through Flatland. A Square sees a circle appear, swell, and vanish.",
+        square: Some("It grows... it shrinks... it is gone! Sorcery!"),
+        sphere: None,
     },
     Beat {
         title: "You",
         caption: "A Square could not picture the sphere. Now imagine 4D passing through us.",
+        square: None,
+        sphere: None,
     },
 ];
 
@@ -318,6 +332,31 @@ fn push_retina(mesh: &mut LineMesh<3>, poly: &[Vec2], s: Vec2, facing: Vec2, per
         let b1 = center + perp * hi;
         push(mesh, v3(b0.x, b0.y), v3(b1.x, b1.y), COLOR_SEES, 4.0);
     }
+}
+
+fn speech_bubble(
+    ctx: &egui::Context,
+    id: &str,
+    pos: egui::Pos2,
+    text: &str,
+    accent: egui::Color32,
+) {
+    egui::Area::new(egui::Id::new(id))
+        .fixed_pos(pos)
+        .pivot(egui::Align2::CENTER_TOP)
+        .show(ctx, |ui| {
+            egui::Frame::popup(&ctx.style())
+                .fill(egui::Color32::from_rgb(252, 252, 250))
+                .stroke(egui::Stroke::new(1.5, accent))
+                .show(ui, |ui| {
+                    ui.set_max_width(250.0);
+                    ui.label(
+                        egui::RichText::new(text)
+                            .size(14.0)
+                            .color(egui::Color32::from_gray(30)),
+                    );
+                });
+        });
 }
 
 impl App for FlatlandApp {
@@ -571,6 +610,32 @@ impl App for FlatlandApp {
                     egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
                 );
             });
+
+        let screen = ctx.content_rect();
+        let twod_frac = 1.0 - 0.5 * self.split.value();
+        let top = screen.top() + 64.0;
+        if let Some(t) = BEATS[self.beat].square {
+            let cx = screen.left() + screen.width() * twod_frac * 0.5;
+            speech_bubble(
+                ctx,
+                "square-bubble",
+                egui::pos2(cx, top),
+                t,
+                egui::Color32::from_rgb(40, 130, 110),
+            );
+        }
+        if let Some(t) = BEATS[self.beat].sphere {
+            if self.split.value() > 0.6 {
+                let cx = screen.left() + screen.width() * (twod_frac + (1.0 - twod_frac) * 0.5);
+                speech_bubble(
+                    ctx,
+                    "sphere-bubble",
+                    egui::pos2(cx, top),
+                    t,
+                    egui::Color32::from_rgb(60, 90, 170),
+                );
+            }
+        }
 
         let mut jump_to: Option<usize> = None;
         let mut scrub: Option<f32> = None;
