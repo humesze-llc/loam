@@ -364,8 +364,9 @@ fn cue_track(starts: &[f32], range: std::ops::Range<usize>) -> Track {
 }
 
 /// Build the timeline tracks (everything is `f(t)`): camera reveal, the Act 1 /
-/// Act 2 object heights, and the intro fade, plus beat starts and total length.
-fn build_tracks() -> (Track, Track, Track, Track, Vec<f32>, f32) {
+/// Act 2 object heights, the intro fade, and the 1D-vision-window slide, plus
+/// beat starts and total length.
+fn build_tracks() -> (Track, Track, Track, Track, Track, Vec<f32>, f32) {
     let mut starts = Vec::with_capacity(BEATS.len());
     let mut t = 0.0;
     for b in BEATS {
@@ -395,7 +396,18 @@ fn build_tracks() -> (Track, Track, Track, Track, Vec<f32>, f32) {
         .key(0.0, 0.0, linear)
         .key(INTRO_SECONDS, 1.0, ease_out_cubic);
 
-    (reveal, sphere_z, w, intro, starts, total)
+    // The vision window is on screen while A Square's sight is the subject: from
+    // the "his vision" beat through the end of Act 1.
+    let vis_in = starts[BEATS.iter().position(|b| b.vision).unwrap()];
+    let vis_out = starts[ACT2_START - 1];
+    let vision_slide = Track::new()
+        .key(0.0, 0.0, linear)
+        .key(vis_in, 0.0, linear)
+        .key(vis_in + 0.4, 1.0, ease_out_cubic)
+        .key(vis_out, 1.0, linear)
+        .key(vis_out + 0.4, 0.0, ease_out_cubic);
+
+    (reveal, sphere_z, w, intro, vision_slide, starts, total)
 }
 
 struct FlatlandApp {
@@ -404,14 +416,16 @@ struct FlatlandApp {
     sky: ShaderEffect,
     wash: ShaderEffect,
     depth: Option<DepthBuffer>,
-    vision_slide: f32,
     sphere_verts: Vec<Vec3>,
     sphere_edges: Vec<[u32; 2]>,
+    scratch_lines: LineMesh<3>,
+    scratch_tris: TriangleMesh<3>,
     playhead: Playhead,
     reveal: Track,
     sphere_z: Track,
     w: Track,
     intro: Track,
+    vision_slide: Track,
     beat_starts: Vec<f32>,
     gaze_target: Vec2,
     vision_bands: Vec<(f32, f32)>,
@@ -596,12 +610,23 @@ impl FlatlandApp {
         }
     }
 
-    fn build(&self) -> (LineMesh<3>, TriangleMesh<3>, usize) {
+    fn build(&mut self) {
         let t = self.playhead.t;
         let beat = self.beat_index();
         let sphere_z = self.sphere_z.sample(t);
-        let mut lines = LineMesh::<3>::default();
-        let mut tris = TriangleMesh::<3>::default();
+        let w = self.w.sample(t);
+        let la = self.look_angle();
+        let face = self.face();
+        // Reuse last frame's buffers (capacity retained on clear); no per-frame
+        // allocation.
+        let mut lines = std::mem::take(&mut self.scratch_lines);
+        let mut tris = std::mem::take(&mut self.scratch_tris);
+        lines.segments.clear();
+        lines.colors.clear();
+        lines.widths.clear();
+        tris.vertices.clear();
+        tris.indices.clear();
+        tris.colors.clear();
 
         // Spaceland floor, receding into the distance.
         for ix in -10..10 {
@@ -643,7 +668,6 @@ impl FlatlandApp {
         // sphere of radius sqrt(R^2 - w^2) (exact, the same ladder one dimension
         // up), shown growing and shrinking in the same Spaceland.
         if beat >= ACT2_START {
-            let w = self.w.sample(t);
             if w.abs() < SPHERE_RADIUS {
                 let scale = (SPHERE_RADIUS * SPHERE_RADIUS - w * w).sqrt() / SPHERE_RADIUS;
                 for e in &self.sphere_edges {
@@ -652,7 +676,9 @@ impl FlatlandApp {
                     push(&mut lines, a, b, COLOR_SPHERE, 1.4);
                 }
             }
-            return (lines, tris, 0);
+            self.scratch_lines = lines;
+            self.scratch_tris = tris;
+            return;
         }
 
         // Flatland pane checkerboard (just behind the on-plane content).
@@ -698,7 +724,6 @@ impl FlatlandApp {
 
         if BEATS[beat].vision {
             let s = square_pos();
-            let la = self.look_angle();
             let mut wedge = vec![v3(s.x, s.y)];
             for k in 0..=14 {
                 let a = la - VISION_HALF_ANGLE + 2.0 * VISION_HALF_ANGLE * (k as f32 / 14.0);
@@ -761,9 +786,10 @@ impl FlatlandApp {
             }
         }
 
-        character::push_face(&mut lines, &mut tris, &self.face());
+        character::push_face(&mut lines, &mut tris, &face);
 
-        (lines, tris, sides)
+        self.scratch_lines = lines;
+        self.scratch_tris = tris;
     }
 
     fn look_angle(&self) -> f32 {
@@ -821,7 +847,7 @@ impl Scene for FlatlandApp {
             }
         }
 
-        let (reveal, sphere_z, w, intro, beat_starts, total) = build_tracks();
+        let (reveal, sphere_z, w, intro, vision_slide, beat_starts, total) = build_tracks();
 
         Ok(Self {
             lines: line_node,
@@ -829,14 +855,16 @@ impl Scene for FlatlandApp {
             sky,
             wash,
             depth: None,
-            vision_slide: 0.0,
             sphere_verts,
             sphere_edges: set.into_iter().collect(),
+            scratch_lines: LineMesh::default(),
+            scratch_tris: TriangleMesh::default(),
             playhead: Playhead::new(total),
             reveal,
             sphere_z,
             w,
             intro,
+            vision_slide,
             beat_starts,
             gaze_target: sphere_xy(),
             vision_bands: Vec::new(),
@@ -872,11 +900,6 @@ impl Scene for FlatlandApp {
             }
         }
         self.vision_bands = bands;
-
-        let active = beat.vision || z.abs() < SPHERE_RADIUS;
-        let target = if active { 1.0 } else { 0.0 };
-        let dt = ctx.dt.min(0.1);
-        self.vision_slide += (target - self.vision_slide) * (1.0 - (-dt * 8.0).exp());
     }
 
     fn render(
@@ -885,7 +908,7 @@ impl Scene for FlatlandApp {
         view: &wgpu::TextureView,
         viewport: Viewport,
     ) -> Result<()> {
-        let (line_mesh, tri_mesh, _sides) = self.build();
+        self.build();
 
         let cfg = &rd.surface_bundle.config;
         let vw = viewport.width.max(1);
@@ -954,15 +977,19 @@ impl Scene for FlatlandApp {
         self.sky.execute(rd, view, Some(&viewport))?;
 
         self.tris.set_camera(&rd.queue, view_proj);
-        self.tris
-            .upload::<EuclideanR3, 3>(&rd.device, &rd.queue, &tri_mesh, &Projection::Identity);
+        self.tris.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            &self.scratch_tris,
+            &Projection::Identity,
+        );
         self.tris.execute(rd, view, Some(&dview), Some(&viewport))?;
         self.lines
             .set_camera(&rd.queue, view_proj, Vec2::new(vw as f32, vh as f32));
         self.lines.upload::<EuclideanR3, 3>(
             &rd.device,
             &rd.queue,
-            &line_mesh,
+            &self.scratch_lines,
             &Projection::Identity,
             1,
         );
@@ -1040,8 +1067,9 @@ impl Scene for FlatlandApp {
 impl FlatlandApp {
     fn vision_window(&self, ctx: &egui::Context) {
         // Slides in from the left while his vision is the subject, out otherwise.
-        let x = -300.0 + 318.0 * self.vision_slide;
-        if self.vision_slide < 0.01 {
+        let slide = self.vision_slide.sample(self.playhead.t);
+        let x = -300.0 + 318.0 * slide;
+        if slide < 0.01 {
             return;
         }
         let mut u = vec![
