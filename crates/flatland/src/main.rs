@@ -44,10 +44,10 @@ const PASSAGE_SECONDS: f32 = 4.0;
 
 // Ground (infinite Flatland cross-section). A fixed large grid whose far cells
 // fade into the horizon colour so no hard edge shows when the camera tilts.
-const GROUND_HALF: f32 = 14.0;
-const GROUND_STEP: f32 = 0.75;
-const GROUND_FADE_NEAR: f32 = 7.0;
-const GROUND_FADE_FAR: f32 = 13.0;
+const GROUND_HALF: f32 = 26.0;
+const GROUND_STEP: f32 = 0.8;
+const GROUND_FADE_NEAR: f32 = 10.0;
+const GROUND_FADE_FAR: f32 = 24.0;
 
 // Deep-slate palette with bright character/section accents.
 const SKY_TOP: [f32; 3] = [0.05, 0.07, 0.12];
@@ -83,7 +83,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = i32(v.params.x);
     for (var i = 0; i < n; i = i + 1) {
         if (in.uv.x >= v.bands[i].x && in.uv.x <= v.bands[i].y) {
-            col = v.cols[i].rgb * v.bands[i].z;
+            // Shade across the band (bright center, darker edges) so each shape
+            // reads as a rounded form, then dim by distance.
+            let w = max(v.bands[i].y - v.bands[i].x, 1e-4);
+            let tt = (in.uv.x - v.bands[i].x) / w * 2.0 - 1.0;
+            let shade = 1.0 - 0.5 * tt * tt;
+            col = v.cols[i].rgb * v.bands[i].z * shade;
         }
     }
     let cu = v.params.z;
@@ -199,11 +204,13 @@ const BEATS: &[Beat] = &[
 /// smaller green square. (center, sides, radius, spin, color). The pentagon and
 /// square are placed nearly collinear from A Square (origin) so the near pentagon
 /// occludes the far square in his 1D vision.
-fn primitives() -> [(Vec2, usize, f32, f32, [f32; 4]); 3] {
+fn primitives() -> [(Vec2, usize, f32, f32, [f32; 4]); 5] {
     [
-        (Vec2::new(-2.2, 2.4), 3, 0.40, 0.6, [0.90, 0.32, 0.30, 1.0]),
-        (Vec2::new(1.4, 2.6), 5, 0.34, -0.4, [0.95, 0.80, 0.25, 1.0]),
-        (Vec2::new(2.3, 4.3), 4, 0.30, 0.8, [0.40, 0.80, 0.42, 1.0]),
+        (Vec2::new(-1.3, 1.5), 3, 0.30, 0.6, [0.90, 0.32, 0.30, 1.0]),
+        (Vec2::new(1.0, 1.4), 5, 0.28, -0.5, [0.95, 0.80, 0.25, 1.0]),
+        (Vec2::new(1.8, 2.5), 4, 0.24, 0.8, [0.40, 0.80, 0.42, 1.0]),
+        (Vec2::new(-2.1, -0.2), 6, 0.26, 0.4, [0.58, 0.46, 0.86, 1.0]),
+        (Vec2::new(0.3, 2.7), 3, 0.20, -0.9, [0.32, 0.72, 0.86, 1.0]),
     ]
 }
 
@@ -273,9 +280,19 @@ fn flat(p: Vec2) -> Vec3 {
     Vec3::new(p.x, 0.0, -p.y)
 }
 
-/// Half-height of the orthographic top-down view, with a slight intro zoom-out.
-fn ortho_half(intro: f32) -> f32 {
-    3.4 * (1.0 + (1.0 - intro) * 0.25)
+/// Half-height of the orthographic top-down view for a section: tight on A Square
+/// while he is introduced, wider once Flatland and the vision are the subject.
+fn section_zoom(section: usize) -> f32 {
+    if BEATS[section].vision {
+        3.8
+    } else {
+        match section {
+            0 => 3.2,
+            1 => 1.9,
+            2 => 2.6,
+            _ => 3.4,
+        }
+    }
 }
 
 /// The angled perspective pose the reveal settles into. Pulled back and rotated
@@ -336,9 +353,11 @@ struct FlatlandApp {
     section_clock: f32,
     reveal: Animated,
     sphere_h: Animated,
+    zoom: Animated,
     gaze: Vec2,
     gaze_target: Vec2,
     cursor_present: bool,
+    woken: bool,
     wake_clock: f32,
     /// Ordered far -> near: (lo, hi, brightness, rgb).
     vision_bands: Vec<(f32, f32, f32, [f32; 3])>,
@@ -390,6 +409,16 @@ impl FlatlandApp {
         };
         self.sphere_h
             .animate_to(sphere_target(b.cue), dur, ease_in_out_cubic);
+        self.zoom.animate_to(
+            section_zoom(self.section),
+            REVEAL_SECONDS,
+            ease_in_out_cubic,
+        );
+        // Returning to the start re-arms the one-shot wake.
+        if self.section == 0 {
+            self.woken = false;
+            self.wake_clock = -1.0;
+        }
     }
 
     fn look_angle(&self) -> f32 {
@@ -411,7 +440,7 @@ impl FlatlandApp {
         // Top-down orthographic view (pure 2D) at rv=0; the up vector is -z so the
         // 2D vertical axis (mapped to world -z) reads upward. Blends to the angled
         // perspective pose as the third dimension is revealed.
-        let half = ortho_half(intro);
+        let half = self.zoom.value();
         let eye = cam_target() + Vec3::new(0.0, 30.0, 0.0);
         let ortho = Mat4::orthographic_rh(-half * aspect, half * aspect, -half, half, 0.1, 200.0)
             * Mat4::look_at_rh(eye, cam_target(), Vec3::new(0.0, 0.0, -1.0));
@@ -449,6 +478,7 @@ impl FlatlandApp {
         let sy;
         let eye_open;
         let mut eye_squash = [1.0_f32; 2];
+        let mut eye_scale = 1.0_f32;
         let mut lookv = Vec2::ZERO;
 
         match waking {
@@ -460,42 +490,67 @@ impl FlatlandApp {
                 sx = 1.0 - breath * 0.03;
                 eye_open = [0.0, 0.0];
             }
-            Some(wp) if wp < 1.9 => {
-                // Wake, following the squash/stretch principle: anticipation
-                // crouch, an eased pop-open with a stretch overshoot, a smooth
-                // glance left and right, then a cheery settle with a small bounce.
-                let open = ease_out_cubic(((wp - 0.25) / 0.30).clamp(0.0, 1.0));
-                let cheer = ((wp - 1.15) / 0.30).clamp(0.0, 1.0);
-                let e = open * (1.0 - 0.5 * cheer);
-                eye_open = [e, e];
-
-                if wp < 0.25 {
-                    let a = wp / 0.25;
-                    sy = 1.0 - 0.14 * a;
-                    sx = 1.0 + 0.12 * a;
-                } else if wp < 0.6 {
-                    let a = ease_out_cubic((wp - 0.25) / 0.35);
-                    sy = 0.86 + 0.28 * a;
-                    sx = 1.12 - 0.18 * a;
+            Some(wp) if wp < 2.4 => {
+                // Wake as a scare that resolves into friendliness (plays once):
+                //   A startle (0..0.45): eyes snap wide and oversized, body jolts
+                //     up then recoils with a fast tremble.
+                //   B wary (0.45..1.2): wide-eyed, quick L-R glances ("coast clear?").
+                //   C relief (1.2..1.8): eyes ease from wide to a cheery semicircle,
+                //     with a happy bounce.
+                //   D settle (1.8..2.4): eyes interpolate semicircle -> open.
+                let e;
+                let escale;
+                if wp < 0.10 {
+                    let a = wp / 0.10;
+                    e = a;
+                    escale = 1.0 + 0.55 * a;
+                } else if wp < 0.45 {
+                    e = 1.0;
+                    escale = 1.55;
+                } else if wp < 1.2 {
+                    e = 1.0;
+                    escale = 1.55 - 0.25 * ((wp - 0.45) / 0.75);
+                } else if wp < 1.8 {
+                    let a = ease_in_out_cubic((wp - 1.2) / 0.6);
+                    e = 1.0 - 0.5 * a;
+                    escale = 1.3 - 0.3 * a;
                 } else {
-                    let a = ease_out_cubic(((wp - 0.6) / 0.5).clamp(0.0, 1.0));
-                    sy = 1.14 - 0.14 * a;
-                    sx = 0.94 + 0.06 * a;
+                    let a = ease_in_out_cubic((wp - 1.8) / 0.6);
+                    e = 0.5 + 0.5 * a;
+                    escale = 1.0;
                 }
+                eye_open = [e, e];
+                eye_scale = escale;
 
-                if (0.6..1.15).contains(&wp) {
-                    lookv = Vec2::new((((wp - 0.6) / 0.55) * TAU).sin(), 0.0);
-                }
-                if wp > 1.15 {
-                    let a = ((wp - 1.15) / 0.5).clamp(0.0, 1.0);
-                    pos.y += (a * std::f32::consts::PI).sin() * 0.12 * (1.0 - a);
+                if wp < 0.10 {
+                    let a = wp / 0.10;
+                    sy = 1.0 + 0.32 * a;
+                    sx = 1.0 - 0.22 * a;
+                } else if wp < 0.45 {
+                    let a = (wp - 0.10) / 0.35;
+                    sy = 1.32 - 0.42 * a;
+                    sx = 0.78 + 0.30 * a;
+                    pos.x += (wp * 60.0).sin() * 0.04 * (1.0 - a);
+                } else if wp < 1.2 {
+                    let a = (wp - 0.45) / 0.75;
+                    sy = 0.9 + 0.1 * a;
+                    sx = 1.08 - 0.08 * a;
+                    let step = (a * 4.0) as i32;
+                    lookv = Vec2::new(if step % 2 == 0 { -1.0 } else { 1.0 }, 0.0);
+                } else if wp < 1.8 {
+                    let a = (wp - 1.2) / 0.6;
+                    sy = 1.0 + (a * std::f32::consts::PI).sin() * 0.12 * (1.0 - a);
+                    sx = 1.0;
+                } else {
+                    sy = 1.0;
+                    sx = 1.0;
                 }
             }
             Some(_) => {
-                // Awake idle: eyes wide open and following the cursor (eyes only,
-                // no body squash). Gentle breathing; a surprise pop when the
-                // section circle crosses him; when the cursor is away he glances
-                // side to side, squinting the trailing eye.
+                // Awake idle: eyes open, following the cursor (eyes only, no body
+                // squash). Gentle breathing; a surprise pop + widen when the
+                // section circle crosses him; when the cursor is away he runs a
+                // quick coast-check of snappy left-right saccades.
                 let breathe = (t * 1.2).sin() * 0.02;
                 let pop = 0.16 * surprise;
                 sy = 1.0 + breathe + pop;
@@ -508,20 +563,22 @@ impl FlatlandApp {
                     1.0
                 };
                 eye_open = [blink, blink];
+                eye_scale = 1.0 + 0.25 * surprise;
 
                 let follow = self.cursor_present && self.reveal.value() < 0.5;
                 if follow || surprise > 0.05 {
                     lookv = look;
                 } else {
-                    // Idle (or in the 3D view, where he no longer tracks the
-                    // cursor): glance side to side, squinting the trailing eye.
-                    let g = (t * 0.5).sin();
-                    lookv = Vec2::new(g, 0.0);
-                    let squint = 0.5 * (1.0 - (t * 0.5).cos().abs());
-                    if g >= 0.0 {
-                        eye_squash[1] = 1.0 - squint;
-                    } else {
-                        eye_squash[0] = 1.0 - squint;
+                    let cyc = t % 7.0;
+                    if cyc < 1.6 {
+                        let step = (cyc / 0.32) as i32;
+                        let dir = if step % 2 == 0 { -1.0 } else { 1.0 };
+                        lookv = Vec2::new(dir, 0.0);
+                        if dir < 0.0 {
+                            eye_squash[1] = 0.45;
+                        } else {
+                            eye_squash[0] = 0.45;
+                        }
                     }
                 }
             }
@@ -533,6 +590,7 @@ impl FlatlandApp {
             scale: Vec2::new(sx, sy),
             eye_open,
             eye_squash,
+            eye_scale,
             look: lookv,
         }
     }
@@ -707,9 +765,11 @@ impl Scene for FlatlandApp {
             section_clock: 0.0,
             reveal: Animated::new(BEATS[0].reveal),
             sphere_h: Animated::new(sphere_target(BEATS[0].cue)),
+            zoom: Animated::new(section_zoom(0)),
             gaze: sphere_xy(),
             gaze_target: sphere_xy(),
             cursor_present: false,
+            woken: false,
             wake_clock: -1.0,
             vision_bands: Vec::new(),
             cursor_u: -1.0,
@@ -723,15 +783,13 @@ impl Scene for FlatlandApp {
         self.clock += dt;
         self.reveal.advance(dt);
         self.sphere_h.advance(dt);
+        self.zoom.advance(dt);
 
-        // Wake on cursor presence during a sleeping section; sleep again when it
-        // leaves.
-        if BEATS[self.section].sleeping {
-            if self.cursor_present && self.wake_clock < 0.0 {
-                self.wake_clock = self.clock;
-            } else if !self.cursor_present {
-                self.wake_clock = -1.0;
-            }
+        // Wake once, the first time the cursor enters during a sleeping section.
+        // It is a one-shot (re-armed only by returning to section 0).
+        if BEATS[self.section].sleeping && self.cursor_present && !self.woken {
+            self.woken = true;
+            self.wake_clock = self.clock;
         }
 
         // He tracks the cursor only in the 2D (top-down) view, where the screen
@@ -776,7 +834,27 @@ impl Scene for FlatlandApp {
         }
         bands.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         self.vision_bands = bands;
-        self.cursor_u = if cursor_drives { 0.5 } else { -1.0 };
+
+        // The cursor marker sits where the cursor actually is in his field of
+        // view. His gaze lags, so while he catches up the cursor rides off-center.
+        self.cursor_u = if cursor_drives {
+            let to = self.gaze_target - s;
+            let mut rel = to.y.atan2(to.x) - look;
+            while rel > std::f32::consts::PI {
+                rel -= TAU;
+            }
+            while rel < -std::f32::consts::PI {
+                rel += TAU;
+            }
+            let u = (rel / VISION_HALF_ANGLE + 1.0) * 0.5;
+            if !(-0.1..=1.1).contains(&u) {
+                -1.0
+            } else {
+                u.clamp(0.0, 1.0)
+            }
+        } else {
+            -1.0
+        };
     }
 
     fn render(
@@ -859,7 +937,7 @@ impl Scene for FlatlandApp {
         // The cursor maps cleanly onto the plane only in the top-down view; once
         // the camera tilts into 3D, stop steering his gaze by it.
         if let Some(p) = hover.filter(|_| self.reveal.value() < 0.5) {
-            let ext_y = ortho_half(self.intro());
+            let ext_y = self.zoom.value();
             let ext_x = ext_y * screen.width().max(1.0) / screen.height().max(1.0);
             let ndc_x = ((p.x - screen.left()) / screen.width()) * 2.0 - 1.0;
             let ndc_up = 1.0 - ((p.y - screen.top()) / screen.height()) * 2.0;

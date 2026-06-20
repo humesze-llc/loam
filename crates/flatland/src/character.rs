@@ -23,6 +23,8 @@ pub struct Face {
     pub eye_open: [f32; 2],
     /// Per-eye vertical squash (1 = round, <1 = squinting oval).
     pub eye_squash: [f32; 2],
+    /// Uniform eye size multiplier (>1 = widened, e.g. startled).
+    pub eye_scale: f32,
     /// Gaze direction the eyes shift toward.
     pub look: Vec2,
 }
@@ -45,7 +47,7 @@ pub fn push_face(tris: &mut TriangleMesh<3>, face: &Face, map: &dyn Fn(Vec2) -> 
     } else {
         Vec2::ZERO
     };
-    let eye_r = 0.24 * h;
+    let eye_r = 0.24 * h * face.eye_scale;
     for (idx, sgn) in [(0usize, -1.0_f32), (1, 1.0)] {
         let socket = c + Vec2::new(sgn * 0.40 * h * s.x, 0.12 * h * s.y) + look * (0.12 * h);
         let sq = face.eye_squash[idx];
