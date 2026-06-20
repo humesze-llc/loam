@@ -274,6 +274,18 @@ fn v3(x: f32, y: f32) -> Vec3 {
     Vec3::new(x, y, 0.0)
 }
 
+/// A filled disc in the plane parallel to xy at `center.z` (a cheap billboard for
+/// A Sphere's eyes, which face the head-on camera).
+fn disc3(tris: &mut TriangleMesh<3>, center: Vec3, radius: f32, color: [f32; 4], n: usize) {
+    let pts: Vec<Vec3> = (0..n)
+        .map(|i| {
+            let a = TAU * i as f32 / n as f32;
+            center + Vec3::new(a.cos() * radius, a.sin() * radius, 0.0)
+        })
+        .collect();
+    fan3(tris, &pts, color);
+}
+
 fn angular_band(s: Vec2, look_ang: f32, center: Vec2, radius: f32) -> Option<(f32, f32)> {
     let to_c = center - s;
     let dist = to_c.length();
@@ -324,15 +336,13 @@ impl FlatlandApp {
     fn face(&self) -> character::Face {
         let t = self.playhead.t;
         let beat = self.beat_index();
-        let pos = square_pos();
         let awake = !BEATS[beat].sleeping;
+        let mut pos = square_pos();
         let look = self.gaze_target - pos;
 
         let z = self.sphere_z.sample(t);
         let surprise = (1.0 - ((z.abs() - SPHERE_RADIUS).max(0.0) / 1.3)).clamp(0.0, 1.0);
 
-        // Wake: eyes ease open + a brief head-shake over the first 0.6s of the
-        // first awake beat.
         let wake_t = if beat >= wake_beat() {
             (t - self.beat_starts[wake_beat()]).max(0.0)
         } else {
@@ -343,32 +353,33 @@ impl FlatlandApp {
         } else {
             (wake_t / 0.6).clamp(0.0, 1.0)
         };
-        let mut lean = if awake {
-            (look.x * 0.09).clamp(-0.28, 0.28)
-        } else {
-            0.0
-        };
+        // Head-shake shimmy on wake (a horizontal wobble; no shear since he floats).
         if (0.0..0.6).contains(&wake_t) {
-            lean += (t * 32.0).sin() * 0.22 * (1.0 - wake_t / 0.6);
+            pos.x += (t * 30.0).sin() * 0.05 * (1.0 - wake_t / 0.6);
         }
 
-        let idle = if awake {
-            (t * 1.3).sin() * 0.012
+        // Squash/stretch: breathing + a vertical reach toward what he watches +
+        // a surprise pop, with a complementary horizontal squash for volume.
+        let breathe = if awake {
+            (t * 1.3).sin() * 0.015
         } else {
-            0.03 + (t * 0.9).sin() * 0.05
+            0.04 + (t * 0.9).sin() * 0.05
         };
         let reach = if awake {
-            (look.y * 0.05).clamp(-0.10, 0.16)
+            (look.y * 0.04).clamp(-0.10, 0.18)
         } else {
             0.0
         };
+        let pop = 0.14 * surprise;
+        let sy = 1.0 + breathe + reach + pop;
+        let sx = 1.0 - reach * 0.4 + pop * 0.5;
+
         let blink_phase = t % 3.4;
         let blink = if awake && blink_phase < 0.16 {
             (blink_phase / 0.08 - 1.0).abs().min(1.0)
         } else {
             1.0
         };
-
         let base = if awake { 0.5 + 0.5 * surprise } else { 0.0 };
         let left_more = if awake && look.x < 0.0 {
             0.5 * (1.0 - surprise)
@@ -384,8 +395,7 @@ impl FlatlandApp {
         character::Face {
             pos,
             half: 0.34,
-            lean,
-            stretch: idle + reach,
+            scale: Vec2::new(sx, sy),
             eye_open: [
                 ((base + left_more) * blink * wake_open).min(1.0),
                 ((base + right_more) * blink * wake_open).min(1.0),
@@ -504,6 +514,29 @@ impl FlatlandApp {
                     world[e[1] as usize],
                     COLOR_SPHERE,
                     1.4,
+                );
+            }
+            // A Sphere is a character too: white eyes on its front face.
+            let ez = center.z + SPHERE_RADIUS * 0.85;
+            for sx in [-1.0_f32, 1.0] {
+                let ec = Vec3::new(
+                    center.x + sx * 0.42 * SPHERE_RADIUS,
+                    center.y + 0.18 * SPHERE_RADIUS,
+                    ez,
+                );
+                disc3(
+                    &mut tris,
+                    ec,
+                    0.22 * SPHERE_RADIUS,
+                    [0.98, 0.99, 0.97, 1.0],
+                    14,
+                );
+                disc3(
+                    &mut tris,
+                    ec + Vec3::new(-0.06 * SPHERE_RADIUS, -0.06 * SPHERE_RADIUS, 0.01),
+                    0.11 * SPHERE_RADIUS,
+                    [0.10, 0.16, 0.20, 1.0],
+                    10,
                 );
             }
         }
