@@ -16,9 +16,11 @@
 //! will be removed once every example has migrated.
 
 mod camera;
+mod cinematic;
 mod controller;
 
 pub use camera::Camera;
+pub use cinematic::OrbitPose;
 pub use controller::{CameraController, FirstPersonController, OrbitController};
 
 use std::f32::consts::FRAC_PI_2;
