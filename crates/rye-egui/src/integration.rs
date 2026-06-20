@@ -54,7 +54,10 @@ impl UiIntegration {
         // build/look up pipelines matching the egui pass's format + samples.
         renderer
             .callback_resources
-            .insert(crate::shader_ui::ShaderUi::new(surface_format, msaa_samples));
+            .insert(crate::shader_ui::ShaderUi::new(
+                surface_format,
+                msaa_samples,
+            ));
         let pixels_per_point = window.scale_factor() as f32;
         Self {
             ctx,

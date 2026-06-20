@@ -33,8 +33,8 @@ mod integration;
 mod linear_indicator;
 pub mod media;
 mod overlay;
-mod slider_edit;
 pub mod shader_ui;
+mod slider_edit;
 pub mod tween;
 mod world;
 

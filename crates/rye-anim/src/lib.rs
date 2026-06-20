@@ -215,9 +215,7 @@ mod tests {
 
     #[test]
     fn track_holds_then_interpolates() {
-        let track = Track::new()
-            .key(1.0, 0.0, linear)
-            .key(2.0, 10.0, linear);
+        let track = Track::new().key(1.0, 0.0, linear).key(2.0, 10.0, linear);
         assert_eq!(track.sample(0.0), 0.0); // before first
         assert_eq!(track.sample(1.0), 0.0);
         assert!((track.sample(1.5) - 5.0).abs() < 1e-5); // midpoint, linear
