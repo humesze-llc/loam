@@ -1,91 +1,117 @@
-//! A Square: a solid-coloured, mouthless character with white eyes, drawn through
-//! [`rye_shape::Canvas`]. Expression comes from body squash/stretch (the Canvas
-//! scale) and the eyes (gaze + a lid from closed -> resting semicircle -> full
-//! circle). No shear/lean: he floats centered in Flatland.
+//! A Square: a single flat color, no border, with off-white eyes and no pupils.
+//! Expressiveness comes from the eye shape morphing rectangle (closed) ->
+//! semicircle (resting/happy) -> circle (open/alert), the body squash/stretch
+//! (which also ovals the eyes), and the gaze shift. Geometry is built in 2D and
+//! placed into the world by a caller-supplied `map`, so the character does not
+//! need to know the world orientation.
 
 use glam::Vec2;
-use rye_shape::{Canvas, LineMesh, TriangleMesh};
+use rye_shape::TriangleMesh;
+use std::f32::consts::{PI, TAU};
 
-const BODY: [f32; 4] = [0.20, 0.52, 0.60, 1.0];
-const OUTLINE: [f32; 4] = [0.10, 0.30, 0.36, 1.0];
-const EYE_WHITE: [f32; 4] = [0.98, 0.99, 0.97, 1.0];
-const PUPIL: [f32; 4] = [0.10, 0.16, 0.20, 1.0];
+const BODY: [f32; 4] = [0.22, 0.72, 0.80, 1.0];
+const EYE: [f32; 4] = [0.93, 0.96, 0.97, 1.0];
+const EYE_N: usize = 24;
 
 pub struct Face {
     pub pos: Vec2,
     pub half: f32,
     /// Non-uniform scale about the center (squash/stretch); `(1, 1)` is rest.
     pub scale: Vec2,
-    /// Per-eye openness: 0 closed, 0.5 resting semicircle, 1 full circle.
+    /// Per-eye shape: 0 closed (rectangle), 0.5 resting (semicircle), 1 open
+    /// (circle).
     pub eye_open: [f32; 2],
-    /// Gaze direction the pupils shift toward.
+    /// Gaze direction the eyes shift toward.
     pub look: Vec2,
 }
 
-pub fn push_face(lines: &mut LineMesh<3>, tris: &mut TriangleMesh<3>, face: &Face) {
-    let mut c = Canvas::new();
-    c.translate(face.pos);
-    c.scale(face.scale);
-
+pub fn push_face(tris: &mut TriangleMesh<3>, face: &Face, map: &dyn Fn(Vec2) -> [f32; 3]) {
     let h = face.half;
-    let body = [
-        Vec2::new(-h, -h),
-        Vec2::new(h, -h),
-        Vec2::new(h, h),
-        Vec2::new(-h, h),
-    ];
-    c.fill_poly(&body, BODY);
-    c.stroke_poly(&body, true, OUTLINE, 2.0);
+    let s = face.scale;
+    let c = face.pos;
 
-    let eye_r = h * 0.30;
+    let body = [
+        c + Vec2::new(-h * s.x, -h * s.y),
+        c + Vec2::new(h * s.x, -h * s.y),
+        c + Vec2::new(h * s.x, h * s.y),
+        c + Vec2::new(-h * s.x, h * s.y),
+    ];
+    fill(tris, &body, BODY, map);
+
     let look = if face.look.length() > 1e-4 {
         face.look.normalize()
     } else {
-        Vec2::new(0.0, 1.0)
+        Vec2::ZERO
     };
-    for (idx, sx) in [(0usize, -1.0_f32), (1, 1.0)] {
-        let socket = Vec2::new(sx * h * 0.40, h * 0.16);
-        let open = face.eye_open[idx].clamp(0.0, 1.0);
-        if open < 0.12 {
-            c.line(
-                socket + Vec2::new(-eye_r * 0.85, eye_r * 0.1),
-                socket + Vec2::new(0.0, -eye_r * 0.22),
-                PUPIL,
-                2.5,
-            );
-            c.line(
-                socket + Vec2::new(0.0, -eye_r * 0.22),
-                socket + Vec2::new(eye_r * 0.85, eye_r * 0.1),
-                PUPIL,
-                2.5,
-            );
-            continue;
-        }
-        c.disc(socket, eye_r, EYE_WHITE, 18);
-        c.disc(socket + look * (eye_r * 0.42), eye_r * 0.5, PUPIL, 12);
-        let lid = 1.0 - open;
-        if lid > 0.01 {
-            let y_top = socket.y + eye_r * 1.1;
-            let y_cut = y_top - 2.2 * eye_r * lid;
-            c.fill_poly(
-                &[
-                    Vec2::new(socket.x - eye_r * 1.2, y_cut),
-                    Vec2::new(socket.x + eye_r * 1.2, y_cut),
-                    Vec2::new(socket.x + eye_r * 1.2, y_top),
-                    Vec2::new(socket.x - eye_r * 1.2, y_top),
-                ],
-                BODY,
-            );
-        }
+    let eye_r = 0.24 * h;
+    for (idx, sgn) in [(0usize, -1.0_f32), (1, 1.0)] {
+        let socket = c + Vec2::new(sgn * 0.40 * h * s.x, 0.12 * h * s.y) + look * (0.12 * h);
+        let poly: Vec<Vec2> = eye_polygon(face.eye_open[idx], eye_r)
+            .into_iter()
+            .map(|p| socket + Vec2::new(p.x * s.x, p.y * s.y))
+            .collect();
+        fill(tris, &poly, EYE, map);
     }
+}
 
-    lines.segments.extend_from_slice(&c.lines.segments);
-    lines.colors.extend_from_slice(&c.lines.colors);
-    lines.widths.extend_from_slice(&c.lines.widths);
+fn fill(
+    tris: &mut TriangleMesh<3>,
+    poly: &[Vec2],
+    color: [f32; 4],
+    map: &dyn Fn(Vec2) -> [f32; 3],
+) {
+    if poly.len() < 3 {
+        return;
+    }
     let base = tris.vertices.len() as u32;
-    tris.vertices.extend_from_slice(&c.tris.vertices);
-    tris.colors.extend_from_slice(&c.tris.colors);
-    for t in &c.tris.indices {
-        tris.indices.push([t[0] + base, t[1] + base, t[2] + base]);
+    for p in poly {
+        tris.vertices.push(map(*p));
+        tris.colors.push(color);
+    }
+    for k in 1..poly.len() as u32 - 1 {
+        tris.indices.push([base, base + k, base + k + 1]);
+    }
+}
+
+/// The eye boundary as `EYE_N` points, morphing rectangle (closed, o=0) ->
+/// semicircle (resting, o=0.5) -> circle (open, o=1). All three keys share the
+/// same perimeter parametrisation (CCW from +x), so the per-point lerp is well
+/// defined.
+fn eye_polygon(o: f32, r: f32) -> Vec<Vec2> {
+    let o = o.clamp(0.0, 1.0);
+    (0..EYE_N)
+        .map(|i| {
+            let u = i as f32 / EYE_N as f32;
+            let a = TAU * u;
+            let circle = Vec2::new(a.cos() * r, a.sin() * r);
+            let semi = semicircle_point(u, r);
+            if o >= 0.5 {
+                semi.lerp(circle, (o - 0.5) * 2.0)
+            } else {
+                rect_point(u, r).lerp(semi, o * 2.0)
+            }
+        })
+        .collect()
+}
+
+/// Resting eye: flat top, round bottom (a smiling "u" shape). Upper half is the
+/// flat top edge; lower half is the circle's lower arc (so it matches the circle
+/// there and only the top flattens as o drops from 1 to 0.5).
+fn semicircle_point(u: f32, r: f32) -> Vec2 {
+    if u < 0.5 {
+        Vec2::new(r - 2.0 * r * (u / 0.5), 0.0)
+    } else {
+        let a = PI + PI * ((u - 0.5) / 0.5);
+        Vec2::new(a.cos() * r, a.sin() * r)
+    }
+}
+
+/// Closed eye: a thin horizontal bar, same perimeter direction as the arc.
+fn rect_point(u: f32, r: f32) -> Vec2 {
+    let rh = 0.16 * r;
+    if u < 0.5 {
+        Vec2::new(r - 2.0 * r * (u / 0.5), rh)
+    } else {
+        Vec2::new(-r + 2.0 * r * ((u - 0.5) / 0.5), -rh)
     }
 }
