@@ -325,6 +325,21 @@ impl FlatlandApp {
         self.playhead.seek(self.beat_starts[b]);
     }
 
+    fn project_to_screen(&self, world: Vec3, screen: egui::Rect) -> Option<egui::Pos2> {
+        let clip = self.camera_view_proj(screen.width() / screen.height()) * world.extend(1.0);
+        if clip.w <= 0.001 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        if ndc.x.abs() > 1.3 || ndc.y.abs() > 1.3 {
+            return None;
+        }
+        Some(egui::pos2(
+            screen.left() + (ndc.x * 0.5 + 0.5) * screen.width(),
+            screen.top() + (1.0 - (ndc.y * 0.5 + 0.5)) * screen.height(),
+        ))
+    }
+
     fn camera_view_proj(&self, aspect: f32) -> glam::Mat4 {
         let rv = self.reveal.sample(self.playhead.t);
         let intro = self.intro.sample(self.playhead.t);
@@ -832,25 +847,41 @@ impl FlatlandApp {
     fn dialogue(&self, ctx: &egui::Context, beat: usize) {
         let b = &BEATS[beat];
         let screen = ctx.content_rect();
-        let top = screen.top() + 70.0;
+
         if let Some(t) = b.square {
-            speech_bubble(
-                ctx,
-                "square-bubble",
-                egui::pos2(screen.left() + screen.width() * 0.3, top),
-                t,
-                egui::Color32::from_rgb(30, 110, 120),
-            );
-        }
-        if let Some(t) = b.sphere {
-            if self.reveal.sample(self.playhead.t) > 0.6 {
+            if let Some(p) = self.project_to_screen(Vec3::new(0.0, 0.4, 0.0), screen) {
                 speech_bubble(
                     ctx,
-                    "sphere-bubble",
-                    egui::pos2(screen.left() + screen.width() * 0.7, top),
+                    "square-bubble",
+                    p - egui::vec2(0.0, 18.0),
                     t,
-                    egui::Color32::from_rgb(170, 80, 55),
+                    egui::Color32::from_rgb(30, 110, 120),
                 );
+            }
+        }
+
+        let z = self.sphere_z.sample(self.playhead.t);
+        if self.reveal.sample(self.playhead.t) > 0.6 && z < SPHERE_TOP + 1.0 {
+            let head = Vec3::new(SPHERE_XY.0, SPHERE_XY.1 + SPHERE_RADIUS, z);
+            if let Some(p) = self.project_to_screen(head, screen) {
+                if matches!(b.cue, Cue::Hover) {
+                    callout(
+                        ctx,
+                        "sphere-callout",
+                        p,
+                        "A Sphere",
+                        egui::Color32::from_rgb(170, 80, 55),
+                    );
+                }
+                if let Some(t) = b.sphere {
+                    speech_bubble(
+                        ctx,
+                        "sphere-bubble",
+                        p - egui::vec2(0.0, 18.0),
+                        t,
+                        egui::Color32::from_rgb(170, 80, 55),
+                    );
+                }
             }
         }
     }
@@ -864,34 +895,55 @@ impl FlatlandApp {
         let playing = self.playhead.playing;
 
         egui::Area::new(egui::Id::new("controls"))
-            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -14.0])
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
-                        set_playing = Some(!playing);
+                ui.vertical_centered(|ui| {
+                    // Thin progress bar with a tick per beat; click/drag to scrub.
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(520.0, 10.0),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 4.0, egui::Color32::from_gray(60));
+                    for &s in &self.beat_starts {
+                        let x = rect.left() + (s / total) * rect.width();
+                        painter.line_segment(
+                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+                        );
                     }
-                    if ui
-                        .add_enabled(beat > 0, egui::Button::new("Back"))
-                        .clicked()
-                    {
-                        seek_to_beat = Some(beat.saturating_sub(1));
-                    }
-                    if ui.button("Replay").clicked() {
-                        seek_t = Some(0.0);
-                        set_playing = Some(true);
-                    }
-                    let mut t = now;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut t, 0.0..=total)
-                                .show_value(false)
-                                .text("t"),
-                        )
-                        .changed()
-                    {
-                        seek_t = Some(t);
+                    let fx = rect.left() + (now / total).clamp(0.0, 1.0) * rect.width();
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(rect.left_top(), egui::pos2(fx, rect.bottom())),
+                        4.0,
+                        egui::Color32::from_rgb(230, 150, 40),
+                    );
+                    painter.circle_filled(
+                        egui::pos2(fx, rect.center().y),
+                        5.0,
+                        egui::Color32::from_rgb(250, 185, 75),
+                    );
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        let u = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                        seek_t = Some(u * total);
                         set_playing = Some(false);
                     }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
+                            set_playing = Some(!playing);
+                        }
+                        if ui
+                            .add_enabled(beat > 0, egui::Button::new("Back"))
+                            .clicked()
+                        {
+                            seek_to_beat = Some(beat.saturating_sub(1));
+                        }
+                        if ui.button("Replay").clicked() {
+                            seek_t = Some(0.0);
+                            set_playing = Some(true);
+                        }
+                    });
                 });
             });
 
@@ -905,6 +957,35 @@ impl FlatlandApp {
             self.seek_beat(bi);
         }
     }
+}
+
+fn callout(ctx: &egui::Context, id: &str, target: egui::Pos2, text: &str, accent: egui::Color32) {
+    let anchor = target + egui::vec2(72.0, -64.0);
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new(id),
+    ));
+    painter.line_segment([anchor, target], egui::Stroke::new(2.0, accent));
+    let dir = (target - anchor).normalized();
+    let perp = egui::vec2(-dir.y, dir.x);
+    let base = target - dir * 12.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![target, base + perp * 6.0, base - perp * 6.0],
+        accent,
+        egui::Stroke::NONE,
+    ));
+    egui::Area::new(egui::Id::new(format!("{id}-label")))
+        .fixed_pos(anchor)
+        .pivot(egui::Align2::CENTER_BOTTOM)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(&ctx.style())
+                .fill(egui::Color32::from_rgb(252, 252, 250))
+                .stroke(egui::Stroke::new(1.5, accent))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(text).size(14.0).strong());
+                });
+        });
 }
 
 fn speech_bubble(
