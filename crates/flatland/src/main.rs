@@ -69,7 +69,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 const VISION_WGSL: &str = r#"
-struct Vision { params: vec4<f32>, bands: array<vec4<f32>, 6> };
+struct Vision { params: vec4<f32>, bands: array<vec4<f32>, 6>, cols: array<vec4<f32>, 6> };
 @group(0) @binding(0) var<uniform> v: Vision;
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
@@ -77,7 +77,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = i32(v.params.x);
     for (var i = 0; i < n; i = i + 1) {
         if (in.uv.x >= v.bands[i].x && in.uv.x <= v.bands[i].y) {
-            col = vec3<f32>(0.95, 0.58, 0.16);
+            col = v.cols[i].rgb;
         }
     }
     return vec4<f32>(col, 0.92);
@@ -106,14 +106,7 @@ struct Beat {
 
 const BEATS: &[Beat] = &[
     Beat {
-        caption: "Welcome to Flatland.",
-        reveal: 0.0,
-        sleeping: true,
-        vision: false,
-        cue: Cue::Hidden,
-    },
-    Beat {
-        caption: "A flat, two-dimensional world.",
+        caption: "Welcome to Flatland, a flat two-dimensional world.",
         reveal: 0.0,
         sleeping: true,
         vision: false,
@@ -127,7 +120,7 @@ const BEATS: &[Beat] = &[
         cue: Cue::Hidden,
     },
     Beat {
-        caption: "He wakes. He has never seen his world from outside it.",
+        caption: "He has never once seen his world from outside it.",
         reveal: 0.0,
         sleeping: false,
         vision: false,
@@ -242,14 +235,15 @@ fn ortho_half(intro: f32) -> f32 {
     3.4 * (1.0 + (1.0 - intro) * 0.25)
 }
 
-/// The angled perspective pose the reveal settles into.
+/// The angled perspective pose the reveal settles into. Pulled back and rotated
+/// off-axis so the third dimension reads clearly.
 fn reveal_pose() -> OrbitPose {
     OrbitPose {
         target: cam_target(),
-        azimuth: 0.0,
-        elevation: 52.0_f32.to_radians(),
-        distance: 9.5,
-        fov_y: 45.0_f32.to_radians(),
+        azimuth: 26.0_f32.to_radians(),
+        elevation: 44.0_f32.to_radians(),
+        distance: 13.5,
+        fov_y: 42.0_f32.to_radians(),
     }
 }
 
@@ -303,7 +297,7 @@ struct FlatlandApp {
     gaze_target: Vec2,
     cursor_present: bool,
     wake_clock: f32,
-    vision_bands: Vec<(f32, f32)>,
+    vision_bands: Vec<(f32, f32, [f32; 3])>,
 }
 
 fn push(mesh: &mut LineMesh<3>, a: Vec3, b: Vec3, color: [f32; 4], width: f32) {
@@ -393,7 +387,7 @@ impl FlatlandApp {
             0.0
         };
 
-        // None = asleep; Some(wp) = seconds since wake began (>=1.6 fully awake).
+        // None = asleep; Some(wp) = seconds since wake began (>=1.9 fully awake).
         let waking = if sleeping {
             if self.wake_clock >= 0.0 {
                 Some(t - self.wake_clock)
@@ -405,57 +399,82 @@ impl FlatlandApp {
         };
 
         let mut pos = square_pos();
-        let (mut sx, mut sy) = (1.0_f32, 1.0_f32);
-        let mut eye_open = [0.0_f32; 2];
-        let mut lookv = look;
+        let sx;
+        let sy;
+        let eye_open;
+        let mut eye_squash = [1.0_f32; 2];
+        let mut lookv = Vec2::ZERO;
 
         match waking {
             None => {
-                // Asleep: bob and breathe; eyes closed (rectangle).
+                // Asleep: slow bob and breathe; eyes closed (rectangle).
                 let breath = (t * 1.1).sin();
                 pos.y += breath * 0.05;
                 sy = 1.0 + breath * 0.03;
-                sx = 1.0 - breath * 0.02;
-                lookv = Vec2::ZERO;
+                sx = 1.0 - breath * 0.03;
+                eye_open = [0.0, 0.0];
             }
-            Some(wp) if wp < 1.6 => {
-                // Wake: open from closed, shake the eyes side to side, settle to a
-                // happy semicircle with a little bounce.
-                let open = ((wp - 0.15) / 0.4).clamp(0.0, 1.0);
-                lookv = if (0.15..0.7).contains(&wp) {
-                    Vec2::new((wp * 26.0).sin(), 0.0)
-                } else {
-                    Vec2::ZERO
-                };
-                let e = if wp < 1.0 {
-                    open
-                } else {
-                    let s = ((wp - 1.0) / 0.6).clamp(0.0, 1.0);
-                    1.0 - 0.5 * s
-                };
+            Some(wp) if wp < 1.9 => {
+                // Wake, following the squash/stretch principle: anticipation
+                // crouch, an eased pop-open with a stretch overshoot, a smooth
+                // glance left and right, then a cheery settle with a small bounce.
+                let open = ease_out_cubic(((wp - 0.25) / 0.30).clamp(0.0, 1.0));
+                let cheer = ((wp - 1.15) / 0.30).clamp(0.0, 1.0);
+                let e = open * (1.0 - 0.5 * cheer);
                 eye_open = [e, e];
-                if wp > 1.0 {
-                    let s = ((wp - 1.0) / 0.6).clamp(0.0, 1.0);
-                    pos.y += (s * std::f32::consts::PI).sin() * 0.12 * (1.0 - s);
+
+                if wp < 0.25 {
+                    let a = wp / 0.25;
+                    sy = 1.0 - 0.14 * a;
+                    sx = 1.0 + 0.12 * a;
+                } else if wp < 0.6 {
+                    let a = ease_out_cubic((wp - 0.25) / 0.35);
+                    sy = 0.86 + 0.28 * a;
+                    sx = 1.12 - 0.18 * a;
+                } else {
+                    let a = ease_out_cubic(((wp - 0.6) / 0.5).clamp(0.0, 1.0));
+                    sy = 1.14 - 0.14 * a;
+                    sx = 0.94 + 0.06 * a;
+                }
+
+                if (0.6..1.15).contains(&wp) {
+                    lookv = Vec2::new((((wp - 0.6) / 0.55) * TAU).sin(), 0.0);
+                }
+                if wp > 1.15 {
+                    let a = ((wp - 1.15) / 0.5).clamp(0.0, 1.0);
+                    pos.y += (a * std::f32::consts::PI).sin() * 0.12 * (1.0 - a);
                 }
             }
             Some(_) => {
-                // Awake idle: breathe, reach toward what he watches, pop in
-                // surprise; eyes rest as a happy semicircle and widen with
-                // interest, blinking occasionally.
-                let breathe = (t * 1.3).sin() * 0.02;
-                let reach = (look.y * 0.05).clamp(-0.10, 0.18);
+                // Awake idle: eyes wide open and following the cursor (eyes only,
+                // no body squash). Gentle breathing; a surprise pop when the
+                // section circle crosses him; when the cursor is away he glances
+                // side to side, squinting the trailing eye.
+                let breathe = (t * 1.2).sin() * 0.02;
                 let pop = 0.16 * surprise;
-                sy = 1.0 + breathe + reach + pop;
-                sx = 1.0 - reach * 0.4 + pop * 0.5;
-                let phase = t % 4.0;
-                let blink = if phase < 0.14 {
-                    (phase / 0.07 - 1.0).abs().min(1.0)
+                sy = 1.0 + breathe + pop;
+                sx = 1.0 - pop * 0.3;
+
+                let phase = t % 4.2;
+                let blink = if phase < 0.13 {
+                    (phase / 0.065 - 1.0).abs().min(1.0)
                 } else {
                     1.0
                 };
-                let interest = 0.5 + 0.5 * surprise;
-                eye_open = [interest * blink, interest * blink];
+                eye_open = [blink, blink];
+
+                if self.cursor_present || surprise > 0.05 {
+                    lookv = look;
+                } else {
+                    let g = (t * 0.5).sin();
+                    lookv = Vec2::new(g, 0.0);
+                    let squint = 0.5 * (1.0 - (t * 0.5).cos().abs());
+                    if g >= 0.0 {
+                        eye_squash[1] = 1.0 - squint;
+                    } else {
+                        eye_squash[0] = 1.0 - squint;
+                    }
+                }
             }
         }
 
@@ -464,6 +483,7 @@ impl FlatlandApp {
             half: 0.34,
             scale: Vec2::new(sx, sy),
             eye_open,
+            eye_squash,
             look: lookv,
         }
     }
@@ -669,14 +689,14 @@ impl Scene for FlatlandApp {
         let h = self.sphere_h.value();
         if h.abs() < SPHERE_RADIUS {
             let rc = (SPHERE_RADIUS * SPHERE_RADIUS - h * h).sqrt();
-            if let Some(b) = angular_band(s, look, sphere_xy(), rc) {
-                bands.push(b);
+            if let Some((lo, hi)) = angular_band(s, look, sphere_xy(), rc) {
+                bands.push((lo, hi, [COLOR_SPHERE[0], COLOR_SPHERE[1], COLOR_SPHERE[2]]));
             }
         }
         if BEATS[self.section].vision {
-            for (c, _, rad, _, _) in primitives() {
-                if let Some(b) = angular_band(s, look, c, rad) {
-                    bands.push(b);
+            for (c, _, rad, _, color) in primitives() {
+                if let Some((lo, hi)) = angular_band(s, look, c, rad) {
+                    bands.push((lo, hi, [color[0], color[1], color[2]]));
                 }
             }
         }
@@ -823,8 +843,15 @@ impl FlatlandApp {
         let x = -300.0 + 318.0 * ease_out_cubic(slide);
         let mut u = vec![self.vision_bands.len().min(6) as f32, self.clock, 0.0, 0.0];
         for i in 0..6 {
-            if let Some((lo, hi)) = self.vision_bands.get(i) {
+            if let Some((lo, hi, _)) = self.vision_bands.get(i) {
                 u.extend([(lo + 1.0) * 0.5, (hi + 1.0) * 0.5, 0.0, 0.0]);
+            } else {
+                u.extend([0.0; 4]);
+            }
+        }
+        for i in 0..6 {
+            if let Some((_, _, c)) = self.vision_bands.get(i) {
+                u.extend([c[0], c[1], c[2], 1.0]);
             } else {
                 u.extend([0.0; 4]);
             }
@@ -837,7 +864,7 @@ impl FlatlandApp {
                         .size(12.0)
                         .color(egui::Color32::from_gray(150)),
                 );
-                rye_egui::shader_widget(ui, egui::vec2(280.0, 26.0), VISION_WGSL, 112, f32_le(&u));
+                rye_egui::shader_widget(ui, egui::vec2(280.0, 26.0), VISION_WGSL, 208, f32_le(&u));
             });
     }
 
@@ -881,6 +908,7 @@ fn main() -> Result<()> {
         window: WindowAttributes::default()
             .with_title("flatland")
             .with_visible(false),
+        msaa_samples: 4,
         ..RunConfig::default()
     })
 }

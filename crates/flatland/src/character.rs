@@ -18,9 +18,11 @@ pub struct Face {
     pub half: f32,
     /// Non-uniform scale about the center (squash/stretch); `(1, 1)` is rest.
     pub scale: Vec2,
-    /// Per-eye shape: 0 closed (rectangle), 0.5 resting (semicircle), 1 open
+    /// Per-eye shape: 0 closed (rectangle), 0.5 cheery (semicircle), 1 open
     /// (circle).
     pub eye_open: [f32; 2],
+    /// Per-eye vertical squash (1 = round, <1 = squinting oval).
+    pub eye_squash: [f32; 2],
     /// Gaze direction the eyes shift toward.
     pub look: Vec2,
 }
@@ -46,9 +48,10 @@ pub fn push_face(tris: &mut TriangleMesh<3>, face: &Face, map: &dyn Fn(Vec2) -> 
     let eye_r = 0.24 * h;
     for (idx, sgn) in [(0usize, -1.0_f32), (1, 1.0)] {
         let socket = c + Vec2::new(sgn * 0.40 * h * s.x, 0.12 * h * s.y) + look * (0.12 * h);
+        let sq = face.eye_squash[idx];
         let poly: Vec<Vec2> = eye_polygon(face.eye_open[idx], eye_r)
             .into_iter()
-            .map(|p| socket + Vec2::new(p.x * s.x, p.y * s.y))
+            .map(|p| socket + Vec2::new(p.x * s.x, p.y * s.y * sq))
             .collect();
         fill(tris, &poly, EYE, map);
     }
@@ -94,15 +97,15 @@ fn eye_polygon(o: f32, r: f32) -> Vec<Vec2> {
         .collect()
 }
 
-/// Resting eye: flat top, round bottom (a smiling "u" shape). Upper half is the
-/// flat top edge; lower half is the circle's lower arc (so it matches the circle
-/// there and only the top flattens as o drops from 1 to 0.5).
+/// Cheery eye: round top, flat bottom (cheeks pushed up). Upper half is the
+/// circle's upper arc (so it matches the circle there and only the bottom
+/// flattens as o drops from 1 to 0.5).
 fn semicircle_point(u: f32, r: f32) -> Vec2 {
     if u < 0.5 {
-        Vec2::new(r - 2.0 * r * (u / 0.5), 0.0)
-    } else {
-        let a = PI + PI * ((u - 0.5) / 0.5);
+        let a = PI * (u / 0.5);
         Vec2::new(a.cos() * r, a.sin() * r)
+    } else {
+        Vec2::new(-r + 2.0 * r * ((u - 0.5) / 0.5), 0.0)
     }
 }
 
