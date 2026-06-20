@@ -42,7 +42,7 @@ impl UiIntegration {
             window.theme(),
             None,
         );
-        let renderer = Renderer::new(
+        let mut renderer = Renderer::new(
             device,
             surface_format,
             RendererOptions {
@@ -50,6 +50,11 @@ impl UiIntegration {
                 ..Default::default()
             },
         );
+        // Register the shader-UI pipeline cache so `shader_widget` callbacks can
+        // build/look up pipelines matching the egui pass's format + samples.
+        renderer
+            .callback_resources
+            .insert(crate::shader_ui::ShaderUi::new(surface_format, msaa_samples));
         let pixels_per_point = window.scale_factor() as f32;
         Self {
             ctx,

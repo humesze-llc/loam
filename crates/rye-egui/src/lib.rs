@@ -34,6 +34,7 @@ mod linear_indicator;
 pub mod media;
 mod overlay;
 mod slider_edit;
+pub mod shader_ui;
 pub mod tween;
 mod world;
 
@@ -49,6 +50,7 @@ pub use floating::{
 pub use integration::UiIntegration;
 pub use linear_indicator::LinearIndicator;
 pub use overlay::BottomOverlay;
+pub use shader_ui::{shader_widget, ShaderUi};
 pub use slider_edit::{slider_with_edit, SliderInteraction};
 pub use tween::{ease_in_out_cubic, ease_out_cubic, Animated};
 pub use world::world_to_screen;
