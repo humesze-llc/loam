@@ -101,6 +101,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 const WASH_BEAT: usize = 1;
+const ACT2_START: usize = 10;
 
 fn f32_le(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -126,16 +127,147 @@ struct Beat {
 }
 
 const BEATS: &[Beat] = &[
-    Beat { caption: "Welcome to Flatland.", secs: 3.0, reveal: 0.0, sleeping: true, vision: false, cue: Cue::Hidden, square: None, sphere: None },
-    Beat { caption: "A flat, two-dimensional world.", secs: 3.4, reveal: 0.0, sleeping: true, vision: false, cue: Cue::Hidden, square: None, sphere: None },
-    Beat { caption: "This is A Square, one of its residents.", secs: 3.4, reveal: 0.0, sleeping: true, vision: false, cue: Cue::Hidden, square: None, sphere: None },
-    Beat { caption: "He wakes. He has never once seen his world from outside it.", secs: 4.2, reveal: 0.0, sleeping: false, vision: false, cue: Cue::Hidden, square: Some("Another ordinary day in Flatland."), sphere: None },
-    Beat { caption: "Yet Flatland is only a slice of a larger 3D world.", secs: 6.0, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Hidden, square: None, sphere: None },
-    Beat { caption: "In 3D, our vision is a 2D projection of that world.", secs: 4.5, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Hidden, square: None, sphere: None },
-    Beat { caption: "In 2D, A Square's vision is just a 1D projection of his.", secs: 7.0, reveal: 0.0, sleeping: false, vision: true, cue: Cue::Hidden, square: None, sphere: None },
-    Beat { caption: "Then a visitor arrives, from the direction he cannot point to.", secs: 5.5, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Hover, square: Some("I see only a circle. Reveal yourself!"), sphere: Some("Greetings, Square. I am A Sphere, from beyond your plane.") },
-    Beat { caption: "A Sphere descends through Flatland.", secs: PASSAGE_SECONDS + 2.5, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Descend, square: Some("It grows... it shrinks... it is gone! Sorcery!"), sphere: None },
-    Beat { caption: "From outside his plane we see even his insides, as 4D would see ours. You are A Square.", secs: 9.0, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Below, square: None, sphere: None },
+    Beat {
+        caption: "Welcome to Flatland.",
+        secs: 3.0,
+        reveal: 0.0,
+        sleeping: true,
+        vision: false,
+        cue: Cue::Hidden,
+        square: None,
+        sphere: None,
+    },
+    Beat {
+        caption: "A flat, two-dimensional world.",
+        secs: 3.4,
+        reveal: 0.0,
+        sleeping: true,
+        vision: false,
+        cue: Cue::Hidden,
+        square: None,
+        sphere: None,
+    },
+    Beat {
+        caption: "This is A Square, one of its residents.",
+        secs: 3.4,
+        reveal: 0.0,
+        sleeping: true,
+        vision: false,
+        cue: Cue::Hidden,
+        square: None,
+        sphere: None,
+    },
+    Beat {
+        caption: "He wakes. He has never once seen his world from outside it.",
+        secs: 4.2,
+        reveal: 0.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Hidden,
+        square: Some("Another ordinary day in Flatland."),
+        sphere: None,
+    },
+    Beat {
+        caption: "Yet Flatland is only a slice of a larger 3D world.",
+        secs: 6.0,
+        reveal: 1.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Hidden,
+        square: None,
+        sphere: None,
+    },
+    Beat {
+        caption: "In 3D, our vision is a 2D projection of that world.",
+        secs: 4.5,
+        reveal: 1.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Hidden,
+        square: None,
+        sphere: None,
+    },
+    Beat {
+        caption: "In 2D, A Square's vision is just a 1D projection of his.",
+        secs: 7.0,
+        reveal: 0.0,
+        sleeping: false,
+        vision: true,
+        cue: Cue::Hidden,
+        square: None,
+        sphere: None,
+    },
+    Beat {
+        caption: "Then a visitor arrives, from the direction he cannot point to.",
+        secs: 5.5,
+        reveal: 1.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Hover,
+        square: Some("I see only a circle. Reveal yourself!"),
+        sphere: Some("Greetings, Square. I am A Sphere, from beyond your plane."),
+    },
+    Beat {
+        caption: "A Sphere descends through Flatland.",
+        secs: PASSAGE_SECONDS + 2.5,
+        reveal: 1.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Descend,
+        square: Some("It grows... it shrinks... it is gone! Sorcery!"),
+        sphere: None,
+    },
+    Beat {
+        caption: "From outside his plane we see even his insides, as 4D would see ours.",
+        secs: 6.5,
+        reveal: 1.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Below,
+        square: None,
+        sphere: None,
+    },
+    // Act 2: the same ladder, one dimension up. Now WE are the Square.
+    Beat {
+        caption: "Now picture us. In our 3D world, we are the Square.",
+        secs: 4.5,
+        reveal: 1.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Hidden,
+        square: None,
+        sphere: None,
+    },
+    Beat {
+        caption: "A hypersphere approaches, from a direction WE cannot point to.",
+        secs: 5.0,
+        reveal: 1.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Hover,
+        square: None,
+        sphere: None,
+    },
+    Beat {
+        caption: "It passes through our space: a whole sphere appears, swells, and vanishes.",
+        secs: PASSAGE_SECONDS + 2.5,
+        reveal: 1.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Descend,
+        square: None,
+        sphere: None,
+    },
+    Beat {
+        caption: "A 4D being sees it whole, and all our insides at once. You are A Square.",
+        secs: 9.0,
+        reveal: 1.0,
+        sleeping: false,
+        vision: false,
+        cue: Cue::Below,
+        square: None,
+        sphere: None,
+    },
 ];
 
 fn primitives() -> [(Vec2, usize, f32, f32); 3] {
@@ -191,9 +323,49 @@ fn wake_beat() -> usize {
     BEATS.iter().position(|b| !b.sleeping).unwrap()
 }
 
-/// Build the timeline tracks (everything is `f(t)`): camera reveal, A Sphere's
-/// height, and the intro fade, plus each beat's start time and the total length.
-fn build_tracks() -> (Track, Track, Track, Vec<f32>, f32) {
+/// The Act 1 height track (`sphere_z`) and Act 2 height track (`w`) share this
+/// cue-driven shape over a beat range: hidden, ease down to hover, descend
+/// through the slice, stay below.
+fn cue_track(starts: &[f32], range: std::ops::Range<usize>) -> Track {
+    let mut tr = Track::new().key(0.0, SPHERE_HIDDEN, linear);
+    let mut zcur = SPHERE_HIDDEN;
+    for i in range {
+        let (b, s) = (&BEATS[i], starts[i]);
+        match b.cue {
+            Cue::Hidden => {
+                if zcur != SPHERE_HIDDEN {
+                    tr = tr.key(s, SPHERE_HIDDEN, linear);
+                    zcur = SPHERE_HIDDEN;
+                }
+            }
+            Cue::Hover => {
+                tr = tr
+                    .key(s, zcur, linear)
+                    .key(s + 0.9, SPHERE_TOP, ease_out_cubic);
+                zcur = SPHERE_TOP;
+            }
+            Cue::Descend => {
+                tr = tr.key(s, zcur, linear).key(
+                    s + PASSAGE_SECONDS.min(b.secs),
+                    -SPHERE_TOP,
+                    ease_in_out_cubic,
+                );
+                zcur = -SPHERE_TOP;
+            }
+            Cue::Below => {
+                if zcur != -SPHERE_TOP {
+                    tr = tr.key(s, -SPHERE_TOP, linear);
+                    zcur = -SPHERE_TOP;
+                }
+            }
+        }
+    }
+    tr
+}
+
+/// Build the timeline tracks (everything is `f(t)`): camera reveal, the Act 1 /
+/// Act 2 object heights, and the intro fade, plus beat starts and total length.
+fn build_tracks() -> (Track, Track, Track, Track, Vec<f32>, f32) {
     let mut starts = Vec::with_capacity(BEATS.len());
     let mut t = 0.0;
     for b in BEATS {
@@ -216,45 +388,14 @@ fn build_tracks() -> (Track, Track, Track, Vec<f32>, f32) {
         }
     }
 
-    let mut sz = Track::new().key(0.0, SPHERE_HIDDEN, linear);
-    let mut zcur = SPHERE_HIDDEN;
-    for (i, b) in BEATS.iter().enumerate() {
-        let s = starts[i];
-        match b.cue {
-            Cue::Hidden => {
-                if zcur != SPHERE_HIDDEN {
-                    sz = sz.key(s, SPHERE_HIDDEN, linear);
-                    zcur = SPHERE_HIDDEN;
-                }
-            }
-            Cue::Hover => {
-                sz = sz
-                    .key(s, zcur, linear)
-                    .key(s + 0.9, SPHERE_TOP, ease_out_cubic);
-                zcur = SPHERE_TOP;
-            }
-            Cue::Descend => {
-                sz = sz.key(s, zcur, linear).key(
-                    s + PASSAGE_SECONDS.min(b.secs),
-                    -SPHERE_TOP,
-                    ease_in_out_cubic,
-                );
-                zcur = -SPHERE_TOP;
-            }
-            Cue::Below => {
-                if zcur != -SPHERE_TOP {
-                    sz = sz.key(s, -SPHERE_TOP, linear);
-                    zcur = -SPHERE_TOP;
-                }
-            }
-        }
-    }
+    let sphere_z = cue_track(&starts, 0..ACT2_START);
+    let w = cue_track(&starts, ACT2_START..BEATS.len());
 
     let intro = Track::new()
         .key(0.0, 0.0, linear)
         .key(INTRO_SECONDS, 1.0, ease_out_cubic);
 
-    (reveal, sz, intro, starts, total)
+    (reveal, sphere_z, w, intro, starts, total)
 }
 
 struct FlatlandApp {
@@ -269,6 +410,7 @@ struct FlatlandApp {
     playhead: Playhead,
     reveal: Track,
     sphere_z: Track,
+    w: Track,
     intro: Track,
     beat_starts: Vec<f32>,
     gaze_target: Vec2,
@@ -497,6 +639,22 @@ impl FlatlandApp {
             }
         }
 
+        // Act 2: our 3-space. A hypersphere descends along w; its 3D section is a
+        // sphere of radius sqrt(R^2 - w^2) (exact, the same ladder one dimension
+        // up), shown growing and shrinking in the same Spaceland.
+        if beat >= ACT2_START {
+            let w = self.w.sample(t);
+            if w.abs() < SPHERE_RADIUS {
+                let scale = (SPHERE_RADIUS * SPHERE_RADIUS - w * w).sqrt() / SPHERE_RADIUS;
+                for e in &self.sphere_edges {
+                    let a = self.sphere_verts[e[0] as usize] * scale;
+                    let b = self.sphere_verts[e[1] as usize] * scale;
+                    push(&mut lines, a, b, COLOR_SPHERE, 1.4);
+                }
+            }
+            return (lines, tris, 0);
+        }
+
         // Flatland pane checkerboard (just behind the on-plane content).
         let h = FLATLAND_HALF;
         let step = 2.0 * h / FLATLAND_CELLS as f32;
@@ -663,7 +821,7 @@ impl Scene for FlatlandApp {
             }
         }
 
-        let (reveal, sphere_z, intro, beat_starts, total) = build_tracks();
+        let (reveal, sphere_z, w, intro, beat_starts, total) = build_tracks();
 
         Ok(Self {
             lines: line_node,
@@ -677,6 +835,7 @@ impl Scene for FlatlandApp {
             playhead: Playhead::new(total),
             reveal,
             sphere_z,
+            w,
             intro,
             beat_starts,
             gaze_target: sphere_xy(),
@@ -911,6 +1070,9 @@ impl FlatlandApp {
     }
 
     fn dialogue(&self, ctx: &egui::Context, beat: usize) {
+        if beat >= ACT2_START {
+            return;
+        }
         let b = &BEATS[beat];
         let screen = ctx.content_rect();
 
