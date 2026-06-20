@@ -69,6 +69,38 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const WASH_WGSL: &str = r#"
+struct Wash { p: vec4<f32> };
+@group(0) @binding(0) var<uniform> w: Wash;
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let d = in.uv.x - w.p.x;
+    let band = exp(-d * d / 0.01);
+    return vec4<f32>(1.0, 1.0, 0.93, band * w.p.y);
+}
+"#;
+
+const VISION_WGSL: &str = r#"
+struct Vision { meta: vec4<f32>, bands: array<vec4<f32>, 6> };
+@group(0) @binding(0) var<uniform> v: Vision;
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    var col = vec3<f32>(0.12, 0.13, 0.16);
+    let count = i32(v.meta.x);
+    for (var i = 0; i < count; i = i + 1) {
+        if (in.uv.x >= v.bands[i].x && in.uv.x <= v.bands[i].y) {
+            col = vec3<f32>(0.95, 0.58, 0.16);
+        }
+    }
+    let scan = fract(v.meta.y * 0.25);
+    let g = exp(-pow((in.uv.x - scan) * 26.0, 2.0));
+    col = col + vec3<f32>(0.16, 0.16, 0.20) * g;
+    return vec4<f32>(col, 0.92);
+}
+"#;
+
+const WASH_BEAT: usize = 1;
+
 fn f32_le(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -228,7 +260,9 @@ struct FlatlandApp {
     lines: LineRasterNode,
     tris: TriangleRasterNode,
     sky: ShaderEffect,
+    wash: ShaderEffect,
     depth: Option<DepthBuffer>,
+    vision_slide: f32,
     sphere_verts: Vec<Vec3>,
     sphere_edges: Vec<[u32; 2]>,
     playhead: Playhead,
@@ -612,6 +646,14 @@ impl App for FlatlandApp {
             wgpu::BlendState::REPLACE,
             ctx.rd.sample_count(),
         );
+        let wash = ShaderEffect::new(
+            &ctx.rd.device,
+            ctx.rd.target_format(),
+            WASH_WGSL,
+            16,
+            wgpu::BlendState::ALPHA_BLENDING,
+            ctx.rd.sample_count(),
+        );
 
         let (raw, faces) = icosphere(SPHERE_SUBDIVISIONS);
         let sphere_verts = raw.iter().map(|v| *v * SPHERE_RADIUS).collect();
@@ -628,7 +670,9 @@ impl App for FlatlandApp {
             lines: line_node,
             tris: tri_node,
             sky,
+            wash,
             depth: None,
+            vision_slide: 0.0,
             sphere_verts,
             sphere_edges: set.into_iter().collect(),
             playhead: Playhead::new(total),
@@ -674,6 +718,11 @@ impl App for FlatlandApp {
             }
         }
         self.vision_bands = bands;
+
+        let active = beat.vision || z.abs() < SPHERE_RADIUS;
+        let target = if active { 1.0 } else { 0.0 };
+        let dt = ctx.dt.min(0.1);
+        self.vision_slide += (target - self.vision_slide) * (1.0 - (-dt * 8.0).exp());
     }
 
     fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
@@ -759,6 +808,15 @@ impl App for FlatlandApp {
             1,
         );
         self.lines.execute(rd, view, Some(&dview), None)?;
+
+        // The "two-dimensional world" beat gets a light wash sweeping across.
+        if self.beat_index() == WASH_BEAT {
+            let p = (self.beat_elapsed() / BEATS[WASH_BEAT].secs).clamp(0.0, 1.0);
+            let strength = (p * std::f32::consts::PI).sin() * 0.5;
+            self.wash
+                .set_uniforms(&rd.queue, &f32_le(&[p, strength, 0.0, 0.0]));
+            self.wash.execute(rd, view, None)?;
+        }
         Ok(())
     }
 
@@ -821,26 +879,33 @@ impl App for FlatlandApp {
 
 impl FlatlandApp {
     fn vision_window(&self, ctx: &egui::Context) {
+        // Slides in from the left while his vision is the subject, out otherwise.
+        let x = -300.0 + 318.0 * self.vision_slide;
+        if self.vision_slide < 0.01 {
+            return;
+        }
+        let mut u = vec![
+            self.vision_bands.len().min(6) as f32,
+            self.playhead.t,
+            0.0,
+            0.0,
+        ];
+        for i in 0..6 {
+            if let Some((lo, hi)) = self.vision_bands.get(i) {
+                u.extend([(lo + 1.0) * 0.5, (hi + 1.0) * 0.5, 0.0, 0.0]);
+            } else {
+                u.extend([0.0; 4]);
+            }
+        }
         egui::Area::new(egui::Id::new("vision-strip"))
-            .anchor(egui::Align2::LEFT_TOP, [18.0, 18.0])
+            .anchor(egui::Align2::LEFT_TOP, [x, 18.0])
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("A Square's vision (1D)")
                         .size(12.0)
                         .color(egui::Color32::from_gray(70)),
                 );
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(280.0, 24.0), egui::Sense::hover());
-                let painter = ui.painter();
-                painter.rect_filled(rect, 4.0, egui::Color32::from_gray(60));
-                let x = |n: f32| rect.left() + (n + 1.0) * 0.5 * rect.width();
-                for (lo, hi) in &self.vision_bands {
-                    let band = egui::Rect::from_min_max(
-                        egui::pos2(x(*lo), rect.top()),
-                        egui::pos2(x(*hi), rect.bottom()),
-                    );
-                    painter.rect_filled(band, 3.0, egui::Color32::from_rgb(235, 140, 40));
-                }
+                rye_egui::shader_widget(ui, egui::vec2(280.0, 26.0), VISION_WGSL, 112, f32_le(&u));
             });
     }
 
