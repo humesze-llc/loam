@@ -21,6 +21,9 @@ rye-math   = { path = "../rye-math" }
 rye-render = { path = "../rye-render" }
 rye-shape  = { path = "../rye-shape" }
 
+[dev-dependencies]
+naga = { version = "27", features = ["wgsl-in"] }
+
 [[bin]]
 name = "flatland"
 path = "src/main.rs"

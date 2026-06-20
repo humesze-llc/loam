@@ -704,6 +704,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "glam",
+ "naga",
  "rye-anim",
  "rye-app",
  "rye-camera",

@@ -10,7 +10,7 @@
 //! frame-exact capture all reproduce identical frames.
 
 use anyhow::Result;
-use glam::{Mat3, Vec2, Vec3};
+use glam::{Mat3, Mat4, Vec2, Vec3};
 use rye_anim::{ease_in_out_cubic, ease_out_cubic, linear, Playhead, Track};
 use rye_app::{egui, run_scene, FrameCtx, RunConfig, Scene, SetupCtx};
 use rye_camera::OrbitPose;
@@ -82,18 +82,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#;
 
 const VISION_WGSL: &str = r#"
-struct Vision { meta: vec4<f32>, bands: array<vec4<f32>, 6> };
+struct Vision { params: vec4<f32>, bands: array<vec4<f32>, 6> };
 @group(0) @binding(0) var<uniform> v: Vision;
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var col = vec3<f32>(0.12, 0.13, 0.16);
-    let count = i32(v.meta.x);
-    for (var i = 0; i < count; i = i + 1) {
+    let n = i32(v.params.x);
+    for (var i = 0; i < n; i = i + 1) {
         if (in.uv.x >= v.bands[i].x && in.uv.x <= v.bands[i].y) {
             col = vec3<f32>(0.95, 0.58, 0.16);
         }
     }
-    let scan = fract(v.meta.y * 0.25);
+    let scan = fract(v.params.y * 0.25);
     let g = exp(-pow((in.uv.x - scan) * 26.0, 2.0));
     col = col + vec3<f32>(0.16, 0.16, 0.20) * g;
     return vec4<f32>(col, 0.92);
@@ -291,14 +291,9 @@ fn cam_target() -> Vec3 {
     Vec3::new(0.6, 0.3, 0.0)
 }
 
-fn flat_pose() -> OrbitPose {
-    OrbitPose {
-        target: cam_target(),
-        azimuth: 0.0,
-        elevation: 0.0,
-        distance: 24.0,
-        fov_y: 15.0_f32.to_radians(),
-    }
+/// Half-height of the orthographic Flatland view, with a slight intro zoom-out.
+fn ortho_half(intro: f32) -> f32 {
+    (FLATLAND_HALF + 0.6) * (1.0 + (1.0 - intro) * 0.35)
 }
 
 fn space_pose() -> OrbitPose {
@@ -531,12 +526,18 @@ impl FlatlandApp {
         ))
     }
 
-    fn camera_view_proj(&self, aspect: f32) -> glam::Mat4 {
+    fn camera_view_proj(&self, aspect: f32) -> Mat4 {
         let rv = self.reveal.sample(self.playhead.t);
         let intro = self.intro.sample(self.playhead.t);
-        let pose = OrbitPose::lerp(&flat_pose(), &space_pose(), rv);
-        let pose = pose.with_distance(pose.distance + (1.0 - intro) * 8.0);
-        pose.view_proj(aspect, 0.1, 120.0)
+        // True orthographic head-on view at rv=0 (pure 2D), blending to the
+        // orbited perspective at rv=1.
+        let half = ortho_half(intro);
+        let ortho = Mat4::orthographic_rh(-half * aspect, half * aspect, -half, half, 0.1, 100.0)
+            * Mat4::look_at_rh(cam_target() + Vec3::Z * 20.0, cam_target(), Vec3::Y);
+        let space = space_pose()
+            .with_distance(space_pose().distance + (1.0 - intro) * 8.0)
+            .view_proj(aspect, 0.1, 120.0);
+        ortho * (1.0 - rv) + space * rv
     }
 
     fn face(&self) -> character::Face {
@@ -1014,12 +1015,7 @@ impl Scene for FlatlandApp {
         if self.reveal.sample(self.playhead.t) < 0.4 && !b.vision && b.cue == Cue::Hidden {
             if let Some(p) = ctx.pointer_latest_pos() {
                 let screen = ctx.content_rect();
-                let pose = OrbitPose::lerp(
-                    &flat_pose(),
-                    &space_pose(),
-                    self.reveal.sample(self.playhead.t),
-                );
-                let ext_y = pose.distance * (pose.fov_y * 0.5).tan();
+                let ext_y = ortho_half(self.intro.sample(self.playhead.t));
                 let ext_x = ext_y * screen.width() / screen.height();
                 let tgt = cam_target();
                 let wx = tgt.x + (((p.x - screen.left()) / screen.width()) * 2.0 - 1.0) * ext_x;
@@ -1276,4 +1272,36 @@ fn main() -> Result<()> {
             .with_visible(false),
         ..RunConfig::default()
     })
+}
+
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+
+    fn check(fragment: &str) {
+        let src = format!("{}\n{}", rye_render::FULLSCREEN_VERTEX_WGSL, fragment);
+        let module = naga::front::wgsl::parse_str(&src)
+            .unwrap_or_else(|e| panic!("WGSL parse error:\n{}", e.emit_to_string(&src)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("WGSL validation error: {e:?}"));
+    }
+
+    #[test]
+    fn sky_wgsl_is_valid() {
+        check(SKY_WGSL);
+    }
+
+    #[test]
+    fn wash_wgsl_is_valid() {
+        check(WASH_WGSL);
+    }
+
+    #[test]
+    fn vision_wgsl_is_valid() {
+        check(VISION_WGSL);
+    }
 }
