@@ -39,6 +39,7 @@ const REVEAL_SECONDS: f32 = 1.6;
 const INTRO_SECONDS: f32 = 1.8;
 
 const FLATLAND_HALF: f32 = 2.8;
+const FLATLAND_FILL_HALF: f32 = 8.0;
 const FLATLAND_CELLS: usize = 10;
 const FLOOR_Y: f32 = -FLATLAND_HALF;
 const PANE_Z: f32 = -0.02;
@@ -616,8 +617,12 @@ impl FlatlandApp {
         let beat = self.beat_index();
         let sphere_z = self.sphere_z.sample(t);
         let w = self.w.sample(t);
+        let rv = self.reveal.sample(t);
         let la = self.look_angle();
         let face = self.face();
+        // At the start Flatland fills the view as an infinite cross-section and
+        // Spaceland is hidden; both appear as the third dimension is revealed.
+        let space_fade = ((rv - 0.05) / 0.45).clamp(0.0, 1.0);
         // Reuse last frame's buffers (capacity retained on clear); no per-frame
         // allocation.
         let mut lines = std::mem::take(&mut self.scratch_lines);
@@ -629,39 +634,39 @@ impl FlatlandApp {
         tris.indices.clear();
         tris.colors.clear();
 
-        // Spaceland floor, receding into the distance.
-        for ix in -10..10 {
-            for iz in -16..3 {
-                let (x0, z0) = (ix as f32 * 1.2, iz as f32 * 1.2);
-                let c = if (ix + iz) & 1 == 0 { FLOOR_A } else { FLOOR_B };
-                quad3(
-                    &mut tris,
-                    [
-                        Vec3::new(x0, FLOOR_Y, z0),
-                        Vec3::new(x0 + 1.2, FLOOR_Y, z0),
-                        Vec3::new(x0 + 1.2, FLOOR_Y, z0 + 1.2),
-                        Vec3::new(x0, FLOOR_Y, z0 + 1.2),
-                    ],
-                    c,
-                );
+        // Spaceland floor + distant solids, faded out at the start so only
+        // Flatland is visible, fading in with the reveal.
+        if space_fade > 0.001 {
+            for ix in -10..10 {
+                for iz in -16..3 {
+                    let (x0, z0) = (ix as f32 * 1.2, iz as f32 * 1.2);
+                    let mut c = if (ix + iz) & 1 == 0 { FLOOR_A } else { FLOOR_B };
+                    c[3] *= space_fade;
+                    quad3(
+                        &mut tris,
+                        [
+                            Vec3::new(x0, FLOOR_Y, z0),
+                            Vec3::new(x0 + 1.2, FLOOR_Y, z0),
+                            Vec3::new(x0 + 1.2, FLOOR_Y, z0 + 1.2),
+                            Vec3::new(x0, FLOOR_Y, z0 + 1.2),
+                        ],
+                        c,
+                    );
+                }
             }
-        }
 
-        for (center, solid, scale, spin) in distants() {
-            let rot = Mat3::from_rotation_y(t * spin) * Mat3::from_rotation_x(t * spin * 0.5);
-            let vs: Vec<Vec3> = solid
-                .vertices()
-                .iter()
-                .map(|v| center + rot * (*v * scale))
-                .collect();
-            for e in solid.edges() {
-                push(
-                    &mut lines,
-                    vs[e[0] as usize],
-                    vs[e[1] as usize],
-                    COLOR_DISTANT,
-                    1.2,
-                );
+            let mut dc = COLOR_DISTANT;
+            dc[3] *= space_fade;
+            for (center, solid, scale, spin) in distants() {
+                let rot = Mat3::from_rotation_y(t * spin) * Mat3::from_rotation_x(t * spin * 0.5);
+                let vs: Vec<Vec3> = solid
+                    .vertices()
+                    .iter()
+                    .map(|v| center + rot * (*v * scale))
+                    .collect();
+                for e in solid.edges() {
+                    push(&mut lines, vs[e[0] as usize], vs[e[1] as usize], dc, 1.2);
+                }
             }
         }
 
@@ -682,11 +687,15 @@ impl FlatlandApp {
             return;
         }
 
-        // Flatland pane checkerboard (just behind the on-plane content).
-        let h = FLATLAND_HALF;
-        let step = 2.0 * h / FLATLAND_CELLS as f32;
-        for i in 0..FLATLAND_CELLS {
-            for j in 0..FLATLAND_CELLS {
+        // Flatland's checkerboard. At the start it fills the view as an infinite
+        // cross-section; on the reveal it shrinks to the bounded pane embedded in
+        // Spaceland. Cell size is constant so the pattern extends rather than
+        // scales.
+        let step = 2.0 * FLATLAND_HALF / FLATLAND_CELLS as f32;
+        let h = FLATLAND_HALF + (FLATLAND_FILL_HALF - FLATLAND_HALF) * (1.0 - rv);
+        let cells = (2.0 * h / step).round() as i32;
+        for i in 0..cells {
+            for j in 0..cells {
                 let (x0, y0) = (-h + i as f32 * step, -h + j as f32 * step);
                 let c = if (i + j) & 1 == 0 {
                     FLATLAND_A
