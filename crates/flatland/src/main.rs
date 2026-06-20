@@ -1,14 +1,19 @@
 //! Flatland, an explorable story of the dimensional ladder. One 3D scene: the
-//! plane `z = 0` is Flatland, an upright pane standing in a larger 3D Spaceland
-//! (a checkerboard floor, a sky, distant tumbling solids). A single camera orbits
-//! from a head-on view (which reads as pure 2D) around to reveal the third
-//! dimension, while Flatland stays upright. A Sphere arrives along the hidden
+//! plane z=0 is Flatland, an upright pane standing in a larger 3D Spaceland
+//! (checkerboard floor, gradient sky, distant tumbling solids). A single camera
+//! orbits from a head-on view (reads as pure 2D) around to reveal the third
+//! dimension while Flatland stays upright. A Sphere arrives along the hidden
 //! depth axis; A Square, a 2D being, perceives it only as a circle.
+//!
+//! The narrative is a pure function of the timeline position `t` (Playhead +
+//! Tracks): play advances `t`, but every visual is `f(t)`, so scrub, replay, and
+//! frame-exact capture all reproduce identical frames.
 
 use anyhow::Result;
-use glam::{Mat3, Mat4, Vec2, Vec3};
+use glam::{Mat3, Vec2, Vec3};
+use rye_anim::{ease_in_out_cubic, ease_out_cubic, linear, Playhead, Track};
 use rye_app::{egui, run, App, FrameCtx, RunConfig, SetupCtx};
-use rye_egui::{ease_in_out_cubic, ease_out_cubic, Animated};
+use rye_camera::OrbitPose;
 use rye_math::{EuclideanR3, Projection, ZPlane};
 use rye_render::device::RenderDevice;
 use rye_render::{
@@ -16,7 +21,7 @@ use rye_render::{
 };
 use rye_shape::{convex_section_polygon, icosphere, LineMesh, Solid3, TriangleMesh};
 use std::collections::BTreeSet;
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 use winit::window::WindowAttributes;
 
 mod character;
@@ -30,24 +35,27 @@ const SPHERE_HIDDEN: f32 = 9.0;
 const SPHERE_XY: (f32, f32) = (1.5, 0.6);
 const PASSAGE_SECONDS: f32 = 6.0;
 const REVEAL_SECONDS: f32 = 1.6;
+const INTRO_SECONDS: f32 = 1.8;
 
 const FLATLAND_HALF: f32 = 2.8;
 const FLATLAND_CELLS: usize = 10;
 const FLOOR_Y: f32 = -FLATLAND_HALF;
-const ON_PANE: f32 = 0.0;
 const PANE_Z: f32 = -0.02;
 const VISION_HALF_ANGLE: f32 = 0.5;
 
-const CAM_DIST: (f32, f32) = (24.0, 11.0);
-const CAM_FOV_DEG: (f32, f32) = (15.0, 50.0);
-const CAM_AZIM_DEG: (f32, f32) = (0.0, 34.0);
-const CAM_ELEV_DEG: (f32, f32) = (0.0, 16.0);
-fn cam_target() -> Vec3 {
-    Vec3::new(0.6, 0.3, 0.0)
-}
-
 const SKY_TOP: [f32; 3] = [0.42, 0.58, 0.82];
 const SKY_HORIZON: [f32; 3] = [0.82, 0.88, 0.93];
+const COLOR_SPHERE: [f32; 4] = [0.86, 0.45, 0.30, 1.0];
+const FLATLAND_A: [f32; 4] = [0.92, 0.92, 0.88, 1.0];
+const FLATLAND_B: [f32; 4] = [0.85, 0.87, 0.84, 1.0];
+const FLOOR_A: [f32; 4] = [0.56, 0.62, 0.58, 1.0];
+const FLOOR_B: [f32; 4] = [0.49, 0.56, 0.53, 1.0];
+const COLOR_PRIMITIVE: [f32; 4] = [0.30, 0.46, 0.48, 1.0];
+const COLOR_DISTANT: [f32; 4] = [0.52, 0.60, 0.66, 1.0];
+const COLOR_SECTION: [f32; 4] = [0.90, 0.40, 0.06, 1.0];
+const COLOR_SECTION_FILL: [f32; 4] = [0.95, 0.55, 0.15, 0.6];
+const COLOR_CONE: [f32; 4] = [0.95, 0.78, 0.30, 0.20];
+const COLOR_CONE_EDGE: [f32; 4] = [0.80, 0.60, 0.18, 0.8];
 
 const SKY_WGSL: &str = r#"
 struct Sky { top: vec4<f32>, horizon: vec4<f32>, fade: vec4<f32> };
@@ -64,17 +72,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 fn f32_le(vals: &[f32]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
-const COLOR_SPHERE: [f32; 4] = [0.86, 0.45, 0.30, 1.0];
-const FLATLAND_A: [f32; 4] = [0.92, 0.92, 0.88, 1.0];
-const FLATLAND_B: [f32; 4] = [0.85, 0.87, 0.84, 1.0];
-const FLOOR_A: [f32; 4] = [0.56, 0.62, 0.58, 1.0];
-const FLOOR_B: [f32; 4] = [0.49, 0.56, 0.53, 1.0];
-const COLOR_PRIMITIVE: [f32; 4] = [0.30, 0.46, 0.48, 1.0];
-const COLOR_DISTANT: [f32; 4] = [0.52, 0.60, 0.66, 1.0];
-const COLOR_SECTION: [f32; 4] = [0.90, 0.40, 0.06, 1.0];
-const COLOR_SECTION_FILL: [f32; 4] = [0.95, 0.55, 0.15, 0.6];
-const COLOR_CONE: [f32; 4] = [0.95, 0.78, 0.30, 0.20];
-const COLOR_CONE_EDGE: [f32; 4] = [0.80, 0.60, 0.18, 0.8];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Cue {
@@ -96,109 +93,18 @@ struct Beat {
 }
 
 const BEATS: &[Beat] = &[
-    Beat {
-        caption: "Welcome to Flatland.",
-        secs: 3.0,
-        reveal: 0.0,
-        sleeping: true,
-        vision: false,
-        cue: Cue::Hidden,
-        square: None,
-        sphere: None,
-    },
-    Beat {
-        caption: "A flat, two-dimensional world.",
-        secs: 3.4,
-        reveal: 0.0,
-        sleeping: true,
-        vision: false,
-        cue: Cue::Hidden,
-        square: None,
-        sphere: None,
-    },
-    Beat {
-        caption: "This is A Square, one of its residents.",
-        secs: 3.4,
-        reveal: 0.0,
-        sleeping: true,
-        vision: false,
-        cue: Cue::Hidden,
-        square: None,
-        sphere: None,
-    },
-    Beat {
-        caption: "He wakes. He has never once seen his world from outside it.",
-        secs: 4.2,
-        reveal: 0.0,
-        sleeping: false,
-        vision: false,
-        cue: Cue::Hidden,
-        square: Some("Another ordinary day in Flatland."),
-        sphere: None,
-    },
-    Beat {
-        caption: "Yet Flatland is only a slice of a larger 3D world.",
-        secs: 6.0,
-        reveal: 1.0,
-        sleeping: false,
-        vision: false,
-        cue: Cue::Hidden,
-        square: None,
-        sphere: None,
-    },
-    Beat {
-        caption: "In 3D, our vision is a 2D projection of that world.",
-        secs: 4.5,
-        reveal: 1.0,
-        sleeping: false,
-        vision: false,
-        cue: Cue::Hidden,
-        square: None,
-        sphere: None,
-    },
-    Beat {
-        caption: "In 2D, A Square's vision is just a 1D projection of his.",
-        secs: 7.0,
-        reveal: 0.0,
-        sleeping: false,
-        vision: true,
-        cue: Cue::Hidden,
-        square: None,
-        sphere: None,
-    },
-    Beat {
-        caption: "Then a visitor arrives, from the direction he cannot point to.",
-        secs: 5.5,
-        reveal: 1.0,
-        sleeping: false,
-        vision: false,
-        cue: Cue::Hover,
-        square: Some("I see only a circle. Reveal yourself!"),
-        sphere: Some("Greetings, Square. I am A Sphere, from beyond your plane."),
-    },
-    Beat {
-        caption: "A Sphere descends through Flatland.",
-        secs: PASSAGE_SECONDS + 2.5,
-        reveal: 1.0,
-        sleeping: false,
-        vision: false,
-        cue: Cue::Descend,
-        square: Some("It grows... it shrinks... it is gone! Sorcery!"),
-        sphere: None,
-    },
-    Beat {
-        caption: "From outside his plane we see even his insides, as 4D would see ours. You are A Square.",
-        secs: 9.0,
-        reveal: 1.0,
-        sleeping: false,
-        vision: false,
-        cue: Cue::Below,
-        square: None,
-        sphere: None,
-    },
+    Beat { caption: "Welcome to Flatland.", secs: 3.0, reveal: 0.0, sleeping: true, vision: false, cue: Cue::Hidden, square: None, sphere: None },
+    Beat { caption: "A flat, two-dimensional world.", secs: 3.4, reveal: 0.0, sleeping: true, vision: false, cue: Cue::Hidden, square: None, sphere: None },
+    Beat { caption: "This is A Square, one of its residents.", secs: 3.4, reveal: 0.0, sleeping: true, vision: false, cue: Cue::Hidden, square: None, sphere: None },
+    Beat { caption: "He wakes. He has never once seen his world from outside it.", secs: 4.2, reveal: 0.0, sleeping: false, vision: false, cue: Cue::Hidden, square: Some("Another ordinary day in Flatland."), sphere: None },
+    Beat { caption: "Yet Flatland is only a slice of a larger 3D world.", secs: 6.0, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Hidden, square: None, sphere: None },
+    Beat { caption: "In 3D, our vision is a 2D projection of that world.", secs: 4.5, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Hidden, square: None, sphere: None },
+    Beat { caption: "In 2D, A Square's vision is just a 1D projection of his.", secs: 7.0, reveal: 0.0, sleeping: false, vision: true, cue: Cue::Hidden, square: None, sphere: None },
+    Beat { caption: "Then a visitor arrives, from the direction he cannot point to.", secs: 5.5, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Hover, square: Some("I see only a circle. Reveal yourself!"), sphere: Some("Greetings, Square. I am A Sphere, from beyond your plane.") },
+    Beat { caption: "A Sphere descends through Flatland.", secs: PASSAGE_SECONDS + 2.5, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Descend, square: Some("It grows... it shrinks... it is gone! Sorcery!"), sphere: None },
+    Beat { caption: "From outside his plane we see even his insides, as 4D would see ours. You are A Square.", secs: 9.0, reveal: 1.0, sleeping: false, vision: false, cue: Cue::Below, square: None, sphere: None },
 ];
 
-/// Slowly rotating 2D primitives on Flatland: (center, sides, radius, spin).
 fn primitives() -> [(Vec2, usize, f32, f32); 3] {
     [
         (Vec2::new(-1.7, 1.3), 3, 0.34, 0.5),
@@ -207,7 +113,6 @@ fn primitives() -> [(Vec2, usize, f32, f32); 3] {
     ]
 }
 
-/// Distant tumbling solids in Spaceland: (center, solid, scale, spin).
 fn distants() -> [(Vec3, Solid3, f32, f32); 4] {
     [
         (Vec3::new(5.5, 1.0, -8.0), Solid3::Cube, 1.0, 0.5),
@@ -217,10 +122,106 @@ fn distants() -> [(Vec3, Solid3, f32, f32); 4] {
     ]
 }
 
-struct Frame {
-    lines: LineMesh<3>,
-    tris: TriangleMesh<3>,
-    sides: usize,
+fn cam_target() -> Vec3 {
+    Vec3::new(0.6, 0.3, 0.0)
+}
+
+fn flat_pose() -> OrbitPose {
+    OrbitPose {
+        target: cam_target(),
+        azimuth: 0.0,
+        elevation: 0.0,
+        distance: 24.0,
+        fov_y: 15.0_f32.to_radians(),
+    }
+}
+
+fn space_pose() -> OrbitPose {
+    OrbitPose {
+        target: cam_target(),
+        azimuth: 34.0_f32.to_radians(),
+        elevation: 16.0_f32.to_radians(),
+        distance: 11.0,
+        fov_y: 50.0_f32.to_radians(),
+    }
+}
+
+fn square_pos() -> Vec2 {
+    Vec2::new(0.0, 0.0)
+}
+
+fn sphere_xy() -> Vec2 {
+    Vec2::new(SPHERE_XY.0, SPHERE_XY.1)
+}
+
+fn wake_beat() -> usize {
+    BEATS.iter().position(|b| !b.sleeping).unwrap()
+}
+
+/// Build the timeline tracks (everything is `f(t)`): camera reveal, A Sphere's
+/// height, and the intro fade, plus each beat's start time and the total length.
+fn build_tracks() -> (Track, Track, Track, Vec<f32>, f32) {
+    let mut starts = Vec::with_capacity(BEATS.len());
+    let mut t = 0.0;
+    for b in BEATS {
+        starts.push(t);
+        t += b.secs;
+    }
+    let total = t;
+
+    let mut reveal = Track::new().key(0.0, BEATS[0].reveal, linear);
+    let mut cur = BEATS[0].reveal;
+    for (i, b) in BEATS.iter().enumerate() {
+        if b.reveal != cur {
+            let s = starts[i];
+            reveal = reveal.key(s, cur, linear).key(
+                s + REVEAL_SECONDS.min(b.secs),
+                b.reveal,
+                ease_in_out_cubic,
+            );
+            cur = b.reveal;
+        }
+    }
+
+    let mut sz = Track::new().key(0.0, SPHERE_HIDDEN, linear);
+    let mut zcur = SPHERE_HIDDEN;
+    for (i, b) in BEATS.iter().enumerate() {
+        let s = starts[i];
+        match b.cue {
+            Cue::Hidden => {
+                if zcur != SPHERE_HIDDEN {
+                    sz = sz.key(s, SPHERE_HIDDEN, linear);
+                    zcur = SPHERE_HIDDEN;
+                }
+            }
+            Cue::Hover => {
+                sz = sz
+                    .key(s, zcur, linear)
+                    .key(s + 0.9, SPHERE_TOP, ease_out_cubic);
+                zcur = SPHERE_TOP;
+            }
+            Cue::Descend => {
+                sz = sz.key(s, zcur, linear).key(
+                    s + PASSAGE_SECONDS.min(b.secs),
+                    -SPHERE_TOP,
+                    ease_in_out_cubic,
+                );
+                zcur = -SPHERE_TOP;
+            }
+            Cue::Below => {
+                if zcur != -SPHERE_TOP {
+                    sz = sz.key(s, -SPHERE_TOP, linear);
+                    zcur = -SPHERE_TOP;
+                }
+            }
+        }
+    }
+
+    let intro = Track::new()
+        .key(0.0, 0.0, linear)
+        .key(INTRO_SECONDS, 1.0, ease_out_cubic);
+
+    (reveal, sz, intro, starts, total)
 }
 
 struct FlatlandApp {
@@ -230,27 +231,13 @@ struct FlatlandApp {
     depth: Option<DepthBuffer>,
     sphere_verts: Vec<Vec3>,
     sphere_edges: Vec<[u32; 2]>,
-    beat: usize,
-    beat_elapsed: f32,
-    paused: bool,
-    intro: Animated,
-    reveal: Animated,
-    sphere_z: Animated,
-    surprise: Animated,
-    surprised: bool,
-    wake_shake: f32,
-    time: f32,
+    playhead: Playhead,
+    reveal: Track,
+    sphere_z: Track,
+    intro: Track,
+    beat_starts: Vec<f32>,
     gaze_target: Vec2,
-    section_sides: usize,
     vision_bands: Vec<(f32, f32)>,
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
-fn v3(x: f32, y: f32) -> Vec3 {
-    Vec3::new(x, y, ON_PANE)
 }
 
 fn push(mesh: &mut LineMesh<3>, a: Vec3, b: Vec3, color: [f32; 4], width: f32) {
@@ -269,16 +256,24 @@ fn quad3(tris: &mut TriangleMesh<3>, p: [Vec3; 4], color: [f32; 4]) {
     tris.indices.push([base, base + 2, base + 3]);
 }
 
-fn square_pos() -> Vec2 {
-    Vec2::new(0.0, 0.0)
+fn fan3(tris: &mut TriangleMesh<3>, pts: &[Vec3], color: [f32; 4]) {
+    if pts.len() < 3 {
+        return;
+    }
+    let base = tris.vertices.len() as u32;
+    for v in pts {
+        tris.vertices.push(v.to_array());
+        tris.colors.push(color);
+    }
+    for k in 1..pts.len() as u32 - 1 {
+        tris.indices.push([base, base + k, base + k + 1]);
+    }
 }
 
-fn sphere_xy() -> Vec2 {
-    Vec2::new(SPHERE_XY.0, SPHERE_XY.1)
+fn v3(x: f32, y: f32) -> Vec3 {
+    Vec3::new(x, y, 0.0)
 }
 
-/// The angular interval, normalized across A Square's field of view, that a disc
-/// of `radius` at `center` subtends relative to his look direction.
 fn angular_band(s: Vec2, look_ang: f32, center: Vec2, radius: f32) -> Option<(f32, f32)> {
     let to_c = center - s;
     let dist = to_c.length();
@@ -286,10 +281,10 @@ fn angular_band(s: Vec2, look_ang: f32, center: Vec2, radius: f32) -> Option<(f3
         return None;
     }
     let mut rel = to_c.y.atan2(to_c.x) - look_ang;
-    while rel > PI {
+    while rel > std::f32::consts::PI {
         rel -= TAU;
     }
-    while rel < -PI {
+    while rel < -std::f32::consts::PI {
         rel += TAU;
     }
     let half = (radius / dist).asin();
@@ -302,77 +297,79 @@ fn angular_band(s: Vec2, look_ang: f32, center: Vec2, radius: f32) -> Option<(f3
 }
 
 impl FlatlandApp {
-    fn enter_beat(&mut self, beat: usize) {
-        let was_sleeping = BEATS[self.beat].sleeping;
-        self.beat = beat.min(BEATS.len() - 1);
-        self.beat_elapsed = 0.0;
-        let b = &BEATS[self.beat];
-        self.reveal
-            .animate_to(b.reveal, REVEAL_SECONDS, ease_in_out_cubic);
-        match b.cue {
-            Cue::Hidden => self.sphere_z.snap(SPHERE_HIDDEN),
-            Cue::Hover => self.sphere_z.animate_to(SPHERE_TOP, 0.9, ease_out_cubic),
-            Cue::Descend => {
-                self.sphere_z
-                    .animate_to(-SPHERE_TOP, PASSAGE_SECONDS, ease_in_out_cubic)
-            }
-            Cue::Below => self.sphere_z.snap(-SPHERE_TOP),
-        }
-        if was_sleeping && !b.sleeping {
-            self.wake_shake = 0.6;
-        }
+    fn beat_index(&self) -> usize {
+        self.beat_starts
+            .partition_point(|&s| s <= self.playhead.t)
+            .saturating_sub(1)
+            .min(BEATS.len() - 1)
     }
 
-    fn look_angle(&self) -> f32 {
-        let d = self.gaze_target - square_pos();
-        if d.length() > 1e-4 {
-            d.y.atan2(d.x)
-        } else {
-            0.0
-        }
+    fn beat_elapsed(&self) -> f32 {
+        self.playhead.t - self.beat_starts[self.beat_index()]
     }
 
-    fn camera_view_proj(&self, aspect: f32) -> Mat4 {
-        let rv = self.reveal.value();
-        let az = lerp(CAM_AZIM_DEG.0, CAM_AZIM_DEG.1, rv).to_radians();
-        let el = lerp(CAM_ELEV_DEG.0, CAM_ELEV_DEG.1, rv).to_radians();
-        let dist = lerp(CAM_DIST.0, CAM_DIST.1, rv) + (1.0 - self.intro.value()) * 8.0;
-        let fov = lerp(CAM_FOV_DEG.0, CAM_FOV_DEG.1, rv).to_radians();
-        let dir = Vec3::new(az.sin() * el.cos(), el.sin(), az.cos() * el.cos());
-        let eye = cam_target() + dir * dist;
-        Mat4::perspective_rh(fov, aspect, 0.1, 120.0) * Mat4::look_at_rh(eye, cam_target(), Vec3::Y)
+    fn seek_beat(&mut self, beat: usize) {
+        let b = beat.min(BEATS.len() - 1);
+        self.playhead.seek(self.beat_starts[b]);
+    }
+
+    fn camera_view_proj(&self, aspect: f32) -> glam::Mat4 {
+        let rv = self.reveal.sample(self.playhead.t);
+        let intro = self.intro.sample(self.playhead.t);
+        let pose = OrbitPose::lerp(&flat_pose(), &space_pose(), rv);
+        let pose = pose.with_distance(pose.distance + (1.0 - intro) * 8.0);
+        pose.view_proj(aspect, 0.1, 120.0)
     }
 
     fn face(&self) -> character::Face {
+        let t = self.playhead.t;
+        let beat = self.beat_index();
         let pos = square_pos();
-        let awake = !BEATS[self.beat].sleeping;
+        let awake = !BEATS[beat].sleeping;
         let look = self.gaze_target - pos;
-        let idle = if awake {
-            (self.time * 1.3).sin() * 0.012
+
+        let z = self.sphere_z.sample(t);
+        let surprise = (1.0 - ((z.abs() - SPHERE_RADIUS).max(0.0) / 1.3)).clamp(0.0, 1.0);
+
+        // Wake: eyes ease open + a brief head-shake over the first 0.6s of the
+        // first awake beat.
+        let wake_t = if beat >= wake_beat() {
+            (t - self.beat_starts[wake_beat()]).max(0.0)
         } else {
-            0.03 + (self.time * 0.9).sin() * 0.05
+            -1.0
+        };
+        let wake_open = if wake_t < 0.0 {
+            0.0
+        } else {
+            (wake_t / 0.6).clamp(0.0, 1.0)
+        };
+        let mut lean = if awake {
+            (look.x * 0.09).clamp(-0.28, 0.28)
+        } else {
+            0.0
+        };
+        if (0.0..0.6).contains(&wake_t) {
+            lean += (t * 32.0).sin() * 0.22 * (1.0 - wake_t / 0.6);
+        }
+
+        let idle = if awake {
+            (t * 1.3).sin() * 0.012
+        } else {
+            0.03 + (t * 0.9).sin() * 0.05
         };
         let reach = if awake {
             (look.y * 0.05).clamp(-0.10, 0.16)
         } else {
             0.0
         };
-        let bp = self.time % 3.4;
-        let blink = if awake && bp < 0.16 {
-            (bp / 0.08 - 1.0).abs().min(1.0)
+        let blink_phase = t % 3.4;
+        let blink = if awake && blink_phase < 0.16 {
+            (blink_phase / 0.08 - 1.0).abs().min(1.0)
         } else {
             1.0
         };
-        let surprise = self.surprise.value();
-        let mut lean = if awake {
-            (look.x * 0.09).clamp(-0.28, 0.28)
-        } else {
-            0.0
-        };
-        if self.wake_shake > 0.0 {
-            lean += (self.time * 32.0).sin() * 0.22 * (self.wake_shake / 0.6);
-        }
-        let base = if awake { lerp(0.5, 1.0, surprise) } else { 0.0 };
+
+        let base = if awake { 0.5 + 0.5 * surprise } else { 0.0 };
         let left_more = if awake && look.x < 0.0 {
             0.5 * (1.0 - surprise)
         } else {
@@ -383,7 +380,7 @@ impl FlatlandApp {
         } else {
             0.0
         };
-        let wake_open = (1.0 - self.wake_shake / 0.6).clamp(0.0, 1.0);
+
         character::Face {
             pos,
             half: 0.34,
@@ -397,11 +394,14 @@ impl FlatlandApp {
         }
     }
 
-    fn build(&self, sphere_z: f32) -> Frame {
+    fn build(&self) -> (LineMesh<3>, TriangleMesh<3>, usize) {
+        let t = self.playhead.t;
+        let beat = self.beat_index();
+        let sphere_z = self.sphere_z.sample(t);
         let mut lines = LineMesh::<3>::default();
         let mut tris = TriangleMesh::<3>::default();
 
-        // Spaceland floor, a checkerboard receding into the distance.
+        // Spaceland floor, receding into the distance.
         for ix in -10..10 {
             for iz in -16..3 {
                 let (x0, z0) = (ix as f32 * 1.2, iz as f32 * 1.2);
@@ -419,10 +419,8 @@ impl FlatlandApp {
             }
         }
 
-        // Distant tumbling solids that make Spaceland's depth legible.
         for (center, solid, scale, spin) in distants() {
-            let rot = Mat3::from_rotation_y(self.time * spin)
-                * Mat3::from_rotation_x(self.time * spin * 0.5);
+            let rot = Mat3::from_rotation_y(t * spin) * Mat3::from_rotation_x(t * spin * 0.5);
             let vs: Vec<Vec3> = solid
                 .vertices()
                 .iter()
@@ -439,7 +437,7 @@ impl FlatlandApp {
             }
         }
 
-        // Flatland: the upright pane at z = 0, its own checkerboard.
+        // Flatland pane checkerboard (just behind the on-plane content).
         let h = FLATLAND_HALF;
         let step = 2.0 * h / FLATLAND_CELLS as f32;
         for i in 0..FLATLAND_CELLS {
@@ -464,7 +462,7 @@ impl FlatlandApp {
         }
 
         for (c, n, rad, spin) in primitives() {
-            let phase = self.time * spin;
+            let phase = t * spin;
             for k in 0..n {
                 let a0 = phase + TAU * k as f32 / n as f32;
                 let a1 = phase + TAU * (k + 1) as f32 / n as f32;
@@ -480,24 +478,16 @@ impl FlatlandApp {
             }
         }
 
-        if BEATS[self.beat].vision {
+        if BEATS[beat].vision {
             let s = square_pos();
             let la = self.look_angle();
-            let mut wedge = vec![Vec3::new(s.x, s.y, ON_PANE)];
+            let mut wedge = vec![v3(s.x, s.y)];
             for k in 0..=14 {
                 let a = la - VISION_HALF_ANGLE + 2.0 * VISION_HALF_ANGLE * (k as f32 / 14.0);
                 let e = s + Vec2::from_angle(a) * 6.0;
-                wedge.push(Vec3::new(e.x, e.y, ON_PANE));
+                wedge.push(v3(e.x, e.y));
             }
-            // Fan-fill the cone manually (it is already centered at s).
-            let base = tris.vertices.len() as u32;
-            for w in &wedge {
-                tris.vertices.push(w.to_array());
-                tris.colors.push(COLOR_CONE);
-            }
-            for k in 1..wedge.len() as u32 - 1 {
-                tris.indices.push([base, base + k, base + k + 1]);
-            }
+            fan3(&mut tris, &wedge, COLOR_CONE);
             for sign in [-1.0_f32, 1.0] {
                 let e = s + Vec2::from_angle(la + sign * VISION_HALF_ANGLE) * 6.0;
                 push(&mut lines, v3(s.x, s.y), v3(e.x, e.y), COLOR_CONE_EDGE, 1.5);
@@ -521,15 +511,8 @@ impl FlatlandApp {
         let poly = convex_section_polygon(&world, &self.sphere_edges, ZPlane::new(0.0));
         let sides = poly.len();
         if sides >= 3 {
-            let lifted: Vec<Vec2> = poly.clone();
-            let base = tris.vertices.len() as u32;
-            for q in &lifted {
-                tris.vertices.push([q.x, q.y, ON_PANE]);
-                tris.colors.push(COLOR_SECTION_FILL);
-            }
-            for k in 1..sides as u32 - 1 {
-                tris.indices.push([base, base + k, base + k + 1]);
-            }
+            let disc: Vec<Vec3> = poly.iter().map(|q| v3(q.x, q.y)).collect();
+            fan3(&mut tris, &disc, COLOR_SECTION_FILL);
             for i in 0..sides {
                 let a = poly[i];
                 let b = poly[(i + 1) % sides];
@@ -539,7 +522,16 @@ impl FlatlandApp {
 
         character::push_face(&mut lines, &mut tris, &self.face());
 
-        Frame { lines, tris, sides }
+        (lines, tris, sides)
+    }
+
+    fn look_angle(&self) -> f32 {
+        let d = self.gaze_target - square_pos();
+        if d.length() > 1e-4 {
+            d.y.atan2(d.x)
+        } else {
+            0.0
+        }
     }
 }
 
@@ -576,36 +568,29 @@ impl App for FlatlandApp {
         let (raw, faces) = icosphere(SPHERE_SUBDIVISIONS);
         let sphere_verts = raw.iter().map(|v| *v * SPHERE_RADIUS).collect();
         let mut set = BTreeSet::new();
-        for t in &faces {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+        for f in &faces {
+            for (a, b) in [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
                 set.insert(if a < b { [a, b] } else { [b, a] });
             }
         }
 
-        let mut app = Self {
+        let (reveal, sphere_z, intro, beat_starts, total) = build_tracks();
+
+        Ok(Self {
             lines: line_node,
             tris: tri_node,
             sky,
             depth: None,
             sphere_verts,
             sphere_edges: set.into_iter().collect(),
-            beat: 0,
-            beat_elapsed: 0.0,
-            paused: false,
-            intro: Animated::new(0.0),
-            reveal: Animated::new(0.0),
-            sphere_z: Animated::new(SPHERE_HIDDEN),
-            surprise: Animated::new(0.0),
-            surprised: false,
-            wake_shake: 0.0,
-            time: 0.0,
+            playhead: Playhead::new(total),
+            reveal,
+            sphere_z,
+            intro,
+            beat_starts,
             gaze_target: sphere_xy(),
-            section_sides: 0,
             vision_bands: Vec::new(),
-        };
-        app.enter_beat(0);
-        app.intro.animate_to(1.0, 1.8, ease_out_cubic);
-        Ok(app)
+        })
     }
 
     fn space(&self) -> &EuclideanR3 {
@@ -613,41 +598,20 @@ impl App for FlatlandApp {
     }
 
     fn update(&mut self, ctx: &mut FrameCtx<'_>) {
-        let dt = ctx.dt.min(0.1);
-        self.time += dt;
-        self.intro.advance(dt);
-        self.reveal.advance(dt);
-        self.sphere_z.advance(dt);
-        self.wake_shake = (self.wake_shake - dt).max(0.0);
-
-        if !self.paused && self.beat + 1 < BEATS.len() {
-            self.beat_elapsed += dt;
-            if self.beat_elapsed >= BEATS[self.beat].secs {
-                self.enter_beat(self.beat + 1);
-            }
-        }
-
-        let beat = &BEATS[self.beat];
+        self.playhead.advance(ctx.dt.min(0.1));
+        let t = self.playhead.t;
+        let beat = &BEATS[self.beat_index()];
         let s = square_pos();
+
         if beat.vision {
-            self.gaze_target = s + Vec2::from_angle((self.time * 0.7).sin() * 1.1 + 0.4) * 2.0;
+            self.gaze_target = s + Vec2::from_angle((t * 0.7).sin() * 1.1 + 0.4) * 2.0;
         } else if matches!(beat.cue, Cue::Hover | Cue::Descend) {
             self.gaze_target = sphere_xy();
         }
 
-        // Surprise when A Sphere is present (arrives or crosses), not only mid-cut.
-        let reacting = matches!(beat.cue, Cue::Hover | Cue::Descend)
-            && self.sphere_z.value() < SPHERE_TOP + 0.5;
-        if reacting != self.surprised {
-            self.surprised = reacting;
-            self.surprise
-                .animate_to(if reacting { 1.0 } else { 0.0 }, 0.35, ease_out_cubic);
-        }
-        self.surprise.advance(dt);
-
         let look = self.look_angle();
         let mut bands = Vec::new();
-        let z = self.sphere_z.value();
+        let z = self.sphere_z.sample(t);
         if z.abs() < SPHERE_RADIUS {
             let rc = (SPHERE_RADIUS * SPHERE_RADIUS - z * z).sqrt();
             if let Some(b) = angular_band(s, look, sphere_xy(), rc) {
@@ -665,8 +629,7 @@ impl App for FlatlandApp {
     }
 
     fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
-        let frame = self.build(self.sphere_z.value());
-        self.section_sides = frame.sides;
+        let (line_mesh, tri_mesh, _sides) = self.build();
 
         let cfg = &rd.surface_bundle.config;
         let w = cfg.width;
@@ -714,8 +677,7 @@ impl App for FlatlandApp {
             rd.queue.submit(Some(enc.finish()));
         }
 
-        // Gradient sky backdrop (opaque), faded in by the intro.
-        let intro = self.intro.value();
+        let intro = self.intro.sample(self.playhead.t);
         self.sky.set_uniforms(
             &rd.queue,
             &f32_le(&[
@@ -736,19 +698,15 @@ impl App for FlatlandApp {
         self.sky.execute(rd, view, None)?;
 
         self.tris.set_camera(&rd.queue, view_proj);
-        self.tris.upload::<EuclideanR3, 3>(
-            &rd.device,
-            &rd.queue,
-            &frame.tris,
-            &Projection::Identity,
-        );
+        self.tris
+            .upload::<EuclideanR3, 3>(&rd.device, &rd.queue, &tri_mesh, &Projection::Identity);
         self.tris.execute(rd, view, Some(&dview), None)?;
         self.lines
             .set_camera(&rd.queue, view_proj, Vec2::new(w as f32, h as f32));
         self.lines.upload::<EuclideanR3, 3>(
             &rd.device,
             &rd.queue,
-            &frame.lines,
+            &line_mesh,
             &Projection::Identity,
             1,
         );
@@ -757,32 +715,34 @@ impl App for FlatlandApp {
     }
 
     fn ui(&mut self, ctx: &egui::Context, _frame: &mut FrameCtx<'_>) {
-        let beat = &BEATS[self.beat];
+        let beat = self.beat_index();
+        let b = &BEATS[beat];
 
-        let free_look = self.reveal.value() < 0.4 && !beat.vision && beat.cue == Cue::Hidden;
-        if free_look {
+        if self.reveal.sample(self.playhead.t) < 0.4 && !b.vision && b.cue == Cue::Hidden {
             if let Some(p) = ctx.pointer_latest_pos() {
                 let screen = ctx.content_rect();
-                let dist = lerp(CAM_DIST.0, CAM_DIST.1, self.reveal.value());
-                let fov = lerp(CAM_FOV_DEG.0, CAM_FOV_DEG.1, self.reveal.value()).to_radians();
-                let ext_y = dist * (fov * 0.5).tan();
+                let pose = OrbitPose::lerp(
+                    &flat_pose(),
+                    &space_pose(),
+                    self.reveal.sample(self.playhead.t),
+                );
+                let ext_y = pose.distance * (pose.fov_y * 0.5).tan();
                 let ext_x = ext_y * screen.width() / screen.height();
-                let t = cam_target();
-                let wx = t.x + (((p.x - screen.left()) / screen.width()) * 2.0 - 1.0) * ext_x;
-                let wy = t.y + (1.0 - ((p.y - screen.top()) / screen.height()) * 2.0) * ext_y;
+                let tgt = cam_target();
+                let wx = tgt.x + (((p.x - screen.left()) / screen.width()) * 2.0 - 1.0) * ext_x;
+                let wy = tgt.y + (1.0 - ((p.y - screen.top()) / screen.height()) * 2.0) * ext_y;
                 self.gaze_target = Vec2::new(wx, wy);
             }
         }
 
         self.vision_window(ctx);
-        self.dialogue(ctx);
+        self.dialogue(ctx, beat);
 
         let fade = {
-            let e = self.beat_elapsed;
-            let s = beat.secs;
+            let e = self.beat_elapsed();
             (e / 0.5)
                 .clamp(0.0, 1.0)
-                .min(((s - e) / 0.7).clamp(0.0, 1.0))
+                .min(((b.secs - e) / 0.7).clamp(0.0, 1.0))
         };
         let a = (fade * 255.0) as u8;
         egui::Area::new(egui::Id::new("caption"))
@@ -795,7 +755,7 @@ impl App for FlatlandApp {
                         ui.set_max_width(640.0);
                         ui.vertical_centered(|ui| {
                             ui.label(
-                                egui::RichText::new(beat.caption)
+                                egui::RichText::new(b.caption)
                                     .size(18.0)
                                     .color(egui::Color32::from_rgba_unmultiplied(30, 34, 40, a)),
                             );
@@ -803,7 +763,7 @@ impl App for FlatlandApp {
                     });
             });
 
-        self.controls(ctx);
+        self.controls(ctx, beat);
     }
 
     fn title(&self, fps: f32) -> std::borrow::Cow<'static, str> {
@@ -836,11 +796,11 @@ impl FlatlandApp {
             });
     }
 
-    fn dialogue(&self, ctx: &egui::Context) {
-        let beat = &BEATS[self.beat];
+    fn dialogue(&self, ctx: &egui::Context, beat: usize) {
+        let b = &BEATS[beat];
         let screen = ctx.content_rect();
         let top = screen.top() + 70.0;
-        if let Some(t) = beat.square {
+        if let Some(t) = b.square {
             speech_bubble(
                 ctx,
                 "square-bubble",
@@ -849,8 +809,8 @@ impl FlatlandApp {
                 egui::Color32::from_rgb(30, 110, 120),
             );
         }
-        if let Some(t) = beat.sphere {
-            if self.reveal.value() > 0.6 {
+        if let Some(t) = b.sphere {
+            if self.reveal.sample(self.playhead.t) > 0.6 {
                 speech_bubble(
                     ctx,
                     "sphere-bubble",
@@ -862,50 +822,54 @@ impl FlatlandApp {
         }
     }
 
-    fn controls(&mut self, ctx: &egui::Context) {
-        let mut jump: Option<usize> = None;
-        let mut scrub: Option<f32> = None;
+    fn controls(&mut self, ctx: &egui::Context, beat: usize) {
+        let mut seek_to_beat: Option<usize> = None;
+        let mut seek_t: Option<f32> = None;
+        let mut set_playing: Option<bool> = None;
+        let total = self.playhead.duration;
+        let now = self.playhead.t;
+        let playing = self.playhead.playing;
+
         egui::Area::new(egui::Id::new("controls"))
             .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -16.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .button(if self.paused { "Play" } else { "Pause" })
-                        .clicked()
-                    {
-                        self.paused = !self.paused;
+                    if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
+                        set_playing = Some(!playing);
                     }
                     if ui
-                        .add_enabled(self.beat > 0, egui::Button::new("Back"))
+                        .add_enabled(beat > 0, egui::Button::new("Back"))
                         .clicked()
                     {
-                        jump = Some(self.beat - 1);
+                        seek_to_beat = Some(beat.saturating_sub(1));
                     }
                     if ui.button("Replay").clicked() {
-                        jump = Some(0);
-                        self.paused = false;
+                        seek_t = Some(0.0);
+                        set_playing = Some(true);
                     }
-                    if BEATS[self.beat].cue == Cue::Descend {
-                        let mut z = self.sphere_z.value();
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut z, SPHERE_TOP..=-SPHERE_TOP)
-                                    .show_value(false)
-                                    .text("scrub"),
-                            )
-                            .changed()
-                        {
-                            scrub = Some(z);
-                            self.paused = true;
-                        }
+                    let mut t = now;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut t, 0.0..=total)
+                                .show_value(false)
+                                .text("t"),
+                        )
+                        .changed()
+                    {
+                        seek_t = Some(t);
+                        set_playing = Some(false);
                     }
                 });
             });
-        if let Some(z) = scrub {
-            self.sphere_z.snap(z);
+
+        if let Some(p) = set_playing {
+            self.playhead.playing = p;
         }
-        if let Some(i) = jump {
-            self.enter_beat(i);
+        if let Some(t) = seek_t {
+            self.playhead.seek(t);
+        }
+        if let Some(bi) = seek_to_beat {
+            self.seek_beat(bi);
         }
     }
 }

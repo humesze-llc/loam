@@ -13,6 +13,7 @@ glam.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 
+rye-anim   = { path = "../rye-anim" }
 rye-app    = { path = "../rye-app", default-features = false }
 rye-camera = { path = "../rye-camera" }
 rye-egui   = { path = "../rye-egui" }
