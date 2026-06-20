@@ -12,12 +12,13 @@
 use anyhow::Result;
 use glam::{Mat3, Vec2, Vec3};
 use rye_anim::{ease_in_out_cubic, ease_out_cubic, linear, Playhead, Track};
-use rye_app::{egui, run, App, FrameCtx, RunConfig, SetupCtx};
+use rye_app::{egui, run_scene, FrameCtx, RunConfig, Scene, SetupCtx};
 use rye_camera::OrbitPose;
 use rye_math::{EuclideanR3, Projection, ZPlane};
 use rye_render::device::RenderDevice;
 use rye_render::{
     DepthBuffer, DepthMode, FragmentShading, LineRasterNode, ShaderEffect, TriangleRasterNode,
+    Viewport,
 };
 use rye_shape::{convex_section_polygon, icosphere, LineMesh, Solid3, TriangleMesh};
 use std::collections::BTreeSet;
@@ -617,10 +618,8 @@ impl FlatlandApp {
     }
 }
 
-impl App for FlatlandApp {
-    type Space = EuclideanR3;
-
-    fn setup(ctx: &mut SetupCtx<'_>) -> Result<Self> {
+impl Scene for FlatlandApp {
+    fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
         let line_node = LineRasterNode::new(
             &ctx.rd.device,
             ctx.rd.target_format(),
@@ -685,10 +684,6 @@ impl App for FlatlandApp {
         })
     }
 
-    fn space(&self) -> &EuclideanR3 {
-        &EuclideanR3
-    }
-
     fn update(&mut self, ctx: &mut FrameCtx<'_>) {
         self.playhead.advance(ctx.dt.min(0.1));
         let t = self.playhead.t;
@@ -725,19 +720,24 @@ impl App for FlatlandApp {
         self.vision_slide += (target - self.vision_slide) * (1.0 - (-dt * 8.0).exp());
     }
 
-    fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
+    fn render(
+        &mut self,
+        rd: &RenderDevice,
+        view: &wgpu::TextureView,
+        viewport: Viewport,
+    ) -> Result<()> {
         let (line_mesh, tri_mesh, _sides) = self.build();
 
         let cfg = &rd.surface_bundle.config;
-        let w = cfg.width;
-        let h = cfg.height.max(1);
-        let view_proj = self.camera_view_proj(w as f32 / h as f32);
+        let vw = viewport.width.max(1);
+        let vh = viewport.height.max(1);
+        let view_proj = self.camera_view_proj(vw as f32 / vh as f32);
 
         DepthBuffer::ensure(
             &mut self.depth,
             &rd.device,
             DEPTH_FORMAT,
-            (w, h),
+            (cfg.width, cfg.height.max(1)),
             rd.sample_count(),
         );
         let dview = self.depth.as_ref().expect("ensured").view.clone();
@@ -792,14 +792,14 @@ impl App for FlatlandApp {
                 0.0,
             ]),
         );
-        self.sky.execute(rd, view, None)?;
+        self.sky.execute(rd, view, Some(&viewport))?;
 
         self.tris.set_camera(&rd.queue, view_proj);
         self.tris
             .upload::<EuclideanR3, 3>(&rd.device, &rd.queue, &tri_mesh, &Projection::Identity);
-        self.tris.execute(rd, view, Some(&dview), None)?;
+        self.tris.execute(rd, view, Some(&dview), Some(&viewport))?;
         self.lines
-            .set_camera(&rd.queue, view_proj, Vec2::new(w as f32, h as f32));
+            .set_camera(&rd.queue, view_proj, Vec2::new(vw as f32, vh as f32));
         self.lines.upload::<EuclideanR3, 3>(
             &rd.device,
             &rd.queue,
@@ -807,7 +807,8 @@ impl App for FlatlandApp {
             &Projection::Identity,
             1,
         );
-        self.lines.execute(rd, view, Some(&dview), None)?;
+        self.lines
+            .execute(rd, view, Some(&dview), Some(&viewport))?;
 
         // The "two-dimensional world" beat gets a light wash sweeping across.
         if self.beat_index() == WASH_BEAT {
@@ -815,7 +816,7 @@ impl App for FlatlandApp {
             let strength = (p * std::f32::consts::PI).sin() * 0.5;
             self.wash
                 .set_uniforms(&rd.queue, &f32_le(&[p, strength, 0.0, 0.0]));
-            self.wash.execute(rd, view, None)?;
+            self.wash.execute(rd, view, Some(&viewport))?;
         }
         Ok(())
     }
@@ -872,8 +873,8 @@ impl App for FlatlandApp {
         self.controls(ctx, beat);
     }
 
-    fn title(&self, fps: f32) -> std::borrow::Cow<'static, str> {
-        format!("flatland  -  {fps:.0} fps").into()
+    fn title(&self) -> std::borrow::Cow<'static, str> {
+        "flatland".into()
     }
 }
 
@@ -1079,7 +1080,7 @@ fn speech_bubble(
 }
 
 fn main() -> Result<()> {
-    run::<FlatlandApp>(RunConfig {
+    run_scene::<FlatlandApp>(RunConfig {
         window: WindowAttributes::default()
             .with_title("flatland")
             .with_visible(false),

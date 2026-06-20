@@ -63,6 +63,7 @@ pub mod frame_pacing;
 pub mod freecam;
 pub mod keymap;
 pub mod log;
+pub mod scene;
 pub mod trace;
 pub mod version;
 pub mod vsync;
@@ -91,6 +92,7 @@ pub use rye_camera::{
 };
 pub use rye_egui::{egui, world_to_screen, BottomOverlay, LinearIndicator};
 pub use rye_input::FrameInput as Input;
+pub use scene::{run_scene, Scene};
 
 // ---------------------------------------------------------------------------
 // App trait
