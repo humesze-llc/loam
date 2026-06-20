@@ -2267,6 +2267,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rye-anim"
+version = "0.1.0"
+
+[[package]]
 name = "rye-app"
 version = "0.1.0"
 dependencies = [
@@ -2327,6 +2331,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "glam",
+ "rye-anim",
  "rye-camera",
  "rye-math",
  "web-sys",

@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/rye-math",
+  "crates/rye-anim",
   "crates/rye-shape",
   "crates/rye-scene",
   "crates/rye-time",

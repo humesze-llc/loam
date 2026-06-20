@@ -18,6 +18,7 @@ winit.workspace = true
 egui = "0.33"
 egui-wgpu = { version = "0.33", default-features = false, features = ["winit"] }
 
+rye-anim   = { path = "../rye-anim" }
 rye-camera = { path = "../rye-camera" }
 rye-math   = { path = "../rye-math" }
 
