@@ -359,6 +359,9 @@ struct FlatlandApp {
     cursor_present: bool,
     woken: bool,
     wake_clock: f32,
+    /// Clock time the cursor was last (re)found (absent -> present), for the
+    /// happy reaction.
+    found_clock: f32,
     /// Ordered far -> near: (lo, hi, brightness, rgb).
     vision_bands: Vec<(f32, f32, f32, [f32; 3])>,
     /// Cursor position in the 1D vision strip (0..1), or -1 when absent.
@@ -473,9 +476,13 @@ impl FlatlandApp {
             Some(10.0)
         };
 
+        let pi = std::f32::consts::PI;
+        let tracking = self.cursor_present && self.reveal.value() < 0.5;
+        let searching = !self.cursor_present && self.reveal.value() < 0.5;
+
         let mut pos = square_pos();
         let sx;
-        let sy;
+        let mut sy;
         let eye_open;
         let mut eye_squash = [1.0_f32; 2];
         let mut eye_scale = 1.0_f32;
@@ -490,71 +497,66 @@ impl FlatlandApp {
                 sx = 1.0 - breath * 0.03;
                 eye_open = [0.0, 0.0];
             }
-            Some(wp) if wp < 2.4 => {
-                // Wake as a scare that resolves into friendliness (plays once):
-                //   A startle (0..0.45): eyes snap wide and oversized, body jolts
-                //     up then recoils with a fast tremble.
-                //   B wary (0.45..1.2): wide-eyed, quick L-R glances ("coast clear?").
-                //   C relief (1.2..1.8): eyes ease from wide to a cheery semicircle,
-                //     with a happy bounce.
-                //   D settle (1.8..2.4): eyes interpolate semicircle -> open.
+            Some(wp) if wp < 2.3 => {
+                // Wake (plays once): panic, frantically hunt for the cursor, then
+                // find it and beam directly AT it.
+                //   A startle (0..0.45): eyes snap wide + oversized, body jolt then
+                //     recoil with a tremble, eyes darting.
+                //   B search (0.45..1.35): squint, dart through directions hunting.
+                //   C find + happy (1.35..2.3): gaze locks to the cursor, eyes go
+                //     cheery then open, with a happy bounce, looking at it.
                 let e;
                 let escale;
                 if wp < 0.10 {
                     let a = wp / 0.10;
                     e = a;
-                    escale = 1.0 + 0.55 * a;
+                    escale = 1.0 + 0.7 * a;
+                    sy = 1.0 + 0.34 * a;
+                    sx = 1.0 - 0.24 * a;
+                    lookv = Vec2::from_angle(wp * 40.0);
                 } else if wp < 0.45 {
+                    let a = (wp - 0.10) / 0.35;
                     e = 1.0;
-                    escale = 1.55;
-                } else if wp < 1.2 {
-                    e = 1.0;
-                    escale = 1.55 - 0.25 * ((wp - 0.45) / 0.75);
-                } else if wp < 1.8 {
-                    let a = ease_in_out_cubic((wp - 1.2) / 0.6);
-                    e = 1.0 - 0.5 * a;
-                    escale = 1.3 - 0.3 * a;
+                    escale = 1.7 - 0.2 * a;
+                    sy = 1.34 - 0.44 * a;
+                    sx = 0.76 + 0.32 * a;
+                    pos.x += (wp * 55.0).sin() * 0.05 * (1.0 - a);
+                    lookv = Vec2::from_angle(wp * 40.0);
+                } else if wp < 1.35 {
+                    let a = (wp - 0.45) / 0.9;
+                    e = 0.75;
+                    escale = 1.5 - 0.3 * a;
+                    eye_squash = [0.7, 0.7];
+                    sy = 0.95 + 0.05 * a;
+                    sx = 1.05 - 0.05 * a;
+                    let dirs = [2.2_f32, 0.5, 1.7, 0.9, 1.3];
+                    lookv = Vec2::from_angle(dirs[((wp - 0.45) / 0.18) as usize % dirs.len()]);
+                    pos.x += (wp * 30.0).sin() * 0.01;
                 } else {
-                    let a = ease_in_out_cubic((wp - 1.8) / 0.6);
-                    e = 0.5 + 0.5 * a;
-                    escale = 1.0;
+                    let a = ((wp - 1.35) / 0.95).clamp(0.0, 1.0);
+                    e = if a < 0.5 {
+                        0.5
+                    } else {
+                        0.5 + 0.5 * ease_in_out_cubic((a - 0.5) / 0.5)
+                    };
+                    escale = 1.0 + 0.2 * (1.0 - a);
+                    sy = 1.0 + (a * pi).sin() * 0.12 * (1.0 - a);
+                    sx = 1.0;
+                    lookv = look;
                 }
                 eye_open = [e, e];
                 eye_scale = escale;
-
-                if wp < 0.10 {
-                    let a = wp / 0.10;
-                    sy = 1.0 + 0.32 * a;
-                    sx = 1.0 - 0.22 * a;
-                } else if wp < 0.45 {
-                    let a = (wp - 0.10) / 0.35;
-                    sy = 1.32 - 0.42 * a;
-                    sx = 0.78 + 0.30 * a;
-                    pos.x += (wp * 60.0).sin() * 0.04 * (1.0 - a);
-                } else if wp < 1.2 {
-                    let a = (wp - 0.45) / 0.75;
-                    sy = 0.9 + 0.1 * a;
-                    sx = 1.08 - 0.08 * a;
-                    let step = (a * 4.0) as i32;
-                    lookv = Vec2::new(if step % 2 == 0 { -1.0 } else { 1.0 }, 0.0);
-                } else if wp < 1.8 {
-                    let a = (wp - 1.2) / 0.6;
-                    sy = 1.0 + (a * std::f32::consts::PI).sin() * 0.12 * (1.0 - a);
-                    sx = 1.0;
-                } else {
-                    sy = 1.0;
-                    sx = 1.0;
-                }
             }
             Some(_) => {
-                // Awake idle: eyes open, following the cursor (eyes only, no body
-                // squash). Gentle breathing; a surprise pop + widen when the
-                // section circle crosses him; when the cursor is away he runs a
-                // quick coast-check of snappy left-right saccades.
+                // Awake: eyes follow where his gaze points (cursor or his search
+                // scan). Breathing + a surprise pop/widen at the section circle.
+                // When the cursor is gone he squints and hunts; when it reappears
+                // he beams at it briefly before settling to engaged.
                 let breathe = (t * 1.2).sin() * 0.02;
                 let pop = 0.16 * surprise;
                 sy = 1.0 + breathe + pop;
                 sx = 1.0 - pop * 0.3;
+                lookv = look;
 
                 let phase = t % 4.2;
                 let blink = if phase < 0.13 {
@@ -562,24 +564,23 @@ impl FlatlandApp {
                 } else {
                     1.0
                 };
-                eye_open = [blink, blink];
-                eye_scale = 1.0 + 0.25 * surprise;
-
-                let follow = self.cursor_present && self.reveal.value() < 0.5;
-                if follow || surprise > 0.05 {
-                    lookv = look;
+                let ft = t - self.found_clock;
+                if surprise > 0.05 {
+                    eye_open = [blink, blink];
+                    eye_scale = 1.0 + 0.25 * surprise;
+                } else if tracking && ft < 0.8 {
+                    let e = if ft < 0.45 {
+                        0.5
+                    } else {
+                        0.5 + 0.5 * ease_out_cubic((ft - 0.45) / 0.35)
+                    };
+                    eye_open = [e * blink, e * blink];
+                    sy += (ft / 0.8 * pi).sin() * 0.06;
+                } else if searching {
+                    eye_open = [0.6 * blink, 0.6 * blink];
+                    eye_squash = [0.6, 0.6];
                 } else {
-                    let cyc = t % 7.0;
-                    if cyc < 1.6 {
-                        let step = (cyc / 0.32) as i32;
-                        let dir = if step % 2 == 0 { -1.0 } else { 1.0 };
-                        lookv = Vec2::new(dir, 0.0);
-                        if dir < 0.0 {
-                            eye_squash[1] = 0.45;
-                        } else {
-                            eye_squash[0] = 0.45;
-                        }
-                    }
+                    eye_open = [blink, blink];
                 }
             }
         }
@@ -771,6 +772,7 @@ impl Scene for FlatlandApp {
             cursor_present: false,
             woken: false,
             wake_clock: -1.0,
+            found_clock: -10.0,
             vision_bands: Vec::new(),
             cursor_u: -1.0,
         };
@@ -798,8 +800,12 @@ impl Scene for FlatlandApp {
         let cursor_drives = self.cursor_present && self.reveal.value() < 0.5;
         if !cursor_drives {
             if BEATS[self.section].vision {
-                self.gaze_target =
-                    square_pos() + Vec2::from_angle(1.35 + (self.clock * 0.5).sin() * 0.85) * 3.0;
+                // Purposeful search: hold each of a few discrete look directions
+                // (the gaze easing turns the steps into look-hold-look), rather
+                // than aimlessly sweeping a circle.
+                let dirs = [2.1_f32, 0.7, 1.6, 1.1, 0.4];
+                let idx = (self.clock / 0.9) as usize % dirs.len();
+                self.gaze_target = square_pos() + Vec2::from_angle(dirs[idx]) * 3.0;
             } else {
                 self.gaze_target = sphere_xy();
             }
@@ -837,6 +843,7 @@ impl Scene for FlatlandApp {
 
         // The cursor marker sits where the cursor actually is in his field of
         // view. His gaze lags, so while he catches up the cursor rides off-center.
+        // It is hidden when a nearer shape stands between him and the cursor.
         self.cursor_u = if cursor_drives {
             let to = self.gaze_target - s;
             let mut rel = to.y.atan2(to.x) - look;
@@ -846,8 +853,14 @@ impl Scene for FlatlandApp {
             while rel < -std::f32::consts::PI {
                 rel += TAU;
             }
-            let u = (rel / VISION_HALF_ANGLE + 1.0) * 0.5;
-            if !(-0.1..=1.1).contains(&u) {
+            let cur_n = rel / VISION_HALF_ANGLE;
+            let cursor_bright = bright(to.length());
+            let occluded = self
+                .vision_bands
+                .iter()
+                .any(|(lo, hi, b, _)| *b > cursor_bright + 1e-3 && cur_n >= *lo && cur_n <= *hi);
+            let u = (cur_n + 1.0) * 0.5;
+            if occluded || !(-0.1..=1.1).contains(&u) {
                 -1.0
             } else {
                 u.clamp(0.0, 1.0)
@@ -933,7 +946,11 @@ impl Scene for FlatlandApp {
     fn ui(&mut self, ctx: &egui::Context, _frame: &mut FrameCtx<'_>) {
         let screen = ctx.content_rect();
         let hover = ctx.input(|i| i.pointer.hover_pos());
-        self.cursor_present = hover.is_some();
+        let now_present = hover.is_some();
+        if now_present && !self.cursor_present {
+            self.found_clock = self.clock;
+        }
+        self.cursor_present = now_present;
         // The cursor maps cleanly onto the plane only in the top-down view; once
         // the camera tilts into 3D, stop steering his gaze by it.
         if let Some(p) = hover.filter(|_| self.reveal.value() < 0.5) {
