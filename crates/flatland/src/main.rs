@@ -42,10 +42,12 @@ const INTRO_SECONDS: f32 = 1.6;
 const REVEAL_SECONDS: f32 = 1.4;
 const PASSAGE_SECONDS: f32 = 4.0;
 
-// Ground (infinite Flatland cross-section). A fixed large grid; it does not
-// resize, so there is no per-frame popping.
-const GROUND_HALF: f32 = 10.5;
-const GROUND_STEP: f32 = 0.7;
+// Ground (infinite Flatland cross-section). A fixed large grid whose far cells
+// fade into the horizon colour so no hard edge shows when the camera tilts.
+const GROUND_HALF: f32 = 14.0;
+const GROUND_STEP: f32 = 0.75;
+const GROUND_FADE_NEAR: f32 = 7.0;
+const GROUND_FADE_FAR: f32 = 13.0;
 
 // Deep-slate palette with bright character/section accents.
 const SKY_TOP: [f32; 3] = [0.05, 0.07, 0.12];
@@ -68,17 +70,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+// params: x=band count, y=clock, z=cursor position (0..1, <0 = none).
+// bands[i]: x=lo, y=hi (both 0..1), z=brightness (distance shading).
+// The bands arrive ordered far -> near, so the last one covering a column wins
+// (nearer shapes occlude farther ones).
 const VISION_WGSL: &str = r#"
 struct Vision { params: vec4<f32>, bands: array<vec4<f32>, 6>, cols: array<vec4<f32>, 6> };
 @group(0) @binding(0) var<uniform> v: Vision;
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    var col = vec3<f32>(0.10, 0.11, 0.14);
+    var col = vec3<f32>(0.07, 0.08, 0.11);
     let n = i32(v.params.x);
     for (var i = 0; i < n; i = i + 1) {
         if (in.uv.x >= v.bands[i].x && in.uv.x <= v.bands[i].y) {
-            col = v.cols[i].rgb;
+            col = v.cols[i].rgb * v.bands[i].z;
         }
+    }
+    let cu = v.params.z;
+    if (cu >= 0.0) {
+        let m = smoothstep(0.014, 0.0, abs(in.uv.x - cu));
+        col = mix(col, vec3<f32>(1.0, 1.0, 1.0), m * 0.85);
     }
     return vec4<f32>(col, 0.92);
 }
@@ -185,19 +196,51 @@ const BEATS: &[Beat] = &[
 ];
 
 /// Spinning polygons that will become characters: red triangle, yellow pentagon,
-/// smaller green square. (center, sides, radius, spin, color)
+/// smaller green square. (center, sides, radius, spin, color). The pentagon and
+/// square are placed nearly collinear from A Square (origin) so the near pentagon
+/// occludes the far square in his 1D vision.
 fn primitives() -> [(Vec2, usize, f32, f32, [f32; 4]); 3] {
     [
-        (Vec2::new(-1.7, 1.3), 3, 0.34, 0.5, [0.90, 0.32, 0.30, 1.0]),
-        (
-            Vec2::new(-1.9, -1.2),
-            5,
-            0.30,
-            -0.4,
-            [0.95, 0.80, 0.25, 1.0],
-        ),
-        (Vec2::new(2.1, -1.4), 4, 0.22, 0.7, [0.40, 0.80, 0.42, 1.0]),
+        (Vec2::new(-2.2, 2.4), 3, 0.40, 0.6, [0.90, 0.32, 0.30, 1.0]),
+        (Vec2::new(1.4, 2.6), 5, 0.34, -0.4, [0.95, 0.80, 0.25, 1.0]),
+        (Vec2::new(2.3, 4.3), 4, 0.30, 0.8, [0.40, 0.80, 0.42, 1.0]),
     ]
+}
+
+/// The angular interval a rotating convex polygon's silhouette subtends in A
+/// Square's 1D vision (so the band pulses as it spins), with its centre distance
+/// for depth shading. Normalized to his half field of view; `None` if outside it.
+fn silhouette_band(
+    s: Vec2,
+    look_ang: f32,
+    center: Vec2,
+    sides: usize,
+    radius: f32,
+    phase: f32,
+) -> Option<(f32, f32, f32)> {
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for k in 0..sides {
+        let v = center + Vec2::from_angle(phase + TAU * k as f32 / sides as f32) * radius;
+        let to = v - s;
+        let mut rel = to.y.atan2(to.x) - look_ang;
+        while rel > std::f32::consts::PI {
+            rel -= TAU;
+        }
+        while rel < -std::f32::consts::PI {
+            rel += TAU;
+        }
+        lo = lo.min(rel);
+        hi = hi.max(rel);
+    }
+    let (lo, hi) = (lo / VISION_HALF_ANGLE, hi / VISION_HALF_ANGLE);
+    if hi < -1.0 || lo > 1.0 {
+        return None;
+    }
+    Some((
+        lo.clamp(-1.0, 1.0),
+        hi.clamp(-1.0, 1.0),
+        (center - s).length(),
+    ))
 }
 
 /// Ambient Spaceland solids, floating above the ground; faded in with the reveal.
@@ -297,7 +340,10 @@ struct FlatlandApp {
     gaze_target: Vec2,
     cursor_present: bool,
     wake_clock: f32,
-    vision_bands: Vec<(f32, f32, [f32; 3])>,
+    /// Ordered far -> near: (lo, hi, brightness, rgb).
+    vision_bands: Vec<(f32, f32, f32, [f32; 3])>,
+    /// Cursor position in the 1D vision strip (0..1), or -1 when absent.
+    cursor_u: f32,
 }
 
 fn push(mesh: &mut LineMesh<3>, a: Vec3, b: Vec3, color: [f32; 4], width: f32) {
@@ -463,9 +509,12 @@ impl FlatlandApp {
                 };
                 eye_open = [blink, blink];
 
-                if self.cursor_present || surprise > 0.05 {
+                let follow = self.cursor_present && self.reveal.value() < 0.5;
+                if follow || surprise > 0.05 {
                     lookv = look;
                 } else {
+                    // Idle (or in the 3D view, where he no longer tracks the
+                    // cursor): glance side to side, squinting the trailing eye.
                     let g = (t * 0.5).sin();
                     lookv = Vec2::new(g, 0.0);
                     let squint = 0.5 * (1.0 - (t * 0.5).cos().abs());
@@ -505,13 +554,24 @@ impl FlatlandApp {
         tris.indices.clear();
         tris.colors.clear();
 
-        // Flatland: the infinite ground checkerboard (the 2D cross-section).
+        // Flatland: the ground checkerboard (the 2D cross-section). Far cells fade
+        // to the horizon colour so the grid reads as infinite with no visible edge.
         let cells = (2.0 * GROUND_HALF / GROUND_STEP).round() as i32;
+        let horizon = [SKY_HORIZON[0], SKY_HORIZON[1], SKY_HORIZON[2], 1.0];
         for i in 0..cells {
             for j in 0..cells {
                 let x0 = -GROUND_HALF + i as f32 * GROUND_STEP;
                 let z0 = -GROUND_HALF + j as f32 * GROUND_STEP;
-                let c = if (i + j) & 1 == 0 { GROUND_A } else { GROUND_B };
+                let base = if (i + j) & 1 == 0 { GROUND_A } else { GROUND_B };
+                let d = (x0 + GROUND_STEP * 0.5).hypot(z0 + GROUND_STEP * 0.5);
+                let f =
+                    ((d - GROUND_FADE_NEAR) / (GROUND_FADE_FAR - GROUND_FADE_NEAR)).clamp(0.0, 1.0);
+                let c = [
+                    base[0] + (horizon[0] - base[0]) * f,
+                    base[1] + (horizon[1] - base[1]) * f,
+                    base[2] + (horizon[2] - base[2]) * f,
+                    1.0,
+                ];
                 quad3(
                     &mut tris,
                     [
@@ -652,6 +712,7 @@ impl Scene for FlatlandApp {
             cursor_present: false,
             wake_clock: -1.0,
             vision_bands: Vec::new(),
+            cursor_u: -1.0,
         };
         app.goto(0);
         Ok(app)
@@ -673,34 +734,49 @@ impl Scene for FlatlandApp {
             }
         }
 
-        // Auto-pan the gaze only while the cursor is away during the vision beat.
-        if !self.cursor_present && BEATS[self.section].vision {
-            self.gaze_target =
-                square_pos() + Vec2::from_angle((self.clock * 0.6).sin() * 1.1 + 0.4) * 2.0;
-        } else if !self.cursor_present {
-            self.gaze_target = sphere_xy();
+        // He tracks the cursor only in the 2D (top-down) view, where the screen
+        // maps cleanly onto the plane. Otherwise his gaze pans automatically (a
+        // sweep across the shapes during the vision beat, the visitor otherwise).
+        let cursor_drives = self.cursor_present && self.reveal.value() < 0.5;
+        if !cursor_drives {
+            if BEATS[self.section].vision {
+                self.gaze_target =
+                    square_pos() + Vec2::from_angle(1.35 + (self.clock * 0.5).sin() * 0.85) * 3.0;
+            } else {
+                self.gaze_target = sphere_xy();
+            }
         }
         self.gaze += (self.gaze_target - self.gaze) * (1.0 - (-dt * 10.0).exp());
 
-        // A Square's 1D vision: the discs that fall in his field of view.
+        // A Square's 1D vision: shapes in his field of view, with distance shading
+        // and ordered far -> near so a near shape occludes a far one.
         let s = square_pos();
         let look = self.look_angle();
-        let mut bands = Vec::new();
+        let bright = |d: f32| (1.0 - (d - 2.0) * 0.08).clamp(0.45, 1.0);
+        let mut bands: Vec<(f32, f32, f32, [f32; 3])> = Vec::new();
         let h = self.sphere_h.value();
         if h.abs() < SPHERE_RADIUS {
             let rc = (SPHERE_RADIUS * SPHERE_RADIUS - h * h).sqrt();
             if let Some((lo, hi)) = angular_band(s, look, sphere_xy(), rc) {
-                bands.push((lo, hi, [COLOR_SPHERE[0], COLOR_SPHERE[1], COLOR_SPHERE[2]]));
+                let d = (sphere_xy() - s).length();
+                bands.push((
+                    lo,
+                    hi,
+                    bright(d),
+                    [COLOR_SPHERE[0], COLOR_SPHERE[1], COLOR_SPHERE[2]],
+                ));
             }
         }
         if BEATS[self.section].vision {
-            for (c, _, rad, _, color) in primitives() {
-                if let Some((lo, hi)) = angular_band(s, look, c, rad) {
-                    bands.push((lo, hi, [color[0], color[1], color[2]]));
+            for (c, n, rad, spin, color) in primitives() {
+                if let Some((lo, hi, d)) = silhouette_band(s, look, c, n, rad, self.clock * spin) {
+                    bands.push((lo, hi, bright(d), [color[0], color[1], color[2]]));
                 }
             }
         }
+        bands.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         self.vision_bands = bands;
+        self.cursor_u = if cursor_drives { 0.5 } else { -1.0 };
     }
 
     fn render(
@@ -780,7 +856,9 @@ impl Scene for FlatlandApp {
         let screen = ctx.content_rect();
         let hover = ctx.input(|i| i.pointer.hover_pos());
         self.cursor_present = hover.is_some();
-        if let Some(p) = hover {
+        // The cursor maps cleanly onto the plane only in the top-down view; once
+        // the camera tilts into 3D, stop steering his gaze by it.
+        if let Some(p) = hover.filter(|_| self.reveal.value() < 0.5) {
             let ext_y = ortho_half(self.intro());
             let ext_x = ext_y * screen.width().max(1.0) / screen.height().max(1.0);
             let ndc_x = ((p.x - screen.left()) / screen.width()) * 2.0 - 1.0;
@@ -841,16 +919,21 @@ impl FlatlandApp {
         // Slide in from the left when the vision beat opens.
         let slide = ((self.clock - self.section_clock) / 0.4).clamp(0.0, 1.0);
         let x = -300.0 + 318.0 * ease_out_cubic(slide);
-        let mut u = vec![self.vision_bands.len().min(6) as f32, self.clock, 0.0, 0.0];
+        let mut u = vec![
+            self.vision_bands.len().min(6) as f32,
+            self.clock,
+            self.cursor_u,
+            0.0,
+        ];
         for i in 0..6 {
-            if let Some((lo, hi, _)) = self.vision_bands.get(i) {
-                u.extend([(lo + 1.0) * 0.5, (hi + 1.0) * 0.5, 0.0, 0.0]);
+            if let Some((lo, hi, b, _)) = self.vision_bands.get(i) {
+                u.extend([(lo + 1.0) * 0.5, (hi + 1.0) * 0.5, *b, 0.0]);
             } else {
                 u.extend([0.0; 4]);
             }
         }
         for i in 0..6 {
-            if let Some((_, _, c)) = self.vision_bands.get(i) {
+            if let Some((_, _, _, c)) = self.vision_bands.get(i) {
                 u.extend([c[0], c[1], c[2], 1.0]);
             } else {
                 u.extend([0.0; 4]);
