@@ -22,8 +22,7 @@ use rye_camera::OrbitPose;
 use rye_math::{EuclideanR3, Projection};
 use rye_render::device::RenderDevice;
 use rye_render::{
-    DepthBuffer, DepthMode, FragmentShading, LineRasterNode, ShaderEffect, TriangleRasterNode,
-    Viewport,
+    DepthMode, FragmentShading, LineRasterNode, ShaderEffect, TriangleRasterNode, Viewport,
 };
 use rye_shape::{icosphere, LineMesh, Solid3, TriangleMesh};
 use std::collections::BTreeSet;
@@ -31,8 +30,6 @@ use std::f32::consts::TAU;
 use winit::window::WindowAttributes;
 
 mod character;
-
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 const SPHERE_RADIUS: f32 = 1.3;
 const SPHERE_SUBDIVISIONS: u32 = 3;
@@ -293,7 +290,6 @@ struct FlatlandApp {
     lines: LineRasterNode,
     tris: TriangleRasterNode,
     sky: ShaderEffect,
-    depth: Option<DepthBuffer>,
     sphere_verts: Vec<Vec3>,
     sphere_edges: Vec<[u32; 2]>,
     scratch_lines: LineMesh<3>,
@@ -585,20 +581,18 @@ impl FlatlandApp {
 
 impl Scene for FlatlandApp {
     fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
+        // The world is the coplanar 2D ground plus flat decals; depth-testing it
+        // against itself only causes z-fighting. Both nodes draw in painter order.
         let line_node = LineRasterNode::new(
             &ctx.rd.device,
             ctx.rd.target_format(),
-            DepthMode::ReadOnly {
-                format: DEPTH_FORMAT,
-            },
+            DepthMode::Off,
             ctx.rd.sample_count(),
         );
         let tri_node = TriangleRasterNode::new(
             &ctx.rd.device,
             ctx.rd.target_format(),
-            DepthMode::ReadWrite {
-                format: DEPTH_FORMAT,
-            },
+            DepthMode::Off,
             FragmentShading::Flat,
             ctx.rd.sample_count(),
         );
@@ -624,7 +618,6 @@ impl Scene for FlatlandApp {
             lines: line_node,
             tris: tri_node,
             sky,
-            depth: None,
             sphere_verts,
             sphere_edges: set.into_iter().collect(),
             scratch_lines: LineMesh::default(),
@@ -698,19 +691,9 @@ impl Scene for FlatlandApp {
     ) -> Result<()> {
         self.build();
 
-        let cfg = &rd.surface_bundle.config;
         let vw = viewport.width.max(1);
         let vh = viewport.height.max(1);
         let view_proj = self.camera_view_proj(vw as f32 / vh as f32);
-
-        DepthBuffer::ensure(
-            &mut self.depth,
-            &rd.device,
-            DEPTH_FORMAT,
-            (cfg.width, cfg.height.max(1)),
-            rd.sample_count(),
-        );
-        let dview = self.depth.as_ref().expect("ensured").view.clone();
 
         {
             let mut enc = rd
@@ -729,14 +712,7 @@ impl Scene for FlatlandApp {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &dview,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
+                depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
@@ -766,7 +742,7 @@ impl Scene for FlatlandApp {
             &self.scratch_tris,
             &Projection::Identity,
         );
-        self.tris.execute(rd, view, Some(&dview), Some(&viewport))?;
+        self.tris.execute(rd, view, None, Some(&viewport))?;
         self.lines
             .set_camera(&rd.queue, view_proj, Vec2::new(vw as f32, vh as f32));
         self.lines.upload::<EuclideanR3, 3>(
@@ -776,8 +752,7 @@ impl Scene for FlatlandApp {
             &Projection::Identity,
             1,
         );
-        self.lines
-            .execute(rd, view, Some(&dview), Some(&viewport))?;
+        self.lines.execute(rd, view, None, Some(&viewport))?;
         Ok(())
     }
 
