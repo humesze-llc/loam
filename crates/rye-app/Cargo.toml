@@ -13,6 +13,9 @@ default = ["capture"]
 # plus GIF stream encoder + console commands + hotkeys. Disable for lean builds
 # that don't need the diagnostic plumbing.
 capture = ["dep:image", "dep:gif", "dep:color_quant", "dep:png"]
+# Offline/headless render harness (deterministic frame capture to disk). Reuses
+# the capture feature's readback + PNG encoder; native-only.
+harness = ["capture"]
 
 [dependencies]
 anyhow.workspace = true

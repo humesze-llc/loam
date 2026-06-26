@@ -57,6 +57,8 @@ pub mod args;
 #[cfg(any(not(feature = "capture"), target_arch = "wasm32"))]
 #[path = "capture_stub.rs"]
 pub mod capture;
+#[cfg(all(feature = "harness", not(target_arch = "wasm32")))]
+pub mod harness;
 pub mod cursor;
 pub mod fps;
 pub mod frame_pacing;

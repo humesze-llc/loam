@@ -1082,6 +1082,12 @@ impl FlatlandApp {
 }
 
 fn main() -> Result<()> {
+    // `--offline` renders deterministically to disk with no window (the harness
+    // build). Detected from raw argv because `Args` only parses `--key=value`.
+    #[cfg(feature = "harness")]
+    if std::env::args().any(|a| a == "--offline") {
+        return run_offline();
+    }
     run_scene::<FlatlandApp>(RunConfig {
         window: WindowAttributes::default()
             .with_title("flatland")
@@ -1089,6 +1095,23 @@ fn main() -> Result<()> {
         msaa_samples: 4,
         ..RunConfig::default()
     })
+}
+
+/// M0: render one scene-only frame at t=0 to `--out` (default
+/// `captures/offline.png`). The fixed-step loop and `--from/--to/--fps` scan
+/// arrive in M1; for now this proves the headless pipeline end to end.
+#[cfg(feature = "harness")]
+fn run_offline() -> Result<()> {
+    let args = rye_app::args::Args::current();
+    let out = args.get("out").unwrap_or("captures/offline.png").to_string();
+    let (width, height) = (1280, 720);
+    rye_app::harness::render_scene_frame::<FlatlandApp>(
+        width,
+        height,
+        std::path::Path::new(&out),
+    )?;
+    println!("offline: wrote {out} ({width}x{height})");
+    Ok(())
 }
 
 #[cfg(test)]

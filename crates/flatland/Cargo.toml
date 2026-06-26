@@ -31,3 +31,5 @@ path = "src/main.rs"
 [features]
 default = ["capture"]
 capture = ["rye-app/capture"]
+# Offline/headless deterministic render (`--offline`). Pulls the rye-app harness.
+harness = ["rye-app/harness"]

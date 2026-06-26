@@ -12,11 +12,22 @@ use wgpu::*;
 use winit::window::Window;
 
 /// Surface + per-frame configuration. Owned by [`RenderDevice`]; exposed so
-/// resize-aware code can read the current size and format.
+/// resize-aware code can read the current size and format. `surface` is `None`
+/// on the headless path ([`RenderDevice::new_headless`]); `config` and `size`
+/// stay populated there (synthesized from the requested dimensions) so every
+/// caller reading `config.format` / `config.width` / `size` is path-agnostic.
 pub struct SurfaceBundle {
-    pub surface: Surface<'static>,
+    pub surface: Option<Surface<'static>>,
     pub config: SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
+}
+
+/// Owned color target for the headless path: both the render attachment and the
+/// readback copy-source, standing in for the absent swapchain texture. `view` is
+/// the color attachment; `texture` is the `copy_texture_to_buffer` source.
+struct HeadlessColor {
+    texture: Texture,
+    view: TextureView,
 }
 
 /// Multisampled color attachment, allocated when the sample count is > 1.
@@ -63,6 +74,9 @@ pub struct RenderDevice {
     /// re-querying `get_surface_capabilities`. Browsers typically advertise only
     /// `Fifo`; native usually all four.
     present_modes: Vec<PresentMode>,
+    /// Owned offscreen color target on the headless path; `None` when a real
+    /// surface is present. Mutually exclusive with `surface_bundle.surface`.
+    headless_color: Option<HeadlessColor>,
 }
 
 impl RenderDevice {
@@ -210,7 +224,7 @@ impl RenderDevice {
             device,
             queue,
             surface_bundle: SurfaceBundle {
-                surface,
+                surface: Some(surface),
                 config,
                 size,
             },
@@ -221,7 +235,118 @@ impl RenderDevice {
             composite,
             scene_format,
             present_modes,
+            headless_color: None,
         })
+    }
+
+    /// Surfaceless constructor for offline/headless rendering: acquire a
+    /// high-performance adapter with no `compatible_surface`, allocate an owned
+    /// sRGB color target of `width`x`height`, and synthesize a `config`/`size`
+    /// so size/format readers stay path-agnostic. Sample count is fixed at 1
+    /// (no MSAA resolve) and the sRGB format sidesteps the composite path, so
+    /// the demo's pipelines (built against [`target_format`] + [`sample_count`])
+    /// match without change. Render into [`headless_view`], read back
+    /// [`headless_texture`].
+    ///
+    /// [`target_format`]: RenderDevice::target_format
+    /// [`sample_count`]: RenderDevice::sample_count
+    /// [`headless_view`]: RenderDevice::headless_view
+    /// [`headless_texture`]: RenderDevice::headless_texture
+    pub async fn new_headless(width: u32, height: u32) -> Result<Self> {
+        let instance = Instance::default();
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                compatible_surface: None,
+                power_preference: PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+            })
+            .await?;
+
+        // Same timestamp-feature negotiation as the surface path (see
+        // `from_surface`): request both query features or neither.
+        let needed = Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let required_features = if adapter.features().contains(needed) {
+            needed
+        } else {
+            Features::empty()
+        };
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("Rye Device (headless)"),
+                required_features,
+                required_limits: Limits::default(),
+                memory_hints: MemoryHints::default(),
+                trace: Trace::Off,
+                experimental_features: Default::default(),
+            })
+            .await?;
+
+        // Rgba (not Bgra) sRGB: sRGB matches the native swapchain's gamma so
+        // headless frames look identical to the window, and Rgba order needs no
+        // channel swap on readback. sRGB also means `needs_composite` is false.
+        let format = TextureFormat::Rgba8UnormSrgb;
+        let size = winit::dpi::PhysicalSize::new(width, height);
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("rye-render::headless-color"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&TextureViewDescriptor::default());
+
+        let config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            format,
+            width,
+            height,
+            present_mode: PresentMode::Fifo,
+            alpha_mode: CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+
+        let gpu_timer = crate::gpu_timer::GpuTimer::new(&device, &queue);
+
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            surface_bundle: SurfaceBundle {
+                surface: None,
+                config,
+                size,
+            },
+            sample_count: 1,
+            msaa_target: None,
+            gpu_timer,
+            scene_target: None,
+            composite: None,
+            scene_format: None,
+            present_modes: Vec::new(),
+            headless_color: Some(HeadlessColor { texture, view }),
+        })
+    }
+
+    /// Color attachment view for the headless path, or `None` when a real
+    /// surface is present. Render this frame's scene into it, then read it back
+    /// with [`RenderDevice::headless_texture`].
+    pub fn headless_view(&self) -> Option<&TextureView> {
+        self.headless_color.as_ref().map(|h| &h.view)
+    }
+
+    /// The headless color texture, the `copy_texture_to_buffer` readback source.
+    /// `None` when a real surface is present.
+    pub fn headless_texture(&self) -> Option<&Texture> {
+        self.headless_color.as_ref().map(|h| &h.texture)
     }
 
     /// Reconfigure the surface for `new_size`. No-ops on a zero dimension (the
@@ -234,9 +359,9 @@ impl RenderDevice {
         self.surface_bundle.size = new_size;
         self.surface_bundle.config.width = new_size.width;
         self.surface_bundle.config.height = new_size.height;
-        self.surface_bundle
-            .surface
-            .configure(&self.device, &self.surface_bundle.config);
+        if let Some(surface) = &self.surface_bundle.surface {
+            surface.configure(&self.device, &self.surface_bundle.config);
+        }
         if self.sample_count > 1 {
             self.msaa_target = Some(create_msaa_target(
                 &self.device,
@@ -261,7 +386,12 @@ impl RenderDevice {
     pub fn begin_frame(
         &self,
     ) -> std::result::Result<(SurfaceTexture, TextureView), wgpu::SurfaceError> {
-        let frame = self.surface_bundle.surface.get_current_texture()?;
+        let frame = self
+            .surface_bundle
+            .surface
+            .as_ref()
+            .expect("begin_frame on a headless RenderDevice (no surface)")
+            .get_current_texture()?;
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -301,9 +431,9 @@ impl RenderDevice {
             return Ok(());
         }
         self.surface_bundle.config.present_mode = mode;
-        self.surface_bundle
-            .surface
-            .configure(&self.device, &self.surface_bundle.config);
+        if let Some(surface) = &self.surface_bundle.surface {
+            surface.configure(&self.device, &self.surface_bundle.config);
+        }
         tracing::info!("surface present_mode -> {mode:?}");
         Ok(())
     }
