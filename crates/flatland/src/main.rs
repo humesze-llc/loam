@@ -1097,20 +1097,32 @@ fn main() -> Result<()> {
     })
 }
 
-/// M0: render one scene-only frame at t=0 to `--out` (default
-/// `captures/offline.png`). The fixed-step loop and `--from/--to/--fps` scan
-/// arrive in M1; for now this proves the headless pipeline end to end.
+/// Render flatland headless over a fixed-dt timeline window. Scene-only (no
+/// egui overlay yet); cursor-driven behavior arrives with M2's synthetic input.
+/// `--from`/`--to` seconds, `--fps`, `--out` (a `.png` file for a single frame,
+/// else a directory for a `frame_NNNN.png` sequence).
 #[cfg(feature = "harness")]
 fn run_offline() -> Result<()> {
     let args = rye_app::args::Args::current();
-    let out = args.get("out").unwrap_or("captures/offline.png").to_string();
-    let (width, height) = (1280, 720);
-    rye_app::harness::render_scene_frame::<FlatlandApp>(
-        width,
-        height,
-        std::path::Path::new(&out),
-    )?;
-    println!("offline: wrote {out} ({width}x{height})");
+    let out = args.get("out").unwrap_or("captures/offline").to_string();
+    let cfg = rye_app::harness::OfflineRender {
+        width: 1280,
+        height: 720,
+        from: args.parse("from").unwrap_or(0.0),
+        to: args.parse("to").unwrap_or(0.0),
+        fps: args.parse("fps").unwrap_or(1),
+        out: std::path::Path::new(&out),
+    };
+    let frames = rye_app::harness::render_scene::<FlatlandApp>(&cfg)?;
+    println!(
+        "offline: wrote {} frame(s) to {out} ({}x{}, {}..{}s @ {}fps)",
+        frames.len(),
+        cfg.width,
+        cfg.height,
+        cfg.from,
+        cfg.to,
+        cfg.fps,
+    );
     Ok(())
 }
 
