@@ -123,9 +123,29 @@ pub fn render_scene<S: Scene>(cfg: &OfflineRender) -> Result<Vec<PathBuf>> {
         sim_t += dt;
     }
 
-    let mut written = Vec::with_capacity(total);
+    // A `.png` target over multiple frames is a contact sheet; a directory is a
+    // sequence; a lone `.png` is that frame. The CSV curve dump rides alongside.
+    let montage = total > 1 && is_png(cfg.out);
+
+    let mut written = Vec::new();
+    let mut frames: Vec<image::RgbaImage> = if montage {
+        Vec::with_capacity(total)
+    } else {
+        Vec::new()
+    };
+    let mut names: Vec<&'static str> = Vec::new();
+    let mut rows: Vec<(f32, Vec<f32>)> = Vec::with_capacity(total);
+
     for i in 0..total {
         drive_ui(&egui_ctx, &mut scene, &rd, cfg, sim_t, dt);
+
+        // Sample the curve values for the state about to be rendered.
+        let scalars = scene.debug_scalars();
+        if i == 0 {
+            names = scalars.iter().map(|(n, _)| *n).collect();
+        }
+        rows.push((sim_t, scalars.iter().map(|(_, v)| *v).collect()));
+
         scene
             .render(&rd, view, Viewport::full([cfg.width, cfg.height]))
             .map_err(|e| e.context("Scene::render"))?;
@@ -138,9 +158,17 @@ pub fn render_scene<S: Scene>(cfg: &OfflineRender) -> Result<Vec<PathBuf>> {
             rd.target_format(),
         )
         .context("headless readback")?;
-        let path = frame_path(cfg.out, i, total);
-        write_png(&path, &img.rgba, img.width, img.height)?;
-        written.push(path);
+
+        if montage {
+            frames.push(
+                image::RgbaImage::from_raw(img.width, img.height, img.rgba)
+                    .context("frame buffer size mismatch")?,
+            );
+        } else {
+            let path = frame_path(cfg.out, i, total);
+            write_png(&path, &img.rgba, img.width, img.height)?;
+            written.push(path);
+        }
 
         if i + 1 < total {
             advance(&mut scene, &rd, dt, sim_t);
@@ -148,7 +176,112 @@ pub fn render_scene<S: Scene>(cfg: &OfflineRender) -> Result<Vec<PathBuf>> {
         }
     }
 
+    if montage {
+        written.push(write_montage(cfg.out, &frames)?);
+    }
+    if !names.is_empty() {
+        let csv = csv_path(cfg.out);
+        write_csv(&csv, &rd, cfg, &names, &rows)?;
+        written.push(csv);
+    }
+
     Ok(written)
+}
+
+/// Composite frames into a reading-order grid contact sheet (roughly square,
+/// one-third scale, thin gaps). No labels burned in: the time axis lives in the
+/// CSV sidecar, which keeps font deps out.
+fn write_montage(out: &Path, frames: &[image::RgbaImage]) -> Result<PathBuf> {
+    const SCALE: u32 = 3;
+    const GAP: u32 = 4;
+    let bg = image::Rgba([20, 24, 30, 255]);
+
+    let n = frames.len();
+    let cols = (n as f32).sqrt().ceil() as u32;
+    let rows = (n as u32).div_ceil(cols);
+    let (cw, ch) = (frames[0].width() / SCALE, frames[0].height() / SCALE);
+    let width = cols * cw + (cols + 1) * GAP;
+    let height = rows * ch + (rows + 1) * GAP;
+
+    let mut canvas = image::RgbaImage::from_pixel(width, height, bg);
+    for (i, f) in frames.iter().enumerate() {
+        let cell = image::imageops::resize(f, cw, ch, image::imageops::FilterType::Triangle);
+        let col = i as u32 % cols;
+        let row = i as u32 / cols;
+        let x = (GAP + col * (cw + GAP)) as i64;
+        let y = (GAP + row * (ch + GAP)) as i64;
+        image::imageops::overlay(&mut canvas, &cell, x, y);
+    }
+
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create output dir {}", parent.display()))?;
+    }
+    canvas
+        .save_with_format(out, image::ImageFormat::Png)
+        .with_context(|| format!("write montage {}", out.display()))?;
+    Ok(out.to_path_buf())
+}
+
+/// CSV curve dump: a determinism-context header comment, then `frame,time,<scalar
+/// columns>`. The header pins what the pixels depend on (adapter/backend/format/
+/// size) so a cross-machine mismatch is explained, not mysterious.
+fn write_csv(
+    path: &Path,
+    rd: &RenderDevice,
+    cfg: &OfflineRender,
+    names: &[&str],
+    rows: &[(f32, Vec<f32>)],
+) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let info = rd.adapter.get_info();
+    let mut s = String::new();
+    writeln!(
+        s,
+        "# adapter={} backend={:?} format={:?} size={}x{} from={} to={} fps={}",
+        info.name,
+        info.backend,
+        rd.target_format(),
+        cfg.width,
+        cfg.height,
+        cfg.from,
+        cfg.to,
+        cfg.fps,
+    )
+    .unwrap();
+    write!(s, "frame,time").unwrap();
+    for n in names {
+        write!(s, ",{n}").unwrap();
+    }
+    writeln!(s).unwrap();
+    for (i, (t, vals)) in rows.iter().enumerate() {
+        write!(s, "{i},{t}").unwrap();
+        for v in vals {
+            write!(s, ",{v}").unwrap();
+        }
+        writeln!(s).unwrap();
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create output dir {}", parent.display()))?;
+    }
+    std::fs::write(path, s).with_context(|| format!("write csv {}", path.display()))
+}
+
+/// `true` if `p` ends in a `.png` extension (case-insensitive).
+fn is_png(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
+}
+
+/// CSV sidecar path: `foo.png` -> `foo.csv`; a directory -> `dir/curves.csv`.
+fn csv_path(out: &Path) -> PathBuf {
+    if is_png(out) {
+        out.with_extension("csv")
+    } else {
+        out.join("curves.csv")
+    }
 }
 
 /// Run one fixed-step `update(dt)` on the scene.

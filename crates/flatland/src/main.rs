@@ -1004,6 +1004,20 @@ impl Scene for FlatlandApp {
     fn title(&self) -> std::borrow::Cow<'static, str> {
         "flatland".into()
     }
+
+    fn debug_scalars(&self) -> Vec<(&'static str, f32)> {
+        vec![
+            ("clock", self.clock),
+            ("reveal", self.reveal.value()),
+            ("zoom", self.zoom.value()),
+            ("sphere_h", self.sphere_h.value()),
+            ("gaze_x", self.gaze.x),
+            ("gaze_y", self.gaze.y),
+            ("cursor", if self.cursor_present { 1.0 } else { 0.0 }),
+            // Seconds since wake fired, or -1 while still asleep.
+            ("wake_t", if self.woken { self.clock - self.wake_clock } else { -1.0 }),
+        ]
+    }
 }
 
 impl FlatlandApp {
@@ -1130,13 +1144,16 @@ fn run_offline() -> Result<()> {
         cursor,
         out: std::path::Path::new(&out),
     };
-    let frames = rye_app::harness::render_scene::<FlatlandApp>(&cfg)?;
+    let outputs = rye_app::harness::render_scene::<FlatlandApp>(&cfg)?;
     println!(
-        "offline: wrote {} frame(s) to {out} ({}x{}, {from}..{to}s @ {fps}fps)",
-        frames.len(),
+        "offline: {}x{} {from}..{to}s @ {fps}fps -> {} file(s):",
         cfg.width,
         cfg.height,
+        outputs.len(),
     );
+    for p in &outputs {
+        println!("  {}", p.display());
+    }
     Ok(())
 }
 
