@@ -6,6 +6,12 @@
 //! reproduces a given frame bit-for-bit on the same adapter. Native + `harness`
 //! feature only.
 //!
+//! Cursor-driven scenes are fed a scripted [`CursorTrack`] through a headless
+//! [`egui::Context`]: the same channel the live app reads pointer hover from, so
+//! gaze / wake behavior reproduces without a mouse. The egui pass runs every
+//! frame for its `ui()` side effects; its overlay is not painted into the frame
+//! (scene-only). Painting the composed overlay is a later milestone.
+//!
 //! Determinism scope: the *driven state* (sim + fixed-dt animation) is
 //! reproducible by construction; the *pixels* are reproducible only on the same
 //! GPU/driver, since wgpu rasterization is not bit-portable across adapters.
@@ -19,28 +25,61 @@ use rye_render::device::RenderDevice;
 use rye_render::Viewport;
 use rye_shader::ShaderDb;
 
+use crate::egui;
 use crate::capture;
 use crate::scene::Scene;
 use crate::{FrameCtx, SetupCtx};
 
+/// A scripted cursor: hold-keyframed pointer state in egui screen points
+/// (pixels at 1x scale). `None` at a key means the cursor is absent (off
+/// surface) from that time. Between keys the previous key's state holds.
+pub struct CursorTrack {
+    /// `(time_seconds, position)`, sorted by time; `None` position is absent.
+    keys: Vec<(f32, Option<(f32, f32)>)>,
+}
+
+impl CursorTrack {
+    /// Build from keyframes; sorted by time so out-of-order input is fine.
+    pub fn new(mut keys: Vec<(f32, Option<(f32, f32)>)>) -> Self {
+        keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Self { keys }
+    }
+
+    /// Cursor position at `t` (the latest key at or before `t`), or `None` when
+    /// no key has fired yet or the active key is absent.
+    pub fn sample(&self, t: f32) -> Option<(f32, f32)> {
+        let mut cur = None;
+        for &(kt, pos) in &self.keys {
+            if kt <= t {
+                cur = pos;
+            } else {
+                break;
+            }
+        }
+        cur
+    }
+}
+
 /// A headless render request: dimensions, the timeline window `[from, to]`
-/// seconds sampled at `fps`, and the output path.
+/// seconds sampled at `fps`, an optional scripted cursor, and the output path.
 pub struct OfflineRender<'a> {
     pub width: u32,
     pub height: u32,
     pub from: f32,
     pub to: f32,
     pub fps: u32,
+    /// Scripted pointer fed through headless egui; `None` = no cursor ever.
+    pub cursor: Option<CursorTrack>,
     /// Single frame (one sample) writes here when it ends in `.png`; a sequence
     /// treats this as a directory and writes `frame_NNNN.png` into it.
     pub out: &'a Path,
 }
 
 /// Render `S` over the configured timeline and write the frames. Builds a
-/// headless device, runs `Scene::new`, fast-forwards to `from` with fixed-dt
-/// `update` calls, then renders each sample at `dt = 1/fps`, advancing the scene
-/// by one `update(dt)` between samples. Scene-only: `ui` (the egui overlay) is
-/// not driven here; cursor injection via synthetic egui input lands in M2.
+/// headless device, runs `Scene::new`, fast-forwards to `from`, then renders
+/// each sample at `dt = 1/fps`, advancing the scene by one `update(dt)` between
+/// samples. Each frame drives `ui()` through a headless egui context with the
+/// scripted cursor (so cursor-gated behavior fires), then renders scene-only.
 /// Returns the written paths in order.
 pub fn render_scene<S: Scene>(cfg: &OfflineRender) -> Result<Vec<PathBuf>> {
     let rd = pollster::block_on(RenderDevice::new_headless(cfg.width, cfg.height))
@@ -59,21 +98,14 @@ pub fn render_scene<S: Scene>(cfg: &OfflineRender) -> Result<Vec<PathBuf>> {
         S::new(&mut ctx).map_err(|e| e.context("Scene::new"))?
     };
 
+    let egui_ctx = egui::Context::default();
+
     let fps = cfg.fps.max(1);
     let dt = 1.0 / fps as f32;
-    // Inclusive endpoints: `from==to` yields a single frame; 0..2.4 @ 12 yields
-    // ceil-of-rounded intervals plus one.
+    // Inclusive endpoints: `from==to` yields a single frame.
     let span = (cfg.to - cfg.from).max(0.0);
-    let intervals = (span * fps as f32).round() as usize;
-    let total = intervals + 1;
-
-    // Fast-forward to `from` so a window not starting at 0 still replays the
-    // exact fixed-dt state history that led there.
+    let total = (span * fps as f32).round() as usize + 1;
     let pre = (cfg.from * fps as f32).round() as usize;
-    for _ in 0..pre {
-        let mut fctx = frame_ctx(&rd, dt, dt);
-        scene.update(&mut fctx);
-    }
 
     let view = rd
         .headless_view()
@@ -82,26 +114,78 @@ pub fn render_scene<S: Scene>(cfg: &OfflineRender) -> Result<Vec<PathBuf>> {
         .headless_texture()
         .expect("new_headless always allocates a headless color target");
 
+    // Sim time advances from 0 so a window that starts after 0 still replays the
+    // exact fixed-dt history (cursor included) that led there.
+    let mut sim_t = 0.0;
+    for _ in 0..pre {
+        drive_ui(&egui_ctx, &mut scene, &rd, cfg, sim_t, dt);
+        advance(&mut scene, &rd, dt, sim_t);
+        sim_t += dt;
+    }
+
     let mut written = Vec::with_capacity(total);
     for i in 0..total {
+        drive_ui(&egui_ctx, &mut scene, &rd, cfg, sim_t, dt);
         scene
             .render(&rd, view, Viewport::full([cfg.width, cfg.height]))
             .map_err(|e| e.context("Scene::render"))?;
-        let img =
-            capture::read_texture_rgba(&rd.device, &rd.queue, texture, cfg.width, cfg.height, rd.target_format())
-                .context("headless readback")?;
+        let img = capture::read_texture_rgba(
+            &rd.device,
+            &rd.queue,
+            texture,
+            cfg.width,
+            cfg.height,
+            rd.target_format(),
+        )
+        .context("headless readback")?;
         let path = frame_path(cfg.out, i, total);
         write_png(&path, &img.rgba, img.width, img.height)?;
         written.push(path);
 
         if i + 1 < total {
-            let t = cfg.from + (i + 1) as f32 * dt;
-            let mut fctx = frame_ctx(&rd, dt, t);
-            scene.update(&mut fctx);
+            advance(&mut scene, &rd, dt, sim_t);
+            sim_t += dt;
         }
     }
 
     Ok(written)
+}
+
+/// Run one fixed-step `update(dt)` on the scene.
+fn advance<S: Scene>(scene: &mut S, rd: &RenderDevice, dt: f32, t: f32) {
+    let mut fctx = frame_ctx(rd, dt, t);
+    scene.update(&mut fctx);
+}
+
+/// Drive the scene's egui `ui()` once with the scripted cursor at `t`, through a
+/// headless egui context. The overlay output is discarded (scene-only); only the
+/// `ui()` side effects (cursor hover -> gaze / wake) are kept.
+fn drive_ui<S: Scene>(
+    egui_ctx: &egui::Context,
+    scene: &mut S,
+    rd: &RenderDevice,
+    cfg: &OfflineRender,
+    t: f32,
+    dt: f32,
+) {
+    // A present cursor is a fresh pointer position; an absent one clears hover.
+    let event = match cfg.cursor.as_ref().and_then(|c| c.sample(t)) {
+        Some((x, y)) => egui::Event::PointerMoved(egui::pos2(x, y)),
+        None => egui::Event::PointerGone,
+    };
+    let raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(cfg.width as f32, cfg.height as f32),
+        )),
+        time: Some(t as f64),
+        events: vec![event],
+        ..Default::default()
+    };
+    let mut fctx = frame_ctx(rd, dt, t);
+    let _ = egui_ctx.run(raw, |ctx| {
+        scene.ui(ctx, &mut fctx);
+    });
 }
 
 /// Construct a synthetic per-frame context: fixed `dt`, empty input, no UI

@@ -1097,33 +1097,60 @@ fn main() -> Result<()> {
     })
 }
 
-/// Render flatland headless over a fixed-dt timeline window. Scene-only (no
-/// egui overlay yet); cursor-driven behavior arrives with M2's synthetic input.
-/// `--from`/`--to` seconds, `--fps`, `--out` (a `.png` file for a single frame,
-/// else a directory for a `frame_NNNN.png` sequence).
+/// Render flatland headless over a fixed-dt timeline window. `--scenario=NAME`
+/// selects a preset (window + scripted cursor); otherwise `--from`/`--to`
+/// seconds, `--fps`, and an optional bare run with no cursor. `--out` is a
+/// `.png` file for a single frame, else a directory for a `frame_NNNN.png`
+/// sequence.
 #[cfg(feature = "harness")]
 fn run_offline() -> Result<()> {
+    use rye_app::harness::OfflineRender;
+
     let args = rye_app::args::Args::current();
     let out = args.get("out").unwrap_or("captures/offline").to_string();
-    let cfg = rye_app::harness::OfflineRender {
+
+    // (from, to, fps, cursor) by scenario; bare runs read --from/--to/--fps.
+    let (from, to, fps, cursor) = match args.get("scenario") {
+        Some("wake") => (0.0, 2.4, 12, Some(wake_cursor())),
+        Some(other) => anyhow::bail!("unknown --scenario={other} (known: wake)"),
+        None => (
+            args.parse("from").unwrap_or(0.0),
+            args.parse("to").unwrap_or(0.0),
+            args.parse("fps").unwrap_or(1),
+            None,
+        ),
+    };
+
+    let cfg = OfflineRender {
         width: 1280,
         height: 720,
-        from: args.parse("from").unwrap_or(0.0),
-        to: args.parse("to").unwrap_or(0.0),
-        fps: args.parse("fps").unwrap_or(1),
+        from,
+        to,
+        fps,
+        cursor,
         out: std::path::Path::new(&out),
     };
     let frames = rye_app::harness::render_scene::<FlatlandApp>(&cfg)?;
     println!(
-        "offline: wrote {} frame(s) to {out} ({}x{}, {}..{}s @ {}fps)",
+        "offline: wrote {} frame(s) to {out} ({}x{}, {from}..{to}s @ {fps}fps)",
         frames.len(),
         cfg.width,
         cfg.height,
-        cfg.from,
-        cfg.to,
-        cfg.fps,
     );
     Ok(())
+}
+
+/// The "wake" scenario cursor: A Square sleeps alone, the visitor's cursor
+/// arrives upper-left (~0.55s) to trigger the startle-search-find wake, then
+/// drifts right (~1.9s) so his gaze visibly tracks it. Screen points in a
+/// 1280x720 frame; center (640,360) maps to him looking at himself.
+#[cfg(feature = "harness")]
+fn wake_cursor() -> rye_app::harness::CursorTrack {
+    rye_app::harness::CursorTrack::new(vec![
+        (0.0, None),
+        (0.55, Some((400.0, 235.0))),
+        (1.9, Some((840.0, 300.0))),
+    ])
 }
 
 #[cfg(test)]
