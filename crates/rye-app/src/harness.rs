@@ -233,13 +233,11 @@ fn write_csv(
     names: &[&str],
     rows: &[(f32, Vec<f32>)],
 ) -> Result<()> {
-    use std::fmt::Write as _;
-
+    // Built with `push_str`/`format!` (infallible to a String) rather than
+    // `write!(..).unwrap()`, so there's no Result to unwrap on the cold path.
     let info = rd.adapter.get_info();
-    let mut s = String::new();
-    writeln!(
-        s,
-        "# adapter={} backend={:?} format={:?} size={}x{} from={} to={} fps={}",
+    let mut s = format!(
+        "# adapter={} backend={:?} format={:?} size={}x{} from={} to={} fps={}\n",
         info.name,
         info.backend,
         rd.target_format(),
@@ -248,19 +246,19 @@ fn write_csv(
         cfg.from,
         cfg.to,
         cfg.fps,
-    )
-    .unwrap();
-    write!(s, "frame,time").unwrap();
+    );
+    s.push_str("frame,time");
     for n in names {
-        write!(s, ",{n}").unwrap();
+        s.push(',');
+        s.push_str(n);
     }
-    writeln!(s).unwrap();
+    s.push('\n');
     for (i, (t, vals)) in rows.iter().enumerate() {
-        write!(s, "{i},{t}").unwrap();
+        s.push_str(&format!("{i},{t}"));
         for v in vals {
-            write!(s, ",{v}").unwrap();
+            s.push_str(&format!(",{v}"));
         }
-        writeln!(s).unwrap();
+        s.push('\n');
     }
 
     if let Some(parent) = path.parent() {

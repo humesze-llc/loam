@@ -34,11 +34,11 @@ pub trait Scene: 'static {
         Cow::Borrowed("rye scene")
     }
 
-    /// Named animated scalars for the offline harness CSV curve dump
-    /// ([`crate::harness`]). Default empty; a demo overrides it to expose the
-    /// values driving its animation so "the curve is wrong" can be told apart
-    /// from "the drawing is wrong" without eyeballing every frame. Names must be
-    /// stable across frames (they become CSV columns).
+    /// Named animated scalars for the offline harness CSV curve dump (the
+    /// `harness` module, native + `harness` feature). Default empty; a demo
+    /// overrides it to expose the values driving its animation so "the curve is
+    /// wrong" can be told apart from "the drawing is wrong" without eyeballing
+    /// every frame. Names must be stable across frames (they become CSV columns).
     fn debug_scalars(&self) -> Vec<(&'static str, f32)> {
         Vec::new()
     }
