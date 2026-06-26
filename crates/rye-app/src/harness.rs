@@ -102,9 +102,7 @@ pub fn render_scene<S: Scene>(cfg: &OfflineRender) -> Result<Vec<PathBuf>> {
 
     let fps = cfg.fps.max(1);
     let dt = 1.0 / fps as f32;
-    // Inclusive endpoints: `from==to` yields a single frame.
-    let span = (cfg.to - cfg.from).max(0.0);
-    let total = (span * fps as f32).round() as usize + 1;
+    let total = frame_count(cfg.from, cfg.to, fps);
     let pre = (cfg.from * fps as f32).round() as usize;
 
     let view = rd
@@ -139,7 +137,10 @@ pub fn render_scene<S: Scene>(cfg: &OfflineRender) -> Result<Vec<PathBuf>> {
     for i in 0..total {
         drive_ui(&egui_ctx, &mut scene, &rd, cfg, sim_t, dt);
 
-        // Sample the curve values for the state about to be rendered.
+        // Sampled post-`ui`/pre-`update`. Gaze columns align with the pixels
+        // (both read state from the prior frame's `advance`); raw-input columns
+        // (cursor) lead the pixels by one frame, since the rendered gaze reflects
+        // the previous frame's cursor (flatland lerps gaze toward it over time).
         let scalars = scene.debug_scalars();
         if i == 0 {
             names = scalars.iter().map(|(n, _)| *n).collect();
@@ -268,6 +269,13 @@ fn write_csv(
     std::fs::write(path, s).with_context(|| format!("write csv {}", path.display()))
 }
 
+/// Number of inclusive timeline samples over `[from, to]` at `fps`: `from==to`
+/// yields one frame. Rounds the span so e.g. 0..2.4 @ 12 gives 30.
+fn frame_count(from: f32, to: f32, fps: u32) -> usize {
+    let span = (to - from).max(0.0);
+    (span * fps.max(1) as f32).round() as usize + 1
+}
+
 /// `true` if `p` ends in a `.png` extension (case-insensitive).
 fn is_png(p: &Path) -> bool {
     p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
@@ -355,4 +363,45 @@ fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
         .with_context(|| format!("RGBA buffer doesn't match {width}x{height}"))?;
     img.save_with_format(path, image::ImageFormat::Png)
         .with_context(|| format!("write png {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_track_starts_absent_and_holds_each_key() {
+        let track = CursorTrack::new(vec![
+            (0.0, None),
+            (0.5, Some((10.0, 20.0))),
+            (1.0, Some((30.0, 40.0))),
+        ]);
+        assert_eq!(track.sample(-1.0), None, "before any key");
+        assert_eq!(track.sample(0.0), None, "absent key");
+        assert_eq!(track.sample(0.25), None, "holds absent");
+        assert_eq!(track.sample(0.5), Some((10.0, 20.0)), "key fires");
+        assert_eq!(track.sample(0.75), Some((10.0, 20.0)), "holds present");
+        assert_eq!(track.sample(1.0), Some((30.0, 40.0)), "next key");
+        assert_eq!(track.sample(99.0), Some((30.0, 40.0)), "holds last");
+    }
+
+    #[test]
+    fn cursor_track_sorts_unordered_keys() {
+        let track = CursorTrack::new(vec![(1.0, Some((3.0, 3.0))), (0.0, Some((1.0, 1.0)))]);
+        assert_eq!(track.sample(0.0), Some((1.0, 1.0)));
+        assert_eq!(track.sample(1.0), Some((3.0, 3.0)));
+    }
+
+    #[test]
+    fn cursor_track_empty_is_always_absent() {
+        assert_eq!(CursorTrack::new(vec![]).sample(0.0), None);
+    }
+
+    #[test]
+    fn frame_count_is_inclusive() {
+        assert_eq!(frame_count(0.0, 0.0, 12), 1, "single frame when from==to");
+        assert_eq!(frame_count(0.0, 2.4, 12), 30, "28.8 rounds to 29, plus endpoint");
+        assert_eq!(frame_count(1.0, 1.0, 60), 1);
+        assert_eq!(frame_count(0.0, 1.0, 30), 31);
+    }
 }
