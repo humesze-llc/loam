@@ -233,8 +233,8 @@ fn write_csv(
     names: &[&str],
     rows: &[(f32, Vec<f32>)],
 ) -> Result<()> {
-    // Built with `push_str`/`format!` (infallible to a String) rather than
-    // `write!(..).unwrap()`, so there's no Result to unwrap on the cold path.
+    // Built with `push_str`/`format!`, infallible to a String, so the cold path
+    // carries no fallible formatting calls to handle.
     let info = rd.adapter.get_info();
     let mut s = format!(
         "# adapter={} backend={:?} format={:?} size={}x{} from={} to={} fps={}\n",
