@@ -366,6 +366,10 @@ struct FlatlandApp {
     vision_bands: Vec<(f32, f32, f32, [f32; 3])>,
     /// Cursor position in the 1D vision strip (0..1), or -1 when absent.
     cursor_u: f32,
+    /// Offline walkthrough: auto-advance one beat every N seconds, so the
+    /// headless harness can replay the whole narrative (which is otherwise gated
+    /// behind the Prev/Next buttons). `None` in normal interactive use.
+    walkthrough: Option<f32>,
 }
 
 fn push(mesh: &mut LineMesh<3>, a: Vec3, b: Vec3, color: [f32; 4], width: f32) {
@@ -775,6 +779,8 @@ impl Scene for FlatlandApp {
             found_clock: -10.0,
             vision_bands: Vec::new(),
             cursor_u: -1.0,
+            // Read only under the offline harness; never set in interactive use.
+            walkthrough: walkthrough_arg(),
         };
         app.goto(0);
         Ok(app)
@@ -782,6 +788,15 @@ impl Scene for FlatlandApp {
 
     fn update(&mut self, ctx: &mut FrameCtx<'_>) {
         let dt = ctx.dt.min(0.1);
+        // Offline walkthrough auto-advances the narrative on a fixed cadence so
+        // the headless harness can replay every beat in one render.
+        if let Some(step) = self.walkthrough {
+            let target = ((self.clock + dt) / step) as usize;
+            let target = target.min(BEATS.len() - 1);
+            if target != self.section {
+                self.goto(target);
+            }
+        }
         self.clock += dt;
         self.reveal.advance(dt);
         self.sphere_h.advance(dt);
@@ -1007,6 +1022,7 @@ impl Scene for FlatlandApp {
 
     fn debug_scalars(&self) -> Vec<(&'static str, f32)> {
         vec![
+            ("section", self.section as f32),
             ("clock", self.clock),
             ("reveal", self.reveal.value()),
             ("zoom", self.zoom.value()),
@@ -1095,6 +1111,17 @@ impl FlatlandApp {
     }
 }
 
+/// Offline walkthrough cadence (seconds per beat) from `--walkthrough=N`, or
+/// `None` in interactive use. Only the harness build reads the CLI here.
+#[cfg(feature = "harness")]
+fn walkthrough_arg() -> Option<f32> {
+    rye_app::args::Args::current().parse::<f32>("walkthrough")
+}
+#[cfg(not(feature = "harness"))]
+fn walkthrough_arg() -> Option<f32> {
+    None
+}
+
 fn main() -> Result<()> {
     // `--offline` renders deterministically to disk with no window (the harness
     // build). Detected from raw argv because `Args` only parses `--key=value`.
@@ -1134,6 +1161,17 @@ fn run_offline() -> Result<()> {
             None,
         ),
     };
+
+    // flatland clamps per-frame dt to 0.1 (interactive hitch guard), so an
+    // offline dt above that (fps < 10) advances the sim slower than the timeline
+    // asks, desyncing `time` from the demo's `clock`. Warn rather than silently
+    // mislead. Proper fix is for the harness to substep sim-dt under sample-fps.
+    if fps < 10 {
+        eprintln!(
+            "warning: fps={fps} < 10 -> per-frame dt > flatland's 0.1 clamp; \
+             the offline timeline will run slower than wall-clock. Use fps >= 10."
+        );
+    }
 
     let cfg = OfflineRender {
         width: 1280,
