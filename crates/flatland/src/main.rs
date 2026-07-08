@@ -1152,7 +1152,7 @@ fn run_offline() -> Result<()> {
 
     // (from, to, fps, cursor) by scenario; bare runs read --from/--to/--fps.
     let (from, to, fps, cursor) = match args.get("scenario") {
-        Some("wake") => (0.0, 2.4, 12, Some(wake_cursor())),
+        Some("wake") => (0.0, 2.4, args.parse("fps").unwrap_or(12), Some(wake_cursor())),
         Some(other) => anyhow::bail!("unknown --scenario={other} (known: wake)"),
         None => (
             args.parse("from").unwrap_or(0.0),
