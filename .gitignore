@@ -28,6 +28,8 @@ desktop.ini
 
 # Personal devlog
 docs/devlog/
+docs/context/
+docs/archive/
 
 # Personal audit / dev scripts (not shipped; rerun locally)
 scripts/
