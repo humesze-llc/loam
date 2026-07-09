@@ -159,6 +159,13 @@ where
             .and_then(|v| v.as_f64())
             .map(|f| f as u32)
             .unwrap_or(600);
+        let read_str = |key: &str| {
+            js_sys::Reflect::get(&data, &JsValue::from_str(key))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default()
+        };
+        crate::args::set_query_override(read_str("search"), read_str("hash"));
 
         tracing::info!(
             "loam_app::wasm::worker: received init ({width}x{height}); spawning wgpu setup"

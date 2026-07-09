@@ -147,6 +147,23 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
             &JsValue::from_str("height"),
             &JsValue::from_f64(height as f64),
         );
+        // Workers have no `window.location`; forward the page query so
+        // `Args::current` works inside `App::setup`.
+        let (search, hash) = web_sys::window()
+            .map(|w| {
+                let loc = w.location();
+                (
+                    loc.search().unwrap_or_default(),
+                    loc.hash().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        let _ = js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("search"),
+            &JsValue::from_str(&search),
+        );
+        let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("hash"), &JsValue::from_str(&hash));
 
         let transfer = js_sys::Array::new();
         transfer.push(&offscreen_for_ready);
