@@ -1653,7 +1653,9 @@ impl CapturePanel {
 
         ui.horizontal(|ui| {
             ui.label("Dir:");
-            ui.add(loam_egui::egui::TextEdit::singleline(&mut self.output_dir).desired_width(180.0));
+            ui.add(
+                loam_egui::egui::TextEdit::singleline(&mut self.output_dir).desired_width(180.0),
+            );
         });
         ui.horizontal(|ui| {
             ui.label("Name:");

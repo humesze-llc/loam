@@ -1294,7 +1294,8 @@ mod tests {
     #[test]
     fn section_faces_use_supplied_color_uniformly() {
         let color = [0.95, 0.55, 0.30, 1.0];
-        let mesh = polytope4_section_faces(Polytope4::Pentatope, loam_math::WPlane::new(0.0), color);
+        let mesh =
+            polytope4_section_faces(Polytope4::Pentatope, loam_math::WPlane::new(0.0), color);
         assert!(!mesh.colors.is_empty(), "section faces must produce colors");
         for (i, c) in mesh.colors.iter().enumerate() {
             assert_eq!(
@@ -1508,7 +1509,8 @@ mod tests {
             // outward direction at any cap is the cap centroid itself.
             let center = Vec3::ZERO;
             for &slice_w in &[-0.5_f32, -0.2, 0.0, 0.2, 0.5] {
-                let (mesh, _) = polytope4_section_overlay(polytope, loam_math::WPlane::new(slice_w));
+                let (mesh, _) =
+                    polytope4_section_overlay(polytope, loam_math::WPlane::new(slice_w));
                 for &[a, b, c] in &mesh.indices {
                     let va = Vec3::from(mesh.vertices[a as usize]);
                     let vb = Vec3::from(mesh.vertices[b as usize]);

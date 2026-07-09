@@ -30,7 +30,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use glam::Vec3;
-use loam_app::{run_with_config, App, Camera, FirstPersonController, FrameCtx, RunConfig, SetupCtx};
+use loam_app::{
+    run_with_config, App, Camera, FirstPersonController, FrameCtx, RunConfig, SetupCtx,
+};
 use loam_camera::CameraController;
 use loam_math::{BlendedSpace, EuclideanR3, HyperbolicH3, LinearBlendX};
 use loam_render::{

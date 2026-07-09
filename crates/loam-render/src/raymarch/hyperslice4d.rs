@@ -1029,7 +1029,9 @@ mod tests {
         // Per-body SDF for normal sampling (issue #17).
         assert!(HYPERSLICE_KERNEL_WGSL.contains("loam_body_sdf_at"));
         // Floor classification by primitive kind, not normal/y.
-        assert!(HYPERSLICE_KERNEL_WGSL.contains("loam_scene_at(p_hit).kind == LOAM_PRIM_HALFSPACE4D"));
+        assert!(
+            HYPERSLICE_KERNEL_WGSL.contains("loam_scene_at(p_hit).kind == LOAM_PRIM_HALFSPACE4D")
+        );
         assert!(!HYPERSLICE_KERNEL_WGSL.contains("abs(p_hit.y) < 0.01"));
         // Analytical far-clip from HalfSpace4D leaves.
         assert!(HYPERSLICE_KERNEL_WGSL.contains("loam_scene_max_t(ro, rd)"));

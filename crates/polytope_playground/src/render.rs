@@ -545,7 +545,12 @@ impl Demo {
             &mut self.section_faces_translucent
         };
         node.set_camera(&rd.queue, view_proj);
-        node.upload::<EuclideanR3, 3>(&rd.device, &rd.queue, mesh, &loam_math::Projection::Identity);
+        node.upload::<EuclideanR3, 3>(
+            &rd.device,
+            &rd.queue,
+            mesh,
+            &loam_math::Projection::Identity,
+        );
         node.execute(rd, view, Some(depth_view), None)?;
         Ok(())
     }

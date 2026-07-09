@@ -36,7 +36,9 @@ use std::borrow::Cow;
 
 use anyhow::Result;
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use loam_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use loam_app::{
+    egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx,
+};
 use loam_egui::{Console, ConsoleWriter};
 use loam_math::{EuclideanR3, EuclideanR4, Projection, WPlane};
 use loam_physics::polytope::{polytope_section_overlay_with_vertices, Polytope4};

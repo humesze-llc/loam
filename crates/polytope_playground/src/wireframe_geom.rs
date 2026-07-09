@@ -106,7 +106,9 @@ pub(crate) fn perspective_scale_at_w(
             Some(focal_distance / (focal_distance - w_slice).max(PERSPECTIVE_SCALE_DENOM_EPSILON))
         }
         // Non-affine: no single-scalar shortcut; caller projects per-vertex.
-        loam_math::Projection::Schlegel { .. } | loam_math::Projection::Stereographic { .. } => None,
+        loam_math::Projection::Schlegel { .. } | loam_math::Projection::Stereographic { .. } => {
+            None
+        }
     }
 }
 
@@ -499,12 +501,14 @@ pub(crate) fn push_blended_edge(
     if blend <= 0.0 {
         if flat_edge_uses_endpoint_chord(projection) {
             let clip_radius = stereographic_clip_radius(projection, view_radius);
-            let a3_local = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
-                a, projection,
-            );
-            let b3_local = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
-                b, projection,
-            );
+            let a3_local =
+                <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
+                    a, projection,
+                );
+            let b3_local =
+                <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
+                    b, projection,
+                );
             if sample_in_radius(a3_local, clip_radius) && sample_in_radius(b3_local, clip_radius) {
                 mesh.segments.push((
                     (a3_local + body_pos_r3).to_array(),
@@ -537,12 +541,14 @@ pub(crate) fn push_blended_edge(
         // (never reached for regular polytopes; guards degenerate input).
         if flat_edge_uses_endpoint_chord(projection) {
             let clip_radius = stereographic_clip_radius(projection, view_radius);
-            let a3_local = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
-                a, projection,
-            );
-            let b3_local = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
-                b, projection,
-            );
+            let a3_local =
+                <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
+                    a, projection,
+                );
+            let b3_local =
+                <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
+                    b, projection,
+                );
             if sample_in_radius(a3_local, clip_radius) && sample_in_radius(b3_local, clip_radius) {
                 mesh.segments.push((
                     (a3_local + body_pos_r3).to_array(),
