@@ -10,29 +10,29 @@ The workspace is a DAG, layered so the stable surfaces never depend on the
 volatile ones. Each crate depends only on tiers below it.
 
 ```
-tier 0  rye-math   rye-input   rye-time   rye-text   rye-asset      (no rye deps)
-tier 1  rye-shape    rye-camera    rye-player    rye-shader
-tier 2  rye-shape ── rye-scene    rye-physics    rye-egui
-tier 3  rye-render
-tier 4  rye-app
+tier 0  loam-math   loam-input   loam-time   loam-text   loam-asset      (no loam deps)
+tier 1  loam-shape    loam-camera    loam-player    loam-shader
+tier 2  loam-shape ── loam-scene    loam-physics    loam-egui
+tier 3  loam-render
+tier 4  loam-app
 tier 5  polytope_playground   tesseract_demo                        (demos, not API)
 ```
 
-- `rye-math` is the root: the `Space` trait, metrics, the bivector/rotor
+- `loam-math` is the root: the `Space` trait, metrics, the bivector/rotor
   geometric algebra, projections. Nothing in the workspace is below it.
-- `rye-shape` (math + the geometry/topology data: `Shape`, polytope topology,
+- `loam-shape` (math + the geometry/topology data: `Shape`, polytope topology,
   the vertex/face generators) is the other stable surface. The two together are
   the foundation; promoting anything into them is a deliberate decision.
-- `rye-render` depends on `rye-math`, `rye-shape`, `rye-time`, `rye-scene` and
-  NOT on `rye-physics`: rendering must not pull in the simulation layer. Polytope
-  topology lives in `rye-shape` precisely so the renderer can use it without the
+- `loam-render` depends on `loam-math`, `loam-shape`, `loam-time`, `loam-scene` and
+  NOT on `loam-physics`: rendering must not pull in the simulation layer. Polytope
+  topology lives in `loam-shape` precisely so the renderer can use it without the
   physics dependency.
-- `rye-physics` is consumed by the demos, not by the engine shell (`rye-app`).
+- `loam-physics` is consumed by the demos, not by the engine shell (`loam-app`).
   4D rigid-body simulation is an application capability, not a render-path
   prerequisite.
 
 The rule: a change in a low tier ripples upward, so the low tiers carry the
-strictest review. A change isolated to `rye-render` or a demo is cheap.
+strictest review. A change isolated to `loam-render` or a demo is cheap.
 
 ## The capability-trait split
 
@@ -62,17 +62,19 @@ truth.
 
 ## The determinism boundary
 
-The math and simulation layers (`rye-math`, `rye-physics`, the sim-critical
-parts of the demos) are held to a reproducibility contract: f32, single-threaded
-fixed-step, deterministic iteration order, no fast-math. Same-binary
-same-architecture replay is bit-identical. Code that runs only locally for
-presentation (UI, render node setup, camera framing) is free of that constraint
-and must not pretend to honor it. The boundary is explicit so a contributor
-knows which side they are editing.
+The math and simulation layers (`loam-math`, `loam-physics`, the sim-critical
+parts of the demos) are held to a reproducibility contract stated as a property,
+not a mechanism: same binary, same inputs, same bits. Concretely: f32,
+fixed-step, deterministic iteration and reduction order, seeded randomness, no
+fast-math. The sim is single-threaded today; parallelism is admissible only with
+a fixed schedule and fixed reduction order, and only backed by a measurement.
+Code that runs only for presentation (UI, render node setup, camera framing) and
+GPU compute are outside the boundary and must not pretend to honor it. The
+boundary is explicit so a contributor knows which side they are editing.
 
 ## Public surface vs internal
 
-`rye-math` and `rye-shape` are the surfaces an external consumer would build on;
+`loam-math` and `loam-shape` are the surfaces an external consumer would build on;
 their `pub` items are contracts. The render/app crates are usable but still
 moving pre-1.0. `polytope_playground` and `tesseract_demo` are demonstrations,
 not API: depend on the engine crates, not on a demo.

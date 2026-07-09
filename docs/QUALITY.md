@@ -13,9 +13,9 @@ required item blocks the merge.
    CPU/GPU parity (probe) tests; boundary cases are explicit.
 4. **Docs**: `cargo doc --workspace --no-deps` with no warnings (broken
    intra-doc links and private-item links fail).
-5. **WebAssembly**: `cargo build -p rye-app --target wasm32-unknown-unknown`
+5. **WebAssembly**: `cargo build -p loam-app --target wasm32-unknown-unknown`
    builds; the browser path is a shipping target, not an afterthought.
-6. **GPU probes**: the shader-probe tests (`rye-shader`) pass: every WGSL
+6. **GPU probes**: the shader-probe tests (`loam-shader`) pass: every WGSL
    `Space`/SDF kernel that has a CPU counterpart is checked for parity.
 
 ## Style (review)
@@ -44,7 +44,8 @@ required item blocks the merge.
 ## Conventions
 
 Code is ground truth: read it before recommending against it. Determinism is
-Tier 0 in the math and simulation layers (f32, single-threaded fixed-step, no
-fast-math). Stable surfaces (`rye-math`, `rye-shape`) do not depend on volatile
-ones (`rye-render`, app shell). Cite the public reference for any non-obvious
+Tier 0 in the math and simulation layers: same binary, same inputs, same bits
+(f32, fixed-step, deterministic order, no fast-math). Stable surfaces
+(`loam-math`, `loam-shape`) do not depend on volatile
+ones (`loam-render`, app shell). Cite the public reference for any non-obvious
 formula or named algorithm at the use site.
