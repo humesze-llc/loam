@@ -3,7 +3,7 @@
 
 use crate::*;
 
-impl RotatePolytopesApp {
+impl RotateScene {
     pub(crate) fn build_console() -> Console<Demo> {
         let mut c = Console::<Demo>::new();
         c.register(loam_egui::cmd(
