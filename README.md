@@ -1,6 +1,6 @@
 # Loam
 
-**A geometry and physics substrate for spaces that are not flat 3D: real-time, rigorously tested mathematics for higher dimensions and curved manifolds, written in Rust on wgpu.**
+**A geometry and physics substrate for spaces that are not flat 3D: higher dimensions and curved manifolds, real-time, in Rust on wgpu.**
 
 [![CI](https://github.com/humesze-llc/loam/actions/workflows/ci.yml/badge.svg)](https://github.com/humesze-llc/loam/actions/workflows/ci.yml)
 
@@ -36,9 +36,9 @@ Stable Rust; any wgpu backend (Vulkan, DX12, Metal, WebGPU). The browser build n
 
 - A geometry is anything implementing `Space` (exp, log, distance, parallel transport, isometries). Everything downstream is an opt-in capability trait (`WgslSpace`, `RasterizableSpace`, `SectionableSpace`, `PhysicsSpace`), so a new geometry is wired in by implementing what it actually supports.
 - Scenes are typed SDF trees that emit WGSL on demand; the emit chain combines scene code with the selected space's shader prelude.
-- Correctness is enforced by an invariant test suite, not by inspecting rendered output: Gauss-Bonnet on geodesic triangles, isometry invariance of distance, transport length preservation, loop holonomy. A primitive whose visualization looks right but whose invariants fail does not ship.
+- Correctness is enforced by an invariant test suite, not by inspecting rendered output: Gauss-Bonnet on geodesic triangles, isometry invariance of distance, transport length preservation, loop holonomy.
 - Apart from `glam` and `bytemuck`, the math layer is first-party. The crate-by-crate map lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-- A variable-curvature `BlendedSpace` (a single Riemannian metric interpolating E³ to H³) exists as a validated reference implementation; it stays out of the headlines until it earns its frame budget.
+- A variable-curvature `BlendedSpace` (a single Riemannian metric interpolating E³ to H³) exists as a validated reference implementation; its numerical geodesics do not yet meet a gameplay frame budget.
 
 ## Lineage
 
