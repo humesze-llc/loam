@@ -2,9 +2,9 @@
 //! pass config, the cross-section projection rule, and the heavy-polychora SDF
 //! gate.
 
-use rye_math::Projection;
-use rye_physics::polytope::Polytope4;
-use rye_render::raymarch::RaymarchShape;
+use loam_math::Projection;
+use loam_physics::polytope::Polytope4;
+use loam_render::raymarch::RaymarchShape;
 
 use crate::catalog::ShapeEntry;
 
@@ -13,7 +13,7 @@ use crate::catalog::ShapeEntry;
 pub(crate) enum SurfaceMode {
     /// Rasterized filled cross-section cell-caps. Exact, much faster on the
     /// 120/600-cell than the SDF, and sidesteps the cell120/600 face-plane BUG
-    /// in `rye_physics::euclidean_r4`.
+    /// in `loam_physics::euclidean_r4`.
     #[default]
     Raster,
     /// SDF raymarch via `Demo::node`. Kept for visual comparison; slower on
@@ -87,7 +87,7 @@ impl SectionLayer {
 }
 
 /// The 4D->R³ projection a section layer renders through. The honest
-/// cross-section is ALWAYS drop-w ([`rye_math::Projection::Identity`]); the slice
+/// cross-section is ALWAYS drop-w ([`loam_math::Projection::Identity`]); the slice
 /// is a 3-flat and drop-w is its undistorted view, matching the SDF raymarch.
 /// The projected cap follows the active wireframe `projection`.
 ///
@@ -109,7 +109,7 @@ pub(crate) fn section_layer_projection(
 /// reasons, either sufficient: (1) their SDFs (120 / 600 face hyperplanes each,
 /// against the per-pixel Wolfe-greedy projection) overrun the browser WebGPU
 /// shader budget and crash the tab; (2) their `cell{120,600}_face_planes` are the
-/// known-wrong dual-vertex approximation (see `rye_shape::polytope_geom`), so the
+/// known-wrong dual-vertex approximation (see `loam_shape::polytope_geom`), so the
 /// SDF is geometrically wrong even where it fits the budget. Do NOT re-enable on a
 /// perf fix alone; the face planes must be corrected first. Free function so the
 /// gate is unit-testable; `Demo::sdf_blocked_by_heavy_polychora` specializes it.

@@ -12,7 +12,7 @@
 //! The 120-cell and 600-cell use a Rust-side face-hyperplane generator
 //! (too large to inline as WGSL); their SDFs run a true-Euclidean Wolfe
 //! greedy hyperplane projection, not a max-plane lower bound. Live state
-//! and controls draw as a `rye-egui` overlay via `App::ui`.
+//! and controls draw as a `loam-egui` overlay via `App::ui`.
 //!
 //! ## Controls
 //!
@@ -35,18 +35,18 @@
 
 use anyhow::{anyhow, Result};
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use rye_app::{
+use loam_app::{
     egui,
     freecam::{CursorMode, Freecam},
     App, Camera, CameraController, FrameCtx, OrbitController, RunConfig, SetupCtx,
 };
-use rye_egui::Console;
-use rye_math::WPlane;
-use rye_math::{Bivector, EuclideanR3, Rotor, Rotor4};
-use rye_physics::polytope::{
+use loam_egui::Console;
+use loam_math::WPlane;
+use loam_math::{Bivector, EuclideanR3, Rotor, Rotor4};
+use loam_physics::polytope::{
     polytope_section_faces_append, polytope_section_overlay_with_vertices, vertex_color_by_position,
 };
-use rye_render::{
+use loam_render::{
     device::RenderDevice,
     raymarch::{
         polytope_extended_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL,
@@ -58,8 +58,8 @@ use rye_render::{
 /// float depth-sorts the 600-cell's densely-packed caps without artifacting.
 const SECTION_FACES_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-use rye_scene::{Scene4, SceneNode4};
-use rye_shape::LineMesh;
+use loam_scene::{Scene4, SceneNode4};
+use loam_shape::LineMesh;
 use winit::window::WindowAttributes;
 
 mod active;
@@ -86,7 +86,7 @@ use consts::{
     BODY_SIZE, BODY_Y, HYPERSLICE_MIN_THICKNESS, T_SCRUB_RATE, T_SLIDER_INITIAL, W_SCRUB_RATE,
 };
 #[cfg(test)]
-use rye_physics::polytope::Polytope4;
+use loam_physics::polytope::Polytope4;
 use state::{
     body_position, CameraMode, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode,
     WireframeProjection,
@@ -118,9 +118,9 @@ use catalog::{parse_shape_name, ShapeEntry, DEFAULT_ROW};
 #[cfg(test)]
 use consts::{CONTROL_H, CONTROL_W, SHAPE_CARD_WIDTH};
 #[cfg(test)]
-use rye_egui::dnd::{drag_source_collapsing as dnd_drag_source_collapsing, make_room_gap};
+use loam_egui::dnd::{drag_source_collapsing as dnd_drag_source_collapsing, make_room_gap};
 #[cfg(test)]
-use rye_egui::media::add_button;
+use loam_egui::media::add_button;
 
 impl Demo {
     pub(crate) fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
@@ -225,7 +225,7 @@ impl Demo {
             DepthMode::ReadWrite {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
-            rye_render::FragmentShading::FaceNormalLambert,
+            loam_render::FragmentShading::FaceNormalLambert,
             ctx.rd.sample_count(),
         );
         // Translucent variant: same pipeline without depth-write, used when
@@ -240,7 +240,7 @@ impl Demo {
             DepthMode::ReadOnly {
                 format: SECTION_FACES_DEPTH_FORMAT,
             },
-            rye_render::FragmentShading::FaceNormalLambert,
+            loam_render::FragmentShading::FaceNormalLambert,
             ctx.rd.sample_count(),
         );
 
@@ -286,17 +286,17 @@ impl Demo {
             floor_enabled: true,
             section_faces,
             section_faces_translucent,
-            section_faces_projected_scratch: rye_shape::TriangleMesh::<3>::default(),
+            section_faces_projected_scratch: loam_shape::TriangleMesh::<3>::default(),
             section_clip_projected_scratch: Vec::new(),
             points_node,
             points_enabled: false,
             points_show_vertices: true,
             points_show_cell_centers: true,
             points_size_px: 4.0,
-            points_mesh_scratch: rye_shape::PointMesh::<3>::default(),
+            points_mesh_scratch: loam_shape::PointMesh::<3>::default(),
             section_faces_depth: None,
             section_world_vertices_scratch: Vec::new(),
-            section_faces_mesh_scratch: rye_shape::TriangleMesh::<3>::default(),
+            section_faces_mesh_scratch: loam_shape::TriangleMesh::<3>::default(),
             body_uniform_scratch: Vec::new(),
             slerp_scratch: Vec::new(),
             surface_mode: SurfaceMode::default(),
@@ -318,13 +318,13 @@ impl Demo {
             expanded: false,
             show_help: false,
             show_render_panel: false,
-            example_callout: rye_egui::CalloutState {
+            example_callout: loam_egui::CalloutState {
                 window_pos: egui::Pos2::new(220.0, 120.0),
                 open: false,
             },
             // Unwired: the per-projection annotation callout stays closed and
             // its render call early-returns; kept for a future re-wire.
-            mode_annotation_open: rye_egui::CalloutState {
+            mode_annotation_open: loam_egui::CalloutState {
                 window_pos: egui::Pos2::new(220.0, 300.0),
                 open: false,
             },
@@ -454,7 +454,7 @@ impl Demo {
             u.time = ctx.time;
             u.tick = ctx.tick as f32;
             u.w_slice = self.w_slice;
-            // Floor gate read by the injected wrapper around `rye_scene_sdf`:
+            // Floor gate read by the injected wrapper around `loam_scene_sdf`:
             // 1.0 = floor on, 0.0 = wrapper short-circuits to 1e9.
             u.params[0] = if self.floor_enabled { 1.0 } else { 0.0 };
         }
@@ -529,7 +529,7 @@ impl Demo {
                     }
                     ui.separator();
                     ui.label(egui::RichText::new("log(R) bivector").small().weak());
-                    rye_egui::bivector_matrix(ui, &bivec);
+                    loam_egui::bivector_matrix(ui, &bivec);
                 });
         }
 
@@ -546,7 +546,7 @@ impl Demo {
         self.render_help_window(ctx);
         // Off by default so the scene fills the window on first launch.
         self.render_render_panel(ctx);
-        // Demonstrates `rye_egui::callout` against the first polychoron.
+        // Demonstrates `loam_egui::callout` against the first polychoron.
         self.render_example_callout(ctx, frame);
         // No-ops in the default drop-w scene; else explains the projection.
         self.render_mode_annotation(ctx, frame);
@@ -583,7 +583,7 @@ impl Demo {
         let ppp = ctx.pixels_per_point();
         let vp_w = (cfg.width as f32 / ppp).round() as u32;
         let vp_h = (cfg.height as f32 / ppp).round() as u32;
-        let Some(screen_pos) = rye_egui::world_to_screen(
+        let Some(screen_pos) = loam_egui::world_to_screen(
             world_pos,
             &view_dir,
             60.0_f32.to_radians(),
@@ -594,7 +594,7 @@ impl Demo {
             return;
         };
 
-        rye_egui::callout(
+        loam_egui::callout(
             ctx,
             "polytope-playground-mode-annotation",
             screen_pos,
@@ -606,7 +606,7 @@ impl Demo {
         );
     }
 
-    /// Demonstrate the `rye_egui::callout` primitive against the first polychoron:
+    /// Demonstrate the `loam_egui::callout` primitive against the first polychoron:
     /// the anchor
     /// follows vertex 0 through the rotor + body-position + projection chain,
     /// reprojected per frame. No-op when the row has no polychora.
@@ -628,7 +628,7 @@ impl Demo {
         let topo = polytope.topology();
         let canonical_v0 = topo.vertices[0];
         let v_local_4d = self.effective_body_size() * self.rot_state.apply(canonical_v0);
-        let v_local_r3 = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+        let v_local_r3 = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
             v_local_4d,
             &self.resolved_wireframe_projection(),
         );
@@ -642,7 +642,7 @@ impl Demo {
         let ppp = ctx.pixels_per_point();
         let vp_w = (cfg.width as f32 / ppp).round() as u32;
         let vp_h = (cfg.height as f32 / ppp).round() as u32;
-        let Some(screen_pos) = rye_egui::world_to_screen(
+        let Some(screen_pos) = loam_egui::world_to_screen(
             world_pos,
             &view_dir,
             60.0_f32.to_radians(),
@@ -654,7 +654,7 @@ impl Demo {
         };
 
         let title = format!("{} vertex 0", entry.label);
-        rye_egui::callout(
+        loam_egui::callout(
             ctx,
             "polytope-playground-example-callout",
             screen_pos,
@@ -665,7 +665,7 @@ impl Demo {
                     "Example callout: this leader line tracks vertex 0 of the first \
                      polychoron in the row as it rotates through 4D. Drag the panel \
                      anywhere; the line keeps the anchor live. Same primitive \
-                     (rye_egui::callout) is the foundation for future tutorial \
+                     (loam_egui::callout) is the foundation for future tutorial \
                      overlays in Polytope Playground.",
                 );
                 ui.add_space(4.0);
@@ -748,10 +748,10 @@ struct RotatePolytopesApp {
     /// (Space / R / arrows): when egui holds keyboard focus they must not fire.
     last_egui_keyboard: bool,
     /// Capture parameters panel; toggled via `capture panel` or F11.
-    capture_panel: rye_app::capture::CapturePanel,
+    capture_panel: loam_app::capture::CapturePanel,
     /// F3-toggle live perf overlay (FPS, frame-time, sparkline) from
-    /// `rye_time::frame_trace`. Cheap when hidden.
-    perf: rye_app::trace::PerfOverlay,
+    /// `loam_time::frame_trace`. Cheap when hidden.
+    perf: loam_app::trace::PerfOverlay,
 }
 
 /// Lower bound on a visible section-layer fill alpha; below this the cap reads
@@ -766,7 +766,7 @@ fn run_section_alpha(
     layer_name: &str,
     layer: &mut state::SectionLayer,
     args: &[&str],
-    out: &mut rye_egui::console::ConsoleWriter,
+    out: &mut loam_egui::console::ConsoleWriter,
 ) -> anyhow::Result<()> {
     match args.first().copied() {
         None => {
@@ -816,8 +816,8 @@ impl App for RotatePolytopesApp {
             demo,
             console,
             last_egui_keyboard: false,
-            capture_panel: rye_app::capture::CapturePanel::new(),
-            perf: rye_app::trace::PerfOverlay::new(),
+            capture_panel: loam_app::capture::CapturePanel::new(),
+            perf: loam_app::trace::PerfOverlay::new(),
         })
     }
 
@@ -835,7 +835,7 @@ impl App for RotatePolytopesApp {
         self.perf.show(ctx);
         // Pump pending tracing events into the scrollback before rendering it,
         // so mirrored log lines show this frame.
-        rye_app::log::pump_into(&mut self.console);
+        loam_app::log::pump_into(&mut self.console);
         self.console.ui(ctx, &mut self.demo);
         // Stash for next frame's hotkey gating, captured after the console
         // renders so a freshly-focused input registers true.
@@ -865,9 +865,9 @@ impl App for RotatePolytopesApp {
 }
 
 fn main() -> Result<()> {
-    // `rye_app::run` handles native + wasm dispatch off the page's `data-mode`
+    // `loam_app::run` handles native + wasm dispatch off the page's `data-mode`
     // and WasmConfig IDs; the demo's `index.html` matches the default layout.
-    rye_app::run::<RotatePolytopesApp>(RunConfig {
+    loam_app::run::<RotatePolytopesApp>(RunConfig {
         window: WindowAttributes::default()
             .with_title("polytope playground")
             .with_visible(false),
@@ -964,12 +964,12 @@ mod color_tests {
 #[cfg(test)]
 mod blended_edge_tests {
     //! Tests for `push_blended_edge`. The S³ slerp math is pinned in
-    //! `rye_math::spherical_embedded`; these pin the demo-side contract: flat
+    //! `loam_math::spherical_embedded`; these pin the demo-side contract: flat
     //! fast path, curved sub-segment count, and curved-edge-bows-off-chord.
     use super::*;
 
-    fn flat_drop_w() -> rye_math::Projection<4> {
-        rye_math::Projection::Identity
+    fn flat_drop_w() -> loam_math::Projection<4> {
+        loam_math::Projection::Identity
     }
 
     /// Total length of all segments in the mesh, in world R³.
@@ -1104,8 +1104,8 @@ mod blended_edge_tests {
 
     /// A non-trivial Perspective4D projection; focal distance sits outside the
     /// unit-circumradius polytope so no vertex straddles the eye plane.
-    fn perspective() -> rye_math::Projection<4> {
-        rye_math::Projection::Perspective4D {
+    fn perspective() -> loam_math::Projection<4> {
+        loam_math::Projection::Perspective4D {
             focal_distance: 3.0,
         }
     }
@@ -1154,7 +1154,7 @@ mod blended_edge_tests {
     fn blend_endpoints_exact_at_all_t() {
         let a = Vec4::new(0.5, 0.5, 0.5, 0.5);
         let b = Vec4::new(-0.5, 0.5, 0.5, -0.5);
-        let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
+        let proj = loam_math::Projection::Stereographic { pole: Vec4::W };
         let body_pos = Vec3::new(-0.25, 1.5, 0.0);
         let expected_a = project_to_world(a, &proj, body_pos).to_array();
         let expected_b = project_to_world(b, &proj, body_pos).to_array();
@@ -1192,7 +1192,7 @@ mod section_command_tests {
     //! Tests for shared console handlers unit-testable without a GPU-backed
     //! `Demo` by exercising the handler body directly.
     use super::*;
-    use rye_egui::console::ConsoleWriter;
+    use loam_egui::console::ConsoleWriter;
 
     /// `run_section_alpha` sets an in-range alpha, accepts `0` as off, rejects
     /// the faint `(0, MIN_VISIBLE)` band / over-range / unparseable input (no
@@ -1977,7 +1977,7 @@ mod section_cap_projection_tests {
     fn perspective_scale_returns_none_for_non_affine() {
         // Affine: Identity at any w is unit scale.
         assert_eq!(
-            perspective_scale_at_w(0.3, &rye_math::Projection::Identity),
+            perspective_scale_at_w(0.3, &loam_math::Projection::Identity),
             Some(1.0)
         );
         // Affine: Perspective4D at w_slice is `focal / (focal - w_slice)`.
@@ -1985,18 +1985,18 @@ mod section_cap_projection_tests {
         let w_slice = 0.5;
         let got = perspective_scale_at_w(
             w_slice,
-            &rye_math::Projection::Perspective4D {
+            &loam_math::Projection::Perspective4D {
                 focal_distance: focal,
             },
         );
         assert_eq!(got, Some(focal / (focal - w_slice)));
         // Non-affine: both report `None`.
         assert_eq!(
-            perspective_scale_at_w(0.0, &rye_math::Projection::Stereographic { pole: Vec4::W }),
+            perspective_scale_at_w(0.0, &loam_math::Projection::Stereographic { pole: Vec4::W }),
             None
         );
         assert_eq!(
-            perspective_scale_at_w(0.0, &rye_math::Projection::schlegel(Vec4::W, 0.5, 0.75)),
+            perspective_scale_at_w(0.0, &loam_math::Projection::schlegel(Vec4::W, 0.5, 0.75)),
             None
         );
     }
@@ -2009,7 +2009,7 @@ mod section_cap_projection_tests {
     fn section_cap_matches_wireframe_under_perspective4d() {
         let focal = 2.0;
         let w_slice = 0.4;
-        let proj = rye_math::Projection::Perspective4D {
+        let proj = loam_math::Projection::Perspective4D {
             focal_distance: focal,
         };
         let body_pos = Vec3::new(1.3, -0.7, 0.2);
@@ -2042,7 +2042,7 @@ mod section_cap_projection_tests {
     #[test]
     fn section_cap_per_vertex_finite_under_stereographic() {
         let w_slice = 0.0;
-        let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
+        let proj = loam_math::Projection::Stereographic { pole: Vec4::W };
         let body_pos = Vec3::new(0.5, 0.0, -0.3);
         let scale = perspective_scale_at_w(w_slice, &proj);
         assert_eq!(scale, None, "Stereographic must take the per-vertex path");
@@ -2069,7 +2069,7 @@ mod section_cap_projection_tests {
     /// flat wireframe is an endpoint-chord overlay.
     #[test]
     fn flat_edge_chord_policy_splits_from_cap_scale_policy() {
-        let schlegel = rye_math::Projection::schlegel(Vec4::W, 0.5, 0.75);
+        let schlegel = loam_math::Projection::schlegel(Vec4::W, 0.5, 0.75);
         assert_eq!(
             perspective_scale_at_w(0.0, &schlegel),
             None,
@@ -2084,7 +2084,7 @@ mod section_cap_projection_tests {
             "flat Schlegel wireframe edges render as one chord"
         );
 
-        let stereo = rye_math::Projection::Stereographic { pole: Vec4::W };
+        let stereo = loam_math::Projection::Stereographic { pole: Vec4::W };
         assert_eq!(
             perspective_scale_at_w(0.0, &stereo),
             None,
@@ -2104,7 +2104,7 @@ mod section_cap_projection_tests {
     /// draw the R3 chord; the faithful S3 edge is sampled at blend one.
     #[test]
     fn stereographic_zero_blend_is_endpoint_chord_overlay() {
-        let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
+        let proj = loam_math::Projection::Stereographic { pole: Vec4::W };
         let body_pos = Vec3::ZERO;
         let a = Vec4::new(0.30, 0.60, 0.20, 0.50);
         let b = Vec4::new(0.70, 0.10, 0.40, -0.30);
@@ -2146,7 +2146,7 @@ mod section_cap_projection_tests {
     /// "non-affine == must subdivide" mistake.
     #[test]
     fn schlegel_flat_wireframe_edge_is_endpoint_chord() {
-        let proj = rye_math::Projection::schlegel(Vec4::W, 0.5, 1.0);
+        let proj = loam_math::Projection::schlegel(Vec4::W, 0.5, 1.0);
         assert_eq!(perspective_scale_at_w(0.0, &proj), None);
         let a = Vec4::new(0.25, 0.50, -0.25, 0.50);
         let b = Vec4::new(-0.25, 0.50, -0.25, -0.50);
@@ -2182,7 +2182,7 @@ mod section_cap_projection_tests {
     /// sensitive common case from the subdivided branch.
     #[test]
     fn affine_wireframe_keeps_single_segment_and_caps_land_on_it() {
-        let proj = rye_math::Projection::Perspective4D {
+        let proj = loam_math::Projection::Perspective4D {
             focal_distance: 2.0,
         };
         let body_pos = Vec3::ZERO;
@@ -2237,17 +2237,17 @@ mod section_cap_projection_tests {
         // it (a pure-radial point could stay collinear).
         let cap_r3 = [0.4, -0.25, 0.15];
         let actives = [
-            rye_math::Projection::Identity,
-            rye_math::Projection::Perspective4D {
+            loam_math::Projection::Identity,
+            loam_math::Projection::Perspective4D {
                 focal_distance: 2.0,
             },
-            rye_math::Projection::Stereographic { pole: Vec4::W },
-            rye_math::Projection::schlegel(Vec4::W, 0.5, 0.9),
+            loam_math::Projection::Stereographic { pole: Vec4::W },
+            loam_math::Projection::schlegel(Vec4::W, 0.5, 0.9),
         ];
 
         // Honest layer (drop-w): identical under every active projection.
         let honest_reference = {
-            let proj = state::section_layer_projection(true, rye_math::Projection::Identity);
+            let proj = state::section_layer_projection(true, loam_math::Projection::Identity);
             let scale = perspective_scale_at_w(w_slice, &proj);
             cap_vertex_projected_and_world(cap_r3, w_slice, scale, &proj, body_pos).1
         };
@@ -2257,7 +2257,7 @@ mod section_cap_projection_tests {
             let honest_proj = state::section_layer_projection(true, active);
             assert_eq!(
                 honest_proj,
-                rye_math::Projection::Identity,
+                loam_math::Projection::Identity,
                 "honest layer must stay drop-w under {active:?}"
             );
             let honest_scale = perspective_scale_at_w(w_slice, &honest_proj);
@@ -2331,12 +2331,12 @@ mod section_cap_projection_tests {
     fn stereographic_view_radius_tracks_camera_distance() {
         // The worst non-pole vertex image (`+w`-cell corner at w = 0.5,
         // magnitude sqrt(3) ~ 1.73): the radius must always clear it.
-        let legit = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+        let legit = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
             Vec4::new(0.5, 0.5, 0.5, 0.5),
-            &rye_math::Projection::Stereographic { pole: Vec4::W },
+            &loam_math::Projection::Stereographic { pole: Vec4::W },
         )
         .length();
-        let clamp_ceiling = (2.0 / rye_math::STEREOGRAPHIC_POLE_EPSILON).sqrt();
+        let clamp_ceiling = (2.0 / loam_math::STEREOGRAPHIC_POLE_EPSILON).sqrt();
 
         // Across the zoom range the 16-cell radius stays a fixed fraction below
         // the camera distance, clears the figure, and sits under the clamp
@@ -2395,18 +2395,18 @@ mod section_cap_projection_tests {
     fn stereographic_clip_radius_only_for_stereographic() {
         assert_eq!(
             stereographic_clip_radius(
-                &rye_math::Projection::Stereographic { pole: Vec4::W },
+                &loam_math::Projection::Stereographic { pole: Vec4::W },
                 STEREOGRAPHIC_VIEW_RADIUS
             ),
             Some(STEREOGRAPHIC_VIEW_RADIUS)
         );
         for proj in [
-            rye_math::Projection::Identity,
-            rye_math::Projection::Orthographic { drop_axis: 3 },
-            rye_math::Projection::Perspective4D {
+            loam_math::Projection::Identity,
+            loam_math::Projection::Orthographic { drop_axis: 3 },
+            loam_math::Projection::Perspective4D {
                 focal_distance: 2.0,
             },
-            rye_math::Projection::schlegel(Vec4::W, 0.5, 0.75),
+            loam_math::Projection::schlegel(Vec4::W, 0.5, 0.75),
         ] {
             assert_eq!(
                 stereographic_clip_radius(&proj, STEREOGRAPHIC_VIEW_RADIUS),
@@ -2423,7 +2423,7 @@ mod section_cap_projection_tests {
         b: Vec4,
         blend: f32,
     ) -> Vec<([f32; 3], [f32; 3])> {
-        let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
+        let proj = loam_math::Projection::Stereographic { pole: Vec4::W };
         let mut mesh = LineMesh::<3>::default();
         let mut scratch = Vec::new();
         let white = [1.0, 1.0, 1.0, 1.0];
@@ -2611,7 +2611,7 @@ mod section_cap_projection_tests {
     /// moves a retained sample.
     #[test]
     fn stereographic_clip_does_not_perturb_off_pole_edge() {
-        let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
+        let proj = loam_math::Projection::Stereographic { pole: Vec4::W };
         // A unit edge straddling w = 0, far from the +w pole on both ends.
         let a = Vec4::new(0.30, 0.60, 0.20, 0.10).normalize();
         let b = Vec4::new(0.70, 0.10, 0.40, -0.30).normalize();
@@ -2624,7 +2624,7 @@ mod section_cap_projection_tests {
         // Reconstruct the un-clipped projected polyline directly and compare.
         let samples = SPACE_TESSELLATION_SAMPLES;
         let mut arc = Vec::new();
-        <rye_math::SphericalS3Embedded as rye_math::RasterizableSpace<4>>::tessellate_segment(
+        <loam_math::SphericalS3Embedded as loam_math::RasterizableSpace<4>>::tessellate_segment(
             a, b, samples, &mut arc,
         );
         let mut prev = project_to_world(a, &proj, Vec3::ZERO).to_array();
@@ -2641,7 +2641,7 @@ mod section_cap_projection_tests {
     /// streaming `continue`, not a `filter().collect()`.
     #[test]
     fn stereographic_clip_reuses_scratch_without_realloc() {
-        let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
+        let proj = loam_math::Projection::Stereographic { pole: Vec4::W };
         let white = [1.0, 1.0, 1.0, 1.0];
         let mut scratch = Vec::new();
         let mut mesh = LineMesh::<3>::default();
@@ -2696,15 +2696,15 @@ mod section_cap_projection_tests {
 
     /// Demo default pole, kept in sync with the state constant by
     /// `state::stereographic_default_pole_is_unit_cell_center`.
-    fn default_stereographic() -> rye_math::Projection<4> {
-        rye_math::Projection::Stereographic {
+    fn default_stereographic() -> loam_math::Projection<4> {
+        loam_math::Projection::Stereographic {
             pole: state::STEREOGRAPHIC_DEFAULT_POLE,
         }
     }
 
     /// The body-local projected point a cap vertex maps to; the point the fill /
     /// perimeter / points clip all test.
-    fn cap_projected(cap_r3: [f32; 3], w_slice: f32, proj: &rye_math::Projection<4>) -> Vec3 {
+    fn cap_projected(cap_r3: [f32; 3], w_slice: f32, proj: &loam_math::Projection<4>) -> Vec3 {
         let scale = perspective_scale_at_w(w_slice, proj);
         cap_vertex_projected_and_world(cap_r3, w_slice, scale, proj, Vec3::ZERO).0
     }
@@ -2760,7 +2760,7 @@ mod section_cap_projection_tests {
     /// the magnitude exceeds the radius.
     #[test]
     fn cap_fill_matches_perimeter_clip() {
-        let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
+        let proj = loam_math::Projection::Stereographic { pole: Vec4::W };
         let clip = stereographic_clip_radius(&proj, STEREOGRAPHIC_VIEW_RADIUS);
         // A near-pole cap vertex (off-axis, large finite image) and a far one.
         let near = cap_projected([0.05, 0.02, 0.01], 0.999, &proj);
@@ -2793,14 +2793,14 @@ mod section_cap_projection_tests {
     /// Affine projection (`clip_radius == None`) keeps every point.
     #[test]
     fn points_overlay_drops_near_pole_vertex() {
-        let proj = rye_math::Projection::Stereographic { pole: Vec4::W };
+        let proj = loam_math::Projection::Stereographic { pole: Vec4::W };
         let clip = stereographic_clip_radius(&proj, STEREOGRAPHIC_VIEW_RADIUS);
         // Project a near-+w vertex as render_points does, then apply the gate.
-        let v_near = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+        let v_near = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
             near_pole(1.0),
             &proj,
         );
-        let v_far = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+        let v_far = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
             Vec4::new(1.0, 0.0, 0.0, 0.0),
             &proj,
         );
@@ -2816,7 +2816,7 @@ mod section_cap_projection_tests {
         );
         // Affine projection carries no clip; its image is bounded anyway.
         let affine_clip =
-            stereographic_clip_radius(&rye_math::Projection::Identity, STEREOGRAPHIC_VIEW_RADIUS);
+            stereographic_clip_radius(&loam_math::Projection::Identity, STEREOGRAPHIC_VIEW_RADIUS);
         assert!(
             sample_in_radius(v_near, affine_clip),
             "affine projection must keep every point (no clip)"

@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use glam::{Mat4, Vec2, Vec3};
-use rye_app::{
+use loam_app::{
     egui, freecam::Freecam, App, Camera, CameraController, FrameCtx, OrbitController, RenderCtx,
     RunConfig, SetupCtx,
 };
@@ -16,14 +16,14 @@ use rye_app::{
 // Per-frame allocation telemetry surfaced in `frame_trace` + PerfOverlay; ~5-10ns
 // per allocation, negligible next to the interop cost being chased.
 #[global_allocator]
-static GLOBAL: rye_time::alloc::CountingAllocator<std::alloc::System> =
-    rye_time::alloc::CountingAllocator::new(std::alloc::System);
-use rye_egui::Console;
-use rye_math::{Bivector, Bivector4, EuclideanR3, Rotor4};
-use rye_physics::polytope::Polytope4;
-use rye_render::device::RenderDevice;
-use rye_render::{DepthMode, LineRasterStaticR4Node, Viewport};
-use rye_shape::LineMesh;
+static GLOBAL: loam_time::alloc::CountingAllocator<std::alloc::System> =
+    loam_time::alloc::CountingAllocator::new(std::alloc::System);
+use loam_egui::Console;
+use loam_math::{Bivector, Bivector4, EuclideanR3, Rotor4};
+use loam_physics::polytope::Polytope4;
+use loam_render::device::RenderDevice;
+use loam_render::{DepthMode, LineRasterStaticR4Node, Viewport};
+use loam_shape::LineMesh;
 use winit::window::WindowAttributes;
 
 /// `Perspective4D` focal distance along the w-axis. Vertices live at `w = ±0.5`
@@ -80,7 +80,7 @@ struct TesseractApp {
     console: Console<()>,
     /// F3-toggle perf overlay: live FPS + frame-gap stats + sparkline. The
     /// dominant gap on wasm is `between-frames` (browser RAF cadence), not render.
-    perf: rye_app::trace::PerfOverlay,
+    perf: loam_app::trace::PerfOverlay,
 }
 
 impl TesseractApp {
@@ -136,7 +136,7 @@ impl App for TesseractApp {
 
         // `?spin_rate=N` (rad/s) and `?paused=true|1` override the defaults, for
         // blog embeds wanting a snapshot or slower animation. Native: `--spin_rate`.
-        let args = rye_app::args::Args::current();
+        let args = loam_app::args::Args::current();
         let spin_rate = args.parse::<f32>("spin_rate").unwrap_or(SPIN_RATE);
         let paused = args
             .get("paused")
@@ -176,18 +176,18 @@ impl App for TesseractApp {
         let freecam = Freecam::new().with_speed(2.5);
 
         let mut console = Console::<()>::new();
-        rye_app::trace::register_command(&mut console);
-        rye_app::fps::register_command(&mut console);
-        rye_app::vsync::register_command(&mut console);
-        rye_app::version::register_command(
+        loam_app::trace::register_command(&mut console);
+        loam_app::fps::register_command(&mut console);
+        loam_app::vsync::register_command(&mut console);
+        loam_app::version::register_command(
             &mut console,
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
             env!("BUILD_HASH"),
             env!("BUILD_DIRTY"),
         );
-        rye_app::log::register_command(&mut console);
-        let perf = rye_app::trace::PerfOverlay::new();
+        loam_app::log::register_command(&mut console);
+        let perf = loam_app::trace::PerfOverlay::new();
 
         let mut app = Self {
             lines,
@@ -378,7 +378,7 @@ impl App for TesseractApp {
         // F3-toggle perf overlay; cheap when hidden.
         self.perf.show(ctx);
         // Mirror tracing events into the console (when `log on`), then draw it.
-        rye_app::log::pump_into(&mut self.console);
+        loam_app::log::pump_into(&mut self.console);
         self.console.ui(ctx, &mut ());
     }
 
@@ -388,9 +388,9 @@ impl App for TesseractApp {
 }
 
 fn main() -> Result<()> {
-    // `rye_app::run` handles native + wasm dispatch; the default `WasmConfig`
+    // `loam_app::run` handles native + wasm dispatch; the default `WasmConfig`
     // matches the standard `index.html` element IDs.
-    rye_app::run::<TesseractApp>(RunConfig {
+    loam_app::run::<TesseractApp>(RunConfig {
         window: WindowAttributes::default()
             .with_title("tesseract demo")
             .with_visible(false),

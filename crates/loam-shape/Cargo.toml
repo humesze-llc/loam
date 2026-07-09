@@ -1,0 +1,16 @@
+[package]
+name = "loam-shape"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Loam canonical geometric primitives: single Shape enum used by both loam-scene (rendering) and loam-physics (collision)."
+
+[dependencies]
+loam-math = { path = "../loam-math" }
+glam = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+ron = { workspace = true }

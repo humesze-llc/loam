@@ -7,8 +7,8 @@
 //! projects `log(rot_state)` onto the seq's net bivector direction so
 //! scrubbing preserves any perpendicular rotation already applied.
 
-use rye_app::egui;
-use rye_egui::{
+use loam_app::egui;
+use loam_egui::{
     dnd::{
         apply_drop_pre_pass as dnd_apply_drop_pre_pass,
         drag_source_collapsing as dnd_drag_source_collapsing, drop_target_idx, force_opaque_active,
@@ -16,7 +16,7 @@ use rye_egui::{
     },
     slider_with_edit,
 };
-use rye_math::{Bivector, Plane4, Rotor};
+use loam_math::{Bivector, Plane4, Rotor};
 
 use crate::consts::{CARD_ITEM_SPACING_X, CONTROL_H, MINI_BUTTON_W};
 use crate::state::{render_plane_sum, DeferredAction, Demo, DragPayload, RotorTerm};

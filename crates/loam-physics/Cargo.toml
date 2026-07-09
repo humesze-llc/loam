@@ -1,0 +1,14 @@
+[package]
+name = "loam-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Loam rigid-body physics: Space-generic integration, narrowphase dispatch, impulse solver."
+
+[dependencies]
+glam.workspace = true
+tracing.workspace = true
+loam-math  = { path = "../loam-math" }
+loam-shape = { path = "../loam-shape" }

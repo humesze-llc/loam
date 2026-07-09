@@ -1,4 +1,4 @@
-// Mandelbulb raymarcher: the fractal demo for Rye.
+// Mandelbulb raymarcher: the fractal demo for Loam.
 //
 // Edit this file while the example is running; the ShaderDb watcher
 // recompiles and RayMarchNode rebuilds on the next frame.
@@ -74,12 +74,12 @@ fn march_geodesic(ro_scene: vec3<f32>, rd_scene: vec3<f32>) -> MarchResult {
     // dependent. The inverse p_space/scale is only accurate at the origin.
     //
     // We therefore march Euclidean rays and apply Space geometry only where
-    // it is well-defined: in the fog computation via rye_distance. This gives
+    // it is well-defined: in the fog computation via loam_distance. This gives
     // correct curved-space attenuation (H³ fog grows faster; S³ fog saturates
     // at π) without phantom-surface artifacts from coordinate conversion error.
     //
-    // Future: add rye_origin_distance(p) to the Space ABI and use
-    //   p_scene = normalize(p_space) * rye_origin_distance(p_space) / scale
+    // Future: add loam_origin_distance(p) to the Space ABI and use
+    //   p_scene = normalize(p_space) * loam_origin_distance(p_space) / scale
     // to enable geodesic ray bending with a geometrically correct SDF lookup.
     var p = ro_scene;
     var t = 0.0;
@@ -135,7 +135,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let heat = mr.iters / 128.0;
         let miss = select(0.0, 1.0, mr.t < 0.0);
         // arc fill: green channel shows arc fraction consumed
-        let arc_frac = clamp(mr.t_arc / max(RYE_MAX_ARC, 1e-5), 0.0, 1.0);
+        let arc_frac = clamp(mr.t_arc / max(LOAM_MAX_ARC, 1e-5), 0.0, 1.0);
         return vec4<f32>(heat, arc_frac * (1.0 - miss), miss * 0.5, 1.0);
     }
 
@@ -149,9 +149,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let diffuse = max(dot(n, sun_dir), 0.0);
     let ambient = 0.15;
 
-    // Exercise the rye-math Space prelude: geodesic stepping is handled
-    // by rye_exp / rye_parallel_transport, and camera-to-hit fog uses
-    // rye_distance. Swapping the host Space changes both trajectory and
+    // Exercise the loam-math Space prelude: geodesic stepping is handled
+    // by loam_exp / loam_parallel_transport, and camera-to-hit fog uses
+    // loam_distance. Swapping the host Space changes both trajectory and
     // attenuation without rewriting the Mandelbulb SDF.
     //
     // `ball_scale` maps Euclidean scene coords into the unit Poincaré
@@ -161,7 +161,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // fully opaque.
     let scaled_pos = u.camera_pos * u.ball_scale;
     let scaled_hit = hit * u.ball_scale;
-    let cam_dist = rye_distance(scaled_pos, scaled_hit);
+    let cam_dist = loam_distance(scaled_pos, scaled_hit);
     let fog = clamp(cam_dist / u.fog_scale, 0.0, 1.0);
 
     let base = vec3<f32>(0.35 + 0.3 * n.x, 0.55 + 0.2 * n.y, 0.9);

@@ -2,8 +2,8 @@
 //! chord and great-circle-arc edge building, and per-cell w-slice helpers.
 
 use glam::{Vec3, Vec4};
-use rye_physics::polytope::Polytope4;
-use rye_shape::LineMesh;
+use loam_physics::polytope::Polytope4;
+use loam_shape::LineMesh;
 
 use crate::consts::{HYPERSLICE_MIN_THICKNESS, SPACE_TESSELLATION_SAMPLES};
 
@@ -68,19 +68,19 @@ pub(crate) const STEREOGRAPHIC_POLE_FAR_CAP: f32 = 1.0e4;
 
 /// Body-local projected-radius clip for a `projection` at the given
 /// `view_radius`, or `None` when the projection needs no clip. Only
-/// [`rye_math::Projection::Stereographic`] has a genuine point-at-infinity in
+/// [`loam_math::Projection::Stereographic`] has a genuine point-at-infinity in
 /// its image; the affine and Schlegel projections keep every sample. The radius
 /// is body-local, so the same 4D edge clips identically at every row slot.
 pub(crate) fn stereographic_clip_radius(
-    projection: &rye_math::Projection<4>,
+    projection: &loam_math::Projection<4>,
     view_radius: f32,
 ) -> Option<f32> {
     match *projection {
-        rye_math::Projection::Stereographic { .. } => Some(view_radius),
-        rye_math::Projection::Identity
-        | rye_math::Projection::Orthographic { .. }
-        | rye_math::Projection::Perspective4D { .. }
-        | rye_math::Projection::Schlegel { .. } => None,
+        loam_math::Projection::Stereographic { .. } => Some(view_radius),
+        loam_math::Projection::Identity
+        | loam_math::Projection::Orthographic { .. }
+        | loam_math::Projection::Perspective4D { .. }
+        | loam_math::Projection::Schlegel { .. } => None,
     }
 }
 
@@ -98,15 +98,17 @@ pub(crate) fn stereographic_clip_radius(
 /// [`crate::WireframeProjection`].
 pub(crate) fn perspective_scale_at_w(
     w_slice: f32,
-    projection: &rye_math::Projection<4>,
+    projection: &loam_math::Projection<4>,
 ) -> Option<f32> {
     match *projection {
-        rye_math::Projection::Identity | rye_math::Projection::Orthographic { .. } => Some(1.0),
-        rye_math::Projection::Perspective4D { focal_distance } => {
+        loam_math::Projection::Identity | loam_math::Projection::Orthographic { .. } => Some(1.0),
+        loam_math::Projection::Perspective4D { focal_distance } => {
             Some(focal_distance / (focal_distance - w_slice).max(PERSPECTIVE_SCALE_DENOM_EPSILON))
         }
         // Non-affine: no single-scalar shortcut; caller projects per-vertex.
-        rye_math::Projection::Schlegel { .. } | rye_math::Projection::Stereographic { .. } => None,
+        loam_math::Projection::Schlegel { .. } | loam_math::Projection::Stereographic { .. } => {
+            None
+        }
     }
 }
 
@@ -114,22 +116,22 @@ pub(crate) fn perspective_scale_at_w(
 /// edge can render as a single line between projected endpoints. `Identity` /
 /// `Orthographic` are linear, `Perspective4D` and `Schlegel` are central
 /// projections (line-preserving). Stereographic curves a sampled chord in R3.
-pub(crate) fn projection_maps_chords_to_lines(projection: &rye_math::Projection<4>) -> bool {
+pub(crate) fn projection_maps_chords_to_lines(projection: &loam_math::Projection<4>) -> bool {
     match *projection {
-        rye_math::Projection::Identity
-        | rye_math::Projection::Orthographic { .. }
-        | rye_math::Projection::Perspective4D { .. }
-        | rye_math::Projection::Schlegel { .. } => true,
-        rye_math::Projection::Stereographic { .. } => false,
+        loam_math::Projection::Identity
+        | loam_math::Projection::Orthographic { .. }
+        | loam_math::Projection::Perspective4D { .. }
+        | loam_math::Projection::Schlegel { .. } => true,
+        loam_math::Projection::Stereographic { .. } => false,
     }
 }
 
 /// Whether a flat wireframe edge (`blend == 0`) should render as the R3 chord
 /// between projected endpoints. Stereographic edges are always drawn as S3 arcs
 /// (`blend == 1`), so this chord path is the affine projections' geometry.
-pub(crate) fn flat_edge_uses_endpoint_chord(projection: &rye_math::Projection<4>) -> bool {
+pub(crate) fn flat_edge_uses_endpoint_chord(projection: &loam_math::Projection<4>) -> bool {
     match *projection {
-        rye_math::Projection::Stereographic { .. } => true,
+        loam_math::Projection::Stereographic { .. } => true,
         _ => projection_maps_chords_to_lines(projection),
     }
 }
@@ -161,7 +163,7 @@ pub(crate) fn cap_vertex_projected_and_world(
     p_r3: [f32; 3],
     w_slice: f32,
     section_scale: Option<f32>,
-    projection: &rye_math::Projection<4>,
+    projection: &loam_math::Projection<4>,
     body_pos_r3: Vec3,
 ) -> (Vec3, [f32; 3]) {
     match section_scale {
@@ -172,7 +174,7 @@ pub(crate) fn cap_vertex_projected_and_world(
         None => {
             let p4 = Vec4::new(p_r3[0], p_r3[1], p_r3[2], w_slice);
             let projected =
-                <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
                     p4, projection,
                 );
             (projected, (projected + body_pos_r3).to_array())
@@ -189,10 +191,10 @@ pub(crate) fn cap_vertex_projected_and_world(
 #[cfg(test)]
 pub(crate) fn project_to_world(
     p: Vec4,
-    projection: &rye_math::Projection<4>,
+    projection: &loam_math::Projection<4>,
     body_pos_r3: Vec3,
 ) -> Vec3 {
-    <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(p, projection)
+    <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(p, projection)
         + body_pos_r3
 }
 
@@ -240,7 +242,7 @@ pub(crate) fn cell_w_range(cell: &[u32], local_vertices: &[Vec4]) -> (f32, f32) 
 /// chord geometry is unchanged (each sample `a.lerp(b, s)`); only the polyline
 /// is refined. Colors lerp linearly, matching [`push_blended_edge`].
 ///
-/// Under [`rye_math::Projection::Stereographic`] a sub-segment is emitted only
+/// Under [`loam_math::Projection::Stereographic`] a sub-segment is emitted only
 /// when both endpoints are within the clip radius; near-pole samples are dropped
 /// rather than rescaled (rescaling keeps the pole-crossing direction flip), and
 /// the polyline resumes from the next in-bounds sample without bridging the gap.
@@ -255,7 +257,7 @@ pub(crate) fn push_projected_chord(
     color_a: [f32; 4],
     color_b: [f32; 4],
     width: f32,
-    projection: &rye_math::Projection<4>,
+    projection: &loam_math::Projection<4>,
     body_pos_r3: Vec3,
     view_radius: f32,
 ) {
@@ -263,7 +265,7 @@ pub(crate) fn push_projected_chord(
     let clip_radius = stereographic_clip_radius(projection, view_radius);
     // Returns the pre-translate projected point (clip test) and world point (mesh).
     let sample_at = |p4: Vec4| {
-        let projected = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+        let projected = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
             p4, projection,
         );
         (projected, (projected + body_pos_r3).to_array())
@@ -409,15 +411,15 @@ pub(crate) fn push_clipped_subsegment(
 /// is. Outside the band, and for non-stereographic projections, this is exactly
 /// `project_point`. The exact pole has no outward direction, so it is left at
 /// the origin (the map's pole-to-origin value).
-pub(crate) fn stereographic_view_point(p: Vec4, projection: &rye_math::Projection<4>) -> Vec3 {
+pub(crate) fn stereographic_view_point(p: Vec4, projection: &loam_math::Projection<4>) -> Vec3 {
     let proj =
-        <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(p, projection);
-    let rye_math::Projection::Stereographic { pole } = projection else {
+        <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(p, projection);
+    let loam_math::Projection::Stereographic { pole } = projection else {
         return proj;
     };
     let dot = p.normalize().dot(*pole).clamp(-1.0, 1.0);
     let raw = 1.0 - dot;
-    if raw < rye_math::STEREOGRAPHIC_POLE_EPSILON && proj.length() > MIN_EDGE_RADIUS {
+    if raw < loam_math::STEREOGRAPHIC_POLE_EPSILON && proj.length() > MIN_EDGE_RADIUS {
         let true_mag = ((1.0 + dot) / raw.max(f32::MIN_POSITIVE))
             .sqrt()
             .min(STEREOGRAPHIC_POLE_FAR_CAP);
@@ -490,7 +492,7 @@ pub(crate) fn push_blended_edge(
     color_b: [f32; 4],
     width: f32,
     blend: f32,
-    projection: &rye_math::Projection<4>,
+    projection: &loam_math::Projection<4>,
     body_pos_r3: Vec3,
     slerp_scratch: &mut Vec<Vec4>,
     view_radius: f32,
@@ -499,12 +501,14 @@ pub(crate) fn push_blended_edge(
     if blend <= 0.0 {
         if flat_edge_uses_endpoint_chord(projection) {
             let clip_radius = stereographic_clip_radius(projection, view_radius);
-            let a3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
-                a, projection,
-            );
-            let b3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
-                b, projection,
-            );
+            let a3_local =
+                <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
+                    a, projection,
+                );
+            let b3_local =
+                <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
+                    b, projection,
+                );
             if sample_in_radius(a3_local, clip_radius) && sample_in_radius(b3_local, clip_radius) {
                 mesh.segments.push((
                     (a3_local + body_pos_r3).to_array(),
@@ -537,12 +541,14 @@ pub(crate) fn push_blended_edge(
         // (never reached for regular polytopes; guards degenerate input).
         if flat_edge_uses_endpoint_chord(projection) {
             let clip_radius = stereographic_clip_radius(projection, view_radius);
-            let a3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
-                a, projection,
-            );
-            let b3_local = <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
-                b, projection,
-            );
+            let a3_local =
+                <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
+                    a, projection,
+                );
+            let b3_local =
+                <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
+                    b, projection,
+                );
             if sample_in_radius(a3_local, clip_radius) && sample_in_radius(b3_local, clip_radius) {
                 mesh.segments.push((
                     (a3_local + body_pos_r3).to_array(),
@@ -573,7 +579,7 @@ pub(crate) fn push_blended_edge(
     let p0u = a / radius_a;
     let p1u = b / radius_b;
     slerp_scratch.clear();
-    <rye_math::SphericalS3Embedded as rye_math::RasterizableSpace<4>>::tessellate_segment(
+    <loam_math::SphericalS3Embedded as loam_math::RasterizableSpace<4>>::tessellate_segment(
         p0u,
         p1u,
         samples,

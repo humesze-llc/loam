@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-    <title>Polytope Playground &middot; Rye</title>
+    <title>Polytope Playground &middot; Loam</title>
 
     <!-- `polytope_playground` is a workspace member crate (promoted from the
          `examples/` tree because Trunk's wasm pipeline can only target `[[bin]]`,
@@ -20,7 +20,7 @@
          `<script type="module">` (immediately above this comment in source
          order) containing the import path to the hashed wasm bundle. This
          synchronous script regex-extracts the URL into
-         `window.__rye_wasm_url` so the main-thread Rust code can spawn a
+         `window.__loam_wasm_url` so the main-thread Rust code can spawn a
          Worker pointing at the same bundle. Generic across demo names --
          picks the first `.js` import in any module script. -->
     <script>
@@ -28,7 +28,7 @@
         for (const s of document.querySelectorAll('script[type="module"]')) {
           const m = s.textContent.match(/from\s*['"]([^'"]+\.js)['"]/);
           if (m) {
-            window.__rye_wasm_url = new URL(m[1], document.baseURI).href;
+            window.__loam_wasm_url = new URL(m[1], document.baseURI).href;
             return;
           }
         }
@@ -47,38 +47,38 @@
                          "Helvetica Neue", Arial, sans-serif;
             overflow: hidden;
         }
-        #rye-canvas-host {
+        #loam-canvas-host {
             position: absolute;
             inset: 0;
         }
-        #rye-canvas-host canvas {
+        #loam-canvas-host canvas {
             width: 100%;
             height: 100%;
             display: block;
             background: #0e0e12;
         }
-        /* `.rye-demo-launch` (the click-to-start overlay) is injected by
-           `rye_app::wasm::launch::inject_launch_overlay` along with its
+        /* `.loam-demo-launch` (the click-to-start overlay) is injected by
+           `loam_app::wasm::launch::inject_launch_overlay` along with its
            CSS. Override by shipping a stylesheet later in the cascade.
-           The static `#rye-page-loader` spinner that covers the
-           wasm-init window is inlined into `#rye-canvas-host` below
+           The static `#loam-page-loader` spinner that covers the
+           wasm-init window is inlined into `#loam-canvas-host` below
            via `data-trunk rel="inline"`; the engine removes it once
            the worker posts `preview_ready`. */
     </style>
 </head>
 <body>
     <!-- `data-mode="manual"` opts into click-to-start. The wasm runtime
-         sees this attribute, injects the `#rye-launch` overlay as a child
+         sees this attribute, injects the `#loam-launch` overlay as a child
          of this host, installs a one-shot click handler that transfers
-         `#rye-canvas` to a fresh Worker on click, and runs the App
+         `#loam-canvas` to a fresh Worker on click, and runs the App
          lifecycle inside the worker. Remove the attribute for auto-start
          on page load (legacy main-thread mode). -->
-    <div id="rye-canvas-host" data-mode="manual">
-        <canvas id="rye-canvas" width="1280" height="800"></canvas>
+    <div id="loam-canvas-host" data-mode="manual">
+        <canvas id="loam-canvas" width="1280" height="800"></canvas>
         <!-- Engine-owned static spinner. The fragment lives in
-             `crates/rye-app/static/page_loader.html`; Trunk inlines it
+             `crates/loam-app/static/page_loader.html`; Trunk inlines it
              here at build time. -->
-        <link data-trunk rel="inline" href="../rye-app/static/page_loader.html" />
+        <link data-trunk rel="inline" href="../loam-app/static/page_loader.html" />
     </div>
 </body>
 </html>

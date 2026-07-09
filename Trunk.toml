@@ -1,4 +1,4 @@
-# Trunk: wasm packager for the rye engine demos.
+# Trunk: wasm packager for the loam engine demos.
 #
 # Tested with Trunk 0.21.x. Trunk is a local-dev tool only: it is NOT in the
 # CI build path (the `wasm-build` job in .github/workflows/ci.yml runs raw
@@ -19,12 +19,12 @@
 # `--no-default-features` (the `data-cargo-no-default-features` attribute in each
 # index.html). Default features are off because the `capture` feature drags in
 # native-only PNG / GIF / APNG encoder crates that don't build on wasm32. The cfg
-# dispatch in `crates/rye-app/src/lib.rs` and `crates/rye-app/src/capture_stub.rs`
+# dispatch in `crates/loam-app/src/lib.rs` and `crates/loam-app/src/capture_stub.rs`
 # keeps the public API surface identical.
 #
 # We promoted `polytope_playground` from `examples/` to a workspace member crate
 # because Trunk's wasm pipeline can only target `[[bin]]`, not `[[example]]`. Other
-# rye demos that need browser builds will follow the same pattern.
+# loam demos that need browser builds will follow the same pattern.
 
 [build]
 # Per-build output directory. Each example writes its bundle into

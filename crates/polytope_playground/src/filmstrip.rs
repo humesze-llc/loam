@@ -1,11 +1,11 @@
 //! Filmstrip view: one polytope sampled across `w`, `t`, or both (a
 //! 2D grid). The grid split lives in
-//! `rye_render::Viewport::split_vertical`; this module owns the
+//! `loam_render::Viewport::split_vertical`; this module owns the
 //! per-cell controls and the axis-label overlay.
 
-use rye_app::egui;
-use rye_physics::polytope::Polytope4;
-use rye_render::raymarch::RaymarchShape;
+use loam_app::egui;
+use loam_physics::polytope::Polytope4;
+use loam_render::raymarch::RaymarchShape;
 
 use crate::catalog::render_shape_catalog_menu;
 use crate::consts::BODY_SIZE;

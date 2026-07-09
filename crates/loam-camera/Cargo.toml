@@ -1,0 +1,13 @@
+[package]
+name = "loam-camera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Loam camera controllers: orbit and first-person."
+
+[dependencies]
+glam.workspace = true
+loam-input = { path = "../loam-input" }
+loam-math  = { path = "../loam-math" }

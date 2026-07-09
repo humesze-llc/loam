@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-    <title>Tesseract &middot; Rye</title>
+    <title>Tesseract &middot; Loam</title>
 
     <!-- Standalone workspace crate; Trunk picks up the implicit `[[bin]]` from
          `src/main.rs`. `data-cargo-no-default-features` drops the `capture`
@@ -38,7 +38,7 @@
         for (const s of document.querySelectorAll('script[type="module"]')) {
           const m = s.textContent.match(/from\s*['"]([^'"]+\.js)['"]/);
           if (m) {
-            window.__rye_wasm_url = new URL(m[1], document.baseURI).href;
+            window.__loam_wasm_url = new URL(m[1], document.baseURI).href;
             return;
           }
         }
@@ -57,36 +57,36 @@
                          "Helvetica Neue", Arial, sans-serif;
             overflow: hidden;
         }
-        #rye-canvas-host {
+        #loam-canvas-host {
             position: absolute;
             inset: 0;
         }
-        #rye-canvas-host canvas {
+        #loam-canvas-host canvas {
             width: 100%;
             height: 100%;
             display: block;
             background: #0e0e12;
         }
-        /* `.rye-demo-launch` (the click-to-start overlay) is injected by
-           `rye_app::wasm::launch::inject_launch_overlay` along with its
+        /* `.loam-demo-launch` (the click-to-start overlay) is injected by
+           `loam_app::wasm::launch::inject_launch_overlay` along with its
            CSS. Override by shipping a stylesheet later in the cascade.
-           The static `#rye-page-loader` spinner that covers the
-           wasm-init window is inlined into `#rye-canvas-host` below
+           The static `#loam-page-loader` spinner that covers the
+           wasm-init window is inlined into `#loam-canvas-host` below
            via `data-trunk rel="inline"`. */
     </style>
 </head>
 <body>
-    <div id="rye-canvas-host" data-mode="manual">
+    <div id="loam-canvas-host" data-mode="manual">
         <!-- Explicit `<canvas>` in the DOM up front so the main thread
              can `transferControlToOffscreen()` it on click. Width/height
              attributes are a fallback; the launcher recomputes the
              physical-pixel size at click time from CSS dimensions × DPR
              before transferring. The overlay button is appended at
              runtime by the engine. -->
-        <canvas id="rye-canvas" width="1280" height="800"></canvas>
+        <canvas id="loam-canvas" width="1280" height="800"></canvas>
         <!-- Engine-owned static spinner; see polytope_playground for the
              rationale. Removed by the wasm runtime on preview_ready. -->
-        <link data-trunk rel="inline" href="../rye-app/static/page_loader.html" />
+        <link data-trunk rel="inline" href="../loam-app/static/page_loader.html" />
     </div>
 </body>
 </html>

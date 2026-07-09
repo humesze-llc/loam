@@ -1,19 +1,19 @@
 [workspace]
 members = [
-  "crates/rye-math",
-  "crates/rye-shape",
-  "crates/rye-scene",
-  "crates/rye-time",
-  "crates/rye-shader",
-  "crates/rye-render",
-  "crates/rye-asset",
-  "crates/rye-input",
-  "crates/rye-camera",
-  "crates/rye-player",
-  "crates/rye-physics",
-  "crates/rye-app",
-  "crates/rye-text",
-  "crates/rye-egui",
+  "crates/loam-math",
+  "crates/loam-shape",
+  "crates/loam-scene",
+  "crates/loam-time",
+  "crates/loam-shader",
+  "crates/loam-render",
+  "crates/loam-asset",
+  "crates/loam-input",
+  "crates/loam-camera",
+  "crates/loam-player",
+  "crates/loam-physics",
+  "crates/loam-app",
+  "crates/loam-text",
+  "crates/loam-egui",
   "crates/polytope_playground",
   "crates/tesseract_demo",
 ]
@@ -24,7 +24,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
 authors = ["Zach Humes <humesze@gmail.com>"]
-repository = "https://github.com/humesze-llc/rye"
+repository = "https://github.com/humesze-llc/loam"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -49,28 +49,28 @@ notify = "6"
 web-time = "1"
 
 [package]
-name = "rye"
+name = "loam"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Rye: a Rust game engine with non-Euclidean geometry as a primitive"
+description = "Loam: a Rust game engine with non-Euclidean geometry as a primitive"
 
 [dependencies]
-rye-math      = { path = "crates/rye-math" }
-rye-scene     = { path = "crates/rye-scene" }
-rye-shape     = { path = "crates/rye-shape" }
-rye-time      = { path = "crates/rye-time" }
-rye-shader    = { path = "crates/rye-shader" }
-rye-render    = { path = "crates/rye-render" }
-rye-asset     = { path = "crates/rye-asset" }
-rye-input     = { path = "crates/rye-input" }
-rye-camera    = { path = "crates/rye-camera" }
-rye-player    = { path = "crates/rye-player" }
-rye-physics   = { path = "crates/rye-physics" }
-rye-app       = { path = "crates/rye-app" }
-rye-text      = { path = "crates/rye-text" }
+loam-math      = { path = "crates/loam-math" }
+loam-scene     = { path = "crates/loam-scene" }
+loam-shape     = { path = "crates/loam-shape" }
+loam-time      = { path = "crates/loam-time" }
+loam-shader    = { path = "crates/loam-shader" }
+loam-render    = { path = "crates/loam-render" }
+loam-asset     = { path = "crates/loam-asset" }
+loam-input     = { path = "crates/loam-input" }
+loam-camera    = { path = "crates/loam-camera" }
+loam-player    = { path = "crates/loam-player" }
+loam-physics   = { path = "crates/loam-physics" }
+loam-app       = { path = "crates/loam-app" }
+loam-text      = { path = "crates/loam-text" }
 
 [features]
 default = []
@@ -86,4 +86,4 @@ tracing-subscriber = { workspace = true }
 glam = { workspace = true }
 png = "0.17"
 gif = "0.13"
-rye-egui = { path = "crates/rye-egui" }
+loam-egui = { path = "crates/loam-egui" }

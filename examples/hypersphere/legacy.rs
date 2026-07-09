@@ -50,16 +50,16 @@ use std::time::Instant;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec4;
-use rye_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx, TickCtx};
-use rye_camera::OrbitCamera;
-use rye_math::{EuclideanR3, EuclideanR4};
-use rye_physics::{
+use loam_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx, TickCtx};
+use loam_camera::OrbitCamera;
+use loam_math::{EuclideanR3, EuclideanR4};
+use loam_physics::{
     euclidean_r4::{halfspace4_body_r4, register_default_narrowphase, sphere_body_r4},
     field::Gravity,
     World,
 };
-use rye_render::{device::RenderDevice, graph::RenderNode};
-use rye_shader::ShaderId;
+use loam_render::{device::RenderDevice, graph::RenderNode};
+use loam_shader::ShaderId;
 use wgpu::{util::DeviceExt, *};
 use winit::{
     event::{ElementState, WindowEvent},
@@ -74,7 +74,7 @@ fn shader_path() -> PathBuf {
     shader_dir().join("hypersphere.wgsl")
 }
 
-const TITLE: &str = "Rye - hypersphere w-slice (live)";
+const TITLE: &str = "Loam - hypersphere w-slice (live)";
 const RADIUS_4D: f32 = 1.0;
 /// Offset range: ±1.5 covers the full ball (radius 1) plus margin so
 /// the user can scrub past the poles and watch the cross-section
@@ -107,7 +107,7 @@ impl Args {
                         .clamp(1, MAX_BODIES);
                 }
                 "-h" | "--help" => {
-                    println!("rye hypersphere w-slice viewer (legacy bespoke-shader path)");
+                    println!("loam hypersphere w-slice viewer (legacy bespoke-shader path)");
                     println!();
                     println!("Usage: cargo run --example hypersphere -- --legacy [options]");
                     println!();
@@ -590,7 +590,7 @@ impl App for LegacyHypersphereApp {
 /// Entry point for the legacy bespoke-shader path. Invoked by the
 /// outer `main` when `--legacy` is on the CLI.
 ///
-/// Now runs through `rye-app`'s framework like every other example;
+/// Now runs through `loam-app`'s framework like every other example;
 /// the "legacy" name persists because this kept the bespoke shader
 /// (volumetric ghost mode) when the parent `hypersphere` migrated
 /// to the slim `Hyperslice4DNode` path. Both are kept around so

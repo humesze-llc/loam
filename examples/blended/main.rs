@@ -30,14 +30,16 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use glam::Vec3;
-use rye_app::{run_with_config, App, Camera, FirstPersonController, FrameCtx, RunConfig, SetupCtx};
-use rye_camera::CameraController;
-use rye_math::{BlendedSpace, EuclideanR3, HyperbolicH3, LinearBlendX};
-use rye_render::{
+use loam_app::{
+    run_with_config, App, Camera, FirstPersonController, FrameCtx, RunConfig, SetupCtx,
+};
+use loam_camera::CameraController;
+use loam_math::{BlendedSpace, EuclideanR3, HyperbolicH3, LinearBlendX};
+use loam_render::{
     device::RenderDevice,
     raymarch::{RayMarchNode, RayMarchUniforms},
 };
-use rye_shader::ShaderId;
+use loam_shader::ShaderId;
 use winit::window::WindowAttributes;
 
 type DemoSpace = BlendedSpace<EuclideanR3, HyperbolicH3, LinearBlendX>;
@@ -61,7 +63,7 @@ fn sphere_x(i: i32) -> f32 { return -0.7 + 0.2 * f32(i); }
 const SPHERE_Y: f32 = 0.12;
 const SPHERE_R: f32 = 0.06;
 
-fn rye_scene_sdf(p: vec3<f32>) -> f32 {
+fn loam_scene_sdf(p: vec3<f32>) -> f32 {
     // Floor as a chart-coordinate horizontal plane at y=0. On the
     // pure-H³ side this is a hyperbolic plane and renders as a
     // spherical cap in Poincaré coordinates, that's geometrically
@@ -138,7 +140,7 @@ impl App for BlendedApp {
         // Re-derive the basis from the initial yaw/pitch.
         let mut look = look;
         look.advance(
-            rye_input::FrameInput::default(),
+            loam_input::FrameInput::default(),
             &mut camera,
             &EuclideanR3,
             0.0,
@@ -171,7 +173,7 @@ impl App for BlendedApp {
         let look_input = if ctx.input.left_mouse_down {
             ctx.input
         } else {
-            rye_input::FrameInput {
+            loam_input::FrameInput {
                 mouse_delta: glam::Vec2::ZERO,
                 ..ctx.input
             }
@@ -232,14 +234,14 @@ impl App for BlendedApp {
     }
 
     fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
-        use rye_render::graph::RenderNode;
+        use loam_render::graph::RenderNode;
         self.ray_march.execute(rd, view)
     }
 
     fn title(&self, fps: f32) -> std::borrow::Cow<'static, str> {
         let p = self.camera.view().position;
         std::borrow::Cow::Owned(format!(
-            "Rye - BlendedSpace<E3,H3> | {fps:.0} fps | pos ({:.2}, {:.2}, {:.2})",
+            "Loam - BlendedSpace<E3,H3> | {fps:.0} fps | pos ({:.2}, {:.2}, {:.2})",
             p.x, p.y, p.z
         ))
     }
@@ -248,7 +250,7 @@ impl App for BlendedApp {
 fn main() -> Result<()> {
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("Rye - BlendedSpace<E3,H3>")
+            .with_title("Loam - BlendedSpace<E3,H3>")
             .with_visible(false),
         ..RunConfig::default()
     };

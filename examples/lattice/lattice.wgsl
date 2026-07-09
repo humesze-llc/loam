@@ -1,11 +1,11 @@
 // Geodesic lattice demo: user shading layer.
 //
 // The Space prelude, scene SDF, and geodesic march kernel are prepended by
-// rye-shader (or the local assemble() call) before this file is compiled.
+// loam-shader (or the local assemble() call) before this file is compiled.
 // Available functions:
-//   rye_safe_normalize, rye_march_geodesic, rye_estimate_normal (kernel)
-//   rye_distance, rye_exp, rye_parallel_transport (Space prelude)
-//   rye_scene_sdf (scene module)
+//   loam_safe_normalize, loam_march_geodesic, loam_estimate_normal (kernel)
+//   loam_distance, loam_exp, loam_parallel_transport (Space prelude)
+//   loam_scene_sdf (scene module)
 //
 // Uniforms.params layout (see main.rs):
 //   params[0] = panel x pixel offset  (e.g. 0, W/3, 2W/3)
@@ -47,7 +47,7 @@ fn panel_ray_dir(frag_pos: vec4<f32>) -> vec3<f32> {
     let py = frag_pos.y;
     let uv = vec2<f32>(px / panel_w, py / panel_h) * 2.0 - 1.0;
     let aspect = panel_w / panel_h;
-    return rye_safe_normalize(
+    return loam_safe_normalize(
         ub.camera_forward
             + ub.camera_right * ( uv.x * aspect * ub.fov_y_tan)
             + ub.camera_up    * (-uv.y          * ub.fov_y_tan),
@@ -72,22 +72,22 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
     let sky_t = 0.5 + 0.5 * rd.y;
     let sky   = mix(vec3<f32>(0.05, 0.04, 0.08), accent * 0.55, sky_t);
 
-    let march = rye_march_geodesic(ub.camera_pos, rd, BALL_SCALE);
+    let march = loam_march_geodesic(ub.camera_pos, rd, BALL_SCALE);
     var col: vec3<f32>;
 
     if march.w < 0.0 {
         col = sky;
     } else {
         let hit_p   = march.xyz;
-        let n       = rye_estimate_normal(hit_p, BALL_SCALE);
-        let sun_dir = rye_safe_normalize(vec3<f32>(0.5, 0.9, 0.3), vec3<f32>(0.0, 1.0, 0.0));
+        let n       = loam_estimate_normal(hit_p, BALL_SCALE);
+        let sun_dir = loam_safe_normalize(vec3<f32>(0.5, 0.9, 0.3), vec3<f32>(0.0, 1.0, 0.0));
         let diff    = max(dot(n, sun_dir), 0.0);
         let rim     = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
         let base    = accent * 0.82;
         col = base * (0.15 + 0.75 * diff) + rim * 0.28 * accent;
 
         // Geodesic fog from camera to hit point.
-        let fog_dist = rye_distance(ub.camera_pos * BALL_SCALE, hit_p);
+        let fog_dist = loam_distance(ub.camera_pos * BALL_SCALE, hit_p);
         let fog      = exp(-fog_dist / max(fog_sc, 1e-4));
         col = mix(sky, col, fog);
     }

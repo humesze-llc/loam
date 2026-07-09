@@ -1,6 +1,6 @@
 //! Rasterization-pipeline development playground.
 //!
-//! Renders a curated test scene of line-segment primitives via [`rye_render::LineRasterNode`]:
+//! Renders a curated test scene of line-segment primitives via [`loam_render::LineRasterNode`]:
 //! world-axes for depth perception, a unit cube wireframe, a width sweep (1 / 2 / 4 / 8 px) to
 //! visually check AA at different widths, a color-gradient line, and a fan of tilted lines to
 //! validate AA at all screen-space orientations. Used to validate the rasterizer pipeline in
@@ -11,7 +11,7 @@
 //! - **Mouse left-drag**: orbit camera.
 //! - **Scroll**: zoom.
 //! - **Esc**: exit.
-//! - **\` (backtick)**: toggle console (default `rye-egui` bind).
+//! - **\` (backtick)**: toggle console (default `loam-egui` bind).
 //!
 //! ## Console commands
 //!
@@ -36,14 +36,16 @@ use std::borrow::Cow;
 
 use anyhow::Result;
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use rye_app::{egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
-use rye_egui::{Console, ConsoleWriter};
-use rye_math::{EuclideanR3, EuclideanR4, Projection, WPlane};
-use rye_physics::polytope::{polytope_section_overlay_with_vertices, Polytope4};
-use rye_render::{
+use loam_app::{
+    egui, run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx,
+};
+use loam_egui::{Console, ConsoleWriter};
+use loam_math::{EuclideanR3, EuclideanR4, Projection, WPlane};
+use loam_physics::polytope::{polytope_section_overlay_with_vertices, Polytope4};
+use loam_render::{
     device::RenderDevice, DepthBuffer, DepthMode, LineRasterNode, TriangleRasterNode,
 };
-use rye_shape::{LineMesh, TriangleMesh};
+use loam_shape::{LineMesh, TriangleMesh};
 use winit::window::WindowAttributes;
 
 /// R⁴ scale factor for the polytope wireframe. Polytope vertices live on the unit
@@ -269,7 +271,7 @@ struct Demo {
     triangle_raster: TriangleRasterNode,
     /// Triangle rasterizer for the active polytope's cross-section caps (filled). Translucent
     /// white per-cell triangulation produced by
-    /// [`rye_physics::polytope::polytope_section_overlay_with_vertices`].
+    /// [`loam_physics::polytope::polytope_section_overlay_with_vertices`].
     section_triangles: TriangleRasterNode,
     /// Line rasterizer for the active polytope's cross-section perimeter (bright cyan edges
     /// around each cap polygon). Same pipeline shape as `line_raster_r3`.
@@ -316,14 +318,14 @@ impl Demo {
             &ctx.rd.device,
             ctx.rd.surface_bundle.config.format,
             depth_mode,
-            rye_render::FragmentShading::Flat,
+            loam_render::FragmentShading::Flat,
             ctx.rd.sample_count(),
         );
         let section_triangles = TriangleRasterNode::new(
             &ctx.rd.device,
             ctx.rd.surface_bundle.config.format,
             depth_mode,
-            rye_render::FragmentShading::Flat,
+            loam_render::FragmentShading::Flat,
             ctx.rd.sample_count(),
         );
         let section_edges = LineRasterNode::new(
@@ -468,7 +470,7 @@ impl Demo {
     }
 
     fn update(&mut self, ctx: &mut FrameCtx<'_>) {
-        use rye_camera::CameraController;
+        use loam_camera::CameraController;
         if !ctx.ui_has_focus {
             self.orbit
                 .advance(ctx.input, &mut self.camera, &EuclideanR3, 0.0);
@@ -583,7 +585,7 @@ struct RasterTestApp {
     /// `capture panel` console command or the F11 default bind. The framework runner reads the
     /// post-UI swapchain after every frame, so png / gif / apng / frame-sequence output works
     /// without any per-app render code.
-    capture_panel: rye_app::capture::CapturePanel,
+    capture_panel: loam_app::capture::CapturePanel,
 }
 
 impl RasterTestApp {
@@ -593,7 +595,7 @@ impl RasterTestApp {
         // The framework parses on/off for toggle subs, completes polytope names at the value
         // slot only when the user has typed `tests polytope ` (context-aware completion).
         c.register(
-            rye_egui::subcommands::<Demo>("tests", "toggle what renders in raster_test")
+            loam_egui::subcommands::<Demo>("tests", "toggle what renders in raster_test")
                 .toggle(
                     "all",
                     "toggle every R³ raster-test category at once",
@@ -712,7 +714,7 @@ impl RasterTestApp {
                     },
                 ),
         );
-        c.register(rye_egui::cmd(
+        c.register(loam_egui::cmd(
             "samples",
             "set tessellation samples-per-segment (default 1)",
             |args, demo: &mut Demo, _out: &mut ConsoleWriter| {
@@ -728,7 +730,7 @@ impl RasterTestApp {
                 Ok(())
             },
         ));
-        c.register(rye_egui::cmd(
+        c.register(loam_egui::cmd(
             "reset",
             "restore all toggles to default (everything on, samples = 1, no polytope)",
             |_args, demo: &mut Demo, _out: &mut ConsoleWriter| {
@@ -743,11 +745,11 @@ impl RasterTestApp {
         // Framework-provided capture: `capture png [pre|post|both] [dir]`,
         // `capture frames|gif|apng [pre|post|both] [dir]`, `capture stop`, `capture panel`.
         // Bound to F12 (one-shot png), F9 (toggle gif sequence), F11 (panel).
-        rye_app::capture::register_commands(&mut c);
-        rye_app::capture::bind_default_hotkeys(&mut c);
+        loam_app::capture::register_commands(&mut c);
+        loam_app::capture::bind_default_hotkeys(&mut c);
 
         // Standard framework log mirror so tracing events show up in the console scrollback.
-        rye_app::log::register_command(&mut c);
+        loam_app::log::register_command(&mut c);
         c
     }
 }
@@ -762,7 +764,7 @@ impl App for RasterTestApp {
             demo,
             console,
             last_egui_keyboard: false,
-            capture_panel: rye_app::capture::CapturePanel::new(),
+            capture_panel: loam_app::capture::CapturePanel::new(),
         })
     }
 
@@ -779,7 +781,7 @@ impl App for RasterTestApp {
     }
 
     fn title(&self, fps: f32) -> Cow<'static, str> {
-        Cow::Owned(format!("rye: raster_test  {fps:.0} fps"))
+        Cow::Owned(format!("loam: raster_test  {fps:.0} fps"))
     }
 
     fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
@@ -839,7 +841,7 @@ impl App for RasterTestApp {
                 ui.label("orbit: drag, zoom: scroll, exit: Esc");
             });
         self.capture_panel.show(ctx);
-        rye_app::log::pump_into(&mut self.console);
+        loam_app::log::pump_into(&mut self.console);
         self.console.ui(ctx, &mut self.demo);
         self.last_egui_keyboard = ctx.wants_keyboard_input();
     }
@@ -854,7 +856,7 @@ impl App for RasterTestApp {
 fn main() -> Result<()> {
     let cfg = RunConfig {
         window: WindowAttributes::default()
-            .with_title("rye: raster_test")
+            .with_title("loam: raster_test")
             .with_visible(false),
         ..RunConfig::default()
     };

@@ -1,0 +1,15 @@
+[package]
+name = "loam-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Loam text rendering: minimal-deps ab_glyph-backed screen-space text overlay. For full UI use loam-egui."
+
+[dependencies]
+wgpu      = { workspace = true }
+bytemuck  = { workspace = true }
+ab_glyph  = "0.2"
+anyhow    = { workspace = true }
+tracing   = { workspace = true }

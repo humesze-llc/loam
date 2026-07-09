@@ -4,7 +4,7 @@
 //!
 //! ## Two implementations in one binary
 //!
-//! - **Default (no flag): `rye-app` + `Hyperslice4DNode`.** Uses
+//! - **Default (no flag): `loam-app` + `Hyperslice4DNode`.** Uses
 //!   the new framework: `App` trait, `Camera<S>`, dynamic-body
 //!   uniform array. Slice-mode only.
 //! - **`--legacy`: hand-rolled custom-shader path.** The
@@ -42,21 +42,21 @@ use std::borrow::Cow;
 
 use anyhow::Result;
 use glam::{Vec3, Vec4};
-use rye_app::{run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
-use rye_math::{EuclideanR3, EuclideanR4};
-use rye_physics::{
+use loam_app::{run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use loam_math::{EuclideanR3, EuclideanR4};
+use loam_physics::{
     euclidean_r4::{halfspace4_body_r4, register_default_narrowphase, sphere_body_r4},
     field::Gravity,
     World,
 };
-use rye_render::{
+use loam_render::{
     device::RenderDevice,
     graph::RenderNode,
     raymarch::{
         polytope_stub_sdfs_wgsl, BodyUniform, Hyperslice4DNode, HYPERSLICE_KERNEL_WGSL, MAX_BODIES,
     },
 };
-use rye_scene::{Scene4, SceneNode4};
+use loam_scene::{Scene4, SceneNode4};
 use winit::window::WindowAttributes;
 
 const RADIUS_4D: f32 = 1.0;
@@ -222,7 +222,7 @@ impl App for HypersphereApp {
         &self.space
     }
 
-    fn tick(&mut self, dt: f32, _ctx: &mut rye_app::TickCtx) {
+    fn tick(&mut self, dt: f32, _ctx: &mut loam_app::TickCtx) {
         if !self.paused {
             self.world.step(dt);
         }
@@ -242,7 +242,7 @@ impl App for HypersphereApp {
         }
 
         // Camera.
-        use rye_camera::CameraController;
+        use loam_camera::CameraController;
         self.orbit
             .advance(ctx.input, &mut self.camera, &EuclideanR3, 0.0);
         let view = self.camera.view();
@@ -322,7 +322,7 @@ impl App for HypersphereApp {
         let mode = if self.auto_sweep { "auto" } else { "manual" };
         let w_eff = p.w + self.w_offset;
         Cow::Owned(format!(
-            "Rye - hypersphere (rye-app) | {fps:.0} fps | n={n} | offset={:+.2} ({mode}) w₀={:+.2}{pause} | pos[0].y={:+.2} pos[0].w={:+.2}",
+            "Loam - hypersphere (loam-app) | {fps:.0} fps | n={n} | offset={:+.2} ({mode}) w₀={:+.2}{pause} | pos[0].y={:+.2} pos[0].w={:+.2}",
             self.w_offset, w_eff, p.y, p.w
         ))
     }
@@ -352,7 +352,7 @@ fn main() -> Result<()> {
     let count = parse_count();
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("Rye - hypersphere (rye-app)")
+            .with_title("Loam - hypersphere (loam-app)")
             .with_visible(false),
         ..RunConfig::default()
     };

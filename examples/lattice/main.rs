@@ -19,14 +19,14 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use rye_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx};
-use rye_camera::OrbitCamera;
-use rye_math::{EuclideanR3, HyperbolicH3, SphericalS3, WgslSpace};
-use rye_render::{
+use loam_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx};
+use loam_camera::OrbitCamera;
+use loam_math::{EuclideanR3, HyperbolicH3, SphericalS3, WgslSpace};
+use loam_render::{
     device::RenderDevice,
     raymarch::{GeodesicRayMarchNode, RayMarchUniforms},
 };
-use rye_shader::{validate_wgsl, GEODESIC_MARCH_KERNEL};
+use loam_shader::{validate_wgsl, GEODESIC_MARCH_KERNEL};
 use winit::window::WindowAttributes;
 
 mod scene;
@@ -51,9 +51,9 @@ fn shader_path() -> PathBuf {
 /// Assemble Space prelude + scene SDF + geodesic kernel + user shader.
 fn assemble(prelude: &str, scene: &str, user: &str) -> String {
     format!(
-        "// ---- rye-math Space prelude ----\n{prelude}\n\
-         // ---- rye-scene scene module ----\n{scene}\n\
-         // ---- rye geodesic march kernel ----\n{GEODESIC_MARCH_KERNEL}\n\
+        "// ---- loam-math Space prelude ----\n{prelude}\n\
+         // ---- loam-scene scene module ----\n{scene}\n\
+         // ---- loam geodesic march kernel ----\n{GEODESIC_MARCH_KERNEL}\n\
          // ---- user shading ----\n{user}"
     )
 }
@@ -211,7 +211,7 @@ impl App for LatticeApp {
 
     fn title(&self, fps: f32) -> Cow<'static, str> {
         Cow::Owned(format!(
-            "Rye - Geodesic Lattice (E³ / H³ / S³) | {fps:.0} fps"
+            "Loam - Geodesic Lattice (E³ / H³ / S³) | {fps:.0} fps"
         ))
     }
 }
@@ -219,7 +219,7 @@ impl App for LatticeApp {
 fn main() -> Result<()> {
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("Rye - Geodesic Lattice (E³ / H³ / S³)")
+            .with_title("Loam - Geodesic Lattice (E³ / H³ / S³)")
             .with_visible(false),
         ..RunConfig::default()
     };

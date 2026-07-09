@@ -1,4 +1,4 @@
-//! `rye` aggregator crate.
+//! `loam` aggregator crate.
 //!
 //! ## Facade scope
 //!
@@ -11,20 +11,20 @@
 //! - [`shader`] (WGSL hot reload + Space-prelude injection)
 //! - [`time`] (fixed-timestep accumulator)
 //!
-//! The remaining crates (`rye-app`, `rye-camera`, `rye-input`,
-//! `rye-physics`, `rye-player`, `rye-scene`, `rye-shape`, `rye-text`)
+//! The remaining crates (`loam-app`, `loam-camera`, `loam-input`,
+//! `loam-physics`, `loam-player`, `loam-scene`, `loam-shape`, `loam-text`)
 //! are deliberately not re-exported here. They form the
 //! application/runtime layer and are best depended on directly so
 //! consumers see them in their own `Cargo.toml` rather than nested
-//! under `rye::*`. Revisit if the surface stabilizes and a flat
-//! `rye::*` import becomes the dominant ergonomic.
+//! under `loam::*`. Revisit if the surface stabilizes and a flat
+//! `loam::*` import becomes the dominant ergonomic.
 //!
-//! Common types are gathered in [`prelude`] for `use rye::prelude::*;`.
+//! Common types are gathered in [`prelude`] for `use loam::prelude::*;`.
 
-pub use rye_asset as asset;
-pub use rye_math as math;
-pub use rye_render as render;
-pub use rye_shader as shader;
-pub use rye_time as time;
+pub use loam_asset as asset;
+pub use loam_math as math;
+pub use loam_render as render;
+pub use loam_shader as shader;
+pub use loam_time as time;
 
 pub mod prelude;

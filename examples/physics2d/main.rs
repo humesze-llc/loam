@@ -12,14 +12,14 @@ use std::borrow::Cow;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
-use rye_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx, TickCtx};
-use rye_math::{EuclideanR2, EuclideanR3};
-use rye_physics::{
+use loam_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx, TickCtx};
+use loam_math::{EuclideanR2, EuclideanR3};
+use loam_physics::{
     euclidean_r2::{polygon_body, register_default_narrowphase, sphere_body, static_wall},
     field::Gravity,
     Collider, World,
 };
-use rye_render::device::RenderDevice;
+use loam_render::device::RenderDevice;
 use winit::{
     event::{ElementState, WindowEvent},
     keyboard::{KeyCode, PhysicalKey},
@@ -362,7 +362,7 @@ impl App for Physics2DApp {
             .filter(|b| b.inv_mass > 0.0)
             .count();
         Cow::Owned(format!(
-            "Rye - 2D Physics | {fps:.0} fps | {dynamic_count} bodies | sim {:.1}s (R: reset)",
+            "Loam - 2D Physics | {fps:.0} fps | {dynamic_count} bodies | sim {:.1}s (R: reset)",
             self.sim_time
         ))
     }
@@ -372,7 +372,7 @@ fn main() -> Result<()> {
     let _ = FIXED_DT; // documentation: framework's fixed_hz drives tick dt
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("Rye - 2D Physics")
+            .with_title("Loam - 2D Physics")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 720.0))
             .with_visible(false),
         fixed_hz: PHYSICS_HZ,
