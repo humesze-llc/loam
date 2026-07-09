@@ -51,5 +51,3 @@ I use AI coding tools, primarily Claude Code, heavily; invariant tests gate ever
 ## License
 
 Dual-licensed under MIT OR Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
-
-*Named for the soil: the ground the games grow from.*
