@@ -7,13 +7,13 @@
 //! diverge), and converging in S³.
 //!
 //! Note: `HalfSpace` SDF emission gates on `WgslSpace::is_chart_flat`
-//! (rye-scene T1-1). E³ corridor walls render honestly via chart-coord
+//! (loam-scene T1-1). E³ corridor walls render honestly via chart-coord
 //! `dot(p, n) - d`; H³ / S³ corridor walls sentinel until closed-form
-//! geodesic-plane SDFs land. The pillars (`rye_distance` spheres)
+//! geodesic-plane SDFs land. The pillars (`loam_distance` spheres)
 //! tell the curvature story in every Space.
 //!
 //! Assembles a shader from three layers:
-//! - Space prelude from `rye-math` (`rye_distance`, `rye_exp`, ...)
+//! - Space prelude from `loam-math` (`loam_distance`, `loam_exp`, ...)
 //! - Scene module from the local `scene` submodule (`corridor_demo_wgsl`)
 //! - User shader from `examples/corridor/corridor.wgsl`
 //!
@@ -27,15 +27,15 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use rye_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx};
-use rye_camera::OrbitCamera;
-use rye_math::{EuclideanR3, HyperbolicH3, SphericalS3, WgslSpace};
-use rye_render::{
+use loam_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx};
+use loam_camera::OrbitCamera;
+use loam_math::{EuclideanR3, HyperbolicH3, SphericalS3, WgslSpace};
+use loam_render::{
     device::RenderDevice,
     graph::RenderNode,
     raymarch::{GeodesicRayMarchNode, RayMarchUniforms},
 };
-use rye_shader::ShaderId;
+use loam_shader::ShaderId;
 use winit::window::WindowAttributes;
 
 mod scene;
@@ -62,19 +62,19 @@ trait CorridorKnobs: WgslSpace + Default + 'static {
 impl CorridorKnobs for EuclideanR3 {
     const BALL_SCALE: f32 = 0.2;
     const FOG_SCALE: f32 = 2.8;
-    const TITLE: &'static str = "Rye - Corridor (E³)";
+    const TITLE: &'static str = "Loam - Corridor (E³)";
 }
 
 impl CorridorKnobs for HyperbolicH3 {
     const BALL_SCALE: f32 = 0.2;
     const FOG_SCALE: f32 = 2.2;
-    const TITLE: &'static str = "Rye - Corridor (H³ geodesics)";
+    const TITLE: &'static str = "Loam - Corridor (H³ geodesics)";
 }
 
 impl CorridorKnobs for SphericalS3 {
     const BALL_SCALE: f32 = 0.2;
     const FOG_SCALE: f32 = 2.4;
-    const TITLE: &'static str = "Rye - Corridor (S³ geodesics)";
+    const TITLE: &'static str = "Loam - Corridor (S³ geodesics)";
 }
 
 /// Initial orbit pose so the camera starts inside the corridor; otherwise
@@ -191,7 +191,7 @@ fn main() -> Result<()> {
 
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("Rye - Corridor")
+            .with_title("Loam - Corridor")
             .with_visible(false),
         ..RunConfig::default()
     };

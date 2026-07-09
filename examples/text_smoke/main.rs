@@ -1,4 +1,4 @@
-//! Smoke test for `rye-text`. Opens a window with a colored
+//! Smoke test for `loam-text`. Opens a window with a colored
 //! background and renders a few text labels at different sizes and
 //! colors. Visual verification only, no assertion.
 //!
@@ -10,10 +10,10 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
-use rye_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx};
-use rye_math::EuclideanR3;
-use rye_render::device::RenderDevice;
-use rye_text::TextRenderer;
+use loam_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx};
+use loam_math::EuclideanR3;
+use loam_render::device::RenderDevice;
+use loam_text::TextRenderer;
 use winit::window::WindowAttributes;
 
 fn load_system_font() -> Result<Vec<u8>> {
@@ -72,7 +72,7 @@ impl App for TextSmokeApp {
 
         // Title-ish label, large.
         self.text.queue(
-            "rye-text smoke test",
+            "loam-text smoke test",
             [16.0, 16.0],
             48.0,
             [1.0, 1.0, 1.0, 1.0],
@@ -159,14 +159,14 @@ impl App for TextSmokeApp {
     }
 
     fn title(&self, fps: f32) -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Owned(format!("rye-text smoke | {fps:.0} fps"))
+        std::borrow::Cow::Owned(format!("loam-text smoke | {fps:.0} fps"))
     }
 }
 
 fn main() -> Result<()> {
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("rye-text smoke")
+            .with_title("loam-text smoke")
             .with_visible(false),
         ..RunConfig::default()
     };

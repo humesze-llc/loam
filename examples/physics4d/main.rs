@@ -1,9 +1,9 @@
 //! 4D physics demo, drop one or two pentatopes (4-simplices) under
 //! gravity and dump per-tick state to stdout.
 //!
-//! There's no rendering: `rye-render` is 3D-only, and a real 4D viewer
+//! There's no rendering: `loam-render` is 3D-only, and a real 4D viewer
 //! needs a hyperslice + slider (queued as a follow-up demo). For now
-//! the example is the harness that drives [`rye_physics::EuclideanR4`]
+//! the example is the harness that drives [`loam_physics::EuclideanR4`]
 //! through the integrator + collision pipeline so we can see numbers.
 //!
 //! Modes:
@@ -26,8 +26,8 @@
 //! - `--print-every N`: print state every N ticks (default 60).
 
 use glam::Vec4;
-use rye_math::EuclideanR4;
-use rye_physics::{
+use loam_math::EuclideanR4;
+use loam_physics::{
     euclidean_r4::{
         halfspace4_body_r4, pentatope_vertices, polytope_body_r4, register_default_narrowphase,
     },
@@ -80,7 +80,7 @@ impl Args {
                         .unwrap_or(args.print_every);
                 }
                 "-h" | "--help" => {
-                    println!("rye 4D physics demo");
+                    println!("loam 4D physics demo");
                     println!();
                     println!("Usage: cargo run --example physics4d [options]");
                     println!();
@@ -206,6 +206,6 @@ fn main() {
     println!("  manifolds at end: {}", world.manifolds.len());
 }
 
-fn omega_mag_sq(b: rye_math::Bivector4) -> f32 {
+fn omega_mag_sq(b: loam_math::Bivector4) -> f32 {
     b.xy * b.xy + b.xz * b.xz + b.xw * b.xw + b.yz * b.yz + b.yw * b.yw + b.zw * b.zw
 }

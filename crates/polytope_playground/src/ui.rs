@@ -8,12 +8,12 @@
 //! and the formula popup live in their own modules; this file owns the
 //! chrome that wraps them.
 
-use rye_app::egui;
-use rye_egui::{
+use loam_app::egui;
+use loam_egui::{
     media::{chevron_button, play_pause_button, rate_toggle, refresh_button},
     slider_with_edit,
 };
-use rye_math::Rotor4;
+use loam_math::Rotor4;
 
 use crate::consts::{CONTROL_H, CONTROL_W, PLAY_PAUSE_W};
 use crate::state::{
@@ -139,7 +139,7 @@ impl Demo {
                         ui.close_kind(egui::UiKind::Menu);
                     }
                 });
-                rye_egui::sticky_menu(ui, "View", |ui| {
+                loam_egui::sticky_menu(ui, "View", |ui| {
                     // Sticky toggles: clicking a checkbox does not close the
                     // dropdown, so several flags can be flipped without reopening.
                     ui.checkbox(&mut self.show_controls, "Rotation controls (H)");
@@ -193,7 +193,7 @@ impl Demo {
             points_size_px,
             ..
         } = self;
-        rye_egui::floating_panel(
+        loam_egui::floating_panel(
             ctx,
             "polytope-playground-render",
             "Render",
@@ -347,7 +347,7 @@ impl Demo {
     }
 
     pub(crate) fn render_help_window(&mut self, ctx: &egui::Context) {
-        rye_egui::floating_panel_builder(
+        loam_egui::floating_panel_builder(
             ctx,
             "polytope-playground-about",
             "About Polytope Playground",

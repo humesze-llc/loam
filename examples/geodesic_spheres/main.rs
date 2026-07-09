@@ -1,8 +1,8 @@
 //! Geodesic spheres raymarch demo.
 //!
 //! Assembles a shader from three layers:
-//! - Space prelude from `rye-math` (`rye_distance`, `rye_exp`, ...)
-//! - scene module from the local `scene` submodule (`rye_scene_sdf`)
+//! - Space prelude from `loam-math` (`loam_distance`, `loam_exp`, ...)
+//! - scene module from the local `scene` submodule (`loam_scene_sdf`)
 //! - user shader from `examples/geodesic_spheres/spheres.wgsl`
 //!
 //! ## Flags
@@ -15,15 +15,15 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use rye_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx};
-use rye_camera::OrbitCamera;
-use rye_math::{EuclideanR3, HyperbolicH3, SphericalS3, WgslSpace};
-use rye_render::{
+use loam_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx};
+use loam_camera::OrbitCamera;
+use loam_math::{EuclideanR3, HyperbolicH3, SphericalS3, WgslSpace};
+use loam_render::{
     device::RenderDevice,
     graph::RenderNode,
     raymarch::{GeodesicRayMarchNode, RayMarchUniforms},
 };
-use rye_shader::ShaderId;
+use loam_shader::ShaderId;
 use winit::window::WindowAttributes;
 
 mod scene;
@@ -46,19 +46,19 @@ trait SphereKnobs: WgslSpace + Default + 'static {
 impl SphereKnobs for EuclideanR3 {
     const BALL_SCALE: f32 = 0.2;
     const FOG_SCALE: f32 = 3.2;
-    const TITLE: &'static str = "Rye - Geodesic Spheres";
+    const TITLE: &'static str = "Loam - Geodesic Spheres";
 }
 
 impl SphereKnobs for HyperbolicH3 {
     const BALL_SCALE: f32 = 0.2;
     const FOG_SCALE: f32 = 3.0;
-    const TITLE: &'static str = "Rye - Geodesic Spheres (H3 fog)";
+    const TITLE: &'static str = "Loam - Geodesic Spheres (H3 fog)";
 }
 
 impl SphereKnobs for SphericalS3 {
     const BALL_SCALE: f32 = 0.2;
     const FOG_SCALE: f32 = 2.6;
-    const TITLE: &'static str = "Rye - Geodesic Spheres (S3 fog)";
+    const TITLE: &'static str = "Loam - Geodesic Spheres (S3 fog)";
 }
 
 /// 1 revolution / 20 s at the framework's 60 Hz fixed timestep.
@@ -169,7 +169,7 @@ fn main() -> Result<()> {
 
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("Rye - Geodesic Spheres")
+            .with_title("Loam - Geodesic Spheres")
             .with_visible(false),
         ..RunConfig::default()
     };

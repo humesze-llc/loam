@@ -1,15 +1,15 @@
 //! Corridor demo scene. Self-contained; depends only on the typed
-//! [`rye_scene::Scene`] / [`rye_scene::SceneNode`] layer and emits WGSL
+//! [`loam_scene::Scene`] / [`loam_scene::SceneNode`] layer and emits WGSL
 //! against `EuclideanR3`.
 
 use glam::Vec3;
-use rye_math::EuclideanR3;
-use rye_scene::{Scene, SceneNode};
+use loam_math::EuclideanR3;
+use loam_scene::{Scene, SceneNode};
 
 /// A rectangular corridor oriented along the Z axis, lined with rows
 /// of geodesic spheres for depth cues.
 ///
-/// Pillars use `rye_distance` so they are space-aware (perfect spheres
+/// Pillars use `loam_distance` so they are space-aware (perfect spheres
 /// in every metric, with the curvature carried by ray bending). Floor,
 /// ceiling, and side walls are chart-coordinate planes chosen
 /// specifically to visualise the chart-vs-geodesic difference.
@@ -100,7 +100,7 @@ impl CorridorScene {
     }
 }
 
-/// Emit WGSL source defining `rye_scene_sdf` for the default
+/// Emit WGSL source defining `loam_scene_sdf` for the default
 /// `CorridorScene`.
 pub fn corridor_demo_wgsl() -> String {
     CorridorScene::default().to_wgsl()

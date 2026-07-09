@@ -32,7 +32,7 @@ docs/devlog/
 # Personal audit / dev scripts (not shipped; rerun locally)
 scripts/
 
-# Demo capture artifacts (rye-app capture module + legacy --capture-{apng,gif} flags)
+# Demo capture artifacts (loam-app capture module + legacy --capture-{apng,gif} flags)
 /captures/
 *.apng
 *.gif

@@ -6,7 +6,7 @@ use crate::*;
 impl RotatePolytopesApp {
     pub(crate) fn build_console() -> Console<Demo> {
         let mut c = Console::<Demo>::new();
-        c.register(rye_egui::cmd(
+        c.register(loam_egui::cmd(
             "reset",
             "full reset (R)",
             |_args, demo: &mut Demo, _out| {
@@ -14,7 +14,7 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
-        c.register(rye_egui::cmd(
+        c.register(loam_egui::cmd(
             "spin",
             "toggle continuous rotation (Space / T)",
             |_args, demo: &mut Demo, _out| {
@@ -22,7 +22,7 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
-        c.register(rye_egui::cmd(
+        c.register(loam_egui::cmd(
             "controls",
             "toggle the bottom controls overlay (H)",
             |_args, demo: &mut Demo, _out| {
@@ -30,7 +30,7 @@ impl RotatePolytopesApp {
                 Ok(())
             },
         ));
-        c.register(rye_egui::cmd(
+        c.register(loam_egui::cmd(
             "formula",
             "toggle the top-right formula popup",
             |_args, demo: &mut Demo, _out| {
@@ -42,7 +42,7 @@ impl RotatePolytopesApp {
         // on/off; subcommands each carry their own value choices for context-
         // aware tab-completion via [`SubcommandSet`].
         c.register(
-            rye_egui::subcommands::<Demo>("wireframe", "wireframe + cross-section overlay")
+            loam_egui::subcommands::<Demo>("wireframe", "wireframe + cross-section overlay")
                 .on_bare(|d| {
                     d.wireframe_enabled = !d.wireframe_enabled;
                     Ok(())
@@ -361,7 +361,7 @@ impl RotatePolytopesApp {
         // `surface` is shorthand for "off". `surface scale <N>` rescales the row
         // by multiplying `BODY_SIZE` (see [`Demo::effective_body_size`]).
         c.register(
-            rye_egui::cmd(
+            loam_egui::cmd(
                 "surface",
                 "polychoral surface mode: raster | sdf | off (bare = off); `scale <N>` to resize (per-layer cap alpha lives under `section`)",
                 |args, demo: &mut Demo, out| {
@@ -455,7 +455,7 @@ impl RotatePolytopesApp {
         // composites through the depth-write-disabled pipeline). Side-by-side /
         // multi-viewport comparison is deferred to the multi-viewport milestone.
         c.register(
-            rye_egui::subcommands::<Demo>(
+            loam_egui::subcommands::<Demo>(
                 "section",
                 "rasterized cross-section layers: cross (honest drop-w) + cap (projection-following), each with perimeter + alpha",
             )
@@ -495,22 +495,22 @@ impl RotatePolytopesApp {
         // `capture frames [pre|post|both] [dir]`, `capture stop`. Bound to F12 (one-shot)
         // and F9 (sequence start; use `capture stop` to end). Requests push to a global
         // queue; the runner drains and processes them at the render-loop's two taps.
-        rye_app::capture::register_commands(&mut c);
-        rye_app::capture::bind_default_hotkeys(&mut c);
+        loam_app::capture::register_commands(&mut c);
+        loam_app::capture::bind_default_hotkeys(&mut c);
 
         // Framework-provided log mirror: `log on|off|toggle` toggles whether
         // `tracing::*` events show up in the console scrollback.
-        rye_app::log::register_command(&mut c);
+        loam_app::log::register_command(&mut c);
 
         // Framework-provided frame-timing surface: `trace [summary|last|clear|cap N]`.
         // The runner is already recording per-section scopes on every redraw; this
         // command lets the user read them. Surfaces the slowest hot-path sections,
         // which is the data the pipeline-warming + wireframe-cache decisions read
         // from.
-        rye_app::trace::register_command(&mut c);
-        rye_app::fps::register_command(&mut c);
-        rye_app::vsync::register_command(&mut c);
-        rye_app::version::register_command(
+        loam_app::trace::register_command(&mut c);
+        loam_app::fps::register_command(&mut c);
+        loam_app::vsync::register_command(&mut c);
+        loam_app::version::register_command(
             &mut c,
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
@@ -531,7 +531,7 @@ impl RotatePolytopesApp {
         //   `camera freecam cursor_mode <m>`  `toggle` (default, FPS) or `hold` (MMO).
         //   `camera freecam cursor_mode`      Print the current mode.
         c.register(
-            rye_egui::cmd::<Demo, _>(
+            loam_egui::cmd::<Demo, _>(
                 "camera",
                 "camera mode: orbit | freecam; bare cycles. `camera freecam speed=<N>` / `cursor_mode hold|toggle` tune the preset",
                 |args, demo, out| {
@@ -653,12 +653,12 @@ impl RotatePolytopesApp {
 
         // Floor toggle for the y=0 hyperplane ground. On by default. The
         // SDF kernel reads `u.params[0]` (set in `Demo::update`); when 0.0
-        // the wrapper around `rye_scene_sdf` (injected into the shader at
+        // the wrapper around `loam_scene_sdf` (injected into the shader at
         // setup time) short-circuits to a huge distance, so the marcher
         // never converges on the floor and the checkerboard never paints.
         // Bare `floor` flips the flag; `floor on|off` is the explicit form.
         c.register(
-            rye_egui::cmd::<Demo, _>(
+            loam_egui::cmd::<Demo, _>(
                 "floor",
                 "toggle the y=0 hyperplane ground (on | off; bare flips)",
                 |args, demo, out| {

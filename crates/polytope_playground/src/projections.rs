@@ -1,7 +1,7 @@
 //! Wireframe projection modes: the `WireframeProjection` enum, Schlegel diagram
 //! parameter resolution, per-mode edge-blend selection, and mode annotations.
 
-use rye_physics::polytope::Polytope4;
+use loam_physics::polytope::Polytope4;
 
 /// How the parent wireframe's 4D vertex positions project to R³. Independent of
 /// the cross-section's projection (always drop-w).
@@ -50,7 +50,7 @@ pub(crate) enum WireframeProjection {
     /// body-local w-range overlaps a slab around `w_slice`. Cell-level (not
     /// edge-level) so a kept edge agrees with the active-edge coloring and the
     /// cross-section. The projection stays drop-w
-    /// ([`rye_math::Projection::Identity`]); the cull does the slicing. Slab width
+    /// ([`loam_math::Projection::Identity`]); the cull does the slicing. Slab width
     /// is `Demo::wireframe_hyperslice_thickness`.
     Hyperslice,
 }
@@ -150,7 +150,7 @@ const SCHLEGEL_EYE_MARGIN: f32 = 0.5;
 /// The cell normal and inradius come from [`Polytope4::face_planes`] (cell
 /// centroids via topology; Coxeter, *Regular Polytopes*, ch. 13). This is the
 /// CORRECT path: the dual-vertex `cell{120,600}_face_planes` helpers in
-/// `rye_physics::euclidean_r4` are wrong for 96 of the 120/600-cell normals (the
+/// `loam_physics::euclidean_r4` are wrong for 96 of the 120/600-cell normals (the
 /// documented BUG) and are NOT used here. The result is canonical; the caller
 /// scales by the live body size.
 pub(crate) fn resolve_schlegel_params(polytope: Polytope4, cell_index: u32) -> SchlegelParams {
@@ -231,7 +231,7 @@ pub(crate) fn apply_projection_selection_defaults(
 }
 
 /// Short educational annotation for the active projection: a callout `title`
-/// plus a one-to-three-sentence `body`. Surfaced via `rye_egui::callout` (see
+/// plus a one-to-three-sentence `body`. Surfaced via `loam_egui::callout` (see
 /// `Demo::render_mode_annotation`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModeAnnotation {
@@ -348,7 +348,7 @@ impl WireframeProjection {
         std::mem::discriminant(&self) == std::mem::discriminant(&other)
     }
 
-    /// Context-free resolution to a [`rye_math::Projection<4>`] for the modes
+    /// Context-free resolution to a [`loam_math::Projection<4>`] for the modes
     /// needing no polytope or rotor context:
     /// - `Shadow`, `Hyperslice` -> `Identity` (drop-w; the demo-side
     ///   `wireframe_hyperslice` filter does Hyperslice's slicing),
@@ -361,18 +361,18 @@ impl WireframeProjection {
     /// `Schlegel` returns `Identity` as a SAFE FALLBACK only: the real projection
     /// needs the cached [`SchlegelParams`] plus the live `rot_state`, built by
     /// `Demo::resolved_wireframe_projection` (the four render sites call it).
-    pub(crate) fn to_projection(self) -> rye_math::Projection<4> {
+    pub(crate) fn to_projection(self) -> loam_math::Projection<4> {
         match self {
             WireframeProjection::Shadow | WireframeProjection::Hyperslice => {
-                rye_math::Projection::Identity
+                loam_math::Projection::Identity
             }
-            WireframeProjection::WPinhole => rye_math::Projection::Perspective4D {
+            WireframeProjection::WPinhole => loam_math::Projection::Perspective4D {
                 focal_distance: 2.0,
             },
             // Schlegel needs cached params + rotor (see doc above); drop-w
             // fallback until `Demo::resolved_wireframe_projection` resolves it.
-            WireframeProjection::Schlegel { .. } => rye_math::Projection::Identity,
-            WireframeProjection::Stereographic => rye_math::Projection::Stereographic {
+            WireframeProjection::Schlegel { .. } => loam_math::Projection::Identity,
+            WireframeProjection::Stereographic => loam_math::Projection::Stereographic {
                 pole: STEREOGRAPHIC_DEFAULT_POLE,
             },
         }

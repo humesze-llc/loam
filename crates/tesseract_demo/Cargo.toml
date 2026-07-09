@@ -8,10 +8,10 @@ repository.workspace = true
 description = "Tesseract w-depth projection + free-roam camera: focused single-pipeline demo. Validates the small-demo perf hypothesis for blog embeds (vs the kitchen-sink polytope_playground)."
 
 # Deliberately minimal dep set:
-# - No `rye-render` raymarch types: rasterized wireframe only via LineRasterNode.
+# - No `loam-render` raymarch types: rasterized wireframe only via LineRasterNode.
 # - No triangle/point rasterizer: lines only.
-# - No `rye-physics` SDF helpers used; just the Polytope4 topology (vertices + edges).
-# - No `rye-shape` other than `LineMesh<4>` (which Visualizable<4> on Polytope4 produces).
+# - No `loam-physics` SDF helpers used; just the Polytope4 topology (vertices + edges).
+# - No `loam-shape` other than `LineMesh<4>` (which Visualizable<4> on Polytope4 produces).
 # Each unused module gets dead-code-eliminated in release builds, so the wasm bundle
 # is much smaller than polytope_playground (which links every render node).
 
@@ -22,19 +22,19 @@ tracing.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 
-rye-app     = { path = "../rye-app", default-features = false }
-rye-camera  = { path = "../rye-camera" }
-rye-egui    = { path = "../rye-egui" }
-rye-math    = { path = "../rye-math" }
-rye-physics = { path = "../rye-physics" }
-rye-render  = { path = "../rye-render" }
-rye-shape   = { path = "../rye-shape" }
+loam-app     = { path = "../loam-app", default-features = false }
+loam-camera  = { path = "../loam-camera" }
+loam-egui    = { path = "../loam-egui" }
+loam-math    = { path = "../loam-math" }
+loam-physics = { path = "../loam-physics" }
+loam-render  = { path = "../loam-render" }
+loam-shape   = { path = "../loam-shape" }
 # Direct dep for the CountingAllocator wrapper installed as #[global_allocator]
-# below. Pulls in nothing extra beyond what rye-app already does transitively.
-rye-time    = { path = "../rye-time" }
+# below. Pulls in nothing extra beyond what loam-app already does transitively.
+loam-time    = { path = "../loam-time" }
 
 [features]
 # Capture feature mirrors polytope_playground: native default-on for frame export,
 # wasm opts out via `data-cargo-no-default-features` in index.html.
 default = ["capture"]
-capture = ["rye-app/capture"]
+capture = ["loam-app/capture"]

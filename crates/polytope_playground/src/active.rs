@@ -11,8 +11,8 @@
 //! mode never reads back through `log`. Composer mode keeps the sum-of-
 //! bivectors model instead.
 
-use rye_app::egui;
-use rye_math::Plane4;
+use loam_app::egui;
+use loam_math::Plane4;
 
 use crate::consts::CONTROL_H;
 

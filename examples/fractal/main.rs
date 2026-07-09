@@ -1,4 +1,4 @@
-//! Rye's first graphics example: a live Mandelbulb raymarcher.
+//! Loam's first graphics example: a live Mandelbulb raymarcher.
 //!
 //! Edit `examples/fractal/fractal.wgsl` while the example runs and the
 //! scene recompiles on save.
@@ -13,13 +13,13 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use rye_app::{run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
-use rye_math::{EuclideanR3, HyperbolicH3, SphericalS3, WgslSpace};
-use rye_render::{
+use loam_app::{run_with_config, App, Camera, FrameCtx, OrbitController, RunConfig, SetupCtx};
+use loam_math::{EuclideanR3, HyperbolicH3, SphericalS3, WgslSpace};
+use loam_render::{
     device::RenderDevice,
     raymarch::{RayMarchNode, RayMarchUniforms},
 };
-use rye_shader::ShaderId;
+use loam_shader::ShaderId;
 use winit::window::WindowAttributes;
 
 fn shader_dir() -> PathBuf {
@@ -43,17 +43,17 @@ trait FractalKnobs: WgslSpace + Default + 'static {
 impl FractalKnobs for EuclideanR3 {
     const BALL_SCALE: f32 = 1.0;
     const FOG_SCALE: f32 = 12.0;
-    const TITLE: &'static str = "Rye - Mandelbulb";
+    const TITLE: &'static str = "Loam - Mandelbulb";
 }
 impl FractalKnobs for HyperbolicH3 {
     const BALL_SCALE: f32 = 0.2;
     const FOG_SCALE: f32 = 4.0;
-    const TITLE: &'static str = "Rye - Mandelbulb (H³ fog)";
+    const TITLE: &'static str = "Loam - Mandelbulb (H³ fog)";
 }
 impl FractalKnobs for SphericalS3 {
     const BALL_SCALE: f32 = 0.15;
     const FOG_SCALE: f32 = 2.5;
-    const TITLE: &'static str = "Rye - Mandelbulb (S³ fog)";
+    const TITLE: &'static str = "Loam - Mandelbulb (S³ fog)";
 }
 
 struct FractalApp<S: FractalKnobs> {
@@ -159,7 +159,7 @@ impl<S: FractalKnobs> App for FractalApp<S> {
     }
 
     fn render(&mut self, rd: &RenderDevice, view: &wgpu::TextureView) -> Result<()> {
-        use rye_render::graph::RenderNode;
+        use loam_render::graph::RenderNode;
         self.ray_march.execute(rd, view)
     }
 
@@ -180,7 +180,7 @@ impl<S: FractalKnobs> App for FractalApp<S> {
 trait OrbitInputExt {
     fn advance_with_input(
         &mut self,
-        input: rye_input::FrameInput,
+        input: loam_input::FrameInput,
         camera: &mut Camera<EuclideanR3>,
         space: &EuclideanR3,
     );
@@ -189,11 +189,11 @@ trait OrbitInputExt {
 impl OrbitInputExt for OrbitController<EuclideanR3> {
     fn advance_with_input(
         &mut self,
-        input: rye_input::FrameInput,
+        input: loam_input::FrameInput,
         camera: &mut Camera<EuclideanR3>,
         space: &EuclideanR3,
     ) {
-        use rye_camera::CameraController;
+        use loam_camera::CameraController;
         self.advance(input, camera, space, 0.0);
     }
 }
@@ -205,7 +205,7 @@ fn main() -> Result<()> {
 
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("Rye - Mandelbulb")
+            .with_title("Loam - Mandelbulb")
             .with_visible(false),
         ..RunConfig::default()
     };

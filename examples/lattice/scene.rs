@@ -1,14 +1,14 @@
 //! Periodic geodesic lattice demo scene. Self-contained; depends only
-//! on the typed [`rye_scene::Scene`] / [`rye_scene::SceneNode`] layer and
-//! emits WGSL against any [`rye_math::WgslSpace`].
+//! on the typed [`loam_scene::Scene`] / [`loam_scene::SceneNode`] layer and
+//! emits WGSL against any [`loam_math::WgslSpace`].
 
 use glam::Vec3;
-use rye_math::{Space, WgslSpace};
-use rye_scene::{Scene, SceneNode};
+use loam_math::{Space, WgslSpace};
+use loam_scene::{Scene, SceneNode};
 
 /// Periodic geodesic lattice scene.
 ///
-/// Emits a `rye_scene_sdf` that places a sphere at the origin and at
+/// Emits a `loam_scene_sdf` that places a sphere at the origin and at
 /// geodesic lattice positions along the ±X, ±Y, ±Z axes. The lattice
 /// centres are computed in Rust by calling `space.exp` so they live at
 /// evenly-spaced geodesic intervals in the given Space:
@@ -43,8 +43,8 @@ impl LatticeSphereScene {
     /// Build the typed scene tree for the given Space.
     ///
     /// Centres are computed via `space.exp` and stored as literal
-    /// positions in `Sphere` primitives. The emitted `rye_scene_sdf`
-    /// calls only `rye_distance`, so the spatial metric is fully
+    /// positions in `Sphere` primitives. The emitted `loam_scene_sdf`
+    /// calls only `loam_distance`, so the spatial metric is fully
     /// Space-aware at runtime.
     pub fn to_scene<S>(self, space: &S) -> Scene
     where

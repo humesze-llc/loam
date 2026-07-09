@@ -1,0 +1,31 @@
+[package]
+name = "loam-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+2d = []
+3d = []
+voxel = []
+postfx = []
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+loam-math    = { path = "../loam-math" }
+loam-shape   = { path = "../loam-shape" }
+# Frame-trace integration: `gpu_timer` callbacks push `gpu-total` sections through
+# `loam_time::frame_trace::record_external` so they appear in `trace summary` next
+# to the CPU sections. Default features pull in the frame-trace cargo feature; on
+# `--no-default-features` builds the calls are no-ops (still compile).
+loam-time    = { path = "../loam-time" }
+
+[dev-dependencies]
+naga.workspace = true
+loam-scene = { path = "../loam-scene" }

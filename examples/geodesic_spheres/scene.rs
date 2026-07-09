@@ -1,12 +1,12 @@
 //! Geodesic-spheres demo scene. Self-contained; depends only on the
-//! typed [`rye_scene::Scene`] / [`rye_scene::SceneNode`] layer and emits
+//! typed [`loam_scene::Scene`] / [`loam_scene::SceneNode`] layer and emits
 //! WGSL against `EuclideanR3`.
 
 use std::f32::consts::PI;
 
 use glam::Vec3;
-use rye_math::EuclideanR3;
-use rye_scene::{Scene, SceneNode};
+use loam_math::EuclideanR3;
+use loam_scene::{Scene, SceneNode};
 
 /// Geodesic-spheres demo scene parameters.
 ///
@@ -43,7 +43,7 @@ impl Default for GeodesicSpheresScene {
 
 impl GeodesicSpheresScene {
     /// Build the typed scene tree. Orbit centres are pre-computed in
-    /// Rust and embedded as literals; `rye_distance` carries the Space
+    /// Rust and embedded as literals; `loam_distance` carries the Space
     /// metric.
     pub fn to_scene(self) -> Scene {
         let mut node = SceneNode::sphere(Vec3::new(0.0, 0.12, 0.0), self.sphere_radius);
@@ -71,7 +71,7 @@ impl GeodesicSpheresScene {
     }
 }
 
-/// Emit WGSL source defining `rye_scene_sdf` for the default scene.
+/// Emit WGSL source defining `loam_scene_sdf` for the default scene.
 pub fn geodesic_spheres_demo_wgsl() -> String {
     GeodesicSpheresScene::default().to_wgsl()
 }

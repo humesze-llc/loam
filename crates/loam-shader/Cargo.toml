@@ -1,0 +1,24 @@
+[package]
+name = "loam-shader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Loam shader system: WGSL loading, Space intrinsic injection, hot reload."
+
+[dependencies]
+loam-math  = { path = "../loam-math" }
+loam-asset = { path = "../loam-asset" }
+
+anyhow.workspace = true
+naga.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+pollster = "0.3"
+tempfile = "3"

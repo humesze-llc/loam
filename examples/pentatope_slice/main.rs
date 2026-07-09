@@ -43,18 +43,18 @@ use std::time::Instant;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec4;
-use rye_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx, TickCtx};
-use rye_camera::OrbitCamera;
-use rye_math::{EuclideanR3, EuclideanR4, Rotor};
-use rye_physics::{
+use loam_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx, TickCtx};
+use loam_camera::OrbitCamera;
+use loam_math::{EuclideanR3, EuclideanR4, Rotor};
+use loam_physics::{
     euclidean_r4::{
         halfspace4_body_r4, pentatope_vertices, polytope_body_r4, register_default_narrowphase,
     },
     field::Gravity,
     World,
 };
-use rye_render::{device::RenderDevice, graph::RenderNode};
-use rye_shader::ShaderId;
+use loam_render::{device::RenderDevice, graph::RenderNode};
+use loam_shader::ShaderId;
 use wgpu::{util::DeviceExt, *};
 use winit::{
     event::{ElementState, WindowEvent},
@@ -69,7 +69,7 @@ fn shader_path() -> PathBuf {
     shader_dir().join("pentatope_slice.wgsl")
 }
 
-const TITLE: &str = "Rye - pentatope w-slice (live)";
+const TITLE: &str = "Loam - pentatope w-slice (live)";
 const PENTATOPE_RADIUS: f32 = 1.0;
 /// Offset range relative to the body's current `w`-position. The
 /// pentatope's local vertices span ≈ `w ∈ [−0.25, +1.0]`, so a range

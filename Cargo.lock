@@ -1319,6 +1319,215 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
+name = "loam"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "gif",
+ "glam",
+ "loam-app",
+ "loam-asset",
+ "loam-camera",
+ "loam-egui",
+ "loam-input",
+ "loam-math",
+ "loam-physics",
+ "loam-player",
+ "loam-render",
+ "loam-scene",
+ "loam-shader",
+ "loam-shape",
+ "loam-text",
+ "loam-time",
+ "png 0.17.16",
+ "pollster",
+ "tracing",
+ "tracing-subscriber",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "loam-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "color_quant",
+ "console_error_panic_hook",
+ "egui-wgpu",
+ "gif",
+ "glam",
+ "image",
+ "js-sys",
+ "loam-asset",
+ "loam-camera",
+ "loam-egui",
+ "loam-input",
+ "loam-math",
+ "loam-render",
+ "loam-shader",
+ "loam-time",
+ "png 0.17.16",
+ "pollster",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-wasm",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "loam-asset"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "notify",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "loam-camera"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "loam-input",
+ "loam-math",
+]
+
+[[package]]
+name = "loam-egui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "glam",
+ "loam-camera",
+ "loam-math",
+ "web-sys",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "loam-input"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "winit",
+]
+
+[[package]]
+name = "loam-math"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "glam",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "loam-physics"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "loam-math",
+ "loam-shape",
+ "tracing",
+]
+
+[[package]]
+name = "loam-player"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "loam-input",
+ "loam-math",
+]
+
+[[package]]
+name = "loam-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "loam-math",
+ "loam-scene",
+ "loam-shape",
+ "loam-time",
+ "naga",
+ "tracing",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "loam-scene"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "loam-math",
+ "loam-shape",
+ "ron",
+ "serde",
+]
+
+[[package]]
+name = "loam-shader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "loam-asset",
+ "loam-math",
+ "naga",
+ "pollster",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
+name = "loam-shape"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "loam-math",
+ "ron",
+ "serde",
+]
+
+[[package]]
+name = "loam-text"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "anyhow",
+ "bytemuck",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
+name = "loam-time"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "web-time",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1973,15 +2182,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "glam",
- "rye-app",
- "rye-camera",
- "rye-egui",
- "rye-math",
- "rye-physics",
- "rye-render",
- "rye-scene",
- "rye-shape",
- "rye-time",
+ "loam-app",
+ "loam-camera",
+ "loam-egui",
+ "loam-math",
+ "loam-physics",
+ "loam-render",
+ "loam-scene",
+ "loam-shape",
+ "loam-time",
  "tracing",
  "wgpu",
  "winit",
@@ -2219,215 +2428,6 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
-name = "rye"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "gif",
- "glam",
- "png 0.17.16",
- "pollster",
- "rye-app",
- "rye-asset",
- "rye-camera",
- "rye-egui",
- "rye-input",
- "rye-math",
- "rye-physics",
- "rye-player",
- "rye-render",
- "rye-scene",
- "rye-shader",
- "rye-shape",
- "rye-text",
- "rye-time",
- "tracing",
- "tracing-subscriber",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "rye-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "color_quant",
- "console_error_panic_hook",
- "egui-wgpu",
- "gif",
- "glam",
- "image",
- "js-sys",
- "png 0.17.16",
- "pollster",
- "rye-asset",
- "rye-camera",
- "rye-egui",
- "rye-input",
- "rye-math",
- "rye-render",
- "rye-shader",
- "rye-time",
- "tracing",
- "tracing-subscriber",
- "tracing-wasm",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "web-time",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "rye-asset"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "notify",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "rye-camera"
-version = "0.1.0"
-dependencies = [
- "glam",
- "rye-input",
- "rye-math",
-]
-
-[[package]]
-name = "rye-egui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "glam",
- "rye-camera",
- "rye-math",
- "web-sys",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "rye-input"
-version = "0.1.0"
-dependencies = [
- "glam",
- "winit",
-]
-
-[[package]]
-name = "rye-math"
-version = "0.1.0"
-dependencies = [
- "approx",
- "glam",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "rye-physics"
-version = "0.1.0"
-dependencies = [
- "glam",
- "rye-math",
- "rye-shape",
- "tracing",
-]
-
-[[package]]
-name = "rye-player"
-version = "0.1.0"
-dependencies = [
- "glam",
- "rye-input",
- "rye-math",
-]
-
-[[package]]
-name = "rye-render"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "glam",
- "naga",
- "rye-math",
- "rye-scene",
- "rye-shape",
- "rye-time",
- "tracing",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "rye-scene"
-version = "0.1.0"
-dependencies = [
- "glam",
- "ron",
- "rye-math",
- "rye-shape",
- "serde",
-]
-
-[[package]]
-name = "rye-shader"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "glam",
- "naga",
- "pollster",
- "rye-asset",
- "rye-math",
- "tempfile",
- "thiserror 1.0.69",
- "tracing",
- "wgpu",
-]
-
-[[package]]
-name = "rye-shape"
-version = "0.1.0"
-dependencies = [
- "glam",
- "ron",
- "rye-math",
- "serde",
-]
-
-[[package]]
-name = "rye-text"
-version = "0.1.0"
-dependencies = [
- "ab_glyph",
- "anyhow",
- "bytemuck",
- "tracing",
- "wgpu",
-]
-
-[[package]]
-name = "rye-time"
-version = "0.1.0"
-dependencies = [
- "tracing",
- "web-time",
-]
 
 [[package]]
 name = "same-file"
@@ -2719,14 +2719,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "glam",
- "rye-app",
- "rye-camera",
- "rye-egui",
- "rye-math",
- "rye-physics",
- "rye-render",
- "rye-shape",
- "rye-time",
+ "loam-app",
+ "loam-camera",
+ "loam-egui",
+ "loam-math",
+ "loam-physics",
+ "loam-render",
+ "loam-shape",
+ "loam-time",
  "tracing",
  "wgpu",
  "winit",

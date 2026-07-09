@@ -1,0 +1,29 @@
+[package]
+name = "loam-time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Loam time primitives: deterministic fixed-timestep accumulator and tick counter."
+
+[features]
+# Frame-timing instrumentation. Default-on for dev builds; disable with
+# `--no-default-features` for lean / embedded builds. When OFF, `scope` returns a
+# zero-sized type whose `Drop` is empty, so instrumented code paths pay zero cost.
+# When ON, every `scope` call records an `Instant::now()` snapshot and pushes a
+# `Section` onto the current frame's vec; the cost is ~50ns per scope on native.
+default = ["frame-trace"]
+frame-trace = []
+
+[dependencies]
+# `web-time` is a drop-in for `std::time::Instant` / `Duration`: on native it re-exports
+# the std types verbatim; on wasm32 it backs `Instant` with `performance.now()`. Keeping
+# `FixedTimestep` usable in the browser is the only thing that pulls this in.
+web-time = { workspace = true }
+# Only used by the `frame-trace` feature path to emit `tracing::warn!` when a
+# section exceeds the spike threshold. Brought in unconditionally because gating
+# the dep behind the feature would force every downstream consumer to also gate
+# the feature; the crate itself is tiny so the prebuilt-with-tracing footprint
+# is negligible.
+tracing = { workspace = true }

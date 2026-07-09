@@ -80,7 +80,7 @@ impl Demo {
             result
         } else {
             {
-                let _scope = rye_time::frame_trace::scope("pp-sdf");
+                let _scope = loam_time::frame_trace::scope("pp-sdf");
                 {
                     let u = self.node.uniforms_mut();
                     u.resolution = viewport.resolution_f32();
@@ -95,19 +95,19 @@ impl Demo {
             // cleared `1.0` lets every wireframe fragment pass.
             self.ensure_and_clear_shared_depth(rd)?;
             if matches!(self.surface_mode, SurfaceMode::Raster) {
-                let _scope = rye_time::frame_trace::scope("pp-section-faces");
+                let _scope = loam_time::frame_trace::scope("pp-section-faces");
                 self.render_section_faces(rd, view)?;
             }
             // Cross-section + wireframe overlay. Shapes view only: Filmstrip's
             // per-cell composition would need per-cell depth-clear + uploads not
             // worth the v1 plumbing.
             if self.wireframe_enabled {
-                let _scope = rye_time::frame_trace::scope("pp-wireframe");
+                let _scope = loam_time::frame_trace::scope("pp-wireframe");
                 self.render_wireframe_overlay(rd, view)?;
             }
             // Points overlay, drawn last so discs sit on top of edges and caps.
             if self.points_enabled {
-                let _scope = rye_time::frame_trace::scope("pp-points");
+                let _scope = loam_time::frame_trace::scope("pp-points");
                 self.render_points(rd, view)?;
             }
             Ok(())
@@ -236,7 +236,7 @@ impl Demo {
                 for (vi, v) in topo.vertices.iter().enumerate() {
                     let v_local = local_vertices[vi];
                     let v3_local =
-                        <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                        <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
                             v_local,
                             &wireframe_projection,
                         );
@@ -275,7 +275,7 @@ impl Demo {
                 for (ci, c) in centers.iter().enumerate() {
                     let c_local = body_size * CELL_CENTER_INSET * self.rot_state.apply(*c);
                     let c3_local =
-                        <rye_math::EuclideanR4 as rye_math::RasterizableSpace<4>>::project_point(
+                        <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
                             c_local,
                             &wireframe_projection,
                         );
@@ -318,7 +318,7 @@ impl Demo {
             &rd.device,
             &rd.queue,
             mesh,
-            &rye_math::Projection::Identity,
+            &loam_math::Projection::Identity,
         );
         // No depth attachment: see `PointRasterNode::new` (drop-w + ReadOnly
         // LessEqual occluded non-w=0 vertices behind their own caps).
@@ -387,7 +387,7 @@ impl Demo {
     /// for both layers, computed once per body before the per-layer transform.
     fn build_section_layer_meshes(
         &mut self,
-        wireframe_projection: rye_math::Projection<4>,
+        wireframe_projection: loam_math::Projection<4>,
         w_slice: f32,
         cross: state::SectionLayer,
         cap: state::SectionLayer,
@@ -453,10 +453,10 @@ impl Demo {
             // clip tests. Under Stereographic a fill triangle is dropped when any
             // vertex exceeds `clip_radius`, matching the perimeter rule so fill
             // and outline cull in lockstep.
-            let append_layer = |mesh: &mut rye_shape::TriangleMesh<3>,
+            let append_layer = |mesh: &mut loam_shape::TriangleMesh<3>,
                                 proj_scratch: &mut Vec<Vec3>,
                                 alpha: f32,
-                                projection: &rye_math::Projection<4>,
+                                projection: &loam_math::Projection<4>,
                                 scale: Option<f32>,
                                 clip_radius: Option<f32>| {
                 let start_v = mesh.vertices.len();
@@ -545,7 +545,7 @@ impl Demo {
             &mut self.section_faces_translucent
         };
         node.set_camera(&rd.queue, view_proj);
-        node.upload::<EuclideanR3, 3>(&rd.device, &rd.queue, mesh, &rye_math::Projection::Identity);
+        node.upload::<EuclideanR3, 3>(&rd.device, &rd.queue, mesh, &loam_math::Projection::Identity);
         node.execute(rd, view, Some(depth_view), None)?;
         Ok(())
     }
@@ -560,7 +560,7 @@ impl Demo {
     /// Build the section-perimeter and parent-wireframe overlay meshes from the
     /// current row + rotor + w_slice, upload them, and execute the raster passes
     /// over the SDF render. Non-polychoral shapes in the row are skipped (no
-    /// [`rye_physics::polytope::Polytope4`] mapping).
+    /// [`loam_physics::polytope::Polytope4`] mapping).
     fn render_wireframe_overlay(
         &mut self,
         rd: &RenderDevice,
@@ -652,7 +652,7 @@ impl Demo {
                     WPlane::new(self.w_slice),
                 );
                 let w_slice = self.w_slice;
-                let mut push_perimeter = |projection: &rye_math::Projection<4>| {
+                let mut push_perimeter = |projection: &loam_math::Projection<4>| {
                     let section_scale = perspective_scale_at_w(w_slice, projection);
                     let clip_radius = stereographic_clip_radius(projection, view_radius);
                     for ((a, b), (color, width)) in perim
@@ -830,14 +830,14 @@ impl Demo {
             &rd.device,
             &rd.queue,
             &section_edges,
-            &rye_math::Projection::Identity,
+            &loam_math::Projection::Identity,
             1,
         );
         self.parent_wireframe.upload::<EuclideanR3, 3>(
             &rd.device,
             &rd.queue,
             &parent_lines,
-            &rye_math::Projection::Identity,
+            &loam_math::Projection::Identity,
             1,
         );
 

@@ -4,9 +4,9 @@
 //! CLI `--shapes` parser.
 
 use anyhow::{anyhow, Result};
-use rye_app::egui;
-use rye_physics::polytope::Polytope4;
-use rye_render::raymarch::RaymarchShape;
+use loam_app::egui;
+use loam_physics::polytope::Polytope4;
+use loam_render::raymarch::RaymarchShape;
 
 /// One polytope's metadata. `body_color` drives `BodyUniform.color`
 /// on the GPU, not the (uniformly grey) card color. `long_name` uses

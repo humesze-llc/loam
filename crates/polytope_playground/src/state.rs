@@ -8,10 +8,10 @@
 
 use std::collections::HashMap;
 
-use rye_app::{freecam::Freecam, Camera, OrbitController};
-use rye_math::{Bivector, Bivector4, EuclideanR3, Plane4, Projection, Rotor, Rotor4};
-use rye_physics::polytope::Polytope4;
-use rye_render::raymarch::{BodyUniform, Hyperslice4DNode};
+use loam_app::{freecam::Freecam, Camera, OrbitController};
+use loam_math::{Bivector, Bivector4, EuclideanR3, Plane4, Projection, Rotor, Rotor4};
+use loam_physics::polytope::Polytope4;
+use loam_render::raymarch::{BodyUniform, Hyperslice4DNode};
 
 use crate::catalog::ShapeEntry;
 use crate::consts::{BASE_ROTATION_RATE, BODY_SIZE, BODY_X_SPACING, BODY_Y, T_SLIDER_INITIAL};
@@ -76,7 +76,7 @@ pub(crate) fn render_row_entries<'a>(
 /// nearest-active toggle modulates alpha on top.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum WireframeColorMode {
-    /// Per-vertex RGB from [`rye_physics::polytope::vertex_color_by_position`];
+    /// Per-vertex RGB from [`loam_physics::polytope::vertex_color_by_position`];
     /// each edge is a gradient between its endpoint hues (same scheme as
     /// `Polytope4::lines_colored_by_position`).
     #[default]
@@ -161,9 +161,9 @@ pub(crate) struct RotorTerm {
 /// plane through `render_plane`. Shared paren + `+` logic keeps a bivector sum
 /// reading identically across all callsites.
 pub(crate) fn render_plane_sum(
-    ui: &mut rye_app::egui::Ui,
+    ui: &mut loam_app::egui::Ui,
     planes: &[Plane4],
-    mut render_plane: impl FnMut(&mut rye_app::egui::Ui, usize, Plane4),
+    mut render_plane: impl FnMut(&mut loam_app::egui::Ui, usize, Plane4),
 ) {
     let multi = planes.len() > 1;
     if multi {
@@ -309,10 +309,10 @@ pub(crate) struct Demo {
     /// Rasterizer node for the cross-section perimeter (cyan edges around each cap
     /// polygon). Filled caps are not drawn here; this only outlines the boundaries
     /// between adjacent cell contributions.
-    pub(crate) section_edges: rye_render::LineRasterNode,
+    pub(crate) section_edges: loam_render::LineRasterNode,
     /// Rasterizer node for the dim "parent wireframe" overlay: the full edge graph
     /// per body, projected via drop-w.
-    pub(crate) parent_wireframe: rye_render::LineRasterNode,
+    pub(crate) parent_wireframe: loam_render::LineRasterNode,
     /// Whether the cross-section + parent-wireframe overlay renders. Off by
     /// default; toggle via `wireframe on|off`.
     pub(crate) wireframe_enabled: bool,
@@ -384,15 +384,15 @@ pub(crate) struct Demo {
     /// is on it replaces the SDF for the six regular 4-polytopes (those SDF slots
     /// get `BodyUniform::default()`, which the kernel skips). Per-body solid color
     /// + face-normal Lambert.
-    pub(crate) section_faces: rye_render::TriangleRasterNode,
+    pub(crate) section_faces: loam_render::TriangleRasterNode,
     /// Translucent, depth-write-disabled variant of [`Self::section_faces`], used
     /// when a layer's `surface_alpha < 1.0` so the wireframe shows through caps.
     /// Same shaders + blend; only `DepthMode::ReadOnly` differs. Both section
     /// layers route through this pair, picking opaque vs translucent per layer.
-    pub(crate) section_faces_translucent: rye_render::TriangleRasterNode,
+    pub(crate) section_faces_translucent: loam_render::TriangleRasterNode,
     /// Antialiased point-disc rasterizer for vertex + cell-center sprites.
     /// Uploaded with the combined point mesh each frame the overlay is enabled.
-    pub(crate) points_node: rye_render::PointRasterNode,
+    pub(crate) points_node: loam_render::PointRasterNode,
     /// Master toggle for the points overlay (off by default).
     pub(crate) points_enabled: bool,
     /// When [`Self::points_enabled`] is on, render a sprite at each vertex.
@@ -404,22 +404,22 @@ pub(crate) struct Demo {
     /// Screen-space radius (px) for both vertex and cell-center sprites.
     pub(crate) points_size_px: f32,
     /// Scratch buffer reused across frames + bodies inside `render_points`.
-    pub(crate) points_mesh_scratch: rye_shape::PointMesh<3>,
+    pub(crate) points_mesh_scratch: loam_shape::PointMesh<3>,
     /// Shared depth attachment for the Shapes-view rasterizer chain, sized to the
-    /// swapchain via [`rye_render::DepthBuffer::ensure`]. Cleared once per frame in
+    /// swapchain via [`loam_render::DepthBuffer::ensure`]. Cleared once per frame in
     /// [`crate::Demo::ensure_and_clear_shared_depth`]; `section_faces` writes it,
     /// `parent_wireframe` reads it for occlusion. In SDF mode the cleared `1.0`
     /// leaves every wireframe fragment passing, preserving the historical visual.
-    pub(crate) section_faces_depth: Option<rye_render::DepthBuffer>,
+    pub(crate) section_faces_depth: Option<loam_render::DepthBuffer>,
     /// Scratch reused across frames + bodies inside `render_section_faces` to avoid
     /// per-body allocation on the 240 fps hot path.
     pub(crate) section_world_vertices_scratch: Vec<glam::Vec4>,
     /// Combined-mesh scratch for the honest drop-w cross-section layer.
-    pub(crate) section_faces_mesh_scratch: rye_shape::TriangleMesh<3>,
+    pub(crate) section_faces_mesh_scratch: loam_shape::TriangleMesh<3>,
     /// Combined-mesh scratch for the projected-cap layer, separate from
     /// [`Self::section_faces_mesh_scratch`] so both layers build in one pass over
     /// the row without clobbering each other's allocation.
-    pub(crate) section_faces_projected_scratch: rye_shape::TriangleMesh<3>,
+    pub(crate) section_faces_projected_scratch: loam_shape::TriangleMesh<3>,
     /// Per-vertex body-local projected points for the cap-fill near-pole clip,
     /// reused inside `build_section_layer_meshes`. Lets the triangle-granularity
     /// Stereographic drop reuse the same `sample_in_radius` predicate the wireframe
@@ -475,14 +475,14 @@ pub(crate) struct Demo {
     pub(crate) show_render_panel: bool,
     /// Persistent state for the example annotation callout, anchored to the first
     /// polychoron's vertex 0. Off by default; `View > Example callout` or the
-    /// `callout` command. Hosts the `rye_egui::callout` primitive.
-    pub(crate) example_callout: rye_egui::CalloutState,
+    /// `callout` command. Hosts the `loam_egui::callout` primitive.
+    pub(crate) example_callout: loam_egui::CalloutState,
 
     /// Persistent state for the per-mode annotation callout: a short explanation of
     /// the active projection, anchored to the leading polychoron. Draws only when
     /// [`mode_annotation`] returns `Some` AND this flag is on (on by default).
     /// Toggle via `View > Mode annotation`.
-    pub(crate) mode_annotation_open: rye_egui::CalloutState,
+    pub(crate) mode_annotation_open: loam_egui::CalloutState,
 
     /// Whether the top-right rotation-formula popup is rendered (off by default;
     /// checkbox in the expanded section).
@@ -631,7 +631,7 @@ impl Demo {
     ) -> BodyUniform {
         // The 120-cell and 600-cell have NO authoritative SDF: their
         // `cell{120,600}_face_planes` are the known-wrong dual-vertex
-        // approximation (see `rye_shape::polytope_geom`), wrong on 96 normals.
+        // approximation (see `loam_shape::polytope_geom`), wrong on 96 normals.
         // Never raymarch them, on any platform or mode; the raster section +
         // wireframe paths are their correct surfaces. (`row_blocks_sdf` also
         // refuses to enter Sdf mode with them; this is the belt-and-suspenders.)
@@ -707,7 +707,7 @@ impl Demo {
         self.schlegel_params = cache;
     }
 
-    /// The live [`rye_math::Projection<4>`] for the wireframe overlay this frame.
+    /// The live [`loam_math::Projection<4>`] for the wireframe overlay this frame.
     /// For Schlegel it builds the engine projection from the cached
     /// [`SchlegelParams`], rotating the normal/basis by `rot_state` (so the chosen
     /// cell stays the outer boundary) and scaling the offsets by
@@ -832,9 +832,9 @@ mod tests {
     };
     use crate::catalog::ShapeEntry;
     use glam::Vec4;
-    use rye_math::{Bivector, Plane4, Projection, Rotor, Rotor4};
-    use rye_physics::polytope::Polytope4;
-    use rye_render::raymarch::RaymarchShape;
+    use loam_math::{Bivector, Plane4, Projection, Rotor, Rotor4};
+    use loam_physics::polytope::Polytope4;
+    use loam_render::raymarch::RaymarchShape;
     use std::collections::HashSet;
 
     fn entry(shape: RaymarchShape) -> ShapeEntry {
@@ -1228,7 +1228,7 @@ mod tests {
     /// least one cell, far from every dual normal.
     #[test]
     fn schlegel_params_from_face_planes_not_dual() {
-        use rye_physics::euclidean_r4::cell600_face_planes;
+        use loam_physics::euclidean_r4::cell600_face_planes;
         let polytope = Polytope4::Cell600;
         let (topo_normals, _) = polytope.face_planes();
         let (dual_normals, _) = cell600_face_planes();

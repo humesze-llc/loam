@@ -1,0 +1,1781 @@
+//! Frame capture: PNG single-shot, PNG sequences, animated GIF, and animated PNG
+//! (APNG) streams, with two taps (`pre`-egui = pure 3D scene, `post`-egui = final
+//! composite).
+//!
+//! ## Picking a format
+//!
+//! - **One-shot PNG** (`capture png`): lossless screenshot.
+//! - **PNG sequence** (`capture frames`): one lossless file per frame; the master
+//!   format for ffmpeg post-processing.
+//! - **APNG** (`capture apng`): lossless 24-bit animation, one file. Recommended for
+//!   shareable clips of raymarched content. All frames buffered in memory until stop
+//!   (`frames * width * height * 4` bytes); practical limit ~5 s at 1080p.
+//! - **GIF** (`capture gif`): NeuQuant-quantized animation. Convenient but has a
+//!   256-color quality ceiling that flickers on raymarched content; prefer APNG or
+//!   `capture frames` + ffmpeg. `palette=global` mitigates but doesn't eliminate it.
+//!
+//! ## How requests flow
+//!
+//! Console commands push [`CaptureRequest`]s onto a global queue via [`enqueue`]. The
+//! runner drains it once per frame, drives the `Capture` state machine, and issues GPU
+//! copies at the two tap points. PNG encodes synchronously (readback-dominated, no
+//! drops); GIF and APNG encode on a worker thread fed by a bounded channel, dropping
+//! frames under backpressure rather than stalling the renderer.
+//!
+//! ## Pre-egui tap and MSAA
+//!
+//! With MSAA off the 3D pass writes the swapchain directly, so the pre-egui tap copies
+//! it as-is. With MSAA on the 3D content is only resolved at the end of the egui pass
+//! and multisamples can't be copied directly, so pre-egui captures are skipped (with a
+//! warning); disable MSAA via [`RunConfig::msaa_samples`](crate::RunConfig).
+//!
+//! ## Output layout
+//!
+//! - One-shot PNG: `{dir}/{name}_post.png` (or `_pre.png` / both)
+//! - PNG sequence: `{dir}/{name}/{stage}_{frame:06}.png`
+//! - GIF stream:   `{dir}/{name}.gif`
+//!
+//! `dir` defaults to `./captures/`; `name` defaults to `{example}_{unix_secs}`.
+//!
+//! ## Post-processing with ffmpeg
+//!
+//! From a PNG sequence, `palettegen + paletteuse` gives a flicker-free GIF; other
+//! containers work too:
+//!
+//! ```text
+//! # Clean GIF (global palette, dithered)
+//! ffmpeg -framerate 30 -i ./captures/clip/post_%06d.png \
+//!   -vf "split[s0][s1];[s0]palettegen=stats_mode=full[p];[s1][p]paletteuse=dither=bayer" \
+//!   out.gif
+//!
+//! # WebP (animated, inline-renders on GitHub, smaller than GIF)
+//! ffmpeg -framerate 30 -i ./captures/clip/post_%06d.png \
+//!   -vcodec libwebp -lossless 0 -q:v 80 -loop 0 out.webp
+//!
+//! # MP4 (best quality, Discord/Twitter inline; GitHub via <video>)
+//! ffmpeg -framerate 30 -i ./captures/clip/post_%06d.png \
+//!   -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p out.mp4
+//! ```
+
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Context as _, Result};
+use wgpu::{
+    BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Device, Extent3d, MapMode, Origin3d,
+    PollType, Queue, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
+    TextureAspect, TextureFormat,
+};
+
+use loam_egui::Console;
+
+/// Where in the frame pipeline the capture is taken from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CaptureStage {
+    /// Pure 3D scene before egui paints. Requires MSAA off.
+    Pre,
+    /// Final composite after egui paints. What DWM receives.
+    Post,
+    /// Both, written to two separate files per frame. PNG-only; GIF can't multiplex.
+    Both,
+}
+
+impl CaptureStage {
+    fn wants_pre(self) -> bool {
+        matches!(self, CaptureStage::Pre | CaptureStage::Both)
+    }
+    fn wants_post(self) -> bool {
+        matches!(self, CaptureStage::Post | CaptureStage::Both)
+    }
+}
+
+/// Output format for streaming captures.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CaptureFormat {
+    /// One PNG file per frame; pre and post stages can write in parallel. FPS
+    /// unlimited by default; pass an fps to throttle.
+    Png,
+    /// Single animated GIF, NeuQuant-quantized, infinite loop. Single stage, default
+    /// fps 30. Quality ceiling on continuous-tone content; see module docs.
+    Gif,
+    /// Single animated PNG, lossless 24-bit/frame, infinite loop. Single stage,
+    /// default fps 30. Worker buffers all frames in memory until stop (~5 s at 1080p).
+    Apng,
+}
+
+/// How GIF frames are palette-quantized. NeuQuant (Dekker, 1994) is a self-organizing
+/// map that picks 256 colors; the mode controls what it trains on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum PaletteMode {
+    /// Per-frame NeuQuant. High quality per frame, but consecutive palettes differ so
+    /// gradients shimmer (the classic GIF flicker).
+    #[default]
+    Local,
+    /// One palette trained on the first ~`GIF_WARMUP_FRAMES` captures, reused for
+    /// every frame. Kills the wobble at slightly worse per-frame fidelity; the warmup
+    /// also avoids training on transient overlays like the console.
+    Global,
+}
+
+impl CaptureFormat {
+    fn default_fps(self) -> Option<u16> {
+        match self {
+            CaptureFormat::Png => None, // unlimited; every frame
+            CaptureFormat::Gif | CaptureFormat::Apng => Some(30),
+        }
+    }
+
+    fn supports_both_stages(self) -> bool {
+        // Single-file animated formats carry one stream; only PNG writes two files.
+        matches!(self, CaptureFormat::Png)
+    }
+}
+
+/// A capture command queued for the runner. Pushed by console commands and hotkey
+/// binds via [`enqueue`]; drained once per frame.
+#[derive(Debug)]
+pub enum CaptureRequest {
+    /// Capture exactly one frame as PNG and stop. Stage `Both` writes two files.
+    OneShot {
+        stage: CaptureStage,
+        dir: Option<PathBuf>,
+        name: Option<String>,
+    },
+    /// Start a streaming sequence. Continues until [`CaptureRequest::Stop`] or until
+    /// the next [`CaptureRequest::Toggle`].
+    StartSequence {
+        format: CaptureFormat,
+        stage: CaptureStage,
+        dir: Option<PathBuf>,
+        name: Option<String>,
+        /// Capture rate cap. `None` = every render frame; GIF and APNG fall back to
+        /// 30 fps.
+        fps: Option<u16>,
+        /// Downscale width in pixels (aspect preserved). `None` = native. GIF-only;
+        /// PNG sequences ignore it.
+        scale: Option<u32>,
+        /// GIF palette strategy. Ignored for PNG sequences.
+        palette: PaletteMode,
+    },
+    /// Stop the current sequence, if any. No-op when idle.
+    Stop,
+    /// Toggle a sequence: stop if running, start with these params if idle.
+    Toggle {
+        format: CaptureFormat,
+        stage: CaptureStage,
+        dir: Option<PathBuf>,
+        name: Option<String>,
+        fps: Option<u16>,
+        scale: Option<u32>,
+        palette: PaletteMode,
+    },
+}
+
+static QUEUE: Mutex<Vec<CaptureRequest>> = Mutex::new(Vec::new());
+
+/// Push a capture request onto the queue. Drained by the runner on the next frame.
+pub fn enqueue(req: CaptureRequest) {
+    QUEUE.lock().expect("capture queue poisoned").push(req);
+}
+
+pub(crate) fn drain_requests() -> Vec<CaptureRequest> {
+    std::mem::take(&mut *QUEUE.lock().expect("capture queue poisoned"))
+}
+
+// ---------------------------------------------------------------------------
+// Status broadcast
+// ---------------------------------------------------------------------------
+
+/// The runner publishes [`Capture::status`] here each frame so UI code can read it
+/// without a reference to the runner.
+static STATUS: Mutex<Option<String>> = Mutex::new(None);
+
+/// Compact one-line status set by the runner each frame; `None` when idle.
+pub fn current_status() -> Option<String> {
+    STATUS.lock().ok().and_then(|g| g.clone())
+}
+
+pub(crate) fn publish_status(status: Option<String>) {
+    if let Ok(mut g) = STATUS.lock() {
+        *g = status;
+    }
+}
+
+/// Console-driven toggle for the capture panel; flipped by `capture panel` and
+/// mirrored by [`CapturePanel::show`].
+static PANEL_OPEN: AtomicBool = AtomicBool::new(false);
+
+fn toggle_panel_global() -> bool {
+    let now_open = !PANEL_OPEN.load(Ordering::Relaxed);
+    PANEL_OPEN.store(now_open, Ordering::Relaxed);
+    now_open
+}
+
+// ---------------------------------------------------------------------------
+// Capture state machine
+// ---------------------------------------------------------------------------
+
+/// Runner-owned state machine. Drives the per-frame copy + write.
+pub(crate) struct Capture {
+    default_dir: PathBuf,
+    state: CaptureState,
+    /// Detached encoder threads still flushing after `stop`. Joined at shutdown so
+    /// trailers finish; finished handles are reaped on each new stop.
+    pending: Vec<JoinHandle<()>>,
+}
+
+enum CaptureState {
+    Idle,
+    OneShot {
+        path_pre: Option<PathBuf>,
+        path_post: Option<PathBuf>,
+    },
+    Sequence {
+        stage: CaptureStage,
+        writer: SequenceWriter,
+        /// Minimum interval between captures. `None` = unlimited.
+        fps_interval: Option<Duration>,
+        /// Wall-clock time of the last capture; `None` until the first.
+        last_capture_time: Option<Instant>,
+        frame_count: u32,
+    },
+}
+
+/// Per-format incremental writer.
+enum SequenceWriter {
+    /// PNG sequence: one stage-labelled file per frame, encoded on the main thread
+    /// (cost is readback-dominated).
+    Png { dir: PathBuf },
+    /// Animated GIF, encoded on a worker thread off the render loop. Frames cross a
+    /// bounded channel and are dropped under backpressure; the dropped count surfaces
+    /// on stop.
+    Gif {
+        worker: GifWorker,
+        path: PathBuf,
+        /// First-frame delay in centiseconds; later frames use wall-clock delays.
+        default_delay_cs: u16,
+        /// Output width in pixels (Lanczos3, aspect preserved).
+        scale: Option<u32>,
+        palette_mode: PaletteMode,
+        /// `Some` during `Global`-mode warmup; `None` for `Local` and post-warmup.
+        warming: Option<WarmingState>,
+        /// Trained `Global` palette, cloned into each emitted frame for indexing.
+        global_palette: Option<Arc<color_quant::NeuQuant>>,
+    },
+    /// Animated PNG. The worker buffers every frame until stop, then writes in one
+    /// pass (the `acTL` chunk needs the frame count up front). Memory =
+    /// `frames * width * height * 4` bytes.
+    Apng {
+        worker: ApngWorker,
+        path: PathBuf,
+        /// Output width in pixels (Lanczos3, aspect preserved).
+        scale: Option<u32>,
+    },
+}
+
+/// Warmup buffer for global-palette mode: the first `GIF_WARMUP_FRAMES` captures,
+/// so the palette trains on representative content, not the startup overlay.
+struct WarmingState {
+    buffer: Vec<WarmupFrame>,
+    target_frames: u32,
+}
+
+struct WarmupFrame {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    captured_at: Instant,
+}
+
+/// Captures buffered before training the global palette (~1 s at 30 fps). Memory is
+/// `frames * width * height * 4` bytes (~57 MB at 800x600), released after training.
+const GIF_WARMUP_FRAMES: u32 = 30;
+
+/// Owns the GIF encoder thread and its feeding channel. The worker drains frames,
+/// runs NeuQuant + Lanczos + LZW, and writes to disk; dropping it closes the channel,
+/// joins the thread, and flushes the trailer.
+pub(crate) struct GifWorker {
+    tx: Option<SyncSender<GifFrame>>,
+    handle: Option<JoinHandle<()>>,
+    dropped: Arc<AtomicU32>,
+}
+
+/// One frame's worth of work for the GIF encoder thread.
+struct GifFrame {
+    rgba: Vec<u8>,
+    src_width: u32,
+    src_height: u32,
+    /// Capture wall-clock time. The worker derives each frame's delay from the gap to
+    /// the previous encoded frame, so dropped frames stretch the next delay and total
+    /// playback duration matches recording duration.
+    captured_at: Instant,
+    /// First-frame fallback delay (no previous timestamp), from the target fps.
+    default_delay_cs: u16,
+    scale: Option<u32>,
+    /// `Some`: index against this shared NeuQuant and emit `palette: None` (global
+    /// table). `None`: per-frame NeuQuant via `Frame::from_rgba_speed`.
+    global_palette: Option<Arc<color_quant::NeuQuant>>,
+}
+
+/// Channel capacity: ~8 frames absorbs a small encode spike while bounding worker
+/// lag to ~270 ms at 30 fps. Higher trades smoothness for latency.
+const GIF_CHANNEL_CAPACITY: usize = 8;
+
+impl GifWorker {
+    fn spawn(path: PathBuf) -> Self {
+        let (tx, rx) = sync_channel::<GifFrame>(GIF_CHANNEL_CAPACITY);
+        let dropped = Arc::new(AtomicU32::new(0));
+        let handle = thread::Builder::new()
+            .name("loam-app::gif-encoder".into())
+            .spawn(move || gif_encoder_loop(path, rx))
+            .expect("spawn gif encoder thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            dropped,
+        }
+    }
+
+    /// Close the channel and return the `JoinHandle` without waiting; the worker
+    /// drains its buffer in the background and the caller parks the handle for
+    /// shutdown join (the trailer flushes when the worker's encoder drops).
+    fn detach(mut self) -> JoinHandle<()> {
+        self.tx.take();
+        self.handle.take().expect("worker handle present")
+    }
+
+    /// Non-blocking enqueue; on a full channel, bumps the dropped counter and returns
+    /// so the renderer never stalls.
+    fn try_send(&self, frame: GifFrame) {
+        let Some(tx) = self.tx.as_ref() else { return };
+        match tx.try_send(frame) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let count = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if count.is_power_of_two() {
+                    tracing::warn!(
+                        "capture: GIF encoder queue full; dropped {count} frame(s) so far"
+                    );
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::error!("capture: GIF encoder thread exited unexpectedly");
+            }
+        }
+    }
+
+    fn dropped(&self) -> u32 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for GifWorker {
+    fn drop(&mut self) {
+        // Fallback for a worker that was never detached (e.g. a panic unwinds through
+        // Capture). The normal `Capture::stop` path detaches first, leaving this a
+        // no-op.
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn gif_encoder_loop(path: PathBuf, rx: Receiver<GifFrame>) {
+    let mut encoder: Option<gif::Encoder<BufWriter<File>>> = None;
+    let mut last_captured_at: Option<Instant> = None;
+    for frame in rx {
+        if let Err(e) = encode_one_frame(&path, &mut encoder, &mut last_captured_at, frame) {
+            tracing::error!("capture: gif encode error: {e:#}");
+            return;
+        }
+    }
+    // Encoder drops here, flushing the trailer.
+    drop(encoder);
+    tracing::info!("capture: gif file finalised at {}", path.display());
+}
+
+/// Encode one GIF frame, in either local (per-frame NeuQuant) or global (shared
+/// palette via `index_of`) mode depending on `frame.global_palette`.
+fn encode_one_frame(
+    path: &Path,
+    encoder: &mut Option<gif::Encoder<BufWriter<File>>>,
+    last_captured_at: &mut Option<Instant>,
+    frame: GifFrame,
+) -> Result<()> {
+    let (out_w, out_h) = scaled_dims(frame.src_width, frame.src_height, frame.scale)?;
+    let w_u16: u16 = out_w.try_into().context("gif width > 65535")?;
+    let h_u16: u16 = out_h.try_into().context("gif height > 65535")?;
+
+    // Open the encoder on the first frame. Global mode seeds the LSD with the shared
+    // palette (later frames write `palette: None`); local mode passes an empty one
+    // and every frame writes its own table.
+    let enc = match encoder {
+        Some(e) => e,
+        None => {
+            let file = File::create(path)
+                .with_context(|| format!("create gif output {}", path.display()))?;
+            let global_palette_bytes: Vec<u8> = frame
+                .global_palette
+                .as_ref()
+                .map(|nq| nq.color_map_rgb())
+                .unwrap_or_default();
+            let mut e =
+                gif::Encoder::new(BufWriter::new(file), w_u16, h_u16, &global_palette_bytes)
+                    .context("init gif encoder")?;
+            e.set_repeat(gif::Repeat::Infinite).context("gif repeat")?;
+            tracing::info!(
+                "capture: gif encoder opened {}x{} target {}cs/frame ({} fps); \
+                 palette={}; actual delays computed from wall-clock per-frame",
+                w_u16,
+                h_u16,
+                frame.default_delay_cs,
+                if frame.default_delay_cs == 0 {
+                    0
+                } else {
+                    100 / frame.default_delay_cs as u32
+                },
+                if frame.global_palette.is_some() {
+                    "global (shared NeuQuant)"
+                } else {
+                    "per-frame"
+                }
+            );
+            *encoder = Some(e);
+            encoder.as_mut().unwrap()
+        }
+    };
+
+    // Delay = wall-clock gap since the previous encoded frame, so dropped frames
+    // stretch the next delay and total duration is preserved. First frame has no
+    // predecessor; use the target delay.
+    let delay_cs = match *last_captured_at {
+        None => frame.default_delay_cs,
+        Some(prev) => {
+            let ms = frame.captured_at.duration_since(prev).as_millis() as u64;
+            // Round to nearest cs, clamp to [1, u16::MAX].
+            let cs = (ms + 5) / 10;
+            cs.clamp(1, u16::MAX as u64) as u16
+        }
+    };
+    *last_captured_at = Some(frame.captured_at);
+
+    // Lanczos3 downscale before quantization, when requested.
+    let mut buf: Vec<u8> = if frame.scale.is_some() {
+        let src: ::image::RgbaImage =
+            ::image::ImageBuffer::from_raw(frame.src_width, frame.src_height, frame.rgba)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "RGBA size mismatch at {}x{}",
+                        frame.src_width,
+                        frame.src_height
+                    )
+                })?;
+        let dst =
+            ::image::imageops::resize(&src, out_w, out_h, ::image::imageops::FilterType::Lanczos3);
+        dst.into_raw()
+    } else {
+        frame.rgba
+    };
+
+    let mut gif_frame = if let Some(nq) = &frame.global_palette {
+        // Normalize alpha to match how the palette was trained
+        // (`train_global_palette` does the same).
+        for px in buf.chunks_exact_mut(4) {
+            if px[3] != 0 {
+                px[3] = 0xFF;
+            }
+        }
+        let mut indices = Vec::with_capacity((out_w as usize) * (out_h as usize));
+        for px in buf.chunks_exact(4) {
+            indices.push(nq.index_of(px) as u8);
+        }
+        gif::Frame {
+            width: w_u16,
+            height: h_u16,
+            buffer: std::borrow::Cow::Owned(indices),
+            // `palette: None` -> use the global color table the encoder was opened with.
+            palette: None,
+            ..gif::Frame::default()
+        }
+    } else {
+        // Per-frame NeuQuant. Speed 10 (crate default) matches the rate the encoder
+        // thread sustains (~30 fps at 800x600).
+        gif::Frame::from_rgba_speed(w_u16, h_u16, &mut buf, 10)
+    };
+    gif_frame.delay = delay_cs;
+    // `Any` (crate default) lets decoders keep full-frame opaque content; forcing
+    // `Background` caused a perceptible inter-frame flash.
+    gif_frame.dispose = gif::DisposalMethod::Any;
+    enc.write_frame(&gif_frame).context("gif encode")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// APNG worker
+// ---------------------------------------------------------------------------
+
+/// Owns the APNG encoder thread. APNG can't stream frame-by-frame: the `acTL` chunk
+/// needs the frame count up front, so the worker buffers every frame and writes the
+/// file once the channel closes on stop.
+pub(crate) struct ApngWorker {
+    tx: Option<SyncSender<ApngFrame>>,
+    handle: Option<JoinHandle<()>>,
+    /// Worker-updated; surfaced in the recording status so the buffer growth shows.
+    frame_count: Arc<AtomicU32>,
+}
+
+struct ApngFrame {
+    rgba: Vec<u8>,
+    src_width: u32,
+    src_height: u32,
+    captured_at: Instant,
+    scale: Option<u32>,
+}
+
+/// In-flight channel capacity; the real memory ceiling is the worker's internal Vec.
+const APNG_CHANNEL_CAPACITY: usize = 16;
+
+impl ApngWorker {
+    fn spawn(path: PathBuf) -> Self {
+        let (tx, rx) = sync_channel::<ApngFrame>(APNG_CHANNEL_CAPACITY);
+        let frame_count = Arc::new(AtomicU32::new(0));
+        let frame_count_for_worker = frame_count.clone();
+        let handle = thread::Builder::new()
+            .name("loam-app::apng-encoder".into())
+            .spawn(move || apng_encoder_loop(path, rx, frame_count_for_worker))
+            .expect("spawn apng encoder thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            frame_count,
+        }
+    }
+
+    /// Non-blocking enqueue; a full channel drops the frame.
+    fn try_send(&self, frame: ApngFrame) {
+        let Some(tx) = self.tx.as_ref() else { return };
+        if let Err(TrySendError::Disconnected(_)) = tx.try_send(frame) {
+            tracing::error!("capture: apng encoder thread exited unexpectedly");
+        }
+    }
+
+    fn frame_count(&self) -> u32 {
+        self.frame_count.load(Ordering::Relaxed)
+    }
+
+    /// Close the channel and return the `JoinHandle`; the worker writes the APNG once
+    /// the channel closes. Mirrors `GifWorker::detach`.
+    fn detach(mut self) -> JoinHandle<()> {
+        self.tx.take();
+        self.handle.take().expect("worker handle present")
+    }
+}
+
+impl Drop for ApngWorker {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn apng_encoder_loop(path: PathBuf, rx: Receiver<ApngFrame>, frame_count: Arc<AtomicU32>) {
+    let mut frames: Vec<ApngFrame> = Vec::new();
+    for frame in rx {
+        frames.push(frame);
+        frame_count.store(frames.len() as u32, Ordering::Relaxed);
+    }
+    if frames.is_empty() {
+        tracing::info!("capture: apng stopped before any frames captured; no file written");
+        return;
+    }
+    if let Err(e) = write_apng(&path, frames) {
+        tracing::error!("capture: apng write failed: {e:#}");
+        return;
+    }
+    tracing::info!("capture: apng file finalised at {}", path.display());
+}
+
+fn write_apng(path: &Path, frames: Vec<ApngFrame>) -> Result<()> {
+    // First frame's dimensions fix the canvas size.
+    let (out_w, out_h) = scaled_dims(frames[0].src_width, frames[0].src_height, frames[0].scale)?;
+    let file =
+        File::create(path).with_context(|| format!("create apng output {}", path.display()))?;
+    let mut encoder = png::Encoder::new(BufWriter::new(file), out_w, out_h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    // num_plays=0 loops infinitely.
+    encoder
+        .set_animated(frames.len() as u32, 0)
+        .context("apng set_animated")?;
+    let mut writer = encoder.write_header().context("apng write_header")?;
+
+    let mut last_captured_at: Option<Instant> = None;
+    for frame in frames {
+        let (fw, fh) = scaled_dims(frame.src_width, frame.src_height, frame.scale)?;
+        if fw != out_w || fh != out_h {
+            return Err(anyhow!(
+                "apng frame dims {fw}x{fh} != first frame {out_w}x{out_h}"
+            ));
+        }
+        let rgba = if frame.scale.is_some() {
+            let src: ::image::RgbaImage =
+                ::image::ImageBuffer::from_raw(frame.src_width, frame.src_height, frame.rgba)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "RGBA size mismatch at {}x{}",
+                            frame.src_width,
+                            frame.src_height
+                        )
+                    })?;
+            ::image::imageops::resize(&src, out_w, out_h, ::image::imageops::FilterType::Lanczos3)
+                .into_raw()
+        } else {
+            frame.rgba
+        };
+
+        // Delay = wall-clock gap since the previous frame, clamped to >= 1 ms.
+        // First frame defaults to 33 ms (~30 fps).
+        let delay_ms = match last_captured_at {
+            None => 33u16,
+            Some(prev) => {
+                let ms = frame.captured_at.duration_since(prev).as_millis();
+                ms.min(u16::MAX as u128).max(1) as u16
+            }
+        };
+        last_captured_at = Some(frame.captured_at);
+
+        writer
+            .set_frame_delay(delay_ms, 1000)
+            .context("apng set_frame_delay")?;
+        writer
+            .write_image_data(&rgba)
+            .context("apng write_image_data")?;
+    }
+    writer.finish().context("apng finish")?;
+    Ok(())
+}
+
+impl Capture {
+    pub(crate) fn new() -> Self {
+        Self {
+            default_dir: PathBuf::from("captures"),
+            state: CaptureState::Idle,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Join already-finished background workers so the pool doesn't grow unbounded.
+    fn reap_finished(&mut self) {
+        let mut still_running = Vec::with_capacity(self.pending.len());
+        for h in self.pending.drain(..) {
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                still_running.push(h);
+            }
+        }
+        self.pending = still_running;
+    }
+
+    pub(crate) fn apply_requests(&mut self, requests: Vec<CaptureRequest>) -> Vec<String> {
+        let mut log = Vec::new();
+        for req in requests {
+            match req {
+                CaptureRequest::OneShot { stage, dir, name } => {
+                    let dir = dir.unwrap_or_else(|| self.default_dir.clone());
+                    let name = name.unwrap_or_else(default_name);
+                    let path_pre = stage
+                        .wants_pre()
+                        .then(|| dir.join(format!("{name}_pre.png")));
+                    let path_post = stage
+                        .wants_post()
+                        .then(|| dir.join(format!("{name}_post.png")));
+                    self.state = CaptureState::OneShot {
+                        path_pre,
+                        path_post,
+                    };
+                    log.push(format!("capture: one-shot queued ({stage:?})"));
+                }
+                CaptureRequest::StartSequence {
+                    format,
+                    stage,
+                    dir,
+                    name,
+                    fps,
+                    scale,
+                    palette,
+                } => match self.start_sequence(format, stage, dir, name, fps, scale, palette) {
+                    Ok(msg) => log.push(msg),
+                    Err(e) => log.push(format!("capture: failed to start sequence: {e:#}")),
+                },
+                CaptureRequest::Stop => self.stop(&mut log),
+                CaptureRequest::Toggle {
+                    format,
+                    stage,
+                    dir,
+                    name,
+                    fps,
+                    scale,
+                    palette,
+                } => {
+                    if matches!(self.state, CaptureState::Sequence { .. }) {
+                        self.stop(&mut log);
+                    } else {
+                        match self.start_sequence(format, stage, dir, name, fps, scale, palette) {
+                            Ok(msg) => log.push(msg),
+                            Err(e) => log.push(format!("capture: failed to start sequence: {e:#}")),
+                        }
+                    }
+                }
+            }
+        }
+        log
+    }
+
+    // Args mirror `CaptureRequest::StartSequence`'s fields; a struct would just rename
+    // them.
+    #[allow(clippy::too_many_arguments)]
+    fn start_sequence(
+        &mut self,
+        format: CaptureFormat,
+        mut stage: CaptureStage,
+        dir: Option<PathBuf>,
+        name: Option<String>,
+        fps: Option<u16>,
+        scale: Option<u32>,
+        palette: PaletteMode,
+    ) -> Result<String> {
+        let dir = dir.unwrap_or_else(|| self.default_dir.clone());
+        let name = name.unwrap_or_else(default_name);
+        let fps = fps.or_else(|| format.default_fps());
+
+        // Single-file formats can't multiplex two stages; downgrade `Both` to `Post`.
+        if !format.supports_both_stages() && stage == CaptureStage::Both {
+            stage = CaptureStage::Post;
+        }
+
+        let writer = match format {
+            CaptureFormat::Png => {
+                let dir = dir.join(&name);
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("create png sequence dir {}", dir.display()))?;
+                SequenceWriter::Png { dir }
+            }
+            CaptureFormat::Gif => {
+                let path = dir.join(format!("{name}.gif"));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create gif parent dir {}", parent.display()))?;
+                }
+                let default_delay_cs = fps_to_centiseconds(fps.unwrap_or(30));
+                let worker = GifWorker::spawn(path.clone());
+                let warming = match palette {
+                    PaletteMode::Local => None,
+                    PaletteMode::Global => Some(WarmingState {
+                        buffer: Vec::with_capacity(GIF_WARMUP_FRAMES as usize),
+                        target_frames: GIF_WARMUP_FRAMES,
+                    }),
+                };
+                SequenceWriter::Gif {
+                    worker,
+                    path,
+                    default_delay_cs,
+                    scale,
+                    palette_mode: palette,
+                    warming,
+                    global_palette: None,
+                }
+            }
+            CaptureFormat::Apng => {
+                let path = dir.join(format!("{name}.apng"));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create apng parent dir {}", parent.display()))?;
+                }
+                let worker = ApngWorker::spawn(path.clone());
+                SequenceWriter::Apng {
+                    worker,
+                    path,
+                    scale,
+                }
+            }
+        };
+
+        let fps_interval = fps.map(|f| Duration::from_secs_f64(1.0 / f.max(1) as f64));
+        self.state = CaptureState::Sequence {
+            stage,
+            writer,
+            fps_interval,
+            last_capture_time: None,
+            frame_count: 0,
+        };
+        Ok(format!(
+            "capture: sequence started ({format:?}, {stage:?}, fps={}, palette={palette:?})",
+            fps.map(|f| f.to_string())
+                .unwrap_or_else(|| "unlimited".into())
+        ))
+    }
+
+    fn stop(&mut self, log: &mut Vec<String>) {
+        self.reap_finished();
+        let state = std::mem::replace(&mut self.state, CaptureState::Idle);
+        match state {
+            CaptureState::Sequence {
+                writer,
+                frame_count,
+                ..
+            } => match writer {
+                SequenceWriter::Png { dir } => {
+                    log.push(format!(
+                        "capture: PNG sequence stopped, {frame_count} frame(s) at {}",
+                        dir.display()
+                    ));
+                }
+                SequenceWriter::Gif {
+                    worker,
+                    path,
+                    default_delay_cs,
+                    scale,
+                    warming,
+                    ..
+                } => {
+                    // Stopped mid-warmup: train on the partial buffer and flush it so
+                    // the file isn't empty.
+                    if let Some(mut w) = warming {
+                        if !w.buffer.is_empty() {
+                            tracing::info!(
+                                "capture: stopped during warmup ({} frame(s)); \
+                                 training palette on partial buffer",
+                                w.buffer.len()
+                            );
+                            let nq = Arc::new(train_global_palette(&w.buffer));
+                            for f in w.buffer.drain(..) {
+                                worker.try_send(GifFrame {
+                                    rgba: f.rgba,
+                                    src_width: f.width,
+                                    src_height: f.height,
+                                    captured_at: f.captured_at,
+                                    default_delay_cs,
+                                    scale,
+                                    global_palette: Some(nq.clone()),
+                                });
+                            }
+                        }
+                    }
+                    let dropped = worker.dropped();
+                    // Detach and park the handle; the worker finishes encoding in the
+                    // background while the main thread returns.
+                    let handle = worker.detach();
+                    self.pending.push(handle);
+                    let drop_note = if dropped > 0 {
+                        format!(", {dropped} dropped under backpressure")
+                    } else {
+                        String::new()
+                    };
+                    log.push(format!(
+                        "capture: GIF stream stopped, {frame_count} frame(s){drop_note} \
+                         encoding in background -> {}",
+                        path.display()
+                    ));
+                }
+                SequenceWriter::Apng { worker, path, .. } => {
+                    let buffered = worker.frame_count();
+                    let handle = worker.detach();
+                    self.pending.push(handle);
+                    log.push(format!(
+                        "capture: APNG stream stopped, {buffered} frame(s) buffered; \
+                         assembling and writing in background -> {}",
+                        path.display()
+                    ));
+                }
+            },
+            CaptureState::OneShot { .. } => {
+                log.push("capture: pending one-shot cancelled".into());
+            }
+            CaptureState::Idle => {
+                log.push("capture: stop with no active session (no-op)".into());
+            }
+        }
+    }
+
+    /// Compact status line; `None` when idle, else `REC 42` / `REC 42 (3 dropped)`.
+    pub(crate) fn status(&self) -> Option<String> {
+        match &self.state {
+            CaptureState::Idle => None,
+            CaptureState::OneShot { .. } => Some("snap".into()),
+            CaptureState::Sequence {
+                writer,
+                frame_count,
+                ..
+            } => {
+                // Surface warmup progress; writing hasn't started yet.
+                if let SequenceWriter::Gif {
+                    warming: Some(w), ..
+                } = writer
+                {
+                    return Some(format!("WARMING {}/{}", w.buffer.len(), w.target_frames));
+                }
+                let dropped = match writer {
+                    SequenceWriter::Png { .. } => 0,
+                    SequenceWriter::Gif { worker, .. } => worker.dropped(),
+                    SequenceWriter::Apng { .. } => 0,
+                };
+                if dropped > 0 {
+                    Some(format!("REC {frame_count} ({dropped} dropped)"))
+                } else {
+                    Some(format!("REC {frame_count}"))
+                }
+            }
+        }
+    }
+
+    pub(crate) fn wants_pre(&self) -> bool {
+        match &self.state {
+            CaptureState::Idle => false,
+            CaptureState::OneShot { path_pre, .. } => path_pre.is_some(),
+            CaptureState::Sequence { stage, .. } => stage.wants_pre(),
+        }
+    }
+
+    pub(crate) fn wants_post(&self) -> bool {
+        match &self.state {
+            CaptureState::Idle => false,
+            CaptureState::OneShot { path_post, .. } => path_post.is_some(),
+            CaptureState::Sequence { stage, .. } => stage.wants_post(),
+        }
+    }
+
+    /// Should this frame be captured? FPS-gated for sequences; always true otherwise.
+    pub(crate) fn should_capture(&self, now: Instant) -> bool {
+        match &self.state {
+            CaptureState::Idle => false,
+            CaptureState::OneShot { .. } => true,
+            CaptureState::Sequence {
+                fps_interval,
+                last_capture_time,
+                ..
+            } => match (fps_interval, last_capture_time) {
+                (None, _) => true,
+                (Some(_), None) => true,
+                (Some(interval), Some(last)) => now.duration_since(*last) >= *interval,
+            },
+        }
+    }
+
+    /// Hand one stage's pixels to the active writer. `captured_at` is the sample
+    /// instant, used by the workers for wall-clock per-frame delays.
+    pub(crate) fn consume_frame(
+        &mut self,
+        is_pre: bool,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+        captured_at: Instant,
+    ) -> Result<()> {
+        match &mut self.state {
+            CaptureState::Idle => Ok(()),
+            CaptureState::OneShot {
+                path_pre,
+                path_post,
+            } => {
+                let path = if is_pre {
+                    path_pre.take()
+                } else {
+                    path_post.take()
+                };
+                if let Some(path) = path {
+                    write_png_bytes(&path, &rgba, width, height)?;
+                    tracing::info!("capture: wrote {}", path.display());
+                }
+                Ok(())
+            }
+            CaptureState::Sequence {
+                writer,
+                frame_count,
+                ..
+            } => writer.write_frame(is_pre, *frame_count, &rgba, width, height, captured_at),
+        }
+    }
+
+    /// Block until all detached workers finish flushing (called from Drop).
+    fn join_pending(&mut self) {
+        for h in self.pending.drain(..) {
+            let _ = h.join();
+        }
+    }
+
+    /// Mark the current frame written. One-shot goes Idle once both stages are
+    /// consumed; sequence bumps the counter and the FPS clock.
+    pub(crate) fn advance_frame(&mut self, now: Instant) {
+        match &mut self.state {
+            CaptureState::OneShot {
+                path_pre,
+                path_post,
+            } => {
+                if path_pre.is_none() && path_post.is_none() {
+                    self.state = CaptureState::Idle;
+                }
+            }
+            CaptureState::Sequence {
+                last_capture_time,
+                frame_count,
+                ..
+            } => {
+                *last_capture_time = Some(now);
+                *frame_count = frame_count.saturating_add(1);
+            }
+            CaptureState::Idle => {}
+        }
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        // Wait on still-encoding workers so their files have valid trailers before
+        // exit; worst case is a brief pause at app close.
+        self.join_pending();
+    }
+}
+
+impl SequenceWriter {
+    fn write_frame(
+        &mut self,
+        is_pre: bool,
+        frame_idx: u32,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        captured_at: Instant,
+    ) -> Result<()> {
+        match self {
+            SequenceWriter::Png { dir } => {
+                let label = if is_pre { "pre" } else { "post" };
+                let path = dir.join(format!("{label}_{frame_idx:06}.png"));
+                write_png_bytes(&path, rgba, width, height)?;
+                Ok(())
+            }
+            SequenceWriter::Gif {
+                worker,
+                default_delay_cs,
+                scale,
+                palette_mode,
+                warming,
+                global_palette,
+                ..
+            } => {
+                match *palette_mode {
+                    // Local: pass RGBA straight through to per-frame NeuQuant.
+                    PaletteMode::Local => {
+                        worker.try_send(GifFrame {
+                            rgba: rgba.to_vec(),
+                            src_width: width,
+                            src_height: height,
+                            captured_at,
+                            default_delay_cs: *default_delay_cs,
+                            scale: *scale,
+                            global_palette: None,
+                        });
+                    }
+                    PaletteMode::Global => {
+                        if let Some(w) = warming.as_mut() {
+                            w.buffer.push(WarmupFrame {
+                                rgba: rgba.to_vec(),
+                                width,
+                                height,
+                                captured_at,
+                            });
+                            if w.buffer.len() as u32 >= w.target_frames {
+                                // Train on the buffer (one-time ~50-100 ms pause), then
+                                // drain it through the worker so no frames are lost.
+                                let nq = Arc::new(train_global_palette(&w.buffer));
+                                tracing::info!(
+                                    "capture: gif global palette trained from {} frames",
+                                    w.buffer.len()
+                                );
+                                for f in w.buffer.drain(..) {
+                                    worker.try_send(GifFrame {
+                                        rgba: f.rgba,
+                                        src_width: f.width,
+                                        src_height: f.height,
+                                        captured_at: f.captured_at,
+                                        default_delay_cs: *default_delay_cs,
+                                        scale: *scale,
+                                        global_palette: Some(nq.clone()),
+                                    });
+                                }
+                                *global_palette = Some(nq);
+                                *warming = None;
+                            }
+                        } else if let Some(nq) = global_palette.as_ref() {
+                            // Post-warmup: send with the shared palette.
+                            worker.try_send(GifFrame {
+                                rgba: rgba.to_vec(),
+                                src_width: width,
+                                src_height: height,
+                                captured_at,
+                                default_delay_cs: *default_delay_cs,
+                                scale: *scale,
+                                global_palette: Some(nq.clone()),
+                            });
+                        } else {
+                            tracing::error!(
+                                "capture: gif global mode lost palette state (frame dropped)"
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+            SequenceWriter::Apng { worker, scale, .. } => {
+                worker.try_send(ApngFrame {
+                    rgba: rgba.to_vec(),
+                    src_width: width,
+                    src_height: height,
+                    captured_at,
+                    scale: *scale,
+                });
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Train a NeuQuant on a sparse (every-STRIDE-th) sample across all warmup frames so
+/// the palette spans the recording's colors. Stride 16 feeds ~110 K samples at
+/// 800x600 with 30 frames, plenty for 256 colors.
+fn train_global_palette(buffer: &[WarmupFrame]) -> color_quant::NeuQuant {
+    const STRIDE: usize = 16;
+    let mut samples: Vec<u8> = Vec::new();
+    for frame in buffer {
+        for px in frame.rgba.chunks_exact(4).step_by(STRIDE) {
+            // Normalize alpha for opaque pixels so NeuQuant's 4D metric isn't biased.
+            samples.push(px[0]);
+            samples.push(px[1]);
+            samples.push(px[2]);
+            samples.push(if px[3] != 0 { 0xFF } else { 0 });
+        }
+    }
+    color_quant::NeuQuant::new(10, 256, &samples)
+}
+
+/// Output dimensions for an optional target width; aspect preserved, height clamped
+/// to >= 1 so degenerate scenes don't crash the encoder.
+fn scaled_dims(width: u32, height: u32, scale: Option<u32>) -> Result<(u32, u32)> {
+    let Some(target_w) = scale else {
+        return Ok((width, height));
+    };
+    if target_w == 0 || width == 0 || height == 0 {
+        return Err(anyhow!(
+            "invalid scale: target_w={target_w}, src={width}x{height}"
+        ));
+    }
+    let h = ((target_w as u64 * height as u64 + (width as u64) / 2) / width as u64) as u32;
+    Ok((target_w, h.max(1)))
+}
+
+fn fps_to_centiseconds(fps: u16) -> u16 {
+    // GIF delay is in centiseconds; clamp to >= 1 so a 0-delay frame isn't rejected.
+    let cs = (100.0_f32 / fps.max(1) as f32).round() as u16;
+    cs.max(1)
+}
+
+fn default_name() -> String {
+    let unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("capture_{unix}")
+}
+
+// ---------------------------------------------------------------------------
+// GPU readback + PNG writer
+// ---------------------------------------------------------------------------
+
+/// Row-major RGBA8 pixels, already R/B-swapped from BGRA sources.
+pub(crate) struct RawImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Synchronous swapchain-texture readback into a tightly-packed RGBA8 buffer. Sync
+/// (poll-wait on the map), so a capture frame may stutter.
+pub(crate) fn read_texture_rgba(
+    device: &Device,
+    queue: &Queue,
+    texture: &Texture,
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+) -> Result<RawImage> {
+    let unpadded_bpr = width.checked_mul(4).context("width * 4 overflows u32")?;
+    let padded_bpr = unpadded_bpr.next_multiple_of(256);
+    let buffer_size = (padded_bpr as u64) * (height as u64);
+
+    let buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("loam-app::capture-staging"),
+        size: buffer_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("loam-app::capture-copy"),
+    });
+    encoder.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bpr),
+                rows_per_image: None,
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = buffer.slice(..);
+    slice.map_async(MapMode::Read, |_| {});
+    device
+        .poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .context("device.poll on capture readback failed")?;
+
+    let data = slice.get_mapped_range();
+    let mut rgba = Vec::with_capacity((unpadded_bpr * height) as usize);
+    for row in 0..height as usize {
+        let start = row * padded_bpr as usize;
+        let end = start + unpadded_bpr as usize;
+        rgba.extend_from_slice(&data[start..end]);
+    }
+    drop(data);
+    buffer.unmap();
+
+    if format_is_bgra(format) {
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+    }
+
+    Ok(RawImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
+fn format_is_bgra(format: TextureFormat) -> bool {
+    matches!(
+        format,
+        TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb
+    )
+}
+
+fn write_png_bytes(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create capture dir {}", parent.display()))?;
+    }
+    let img: ::image::RgbaImage = ::image::ImageBuffer::from_raw(width, height, rgba.to_vec())
+        .ok_or_else(|| anyhow!("RGBA buffer size doesn't match {width}x{height}"))?;
+    img.save_with_format(path, ::image::ImageFormat::Png)
+        .with_context(|| format!("write png {}", path.display()))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Console command registration
+// ---------------------------------------------------------------------------
+
+/// Register the `capture` console command (subcommands png / frames / gif / apng /
+/// toggle / stop / panel; see `capture_help` for the grammar).
+pub fn register_commands<Ctx: 'static>(console: &mut Console<Ctx>) {
+    // Per-subcommand `arg_choices` drive context-aware completion; `palette=` is the
+    // only kv key with enumerable values. Handlers own arg parsing + enqueue.
+    let stage_choices: &[&'static str] = &["pre", "post", "both"];
+    let png_kv: &[&'static str] = &["fps=", "scale="];
+    let gif_kv: &[&'static str] = &["fps=", "palette=", "scale="];
+    let palette_values: &[&'static str] = &["local", "global"];
+
+    let cap = loam_egui::subcommands::<Ctx>("capture", capture_help())
+        .custom(
+            "png",
+            "one-shot PNG capture",
+            &[stage_choices],
+            &[],
+            |_, rest, out| {
+                let p = parse_capture_args(rest);
+                enqueue(CaptureRequest::OneShot {
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                });
+                out.line(format!("queued one-shot ({:?})", p.stage));
+                Ok(())
+            },
+        )
+        .custom(
+            "frames",
+            "PNG frame sequence (per-frame .png files)",
+            &[stage_choices, png_kv, png_kv],
+            &[],
+            |_, rest, out| {
+                let p = parse_capture_args(rest);
+                enqueue(CaptureRequest::StartSequence {
+                    format: CaptureFormat::Png,
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                    fps: p.fps,
+                    scale: None,
+                    palette: PaletteMode::default(),
+                });
+                out.line(format!("started PNG sequence ({:?})", p.stage));
+                Ok(())
+            },
+        )
+        .custom(
+            "gif",
+            "GIF sequence (limited quality on raymarched content)",
+            &[stage_choices, gif_kv, gif_kv, gif_kv],
+            &[("palette", palette_values)],
+            |_, rest, out| {
+                let p = parse_capture_args(rest);
+                // Surface the GIF quality caveat (256-color flicker on raymarched).
+                out.error(
+                    "GIF: per-frame NeuQuant flickers on raymarched content. Prefer \
+                     `capture apng` for shareable clips, or `capture frames` + ffmpeg \
+                     palettegen for high-quality post-processed GIFs.",
+                );
+                tracing::warn!(
+                    "capture: GIF quality is limited for raymarched content (per-frame \
+                     palette regeneration causes flicker); prefer apng or PNG sequence"
+                );
+                if p.palette == PaletteMode::Global {
+                    out.error(
+                        "GIF palette=global: palette is trained from the first ~1s of \
+                         captures; anything on screen during that window (the console, \
+                         transient overlays) biases the palette toward those colors and \
+                         the rest of the recording looks desaturated. Capture pre-egui \
+                         (`capture gif pre palette=global`) to avoid.",
+                    );
+                    tracing::warn!(
+                        "capture: GIF palette=global trains on the warmup buffer; ensure \
+                         no transient UI is visible during the first ~1s of capture"
+                    );
+                }
+                enqueue(CaptureRequest::StartSequence {
+                    format: CaptureFormat::Gif,
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                    fps: p.fps,
+                    scale: p.scale,
+                    palette: p.palette,
+                });
+                out.line(format!(
+                    "started GIF stream ({:?}, fps={}, scale={}, palette={:?})",
+                    p.stage,
+                    p.fps.map_or("default".into(), |f| f.to_string()),
+                    p.scale.map_or("native".into(), |s| s.to_string()),
+                    p.palette,
+                ));
+                Ok(())
+            },
+        )
+        .custom(
+            "apng",
+            "APNG sequence (true-color, larger than GIF)",
+            &[stage_choices, png_kv, png_kv],
+            &[],
+            |_, rest, out| {
+                let p = parse_capture_args(rest);
+                enqueue(CaptureRequest::StartSequence {
+                    format: CaptureFormat::Apng,
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                    fps: p.fps,
+                    scale: p.scale,
+                    palette: PaletteMode::default(),
+                });
+                out.line(format!(
+                    "started APNG stream ({:?}, fps={}, scale={})",
+                    p.stage,
+                    p.fps.map_or("default".into(), |f| f.to_string()),
+                    p.scale.map_or("native".into(), |s| s.to_string()),
+                ));
+                Ok(())
+            },
+        )
+        .custom(
+            "toggle",
+            "start/stop a sequence in one command (format + args)",
+            &[
+                &["png", "frames", "gif", "apng"],
+                stage_choices,
+                gif_kv,
+                gif_kv,
+            ],
+            &[("palette", palette_values)],
+            |_, rest, out| {
+                let (format, after_format) = parse_format(rest);
+                let p = parse_capture_args(after_format);
+                enqueue(CaptureRequest::Toggle {
+                    format,
+                    stage: p.stage,
+                    dir: p.dir,
+                    name: None,
+                    fps: p.fps,
+                    scale: p.scale,
+                    palette: p.palette,
+                });
+                out.line(format!("toggle queued ({format:?}, {:?})", p.stage));
+                Ok(())
+            },
+        )
+        .custom(
+            "stop",
+            "stop the active sequence",
+            &[],
+            &[],
+            |_, _rest, out| {
+                enqueue(CaptureRequest::Stop);
+                out.line("stop queued");
+                Ok(())
+            },
+        )
+        .custom(
+            "panel",
+            "toggle the capture parameters panel",
+            &[],
+            &[],
+            |_, _rest, out| {
+                let now_open = toggle_panel_global();
+                out.line(if now_open {
+                    "panel opened"
+                } else {
+                    "panel closed"
+                });
+                Ok(())
+            },
+        );
+    console.register(cap);
+}
+
+fn capture_help() -> &'static str {
+    "capture <png|frames|gif|apng|toggle|stop|panel> [pre|post|both] [dir] [fps=N] \
+     [scale=W] [palette=local|global]"
+}
+
+struct ParsedCaptureArgs {
+    stage: CaptureStage,
+    dir: Option<PathBuf>,
+    fps: Option<u16>,
+    scale: Option<u32>,
+    palette: PaletteMode,
+}
+
+impl Default for ParsedCaptureArgs {
+    fn default() -> Self {
+        Self {
+            stage: CaptureStage::Post,
+            dir: None,
+            fps: None,
+            scale: None,
+            palette: PaletteMode::default(),
+        }
+    }
+}
+
+/// Tokenise post-format positional args:
+/// - `pre|post|both`     => stage
+/// - `fps=N`             => target frame rate
+/// - `scale=N`           => output width in pixels (GIF only)
+/// - `palette=local`     => per-frame NeuQuant (GIF only)
+/// - `palette=global`    => warmup-trained global NeuQuant (GIF only)
+/// - anything else       => treat as output directory
+fn parse_capture_args(args: &[&str]) -> ParsedCaptureArgs {
+    let mut p = ParsedCaptureArgs::default();
+    for arg in args {
+        if let Some(v) = arg.strip_prefix("fps=") {
+            if let Ok(n) = v.parse::<u16>() {
+                p.fps = Some(n);
+            }
+        } else if let Some(v) = arg.strip_prefix("scale=") {
+            if let Ok(n) = v.parse::<u32>() {
+                p.scale = Some(n);
+            }
+        } else if let Some(v) = arg.strip_prefix("palette=") {
+            match v {
+                "local" => p.palette = PaletteMode::Local,
+                "global" => p.palette = PaletteMode::Global,
+                _ => {}
+            }
+        } else {
+            match *arg {
+                "pre" => p.stage = CaptureStage::Pre,
+                "post" => p.stage = CaptureStage::Post,
+                "both" => p.stage = CaptureStage::Both,
+                other => p.dir = Some(PathBuf::from(other)),
+            }
+        }
+    }
+    p
+}
+
+fn parse_format<'a>(args: &'a [&'a str]) -> (CaptureFormat, &'a [&'a str]) {
+    match args.split_first() {
+        Some((&"png", rest)) | Some((&"frames", rest)) => (CaptureFormat::Png, rest),
+        Some((&"gif", rest)) => (CaptureFormat::Gif, rest),
+        Some((&"apng", rest)) => (CaptureFormat::Apng, rest),
+        // No format keyword: treat the list as stage/dir args, default to gif.
+        _ => (CaptureFormat::Gif, args),
+    }
+}
+
+/// Bind the default capture hotkeys on the given console:
+/// - `F12`: `capture png post` (one-shot screenshot)
+/// - `F9`:  `capture toggle gif post` (press to start a GIF, again to stop)
+/// - `F11`: `capture panel` (toggle the parameters UI)
+pub fn bind_default_hotkeys<Ctx: 'static>(console: &mut Console<Ctx>) {
+    console.bind(loam_egui::egui::Key::F12, "capture png post");
+    console.bind(loam_egui::egui::Key::F9, "capture toggle gif post");
+    console.bind(loam_egui::egui::Key::F11, "capture panel");
+}
+
+// ---------------------------------------------------------------------------
+// Panel UI
+// ---------------------------------------------------------------------------
+
+/// Egui widget for setting capture parameters and driving start / stop / one-shot.
+/// Buttons synthesise a [`CaptureRequest`] onto the global queue. Visibility tracks
+/// [`CapturePanel::open`] or the `capture panel` console toggle, whichever changed last.
+///
+/// ```ignore
+/// // setup:
+/// let capture_panel = loam_app::capture::CapturePanel::new();
+///
+/// // each frame in App::ui:
+/// self.capture_panel.show(egui_ctx);
+/// ```
+pub struct CapturePanel {
+    /// Visible? Toggle via [`CapturePanel::toggle`] or the `capture panel` subcommand.
+    pub open: bool,
+    output_dir: String,
+    name: String,
+    format: CaptureFormat,
+    stage: CaptureStage,
+    fps: u16,
+    scale_enabled: bool,
+    scale_width: u32,
+    palette_mode: PaletteMode,
+}
+
+impl Default for CapturePanel {
+    fn default() -> Self {
+        Self {
+            open: false,
+            output_dir: "captures".into(),
+            name: String::new(),
+            format: CaptureFormat::Gif,
+            stage: CaptureStage::Post,
+            fps: 30,
+            scale_enabled: false,
+            scale_width: 720,
+            palette_mode: PaletteMode::default(),
+        }
+    }
+}
+
+impl CapturePanel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+        PANEL_OPEN.store(self.open, Ordering::Relaxed);
+    }
+
+    /// Per-frame entry point: mirror the global toggle into `self.open`, then render.
+    pub fn show(&mut self, ctx: &loam_egui::egui::Context) {
+        let global = PANEL_OPEN.load(Ordering::Relaxed);
+        if global != self.open {
+            self.open = global;
+        }
+        if !self.open {
+            return;
+        }
+        let mut open_flag = self.open;
+        loam_egui::egui::Window::new("capture")
+            .open(&mut open_flag)
+            .resizable(true)
+            .default_width(280.0)
+            .show(ctx, |ui| self.body(ui));
+        if open_flag != self.open {
+            self.open = open_flag;
+            PANEL_OPEN.store(self.open, Ordering::Relaxed);
+        }
+    }
+
+    fn body(&mut self, ui: &mut loam_egui::egui::Ui) {
+        let recording_status = current_status();
+        let recording = recording_status.is_some();
+
+        ui.label(format!(
+            "Status: {}",
+            recording_status.as_deref().unwrap_or("Idle")
+        ));
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("Dir:");
+            ui.add(loam_egui::egui::TextEdit::singleline(&mut self.output_dir).desired_width(180.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            ui.add(loam_egui::egui::TextEdit::singleline(&mut self.name).desired_width(160.0));
+            if self.name.is_empty() {
+                ui.weak("(auto)");
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Format:");
+            ui.radio_value(&mut self.format, CaptureFormat::Png, "PNG");
+            ui.radio_value(&mut self.format, CaptureFormat::Gif, "GIF");
+            ui.radio_value(&mut self.format, CaptureFormat::Apng, "APNG");
+        });
+
+        // Only PNG supports pre/both; other formats are forced to Post.
+        let stage_enabled = self.format == CaptureFormat::Png;
+        ui.add_enabled_ui(stage_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Stage:");
+                ui.radio_value(&mut self.stage, CaptureStage::Pre, "pre");
+                ui.radio_value(&mut self.stage, CaptureStage::Post, "post");
+                ui.radio_value(&mut self.stage, CaptureStage::Both, "both");
+            });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("FPS:");
+            ui.add(loam_egui::egui::Slider::new(&mut self.fps, 1..=60));
+        });
+
+        // Scale is animated-format-only; PNG keeps native size for diagnostic fidelity.
+        let scale_supported = matches!(self.format, CaptureFormat::Gif | CaptureFormat::Apng);
+        ui.add_enabled_ui(scale_supported, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.scale_enabled, "Scale:");
+                ui.add_enabled(
+                    self.scale_enabled,
+                    loam_egui::egui::Slider::new(&mut self.scale_width, 240..=2160).suffix(" px"),
+                );
+            });
+        });
+
+        // Palette is GIF-only; PNG and APNG are 24-bit per frame.
+        ui.add_enabled_ui(self.format == CaptureFormat::Gif, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Palette:");
+                ui.radio_value(&mut self.palette_mode, PaletteMode::Local, "local");
+                ui.radio_value(&mut self.palette_mode, PaletteMode::Global, "global");
+            });
+        });
+
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            if ui.button("Screenshot").clicked() {
+                enqueue(CaptureRequest::OneShot {
+                    stage: CaptureStage::Both,
+                    dir: Some(PathBuf::from(&self.output_dir)),
+                    name: (!self.name.is_empty()).then(|| self.name.clone()),
+                });
+            }
+            let label = if recording { "Stop" } else { "Start" };
+            if ui.button(label).clicked() {
+                if recording {
+                    enqueue(CaptureRequest::Stop);
+                } else {
+                    enqueue(CaptureRequest::StartSequence {
+                        format: self.format,
+                        stage: self.stage,
+                        dir: Some(PathBuf::from(&self.output_dir)),
+                        name: (!self.name.is_empty()).then(|| self.name.clone()),
+                        fps: Some(self.fps),
+                        scale: self.scale_enabled.then_some(self.scale_width),
+                        palette: self.palette_mode,
+                    });
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaled_dims_preserves_aspect_ratio() {
+        // 1920x1080 -> 720 width should give 405 height (16:9).
+        assert_eq!(scaled_dims(1920, 1080, Some(720)).unwrap(), (720, 405));
+        // Square downsample.
+        assert_eq!(scaled_dims(1024, 1024, Some(512)).unwrap(), (512, 512));
+        // Tall portrait.
+        assert_eq!(scaled_dims(1080, 1920, Some(360)).unwrap(), (360, 640));
+        // None -> identity.
+        assert_eq!(scaled_dims(800, 600, None).unwrap(), (800, 600));
+        // Height clamped to >= 1 for degenerate aspect ratios.
+        assert_eq!(scaled_dims(10000, 1, Some(100)).unwrap(), (100, 1));
+    }
+
+    #[test]
+    fn scaled_dims_rejects_zero_target() {
+        assert!(scaled_dims(1920, 1080, Some(0)).is_err());
+        assert!(scaled_dims(0, 1080, Some(720)).is_err());
+        assert!(scaled_dims(1920, 0, Some(720)).is_err());
+    }
+
+    #[test]
+    fn parse_capture_args_extracts_kv_pairs() {
+        let p = parse_capture_args(&["pre", "./shots", "fps=24", "scale=480"]);
+        assert_eq!(p.stage, CaptureStage::Pre);
+        assert_eq!(p.dir.as_deref(), Some(std::path::Path::new("./shots")));
+        assert_eq!(p.fps, Some(24));
+        assert_eq!(p.scale, Some(480));
+    }
+
+    #[test]
+    fn parse_capture_args_ignores_malformed_kv() {
+        // `fps=` with non-numeric value silently drops; user gets default.
+        let p = parse_capture_args(&["fps=abc", "scale=xyz"]);
+        assert!(p.fps.is_none());
+        assert!(p.scale.is_none());
+    }
+}

@@ -1,12 +1,12 @@
 // BlendedSpace demo: user shading layer.
 //
 // The Space prelude (BlendedSpace<E3, H3, LinearBlendX>), scene SDF, and
-// geodesic march kernel are prepended by rye-shader before this file is
+// geodesic march kernel are prepended by loam-shader before this file is
 // compiled. Available functions:
-//   rye_safe_normalize, rye_march_geodesic, rye_estimate_normal (kernel)
-//   rye_distance, rye_exp, rye_parallel_transport (Space prelude)
-//   rye_blended_alpha (BlendedSpace prelude, for tinting by zone)
-//   rye_scene_sdf (scene module)
+//   loam_safe_normalize, loam_march_geodesic, loam_estimate_normal (kernel)
+//   loam_distance, loam_exp, loam_parallel_transport (Space prelude)
+//   loam_blended_alpha (BlendedSpace prelude, for tinting by zone)
+//   loam_scene_sdf (scene module)
 //
 // Edit while the example is running; ShaderDb hot-reloads this file.
 
@@ -40,14 +40,14 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let aspect = u.resolution.x / u.resolution.y;
     let ndc = vec2<f32>(uv.x * aspect, -uv.y);
 
-    let rd = rye_safe_normalize(
+    let rd = loam_safe_normalize(
         u.camera_forward
             + u.camera_right * ndc.x * u.fov_y_tan
             + u.camera_up    * ndc.y * u.fov_y_tan,
         vec3<f32>(0.0, 0.0, -1.0),
     );
 
-    let march_out = rye_march_geodesic(u.camera_pos, rd, u.ball_scale);
+    let march_out = loam_march_geodesic(u.camera_pos, rd, u.ball_scale);
     let t = march_out.w;
     if t < 0.0 {
         // Sky: graded blue with a warm horizon hinting at the H³ side.
@@ -57,15 +57,15 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     let hit_space = march_out.xyz;
-    let n         = rye_estimate_normal(hit_space, u.ball_scale);
-    let sun_dir   = rye_safe_normalize(vec3<f32>(0.4, 0.8, 0.3), vec3<f32>(0.0, 1.0, 0.0));
+    let n         = loam_estimate_normal(hit_space, u.ball_scale);
+    let sun_dir   = loam_safe_normalize(vec3<f32>(0.4, 0.8, 0.3), vec3<f32>(0.0, 1.0, 0.0));
     let diffuse   = max(dot(n, sun_dir), 0.0);
     let ambient   = 0.22;
 
     // Tint by blending zone: E³ side cool blue, H³ side warm red.
     // The transition zone shows a smooth gradient; *that* is the
     // visible BlendedSpace seam.
-    let alpha = rye_blended_alpha(hit_space);
+    let alpha = loam_blended_alpha(hit_space);
     let e3_color = vec3<f32>(0.40, 0.62, 0.95);
     let h3_color = vec3<f32>(0.95, 0.45, 0.30);
     var base = mix(e3_color, h3_color, alpha);
@@ -87,7 +87,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     // Geodesic fog under the BlendedSpace metric.
-    let cam_dist = rye_distance(u.camera_pos * u.ball_scale, hit_space);
+    let cam_dist = loam_distance(u.camera_pos * u.ball_scale, hit_space);
     let fog      = exp(-cam_dist / max(u.fog_scale, 1e-4));
 
     let shaded = base * (diffuse + ambient) * fog;

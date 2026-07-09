@@ -1,4 +1,4 @@
-//! Smoke test for the `rye-egui` egui integration.
+//! Smoke test for the `loam-egui` egui integration.
 //!
 //! **What this is.** A tiny test that the framework wiring works:
 //! widgets render, input flows in, focus gating works, world-anchored
@@ -8,7 +8,7 @@
 //! not render a scene, and does not have a floor.
 //!
 //! **What you should see.** A coloured background, an egui window
-//! titled "rye-egui smoke" with a few widgets, and (when enabled) a
+//! titled "loam-egui smoke" with a few widgets, and (when enabled) a
 //! small floating label that orbits the centre of the screen.
 //!
 //! **What the widgets do:**
@@ -36,13 +36,13 @@ use std::borrow::Cow;
 
 use anyhow::Result;
 use glam::Vec3;
-use rye_app::{egui, run_with_config, world_to_screen, App, FrameCtx, RunConfig, SetupCtx};
-use rye_camera::CameraView;
-use rye_render::device::RenderDevice;
+use loam_app::{egui, run_with_config, world_to_screen, App, FrameCtx, RunConfig, SetupCtx};
+use loam_camera::CameraView;
+use loam_render::device::RenderDevice;
 use winit::window::WindowAttributes;
 
 struct UiSmokeApp {
-    space: rye_math::EuclideanR3,
+    space: loam_math::EuclideanR3,
 
     // Driven by the UI.
     title: String,
@@ -61,12 +61,12 @@ struct UiSmokeApp {
 }
 
 impl App for UiSmokeApp {
-    type Space = rye_math::EuclideanR3;
+    type Space = loam_math::EuclideanR3;
 
     fn setup(_ctx: &mut SetupCtx<'_>) -> Result<Self> {
         Ok(Self {
-            space: rye_math::EuclideanR3,
-            title: "rye-egui smoke".to_string(),
+            space: loam_math::EuclideanR3,
+            title: "loam-egui smoke".to_string(),
             hue: 0.55,
             anchor_radius: 2.0,
             anchor_speed: 1.0,
@@ -80,7 +80,7 @@ impl App for UiSmokeApp {
         &self.space
     }
 
-    fn tick(&mut self, dt: f32, _ctx: &mut rye_app::TickCtx) {
+    fn tick(&mut self, dt: f32, _ctx: &mut loam_app::TickCtx) {
         self.anchor_angle += self.anchor_speed * dt;
     }
 
@@ -95,7 +95,7 @@ impl App for UiSmokeApp {
     }
 
     fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
-        egui::Window::new("rye-egui smoke")
+        egui::Window::new("loam-egui smoke")
             .default_pos([16.0, 16.0])
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -233,7 +233,7 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 fn main() -> Result<()> {
     run_with_config::<UiSmokeApp>(RunConfig {
         window: WindowAttributes::default()
-            .with_title("rye-egui smoke")
+            .with_title("loam-egui smoke")
             .with_visible(false),
         // Drop wgpu_hal to `error` so the Windows Vulkan loader's noisy
         // "validation layer not found" + "D3D12 mapping JSON parse"

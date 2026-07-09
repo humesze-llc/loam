@@ -3,8 +3,8 @@
 //! context menu. Drives `self.row` (the visible polytopes in
 //! `Shapes` view mode); mutations here trigger `rebuild_bodies()`.
 
-use rye_app::egui;
-use rye_egui::{
+use loam_app::egui;
+use loam_egui::{
     dnd::{
         apply_drop_pre_pass as dnd_apply_drop_pre_pass,
         drag_source_collapsing as dnd_drag_source_collapsing, drop_target_idx, force_opaque_active,
@@ -12,8 +12,8 @@ use rye_egui::{
     },
     media::add_button,
 };
-use rye_physics::polytope::Polytope4;
-use rye_render::raymarch::RaymarchShape;
+use loam_physics::polytope::Polytope4;
+use loam_render::raymarch::RaymarchShape;
 
 use crate::catalog::{render_shape_catalog_menu, ShapeEntry};
 use crate::consts::{CARD_ITEM_SPACING_X, CONTROL_H, CONTROL_W, MAX_ROW_LEN, SHAPE_CARD_WIDTH};

@@ -11,15 +11,15 @@ use std::borrow::Cow;
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
-use rye_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx, TickCtx};
-use rye_camera::OrbitCamera;
-use rye_math::EuclideanR3;
-use rye_physics::{
+use loam_app::{run_with_config, App, FrameCtx, RunConfig, SetupCtx, TickCtx};
+use loam_camera::OrbitCamera;
+use loam_math::EuclideanR3;
+use loam_physics::{
     euclidean_r3::{box_body, halfspace_body_r3, register_default_narrowphase, sphere_body_r3},
     field::Gravity,
     Collider, World,
 };
-use rye_render::device::RenderDevice;
+use loam_render::device::RenderDevice;
 use winit::{
     event::{ElementState, WindowEvent},
     keyboard::{KeyCode, PhysicalKey},
@@ -453,7 +453,7 @@ impl App for Physics3DApp {
             .filter(|b| b.inv_mass > 0.0)
             .count();
         Cow::Owned(format!(
-            "Rye - 3D Physics | {fps:.0} fps | {dynamic_count} bodies | sim {:.1}s (R: reset, drag: orbit, scroll: zoom)",
+            "Loam - 3D Physics | {fps:.0} fps | {dynamic_count} bodies | sim {:.1}s (R: reset, drag: orbit, scroll: zoom)",
             self.sim_time
         ))
     }
@@ -480,7 +480,7 @@ fn main() -> Result<()> {
 
     let config = RunConfig {
         window: WindowAttributes::default()
-            .with_title("Rye - 3D Physics")
+            .with_title("Loam - 3D Physics")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 720.0))
             .with_visible(false),
         fixed_hz: PHYSICS_HZ,
