@@ -63,6 +63,8 @@ pub mod frame_pacing;
 pub mod freecam;
 pub mod keymap;
 pub mod log;
+#[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+mod probe;
 pub mod trace;
 pub mod version;
 pub mod vsync;
@@ -699,6 +701,9 @@ struct Runner<A: App> {
 
     #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
     capture: capture::Capture,
+
+    #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+    probe: Option<probe::Probe>,
 }
 
 impl<A: App> Runner<A> {
@@ -731,6 +736,8 @@ impl<A: App> Runner<A> {
 
             #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
             capture: capture::Capture::new(),
+            #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+            probe: probe::Probe::from_args(),
         }
     }
 
@@ -1323,6 +1330,10 @@ impl<A: App> Runner<A> {
                 let _scope = loam_time::frame_trace::scope("app-ui");
                 let egui_ctx = ui.begin_frame(win.as_ref()).clone();
                 app.ui(&egui_ctx, &mut fctx);
+                #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+                if let Some(probe) = self.probe.as_ref() {
+                    probe.overlay(&egui_ctx);
+                }
             }
         }
 
@@ -1512,6 +1523,22 @@ impl<A: App> Runner<A> {
                             label: Some("loam-app::frame-post-post-capture"),
                         });
                     capture_consume(&mut self.capture, rd, &frame.texture, false, capture_now);
+                }
+                // Probe tap: same mid-frame submit pattern as the capture taps
+                // so the readback sees the fully composited frame.
+                #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+                if let Some(probe) = self.probe.as_mut() {
+                    rd.queue.submit(Some(encoder.finish()));
+                    encoder = rd
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("loam-app::frame-post-probe"),
+                        });
+                    if probe.consume(rd, &frame.texture) {
+                        // Probe runs are disposable processes; exit beats
+                        // threading a shutdown request through the runner.
+                        std::process::exit(0);
+                    }
                 }
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 if do_capture {
