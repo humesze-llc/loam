@@ -26,6 +26,8 @@ pub struct MsaaTarget {
     #[allow(dead_code)]
     texture: Texture,
     pub view: TextureView,
+    /// Non-sRGB reinterpretation for the gamma-space UI pass.
+    pub ui_view: TextureView,
 }
 
 /// Offscreen sRGB render target for the non-sRGB-surface (browser-WebGPU) path:
@@ -149,6 +151,15 @@ impl RenderDevice {
             .find(|m| *m == CompositeAlphaMode::Opaque)
             .unwrap_or(caps.alpha_modes[0]);
 
+        // Register the non-sRGB twin so the UI pass can reinterpret the
+        // swapchain and blend in gamma space (egui's feathering assumes it;
+        // linear-space blending thins and darkens hairlines). Scene passes
+        // keep the sRGB view.
+        let view_formats = if format.is_srgb() {
+            vec![format.remove_srgb_suffix()]
+        } else {
+            vec![]
+        };
         let config = SurfaceConfiguration {
             // COPY_SRC keeps headless screenshot readback open at negligible cost.
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
@@ -157,7 +168,7 @@ impl RenderDevice {
             height: size.height,
             present_mode: PresentMode::Fifo,
             alpha_mode,
-            view_formats: vec![],
+            view_formats,
             desired_maximum_frame_latency: 2,
         };
 
@@ -330,6 +341,32 @@ impl RenderDevice {
             .unwrap_or(self.surface_bundle.config.format)
     }
 
+    /// Format the egui/UI pipeline should target: the swapchain format with
+    /// the sRGB suffix stripped, so blending happens in gamma space as egui's
+    /// feathering assumes. On the composite path the UI renders into the
+    /// scene texture before the composite, so this stays `target_format`.
+    pub fn ui_format(&self) -> TextureFormat {
+        match self.scene_format {
+            Some(f) => f,
+            None => self.surface_bundle.config.format.remove_srgb_suffix(),
+        }
+    }
+
+    /// Non-sRGB reinterpreted view of the acquired swapchain texture for the
+    /// UI pass. Identity reinterpretation on non-sRGB surfaces.
+    pub fn create_ui_swap_view(&self, frame: &SurfaceTexture) -> TextureView {
+        frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.surface_bundle.config.format.remove_srgb_suffix()),
+            ..Default::default()
+        })
+    }
+
+    /// Non-sRGB view of the MSAA attachment for the UI pass, `None` when
+    /// MSAA is off.
+    pub fn msaa_ui_view(&self) -> Option<&TextureView> {
+        self.msaa_target.as_ref().map(|t| &t.ui_view)
+    }
+
     /// Run the final composite pass: sample the scene texture, gamma-encode in the
     /// fragment shader, and write to `swap_view`. Caller submits the encoder.
     /// No-op when `scene_view()` is `None` (native fast path).
@@ -449,8 +486,16 @@ fn create_msaa_target(
         dimension: TextureDimension::D2,
         format,
         usage: TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
+        view_formats: &[format.remove_srgb_suffix()],
     });
     let view = texture.create_view(&TextureViewDescriptor::default());
-    MsaaTarget { texture, view }
+    let ui_view = texture.create_view(&TextureViewDescriptor {
+        format: Some(format.remove_srgb_suffix()),
+        ..Default::default()
+    });
+    MsaaTarget {
+        texture,
+        view,
+        ui_view,
+    }
 }
