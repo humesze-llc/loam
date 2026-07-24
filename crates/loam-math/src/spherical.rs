@@ -236,8 +236,11 @@ fn loam_s3_lift(p: vec3<f32>) -> vec4<f32> {
 }
 
 fn loam_origin_distance(p: vec3<f32>) -> f32 {
+    // Arc from the north pole (0,0,0,1) to the lift (p, √(1−|p|²)) is
+    // asin(|p|). The equivalent acos(√(1−|p|²)) returns exactly 0 for
+    // |p| < ~3.4e-4, where √(1−|p|²) rounds to 1.0 in f32.
     let r2 = min(dot(p, p), LOAM_S3_R2_MAX);
-    return acos(sqrt(1.0 - r2));
+    return asin(sqrt(r2));
 }
 
 fn loam_distance(a: vec3<f32>, b: vec3<f32>) -> f32 {
@@ -483,6 +486,59 @@ mod tests {
         let d2 = s.distance(inside, outside);
         assert!(d1.is_finite() && d1 >= 0.0);
         assert!(d2.is_finite() && d2 >= 0.0);
+    }
+
+    /// The statements of the shipped `loam_origin_distance`, verbatim. Pinned
+    /// so `wgsl_origin_distance_mirror` cannot drift from the shader it stands
+    /// in for.
+    const WGSL_ORIGIN_DISTANCE_BODY: &str =
+        "    let r2 = min(dot(p, p), LOAM_S3_R2_MAX);\n    return asin(sqrt(r2));\n}";
+
+    /// CPU port of the shipped `loam_origin_distance`, expression for
+    /// expression, so GPU/CPU parity is checkable without an adapter.
+    fn wgsl_origin_distance_mirror(p: Vec3) -> f32 {
+        let r2 = p.length_squared().min(SPHERE_R2_MAX);
+        r2.sqrt().asin()
+    }
+
+    #[test]
+    fn wgsl_origin_distance_body_matches_the_cpu_mirror() {
+        assert!(
+            s3().wgsl_impl().contains(WGSL_ORIGIN_DISTANCE_BODY),
+            "loam_origin_distance drifted from wgsl_origin_distance_mirror",
+        );
+    }
+
+    #[test]
+    fn wgsl_origin_distance_matches_cpu_distance_near_origin() {
+        let s = s3();
+        // Radii straddling |p| ≈ 3.4e-4, below which acos(√(1−|p|²)) returns
+        // exactly 0 in f32.
+        let diagonal = Vec3::new(1.0, 1.0, 1.0).normalize();
+        for r in [1e-3_f32, 3e-4, 1e-4, 1e-5, 1e-6] {
+            for dir in [Vec3::X, diagonal] {
+                let p = dir * r;
+                assert_relative_eq!(
+                    wgsl_origin_distance_mirror(p),
+                    s.distance(Vec3::ZERO, p),
+                    max_relative = 1e-6
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wgsl_origin_distance_matches_cpu_distance_across_the_hemisphere() {
+        let s = s3();
+        let dir = Vec3::new(0.6, -0.48, 0.64).normalize();
+        for r in [0.01_f32, 0.1, 0.4, 0.7, 0.9] {
+            let p = dir * r;
+            assert_relative_eq!(
+                wgsl_origin_distance_mirror(p),
+                s.distance(Vec3::ZERO, p),
+                max_relative = 1e-5
+            );
+        }
     }
 
     #[test]
