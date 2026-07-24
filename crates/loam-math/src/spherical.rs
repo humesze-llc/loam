@@ -237,8 +237,11 @@ fn loam_s3_lift(p: vec3<f32>) -> vec4<f32> {
 
 fn loam_origin_distance(p: vec3<f32>) -> f32 {
     // Arc from the north pole (0,0,0,1) to the lift (p, √(1−|p|²)) is
-    // asin(|p|). The equivalent acos(√(1−|p|²)) returns exactly 0 for
-    // |p| < ~3.4e-4, where √(1−|p|²) rounds to 1.0 in f32.
+    // asin(|p|). The equivalent acos(√(1−|p|²)) loses the small-|p| regime
+    // twice over in f32: it collapses to exactly 0 below |p| ≈ 1.73e-4
+    // (1−|p|² rounds to 1.0 once |p|² ≤ 2⁻²⁵), and its smallest nonzero
+    // output is 3.45e-4 = acos(1−2⁻²⁴), so every radius under that is
+    // either zero or overstated (3.6% high at |p| = 1e-3).
     let r2 = min(dot(p, p), LOAM_S3_R2_MAX);
     return asin(sqrt(r2));
 }
@@ -512,8 +515,8 @@ mod tests {
     #[test]
     fn wgsl_origin_distance_matches_cpu_distance_near_origin() {
         let s = s3();
-        // Radii straddling |p| ≈ 3.4e-4, below which acos(√(1−|p|²)) returns
-        // exactly 0 in f32.
+        // Radii straddling both failure regimes of acos(√(1−|p|²)) in f32:
+        // exact 0 below |p| ≈ 1.73e-4, and a quantized 3.45e-4 floor above it.
         let diagonal = Vec3::new(1.0, 1.0, 1.0).normalize();
         for r in [1e-3_f32, 3e-4, 1e-4, 1e-5, 1e-6] {
             for dir in [Vec3::X, diagonal] {
