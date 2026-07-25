@@ -1,0 +1,156 @@
+//! One scenario, one hash mixer, one committed golden constant, shared by
+//! every determinism gate in the crate. Callers drive [`World::step`] through
+//! this module rather than re-implementing the phase loop, so a schedule
+//! variant is always compared against the simulation the golden hash pins.
+
+use glam::Vec4;
+use loam_math::EuclideanR4;
+
+use crate::euclidean_r4::{halfspace4_body_r4, register_default_narrowphase, sphere_body_r4};
+use crate::field::Gravity;
+use crate::world::{Schedule, World};
+
+/// FNV-1a 64-bit (Fowler/Noll/Vo 1991; reference offset basis and prime,
+/// <http://www.isthe.com/chongo/tech/comp/fnv/>). `std`'s `DefaultHasher` is
+/// documented as unstable across releases, so a hash committed as a constant
+/// needs its own mixer.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a64_update(mut hash: u64, words: &[u32]) -> u64 {
+    for word in words {
+        // Fixed little-endian byte order so the hash does not depend on host
+        // endianness.
+        for byte in word.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
+
+pub fn fnv1a64(words: &[u32]) -> u64 {
+    fnv1a64_update(FNV_OFFSET_BASIS, words)
+}
+
+/// FNV-1a of [`ScenarioRun::trajectory`] under the default schedule, recorded
+/// on x86_64. This pins behavior rather than self-consistency: a
+/// deterministic-but-changed integrator, solver order, contact constant, or
+/// narrowphase moves it. Scoped to one architecture family, since glam's SIMD
+/// dot reduces in a different order than its scalar fallback. When a
+/// simulation change is intended, replace this with the value the assertion
+/// prints.
+pub const GOLDEN_TRAJECTORY_HASH: u64 = 0xfcfa_9165_cc85_e57b;
+
+pub struct ScenarioRun {
+    /// Every step, every body, linear and angular state as raw f32 bits, so
+    /// the pins see the path and not just the endpoint.
+    pub trajectory: Vec<u32>,
+    /// Running hash after each step over a superset of `trajectory`: the same
+    /// body words plus the manifold key list, each manifold's point count, and
+    /// each point's accumulated normal impulse. Warm-start impulses are
+    /// carried state, so a schedule change can leave body state identical for
+    /// one step and diverge several steps later; hashing bodies alone would
+    /// find that late or not at all. A vector rather than a scalar because the
+    /// first differing index is the first divergent step, which is the whole
+    /// triage story for a hash mismatch.
+    pub step_hashes: Vec<u64>,
+}
+
+const STEPS: usize = 240;
+const WORDS_PER_BODY: usize = 14;
+
+/// The determinism fixture: 4D gravity, a static floor, and a six-sphere stack
+/// at fixed offsets landing on it. No RNG, so any run-to-run difference is
+/// genuine nondeterminism rather than seed noise.
+///
+/// Orientation is deliberately not sampled. `Bivector4::exp` routes through
+/// libm `sin`/`cos`, whose last-ULP results differ between platform libms, and
+/// for sphere colliders orientation never feeds back into the dynamics. Every
+/// sampled quantity comes from +, -, *, / and sqrt, which IEEE-754 rounds
+/// exactly, so the trajectory is reproducible wherever glam takes the same
+/// reduction path.
+pub fn determinism_scenario_run(schedule: Schedule) -> ScenarioRun {
+    let mut world = World::new(EuclideanR4);
+    // Contacts are what make the trajectory worth pinning: without a
+    // narrowphase the scenario is free fall and exercises no solver, manifold,
+    // or iteration-order behavior.
+    register_default_narrowphase(&mut world.narrowphase);
+    world.schedule = schedule;
+    world.push_field(Box::new(Gravity::new(Vec4::new(0.0, -9.8, 0.0, 0.0))));
+    world.push_body(halfspace4_body_r4(Vec4::Y, 0.0));
+    for i in 0..6u32 {
+        let y = 1.0 + i as f32 * 0.45;
+        let x = ((i % 3) as f32 - 1.0) * 0.05;
+        world.push_body(sphere_body_r4(
+            Vec4::new(x, y, 0.0, 0.0),
+            Vec4::ZERO,
+            0.2,
+            1.0,
+        ));
+    }
+
+    let dt = 1.0 / 60.0;
+    let mut run = ScenarioRun {
+        trajectory: Vec::with_capacity(STEPS * world.bodies.len() * WORDS_PER_BODY),
+        step_hashes: Vec::with_capacity(STEPS),
+    };
+    let mut hash = FNV_OFFSET_BASIS;
+    let mut contact_words = Vec::new();
+    for _ in 0..STEPS {
+        world.step(dt);
+        let step_start = run.trajectory.len();
+        for body in &world.bodies {
+            let p = body.position;
+            let v = body.velocity;
+            let w = body.angular_velocity;
+            run.trajectory.extend_from_slice(&[
+                p.x.to_bits(),
+                p.y.to_bits(),
+                p.z.to_bits(),
+                p.w.to_bits(),
+                v.x.to_bits(),
+                v.y.to_bits(),
+                v.z.to_bits(),
+                v.w.to_bits(),
+                w.xy.to_bits(),
+                w.xz.to_bits(),
+                w.xw.to_bits(),
+                w.yz.to_bits(),
+                w.yw.to_bits(),
+                w.zw.to_bits(),
+            ]);
+        }
+
+        // Sampled in `BTreeMap` key order under every schedule, so a moved
+        // hash means the simulation diverged and never that the instrument
+        // read the same state in a different order.
+        contact_words.clear();
+        for (key, manifold) in &world.manifolds {
+            contact_words.push(key.0 as u32);
+            contact_words.push(key.1 as u32);
+            contact_words.push(manifold.points.len() as u32);
+            for cp in &manifold.points {
+                contact_words.push(cp.normal_impulse.to_bits());
+            }
+        }
+
+        hash = fnv1a64_update(hash, &run.trajectory[step_start..]);
+        hash = fnv1a64_update(hash, &contact_words);
+        run.step_hashes.push(hash);
+    }
+    run
+}
+
+pub fn determinism_scenario_trajectory() -> Vec<u32> {
+    determinism_scenario_run(Schedule::default()).trajectory
+}
+
+/// Index of the first step whose hash differs, for an assertion message that
+/// names where a schedule diverged instead of only that it did.
+pub fn first_divergent_step(a: &ScenarioRun, b: &ScenarioRun) -> Option<usize> {
+    a.step_hashes
+        .iter()
+        .zip(&b.step_hashes)
+        .position(|(x, y)| x != y)
+}

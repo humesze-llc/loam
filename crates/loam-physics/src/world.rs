@@ -7,6 +7,14 @@
 //! Each tick runs a fixed phase order: apply forces, integrate, broadphase,
 //! narrowphase, manifold maintenance, warm start, PGS solve. Each phase is a
 //! method so harnesses can substitute or inspect it without forking the loop.
+//!
+//! ## Schedule seam
+//!
+//! Every phase materialises its work units into a reused buffer and runs the
+//! buffer, so [`Schedule`] can reorder a phase without the phase knowing. For
+//! work units that are independent, the orders a thread pool can produce are a
+//! subset of the permutations of that buffer, which is what makes
+//! permutation invariance testable before an executor exists.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -25,6 +33,87 @@ use crate::response::FRICTION_COEFF;
 /// one canonical key regardless of broadphase iteration order.
 pub type PairKey = (usize, usize);
 
+/// How a step's work units are executed. Ships in release rather than behind
+/// `cfg(test)`: the determinism contract is a claim about the shipping binary,
+/// so the instrument that checks it has to live in the same binary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Schedule {
+    /// Worker count. Fixed at 1 until an executor lands, and permanently 1 on
+    /// wasm32.
+    pub threads: usize,
+    pub order: OrderPolicy,
+}
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Self {
+            threads: 1,
+            order: OrderPolicy::Canonical,
+        }
+    }
+}
+
+/// Visit order for one phase's work-unit buffer. Exactly one phase is
+/// reordered so a fixture varies one axis with every other held canonical;
+/// a hash that moves then names the phase responsible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderPolicy {
+    Canonical,
+    /// The adversarial case for a Gauss-Seidel sweep: every dependency edge
+    /// traversed against the canonical direction.
+    Reversed {
+        phase: SchedulePhase,
+    },
+    Permuted {
+        phase: SchedulePhase,
+        seed: u64,
+    },
+}
+
+/// A phase group sharing one work-unit buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedulePhase {
+    /// Body visit order, shared by `apply_forces` and `integrate`.
+    Body,
+    /// Pair visit order in `update_manifolds`.
+    BroadphasePair,
+    /// Constraint visit order, shared by `prepare_solve`, `warm_start`, and
+    /// every `solve` sweep.
+    Constraint,
+}
+
+impl OrderPolicy {
+    fn apply<T>(self, phase: SchedulePhase, units: &mut [T]) {
+        match self {
+            OrderPolicy::Canonical => {}
+            OrderPolicy::Reversed { phase: target } if target == phase => units.reverse(),
+            OrderPolicy::Permuted {
+                phase: target,
+                seed,
+            } if target == phase => shuffle(units, seed),
+            _ => {}
+        }
+    }
+}
+
+/// Durstenfeld's in-place Fisher-Yates shuffle (Fisher and Yates 1938, table
+/// XXXIII; Durstenfeld 1964, CACM 7(7):420) driven by xorshift64 (Marsaglia
+/// 2003, "Xorshift RNGs", J. Stat. Soft. 8(14), the 13/7/17 triple). Modulo
+/// bias is accepted: the requirement is a reproducible permutation reportable
+/// by seed, not a uniform one.
+fn shuffle<T>(units: &mut [T], seed: u64) {
+    // xorshift64 is absorbing at zero, so a zero seed must not reach it.
+    let mut state = seed | 1;
+    for i in (1..units.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        units.swap(i, (state % (i as u64 + 1)) as usize);
+    }
+}
+
+const STALE_CONSTRAINT_KEY: &str = "constraint buffer outlived its manifold";
+
 pub struct World<S: PhysicsSpace> {
     pub space: S,
     pub bodies: Vec<RigidBody<S>>,
@@ -38,6 +127,14 @@ pub struct World<S: PhysicsSpace> {
     /// PGS iterations per step. Defaults to [`DEFAULT_PGS_ITERS`].
     pub pgs_iters: usize,
     pub time: f32,
+    pub schedule: Schedule,
+    /// Work-unit buffers, refilled and reordered at the head of their phase
+    /// group and retained across steps so the seam allocates once. Each phase
+    /// loop swaps its buffer out with `mem::take` and swaps it back, which is
+    /// what keeps the allocation while the loop holds `&mut self`.
+    body_order: Vec<usize>,
+    pair_order: Vec<PairKey>,
+    constraint_keys: Vec<PairKey>,
 }
 
 impl<S: PhysicsSpace> World<S> {
@@ -50,6 +147,10 @@ impl<S: PhysicsSpace> World<S> {
             manifolds: BTreeMap::new(),
             pgs_iters: DEFAULT_PGS_ITERS,
             time: 0.0,
+            schedule: Schedule::default(),
+            body_order: Vec::new(),
+            pair_order: Vec::new(),
+            constraint_keys: Vec::new(),
         }
     }
 
@@ -71,9 +172,11 @@ impl<S: PhysicsSpace> World<S> {
         S::Vector: VectorOps,
         S::Point: Copy + std::ops::Sub<Output = S::Vector>,
     {
+        self.collect_bodies();
         self.apply_forces(dt);
         self.integrate(dt);
         self.update_manifolds();
+        self.collect_constraints();
         self.prepare_solve(dt);
         self.warm_start();
         self.solve();
@@ -81,11 +184,24 @@ impl<S: PhysicsSpace> World<S> {
         self.time += dt;
     }
 
+    /// Refill the body buffer in slot order, then hand it to the schedule.
+    /// Refilled rather than reused in place so a permutation cannot compound
+    /// across steps.
+    fn collect_bodies(&mut self) {
+        self.body_order.clear();
+        self.body_order.extend(0..self.bodies.len());
+        self.schedule
+            .order
+            .apply(SchedulePhase::Body, &mut self.body_order);
+    }
+
     fn apply_forces(&mut self, dt: f32)
     where
         S::Vector: VectorOps,
     {
-        for body in &mut self.bodies {
+        let order = std::mem::take(&mut self.body_order);
+        for &i in &order {
+            let body = &mut self.bodies[i];
             if body.inv_mass == 0.0 {
                 continue;
             }
@@ -94,15 +210,18 @@ impl<S: PhysicsSpace> World<S> {
                 body.velocity = body.velocity + f * (dt * body.inv_mass);
             }
         }
+        self.body_order = order;
     }
 
     fn integrate(&mut self, dt: f32)
     where
         S::Vector: VectorOps,
     {
-        for body in &mut self.bodies {
-            integrate_body(&self.space, body, dt);
+        let order = std::mem::take(&mut self.body_order);
+        for &i in &order {
+            integrate_body(&self.space, &mut self.bodies[i], dt);
         }
+        self.body_order = order;
     }
 
     /// Broadphase + narrowphase, merging each contact into its pair's manifold.
@@ -113,10 +232,14 @@ impl<S: PhysicsSpace> World<S> {
         S::Vector: VectorOps,
         S::Point: Copy + std::ops::Sub<Output = S::Vector>,
     {
-        let pairs = self.broadphase();
+        let mut pairs = std::mem::take(&mut self.pair_order);
+        self.fill_broadphase(&mut pairs);
+        self.schedule
+            .order
+            .apply(SchedulePhase::BroadphasePair, &mut pairs);
         let mut touched: HashSet<PairKey> = HashSet::with_capacity(pairs.len());
 
-        for (i, j) in pairs {
+        for &(i, j) in &pairs {
             let (a, b) = split_two_mut(&mut self.bodies, i, j);
             let Some(contact) = self.narrowphase.test(a, b, &self.space) else {
                 continue;
@@ -132,6 +255,20 @@ impl<S: PhysicsSpace> World<S> {
         }
 
         self.manifolds.retain(|k, _| touched.contains(k));
+        self.pair_order = pairs;
+    }
+
+    /// Refill the constraint buffer in `manifolds` key order, then hand it to
+    /// the schedule. One buffer serves `prepare_solve`, `warm_start`, and
+    /// `solve`, so those three always agree on the constraint order. Nothing
+    /// between here and the end of the solve inserts or removes a manifold,
+    /// which is why those three phases can index by key without a fallback.
+    fn collect_constraints(&mut self) {
+        self.constraint_keys.clear();
+        self.constraint_keys.extend(self.manifolds.keys().copied());
+        self.schedule
+            .order
+            .apply(SchedulePhase::Constraint, &mut self.constraint_keys);
     }
 
     /// Snapshot per-contact `velocity_bias` (restitution + Baumgarte) and reset
@@ -142,7 +279,9 @@ impl<S: PhysicsSpace> World<S> {
     where
         S::Vector: VectorOps,
     {
-        for manifold in self.manifolds.values_mut() {
+        let keys = std::mem::take(&mut self.constraint_keys);
+        for key in &keys {
+            let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
             let (a, b) = split_two_mut(&mut self.bodies, manifold.body_a, manifold.body_b);
             for cp in &mut manifold.points {
                 let v_rel = self.space.velocity_at_point(b, cp.world_point)
@@ -170,6 +309,7 @@ impl<S: PhysicsSpace> World<S> {
                 cp.tangent_dir = VectorOps::zero();
             }
         }
+        self.constraint_keys = keys;
     }
 
     /// Re-apply each contact's previous-frame normal impulse. Tangent was reset
@@ -178,7 +318,9 @@ impl<S: PhysicsSpace> World<S> {
     where
         S::Vector: VectorOps,
     {
-        for manifold in self.manifolds.values() {
+        let keys = std::mem::take(&mut self.constraint_keys);
+        for key in &keys {
+            let manifold = self.manifolds.get(key).expect(STALE_CONSTRAINT_KEY);
             let (a, b) = split_two_mut(&mut self.bodies, manifold.body_a, manifold.body_b);
             for cp in &manifold.points {
                 if cp.normal_impulse > 0.0 {
@@ -192,6 +334,7 @@ impl<S: PhysicsSpace> World<S> {
                 }
             }
         }
+        self.constraint_keys = keys;
     }
 
     /// PGS solve: `pgs_iters` passes of clamped incremental normal-then-tangent
@@ -201,26 +344,29 @@ impl<S: PhysicsSpace> World<S> {
     where
         S::Vector: VectorOps,
     {
-        let keys: Vec<PairKey> = self.manifolds.keys().copied().collect();
-
+        let keys = std::mem::take(&mut self.constraint_keys);
         for _ in 0..self.pgs_iters {
-            for &key in &keys {
-                let manifold = match self.manifolds.get_mut(&key) {
-                    Some(m) => m,
-                    None => continue,
-                };
+            for key in &keys {
+                let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
                 let (a, b) = split_two_mut(&mut self.bodies, manifold.body_a, manifold.body_b);
                 for cp in &mut manifold.points {
                     solve_normal_then_tangent(&self.space, a, b, cp);
                 }
             }
         }
+        self.constraint_keys = keys;
     }
 
     /// All-pairs broadphase. Returns `(i, j)` pairs with `i < j`.
     pub fn broadphase(&self) -> Vec<PairKey> {
-        let n = self.bodies.len();
         let mut pairs = Vec::new();
+        self.fill_broadphase(&mut pairs);
+        pairs
+    }
+
+    fn fill_broadphase(&self, pairs: &mut Vec<PairKey>) {
+        pairs.clear();
+        let n = self.bodies.len();
         for i in 0..n {
             for j in (i + 1)..n {
                 if self.bodies[i].inv_mass == 0.0 && self.bodies[j].inv_mass == 0.0 {
@@ -229,7 +375,6 @@ impl<S: PhysicsSpace> World<S> {
                 pairs.push((i, j));
             }
         }
-        pairs
     }
 }
 
@@ -312,10 +457,159 @@ fn solve_normal_then_tangent<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::determinism_fixture::{
+        determinism_scenario_run, first_divergent_step, fnv1a64, ScenarioRun,
+        GOLDEN_TRAJECTORY_HASH,
+    };
     use crate::euclidean_r3::{halfspace_body_r3, register_default_narrowphase, sphere_body_r3};
     use crate::field::Gravity;
     use glam::Vec3;
     use loam_math::EuclideanR3;
+
+    /// Arbitrary but fixed, so a failure is reproducible from its message.
+    const PERMUTATION_SEEDS: [u64; 4] = [1, 0x9e37_79b9_7f4a_7c15, 0xdead_beef_cafe_f00d, 424_242];
+
+    /// Reversal first: for a Gauss-Seidel sweep it is the adversarial order,
+    /// not just another sample.
+    fn order_variants(phase: SchedulePhase) -> Vec<OrderPolicy> {
+        let mut variants = vec![OrderPolicy::Reversed { phase }];
+        variants.extend(
+            PERMUTATION_SEEDS
+                .iter()
+                .map(|&seed| OrderPolicy::Permuted { phase, seed }),
+        );
+        variants
+    }
+
+    fn run_with(order: OrderPolicy) -> ScenarioRun {
+        determinism_scenario_run(Schedule { threads: 1, order })
+    }
+
+    /// The harness's sensitivity control. Global PGS is Gauss-Seidel, so its
+    /// converged state depends on constraint visit order; if permuting that
+    /// order left the hash untouched, the hash could not see the solver and
+    /// every invariance assertion built on it would be a rubber stamp.
+    #[test]
+    fn global_solve_order_permutation_changes_state_hash_determinism() {
+        let canonical = run_with(OrderPolicy::Canonical);
+        assert!(
+            canonical.step_hashes.len() > 1,
+            "fixture produced no steps to compare"
+        );
+        for order in order_variants(SchedulePhase::Constraint) {
+            let permuted = run_with(order);
+            assert!(
+                first_divergent_step(&canonical, &permuted).is_some(),
+                "{order:?} left the state hash identical: the hash cannot see \
+                 constraint visit order, so the positive axes below prove nothing"
+            );
+        }
+    }
+
+    /// Both invariance axes, asserted as `permuted == canonical == golden`.
+    /// Mutual agreement among variants would certify a schedule that is
+    /// self-consistently wrong, so the committed constant is the third link
+    /// and not a redundant one.
+    ///
+    /// Non-vacuity rests on
+    /// [`global_solve_order_permutation_changes_state_hash_determinism`]: that
+    /// the same fixture's hash moves under a constraint permutation is what
+    /// establishes it reaches contacts and that the hash observes them.
+    fn assert_phase_order_does_not_reach_the_state_hash(phase: SchedulePhase) {
+        let canonical = run_with(OrderPolicy::Canonical);
+        assert_eq!(
+            fnv1a64(&canonical.trajectory),
+            GOLDEN_TRAJECTORY_HASH,
+            "canonical run no longer matches the committed golden hash"
+        );
+
+        for order in order_variants(phase) {
+            let permuted = run_with(order);
+            if let Some(step) = first_divergent_step(&canonical, &permuted) {
+                panic!("{order:?} diverged from the canonical schedule at step {step}");
+            }
+            let word_gap = canonical
+                .trajectory
+                .iter()
+                .zip(&permuted.trajectory)
+                .position(|(a, b)| a != b);
+            assert!(
+                word_gap.is_none() && permuted.trajectory.len() == canonical.trajectory.len(),
+                "{order:?} moved trajectory word {word_gap:?}"
+            );
+            let hash = fnv1a64(&permuted.trajectory);
+            assert_eq!(
+                hash, GOLDEN_TRAJECTORY_HASH,
+                "{order:?} produced {hash:#018x} against the committed golden \
+                 {GOLDEN_TRAJECTORY_HASH:#018x}"
+            );
+        }
+    }
+
+    /// `apply_forces` and `integrate` read and write one body each, and
+    /// `force_at` is a pure function of body state and `time`, so body visit
+    /// order must not reach the state hash. Vacuous by construction today and
+    /// deliberately so: it is the tripwire that fires the moment force
+    /// accumulation grows a shared buffer.
+    #[test]
+    fn body_visit_order_permutation_preserves_state_hash_determinism() {
+        assert_phase_order_does_not_reach_the_state_hash(SchedulePhase::Body);
+    }
+
+    /// Narrowphase runs once per pair, results land in a `BTreeMap` keyed
+    /// canonically, and each pair contributes one contact per step, so pair
+    /// emission order must not reach the solve. This is the property a
+    /// parallel narrowphase would depend on, and unlike the body axis it is
+    /// not true by construction.
+    #[test]
+    fn broadphase_pair_order_permutation_preserves_state_hash_determinism() {
+        assert_phase_order_does_not_reach_the_state_hash(SchedulePhase::BroadphasePair);
+    }
+
+    /// The invariance axes are only evidence if the policy actually reorders
+    /// the buffers the fixture builds: 7 bodies and 21 broadphase pairs.
+    #[test]
+    fn order_policy_permutes_reproducibly_and_never_to_identity_determinism() {
+        for len in [7usize, 21] {
+            let canonical: Vec<usize> = (0..len).collect();
+            for phase in [
+                SchedulePhase::Body,
+                SchedulePhase::BroadphasePair,
+                SchedulePhase::Constraint,
+            ] {
+                for order in order_variants(phase) {
+                    let mut units = canonical.clone();
+                    order.apply(phase, &mut units);
+                    assert_ne!(units, canonical, "{order:?} on {len} units is the identity");
+                    let mut sorted = units.clone();
+                    sorted.sort_unstable();
+                    assert_eq!(
+                        sorted, canonical,
+                        "{order:?} on {len} units lost or duplicated a unit"
+                    );
+
+                    let mut repeat = canonical.clone();
+                    order.apply(phase, &mut repeat);
+                    assert_eq!(repeat, units, "{order:?} is not reproducible");
+
+                    // A policy naming one phase must leave the others alone,
+                    // or the axes are not independent.
+                    for other in [
+                        SchedulePhase::Body,
+                        SchedulePhase::BroadphasePair,
+                        SchedulePhase::Constraint,
+                    ] {
+                        if other == phase {
+                            continue;
+                        }
+                        let mut untouched = canonical.clone();
+                        order.apply(other, &mut untouched);
+                        assert_eq!(untouched, canonical, "{order:?} reordered {other:?}");
+                    }
+                }
+            }
+        }
+    }
 
     const SPHERE_RADIUS: f32 = 0.5;
     const GRAVITY_Y: f32 = -9.8;
