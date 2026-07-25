@@ -431,7 +431,7 @@ mod tests {
         assert!(contact.point.w.abs() < 0.1);
     }
 
-    // The three polytope fixtures below all take `B = A + t`, so the Minkowski
+    // The polytope fixtures below all take `B = A + t`, so the Minkowski
     // difference is `K − t` with `K = A ⊕ (−A)` the difference body. For an
     // interior origin the depth is `min_j (h_K(u_j) − ⟨u_j, t⟩)` over K's
     // facet normals `u_j`, and the minimizing `u_j` is the contact normal.
@@ -439,6 +439,11 @@ mod tests {
     // Bodies: The Brunn-Minkowski Theory*, §1.7) and the normal fan of a sum
     // is the common refinement of the summands' fans (Ziegler 1995, *Lectures
     // on Polytopes*, §7.1), which is what gives each K below its facet list.
+    // Every fixture but the pentatope uses a centrally symmetric polytope, so
+    // there `−A = A`, `K = 2A`, and `h_K = 2·h_A` on the facet normals of A.
+    // Pinning both the depth and the normal is what makes these regressions on
+    // `FACE_COPLANAR_EPS`: drop it to 0 and the pentatope, 24-cell and
+    // 600-cell all resolve against a face the expansion should have retired.
 
     /// Deep pentatope overlap. K's facet normals are `ŵ_S ∝ Σ_{i∈S} v_i` over
     /// the proper nonempty subsets S, and at circumradius 1
@@ -539,5 +544,116 @@ mod tests {
 
         assert_close(contact.penetration, 1.0 - 0.25, EPA_TOLERANCE);
         assert_close(contact.normal.x, 0.5, EPA_TOLERANCE);
+    }
+
+    /// 24-cell vs 24-cell, K's 24 octahedral facets each tiled by several
+    /// coplanar EPA faces. The 24-cell is self-dual (Wikipedia "24-cell"), so
+    /// its facet normals are the dual's vertex directions, the 8 axes `±ê_i`
+    /// and the 16 patterns `(±1,±1,±1,±1)/2`. Both families
+    /// support the vertex set `perms(±r/√2, ±r/√2, 0, 0)` at `h_A = r/√2`, so
+    /// `h_K = √2·r`. For `t = d·x̂` only `x̂` attains `⟨u_j, t⟩ = d`, the sign
+    /// patterns reaching `d/2`, so the minimizer is unique: depth `√2·r − d`
+    /// with the normal exactly `x̂`.
+    #[test]
+    fn cell24_cell24_contact_matches_axis_facet() {
+        use crate::collision::gjk_r4::ConvexHull4;
+        use crate::euclidean_r4::cell24_vertices;
+
+        let va: Vec<Vec4> = cell24_vertices(1.0);
+        let vb: Vec<Vec4> = cell24_vertices(1.0)
+            .into_iter()
+            .map(|v| v + Vec4::new(0.3, 0.0, 0.0, 0.0))
+            .collect();
+
+        let a = ConvexHull4 { vertices: &va };
+        let b = ConvexHull4 { vertices: &vb };
+        let simplex = match gjk_intersect_r4(&a, &b, Vec4::X) {
+            GjkResult4::Intersecting { simplex } => simplex,
+            _ => panic!("24-cells should overlap"),
+        };
+        let contact = epa_r4(&a, &b, simplex).expect("EPA should succeed");
+
+        assert_close(contact.penetration, 2.0_f32.sqrt() - 0.3, EPA_TOLERANCE);
+        assert!(
+            contact.normal.dot(Vec4::X) > 0.999,
+            "normal must run from A toward B along +x, got {:?}",
+            contact.normal
+        );
+    }
+
+    /// 600-cell vs 600-cell, the most facets in the suite: K carries 600
+    /// simplicial ones. In `cell600_vertices` at circumradius 1 the nearest
+    /// neighbours sit at `⟨v_i, v_j⟩ = 1 − 1/(2φ²) = φ/2` (edge `1/φ`), so a
+    /// cell's four mutually adjacent vertices have centroid norm
+    /// `|c|² = (4 + 12·φ/2)/16 = φ⁴/8`, the inradius `r_in = φ²/(2√2)`.
+    /// `x̂` is not a facet normal here: it is maximized by the single vertex
+    /// `(1, 0, 0, 0)`. The 20 cells meeting that vertex are the closest
+    /// facets to it, each with `c_x = (1 + 3·φ/2)/4 = φ⁴/8`, hence a unit
+    /// normal with x-component `c_x / r_in = r_in`, the largest over all 600
+    /// facets. Depth is `2·r_in − d·r_in`; the 20-fold tie pins the normal
+    /// only through that x-component.
+    #[test]
+    fn cell600_cell600_contact_matches_vertex_incident_facet() {
+        use crate::collision::gjk_r4::ConvexHull4;
+        use crate::euclidean_r4::cell600_vertices;
+
+        let va: Vec<Vec4> = cell600_vertices(1.0);
+        let vb: Vec<Vec4> = cell600_vertices(1.0)
+            .into_iter()
+            .map(|v| v + Vec4::new(0.3, 0.0, 0.0, 0.0))
+            .collect();
+
+        let a = ConvexHull4 { vertices: &va };
+        let b = ConvexHull4 { vertices: &vb };
+        let simplex = match gjk_intersect_r4(&a, &b, Vec4::X) {
+            GjkResult4::Intersecting { simplex } => simplex,
+            _ => panic!("600-cells should overlap"),
+        };
+        let contact = epa_r4(&a, &b, simplex).expect("EPA should succeed");
+
+        let phi = (1.0 + 5.0_f32.sqrt()) * 0.5;
+        let inradius = phi * phi / (2.0 * 2.0_f32.sqrt());
+        assert_close(contact.penetration, inradius * (2.0 - 0.3), EPA_TOLERANCE);
+        assert_close(contact.normal.x, inradius, EPA_TOLERANCE);
+    }
+
+    /// 120-cell vs 120-cell, 600 vertices: the largest support set in the
+    /// suite. Facet normals are the dual 600-cell's vertex directions
+    /// (Wikipedia "120-cell"), which include the axes: in
+    /// `cell120_vertices` the largest coordinate is `φ²` before the
+    /// `1/(2√2)` rescale, and the 20 vertices attaining `x = φ²/(2√2)` are one
+    /// dodecahedral cell, so `h_A(x̂) = φ²/(2√2)`. Being a facet normal, `x̂`
+    /// maximizes `⟨u_j, t⟩` for `t = d·x̂` outright: depth `φ²/√2 − d`, normal
+    /// exactly `x̂`, no tie.
+    #[test]
+    fn cell120_cell120_contact_matches_dodecahedral_facet() {
+        use crate::collision::gjk_r4::ConvexHull4;
+        use crate::euclidean_r4::cell120_vertices;
+
+        let va: Vec<Vec4> = cell120_vertices(1.0);
+        let vb: Vec<Vec4> = cell120_vertices(1.0)
+            .into_iter()
+            .map(|v| v + Vec4::new(0.3, 0.0, 0.0, 0.0))
+            .collect();
+
+        let a = ConvexHull4 { vertices: &va };
+        let b = ConvexHull4 { vertices: &vb };
+        let simplex = match gjk_intersect_r4(&a, &b, Vec4::X) {
+            GjkResult4::Intersecting { simplex } => simplex,
+            _ => panic!("120-cells should overlap"),
+        };
+        let contact = epa_r4(&a, &b, simplex).expect("EPA should succeed");
+
+        let phi = (1.0 + 5.0_f32.sqrt()) * 0.5;
+        assert_close(
+            contact.penetration,
+            phi * phi / 2.0_f32.sqrt() - 0.3,
+            EPA_TOLERANCE,
+        );
+        assert!(
+            contact.normal.dot(Vec4::X) > 0.999,
+            "normal must run from A toward B along +x, got {:?}",
+            contact.normal
+        );
     }
 }
