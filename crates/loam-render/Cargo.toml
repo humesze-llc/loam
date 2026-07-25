@@ -2,7 +2,13 @@
 name = "loam-render"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Loam renderer: wgpu surface lifecycle, raymarch and raster pipelines, GPU frame timing."
+keywords = ["wgpu", "renderer", "raymarching", "graphics", "gamedev"]
+categories = ["graphics", "rendering", "game-development"]
 
 [features]
 default = []

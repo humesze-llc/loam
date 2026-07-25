@@ -2,10 +2,13 @@
 name = "loam-text"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam text rendering: minimal-deps ab_glyph-backed screen-space text overlay. For full UI use loam-egui."
+keywords = ["text", "overlay", "glyph", "wgpu", "gamedev"]
+categories = ["game-development", "graphics"]
 
 [dependencies]
 wgpu      = { workspace = true }

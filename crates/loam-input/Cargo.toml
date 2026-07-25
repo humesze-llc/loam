@@ -2,10 +2,13 @@
 name = "loam-input"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam input accumulator: mouse, keyboard, and per-frame drain."
+keywords = ["input", "keyboard", "mouse", "winit", "gamedev"]
+categories = ["game-development"]
 
 [dependencies]
 glam.workspace = true

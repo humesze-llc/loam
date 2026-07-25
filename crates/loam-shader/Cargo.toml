@@ -2,10 +2,13 @@
 name = "loam-shader"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam shader system: WGSL loading, Space intrinsic injection, hot reload."
+keywords = ["wgsl", "shader", "wgpu", "hot-reload", "graphics"]
+categories = ["graphics", "rendering", "game-development"]
 
 [dependencies]
 loam-math  = { path = "../loam-math" }

@@ -2,10 +2,13 @@
 name = "loam-app"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Loam App: thin trait + event-loop runner that extracts the winit boilerplate every example rewrites."
+description = "Loam App: thin trait + event-loop runner over winit, native and wasm32."
+keywords = ["winit", "event-loop", "wgpu", "wasm", "gamedev"]
+categories = ["game-development"]
 
 [features]
 default = ["capture"]
