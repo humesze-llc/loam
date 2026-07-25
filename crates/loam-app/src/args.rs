@@ -10,7 +10,9 @@
 //! ## Syntax
 //!
 //! - **Native:** `--key=value` pairs; positional args ignored, `--` stripped.
-//!   The older `--key value` style is unsupported (ambiguous for multi-value).
+//!   The older `--key value` style is unsupported (ambiguous for multi-value);
+//!   a bare `--key` is recorded for [`Args::has_bare_flag`] so callers can
+//!   diagnose it instead of silently defaulting.
 //! - **Wasm32:** `?key=value&...` query string plus `#key=value` hash; both
 //!   populate the same map, hash winning on collision (share-link UI sets it
 //!   more deliberately than the page URL).
@@ -24,57 +26,75 @@ use std::collections::HashMap;
 /// Parsed key=value pairs from the host's argument surface.
 ///
 /// Construct via [`Args::current`] to read the live environment, or
-/// [`Args::from_pairs`] for tests / synthetic input.
+/// [`Args::from_argv`] / [`Args::from_pairs`] for tests and synthetic input.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
     map: HashMap<String, String>,
+    bare_flags: Vec<String>,
 }
 
 impl Args {
-    /// Read from the platform's argument surface.
-    ///
-    /// On native: parses `std::env::args` for `--key=value` pairs.
-    /// On wasm32: parses `window.location.search` + `window.location.hash`.
+    /// Read `std::env::args` for `--key=value` pairs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn current() -> Self {
+        Self::from_argv(std::env::args().skip(1))
+    }
+
+    /// Read `window.location.search` + `window.location.hash`.
+    #[cfg(target_arch = "wasm32")]
     pub fn current() -> Self {
         let mut map = HashMap::new();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // Skip arg[0]. Non-`--key=value` args are ignored rather than
-            // errored: a parent harness (cargo test, a wrapper) may add
-            // positionals we shouldn't fail on.
-            for arg in std::env::args().skip(1) {
-                if let Some(stripped) = arg.strip_prefix("--") {
-                    if let Some((k, v)) = stripped.split_once('=') {
-                        if !k.is_empty() {
-                            map.insert(k.to_string(), v.to_string());
-                        }
-                    }
-                }
+        if let Some(window) = web_sys::window() {
+            if let Ok(search) = window.location().search() {
+                parse_query_into(&search, &mut map);
+            }
+            if let Ok(hash) = window.location().hash() {
+                parse_query_into(&hash, &mut map);
             }
         }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            if let Some(window) = web_sys::window() {
-                if let Ok(search) = window.location().search() {
-                    parse_query_into(&search, &mut map);
-                }
-                if let Ok(hash) = window.location().hash() {
-                    parse_query_into(&hash, &mut map);
-                }
+        // Workers have no `window`; the init message forwards the page's
+        // query (see set_query_override).
+        QUERY_OVERRIDE.with(|q| {
+            if let Some((search, hash)) = q.borrow().as_ref() {
+                parse_query_into(search, &mut map);
+                parse_query_into(hash, &mut map);
             }
-            // Workers have no `window`; the init message forwards the page's
-            // query (see set_query_override).
-            QUERY_OVERRIDE.with(|q| {
-                if let Some((search, hash)) = q.borrow().as_ref() {
-                    parse_query_into(search, &mut map);
-                    parse_query_into(hash, &mut map);
-                }
-            });
+        });
+        // `?key` with no `=` is dropped by parse_query_into, so the query
+        // surface has no bare-flag form to record.
+        Self {
+            map,
+            bare_flags: Vec::new(),
         }
+    }
 
-        Self { map }
+    /// Parse native-syntax arguments, `argv[0]` already removed.
+    ///
+    /// Non-`--key=value` arguments are ignored rather than errored: a parent
+    /// harness (cargo test, a wrapper) may add positionals we shouldn't fail
+    /// on. A bare `--key` is kept for [`Args::has_bare_flag`].
+    pub fn from_argv<I, S>(argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut map = HashMap::new();
+        let mut bare_flags = Vec::new();
+        for arg in argv {
+            let Some(stripped) = arg.as_ref().strip_prefix("--") else {
+                continue;
+            };
+            match stripped.split_once('=') {
+                Some((k, v)) if !k.is_empty() => {
+                    map.insert(k.to_string(), v.to_string());
+                }
+                // A lone `--` is the conventional end-of-flags marker, not
+                // a flag named "".
+                None if !stripped.is_empty() => bare_flags.push(stripped.to_string()),
+                _ => {}
+            }
+        }
+        Self { map, bare_flags }
     }
 
     /// Construct from explicit pairs. For tests and hosts synthesizing an
@@ -90,7 +110,17 @@ impl Args {
                 .into_iter()
                 .map(|(k, v)| (k.into(), v.into()))
                 .collect(),
+            bare_flags: Vec::new(),
         }
+    }
+
+    /// Whether `--key` was passed without an attached `=value`.
+    ///
+    /// The value such a flag meant to carry stays a positional and is
+    /// dropped, so a caller that requires the key can diagnose the syntax
+    /// instead of silently taking its default. Always false on wasm32.
+    pub fn has_bare_flag(&self, key: &str) -> bool {
+        self.bare_flags.iter().any(|flag| flag == key)
     }
 
     /// Look up a single value by key. `None` if the key was not provided.
@@ -178,6 +208,29 @@ mod tests {
         assert_eq!(args.parse::<f32>("fov"), Some(60.5));
         assert_eq!(args.parse::<u32>("bad"), None);
         assert_eq!(args.parse::<u32>("missing"), None);
+    }
+
+    #[test]
+    fn from_argv_keeps_only_attached_values_and_ignores_positionals() {
+        let args = Args::from_argv(["--seed=42", "sub", "--", "--=x", "--fov=60.5"]);
+        assert_eq!(args.get("seed"), Some("42"));
+        assert_eq!(args.get("fov"), Some("60.5"));
+        assert_eq!(args.get("sub"), None);
+        assert_eq!(args.get(""), None);
+    }
+
+    #[test]
+    fn a_bare_flag_is_recorded_and_its_value_is_not_absorbed() {
+        let args = Args::from_argv(["--shapes", "5-cell,8-cell", "--seed=42"]);
+        // The value the user meant to attach is gone, so a missing key
+        // alone cannot be read as "the user asked for nothing".
+        assert_eq!(args.get("shapes"), None);
+        assert!(args.has_bare_flag("shapes"));
+
+        assert!(!args.has_bare_flag("seed"));
+        assert!(!args.has_bare_flag("5-cell,8-cell"));
+        assert!(!args.has_bare_flag(""));
+        assert!(!Args::from_pairs([("shapes", "5-cell")]).has_bare_flag("shapes"));
     }
 
     #[test]

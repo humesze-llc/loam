@@ -192,36 +192,18 @@ pub(crate) fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
     })
 }
 
-/// Reject the space-separated `--shapes a,b` form, given the process
-/// arguments minus `argv[0]`.
-///
-/// [`Args`] keeps only `--key=value` tokens, so a bare `--shapes` and
-/// its value disappear before [`parse_row`] can see them and the demo
-/// starts on [`DEFAULT_ROW`] as if no row had been requested.
-fn reject_space_separated_shapes(argv: impl IntoIterator<Item = String>) -> Result<()> {
-    let mut argv = argv.into_iter();
-    while let Some(arg) = argv.next() {
-        if arg != "--shapes" {
-            continue;
-        }
-        let corrected = match argv.next() {
-            Some(value) => format!("--shapes={value}"),
-            None => "--shapes=24-cell,8-cell".to_string(),
-        };
-        return Err(anyhow!(
-            "`--shapes` needs its value attached with `=`; write \
-             `{corrected}` instead (comma-separated for several shapes)"
-        ));
-    }
-    Ok(())
-}
-
 /// Parse the comma-separated `shapes` key (`--shapes=a,b` natively,
 /// `?shapes=a,b` in the browser). Returns [`DEFAULT_ROW`] when the key
 /// is absent, and an error for the space-separated `--shapes a,b` form,
-/// which reaches `args` as nothing at all.
+/// whose value never reaches `args`.
 pub(crate) fn parse_row(args: &Args) -> Result<Vec<ShapeEntry>> {
-    reject_space_separated_shapes(std::env::args().skip(1))?;
+    if args.has_bare_flag("shapes") {
+        return Err(anyhow!(
+            "`--shapes` needs its value attached with `=`, as in \
+             `--shapes=24-cell,8-cell` (comma-separated for several \
+             shapes); the space-separated form drops the value"
+        ));
+    }
     let Some(raw) = args.get("shapes") else {
         return Ok(DEFAULT_ROW.to_vec());
     };
@@ -253,30 +235,28 @@ mod tests {
         );
     }
 
-    fn argv(tokens: &[&str]) -> Vec<String> {
-        tokens.iter().map(|s| s.to_string()).collect()
+    #[test]
+    fn a_bare_shapes_flag_is_diagnosed_rather_than_silently_defaulting() {
+        let args = Args::from_argv(["--shapes", "120-cell,tesseract"]);
+        assert_eq!(args.get("shapes"), None);
+        let err = parse_row(&args).unwrap_err().to_string();
+        assert!(err.contains("--shapes="), "{err}");
+
+        // A trailing `--shapes` with nothing after it is the same mistake.
+        assert!(parse_row(&Args::from_argv(["--seed=42", "--shapes"])).is_err());
     }
 
     #[test]
-    fn a_bare_shapes_flag_is_diagnosed_and_names_the_equals_form() {
-        let err = reject_space_separated_shapes(argv(&["--shapes", "nonesuch"]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--shapes=nonesuch"), "{err}");
-
-        let trailing = reject_space_separated_shapes(argv(&["--seed=42", "--shapes"]))
-            .unwrap_err()
-            .to_string();
-        assert!(trailing.contains("--shapes="), "{trailing}");
-    }
-
-    #[test]
-    fn the_equals_form_and_unrelated_arguments_pass_the_syntax_guard() {
-        assert!(reject_space_separated_shapes(argv(&["--shapes=5-cell,8-cell"])).is_ok());
-        assert!(
-            reject_space_separated_shapes(argv(&["--seed=42", "shapes", "--x=--shapes"])).is_ok()
+    fn the_attached_form_and_unrelated_arguments_are_not_diagnosed() {
+        let row = parse_row(&Args::from_argv(["--seed=42", "--shapes=5-cell,8-cell"])).unwrap();
+        assert_eq!(
+            row.iter().map(|e| e.label).collect::<Vec<_>>(),
+            ["5-cell", "8-cell"]
         );
-        assert!(reject_space_separated_shapes(argv(&[])).is_ok());
+        assert_eq!(
+            parse_row(&Args::from_argv(["shapes", "--x=--shapes"])).unwrap(),
+            DEFAULT_ROW
+        );
     }
 
     #[test]
