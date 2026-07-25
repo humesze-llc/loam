@@ -6,6 +6,11 @@
 //!
 //! [`combinator`] provides Space-agnostic combinators (union, intersection,
 //! smooth-min) over the scalar distances returned by primitive SDFs.
+//!
+//! Emit contract, shared by the 3D and 4D paths: every baked constant is printed
+//! with `Display`, which is shortest-round-trip for `f32`. Parsing the emitted
+//! literal recovers the exact input bits, so the emitter contributes no floor to
+//! CPU/GPU parity and no divisor collapses to zero.
 
 pub mod combinator;
 pub mod primitive;
@@ -33,7 +38,37 @@ mod tests {
         let src = s.to_wgsl(&EuclideanR3, "sdf_0");
         assert!(src.contains("fn sdf_0(p: vec3<f32>) -> f32"));
         assert!(src.contains("loam_distance"));
-        assert!(src.contains("0.250000"));
+        assert!(src.contains("- (0.25)"));
+    }
+
+    /// Every baked constant must parse back to the exact input `f32`, including
+    /// magnitudes below the 5e-7 floor that fixed-precision printing collapsed to
+    /// `0.000000`. This is the emitter's half of the CPU/GPU parity contract.
+    #[test]
+    fn sphere_constants_round_trip_below_the_old_print_floor() {
+        use loam_math::EuclideanR3;
+        let center = Vec3::new(3.7e-7, -1.25e-7, 0.0);
+        let radius = 1e-7_f32;
+        let src = Shape::sphere_at(center, radius).to_wgsl(&EuclideanR3, "sdf_0");
+        let args = src
+            .split("vec3<f32>(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("center is emitted");
+        let coords: Vec<f32> = args
+            .split(", ")
+            .map(|c| c.parse().expect("coordinate parses as f32"))
+            .collect();
+        assert_eq!(coords, vec![center.x, center.y, center.z], "emitted {args}");
+        let radius_literal = src
+            .split("- (")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("radius is emitted");
+        assert_eq!(
+            radius_literal.parse::<f32>().expect("radius parses as f32"),
+            radius,
+        );
     }
 
     #[test]
@@ -60,7 +95,7 @@ mod tests {
         let src = p.to_wgsl(&EuclideanR3, "sdf_floor");
         assert!(src.contains("fn sdf_floor(p: vec3<f32>) -> f32"));
         assert!(src.contains("dot(p,"));
-        assert!(src.contains("-0.500000"));
+        assert!(src.contains("- (-0.5)"));
     }
 
     /// `HalfSpace` sentinels in a curved Space; pinned so a regression that
@@ -90,7 +125,7 @@ mod tests {
         let src = b.to_wgsl(&EuclideanR3, "sdf_box");
         assert!(src.contains("fn sdf_box(p: vec3<f32>) -> f32"));
         assert!(src.contains("abs(p)"));
-        assert!(src.contains("0.400000"));
+        assert!(src.contains("vec3<f32>(0.4, 0.4, 0.4)"));
     }
 
     #[test]
@@ -105,7 +140,7 @@ mod tests {
         use combinator::smooth_min_fn;
         let src = smooth_min_fn("smin", 0.08);
         assert!(src.contains("fn smin(a: f32, b: f32) -> f32"));
-        assert!(src.contains("0.080000"));
+        assert!(src.contains("/ (0.08)"));
         assert!(src.contains("clamp"));
         assert!(src.contains("mix"));
     }
@@ -123,7 +158,7 @@ mod tests {
         assert!(src.contains("fn loam_scene_sdf"));
         assert!(src.contains("loam_distance"));
         assert!(src.contains("dot(p,"));
-        assert!(src.contains("-0.500000"));
+        assert!(src.contains("- (-0.5)"));
     }
 
     /// A sphere-only scene emits no `dot()` calls.
@@ -143,7 +178,7 @@ mod tests {
         use loam_math::EuclideanR3;
         let scene = Scene::new(SceneNode::sphere(Vec3::new(0.5, 0.0, 0.0), 0.1));
         let src = scene.to_wgsl(&EuclideanR3);
-        assert!(src.contains("0.500000, 0.000000, 0.000000"));
+        assert!(src.contains("vec3<f32>(0.5, 0, 0)"));
     }
 
     /// A tangent vector exped through H³ compresses below its E³ coordinate, so
@@ -156,7 +191,7 @@ mod tests {
         let src = scene.to_wgsl(&HyperbolicH3);
         // tanh(0.25) ≈ 0.2449, well under 0.5.
         assert!(p.x < 0.5);
-        assert!(!src.contains("0.500000, 0.000000, 0.000000"));
+        assert!(!src.contains("vec3<f32>(0.5, 0, 0)"));
     }
 
     // ---- Semantic-SDF correctness + Lipschitz-bound tests ------------------

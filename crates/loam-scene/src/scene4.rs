@@ -228,10 +228,10 @@ fn walk_max_t(node: &SceneNode4, body: &mut String, halfspace_gate_expr: Option<
             // catch only rays heading toward the solid side. A set gate wraps the
             // whole t-contribution so a gated-off halfspace yields no bound.
             let inner = format!(
-                "\t\tlet n = vec3<f32>({nx:.6}, {ny:.6}, {nz:.6});\n\
+                "\t\tlet n = vec3<f32>({nx}, {ny}, {nz});\n\
                  \t\tlet dr = dot(rd, n);\n\
                  \t\tif (dr < -1.0e-4) {{\n\
-                 \t\t\tlet t = ({offset:.6} - dot(ro, n)) / dr;\n\
+                 \t\t\tlet t = (({offset}) - dot(ro, n)) / dr;\n\
                  \t\t\tif (t > 0.0 && t < t_max) {{ t_max = t; }}\n\
                  \t\t}}\n",
                 nx = normal.x,

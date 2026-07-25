@@ -44,7 +44,7 @@ impl Primitive for Shape {
         match self {
             Shape::Sphere { center, radius } => format!(
                 "fn {name}(p: vec3<f32>) -> f32 {{\n\
-                 \treturn loam_distance(p, vec3<f32>({cx:.6}, {cy:.6}, {cz:.6})) - {r:.6};\n\
+                 \treturn loam_distance(p, vec3<f32>({cx}, {cy}, {cz})) - ({r});\n\
                  }}\n",
                 name = name,
                 cx = center.x,
@@ -54,7 +54,7 @@ impl Primitive for Shape {
             ),
             Shape::Box3 { half_extents } => format!(
                 "fn {name}(p: vec3<f32>) -> f32 {{\n\
-                 \tlet b = vec3<f32>({hx:.6}, {hy:.6}, {hz:.6});\n\
+                 \tlet b = vec3<f32>({hx}, {hy}, {hz});\n\
                  \tlet q = abs(p) - b;\n\
                  \treturn length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);\n\
                  }}\n",
@@ -65,7 +65,7 @@ impl Primitive for Shape {
             ),
             Shape::HalfSpace { normal, offset } if space.is_chart_flat() => format!(
                 "fn {name}(p: vec3<f32>) -> f32 {{\n\
-                 \treturn dot(p, vec3<f32>({nx:.6}, {ny:.6}, {nz:.6})) - ({d:.6});\n\
+                 \treturn dot(p, vec3<f32>({nx}, {ny}, {nz})) - ({d});\n\
                  }}\n",
                 name = name,
                 nx = normal.x,
