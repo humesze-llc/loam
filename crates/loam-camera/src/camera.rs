@@ -11,11 +11,21 @@
 //! [`Camera::view`] yields a [`CameraView`] for direct shader upload,
 //! available where `S::Point` and `S::Vector` are both `glam::Vec3`.
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use loam_math::Space;
 use std::ops::Mul;
 
 use crate::CameraView;
+
+/// A geodesic ray: a point on the manifold plus the initial velocity of
+/// the geodesic leaving it. `direction` is Euclidean-unit in the Space's
+/// embedding, matching [`Camera`]'s frame convention, so
+/// `Space::exp(origin, direction * t)` walks the ray.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ray {
+    pub origin: Vec3,
+    pub direction: Vec3,
+}
 
 /// Position + orthonormal tangent frame at that position. Generic over
 /// any [`Space`]; `view` and `translate` require `S::Point = S::Vector =
@@ -94,6 +104,35 @@ impl<S: Space<Point = Vec3, Vector = Vec3>> Camera<S> {
         }
     }
 
+    /// Inverse of the perspective projection: the primary ray through the
+    /// normalised device coordinate `ndc`, both components in [-1, 1] with
+    /// y up. Pixel-space callers must flip y, since window coordinates are
+    /// y-down.
+    ///
+    /// A point at depth `d` along `forward` projects to
+    /// `ndc.x = x / (aspect · tan(fov_y/2) · d)` and
+    /// `ndc.y = y / (tan(fov_y/2) · d)` under a right-handed perspective
+    /// matrix (Akenine-Möller, Haines, Hoffman, *Real-Time Rendering* 4th
+    /// ed, 2018, §4.7); solving for the view-space offsets and dropping the
+    /// depth scale gives the direction below. The raymarch shaders build
+    /// their primary rays from the same three coefficients.
+    ///
+    /// `ndc` outside [-1, 1] is meaningful and returns the ray through that
+    /// off-screen point.
+    pub fn ray_from_ndc(&self, ndc: Vec2) -> Ray {
+        let tan_half_fov_y = (self.fov_y * 0.5).tan();
+        let direction = self.forward
+            + self.right * (ndc.x * self.aspect * tan_half_fov_y)
+            + self.up * (ndc.y * tan_half_fov_y);
+        Ray {
+            origin: self.position,
+            // The lateral terms are orthogonal to the unit `forward`, so
+            // |direction|² = 1 + |lateral|² ≥ 1: normalize cannot underflow
+            // for any finite `ndc`, and needs no fallback.
+            direction: direction.normalize(),
+        }
+    }
+
     /// Move along the geodesic from `v * dt`, parallel-transporting the
     /// frame so it stays orthonormal at the new point. Identity on the
     /// basis in flat space; a holonomy rotation in H³ / S³.
@@ -126,10 +165,27 @@ impl<S: Space<Point = Vec3, Vector = Vec3>> Camera<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::{Mat4, Vec4Swizzles};
     use loam_math::EuclideanR3;
 
     fn close(a: Vec3, b: Vec3, tol: f32) {
         assert!((a - b).length() < tol, "expected {a:?} ≈ {b:?}");
+    }
+
+    /// The forward projection `ray_from_ndc` must invert: the same
+    /// `look_to_rh` + `perspective_rh` pipeline and the same y-down pixel
+    /// mapping that `loam_egui::world_to_screen` applies, minus its
+    /// off-frustum rejection. Rebuilt here rather than called because
+    /// loam-camera sits below loam-egui in the dependency DAG.
+    fn project_to_pixel(camera: &Camera<EuclideanR3>, world: Vec3, viewport: Vec2) -> Vec2 {
+        let view = Mat4::look_to_rh(camera.position, camera.forward, camera.up);
+        let projection = Mat4::perspective_rh(camera.fov_y, camera.aspect, camera.near, camera.far);
+        let clip = projection * view * world.extend(1.0);
+        let ndc = clip.xyz() / clip.w;
+        Vec2::new(
+            (ndc.x * 0.5 + 0.5) * viewport.x,
+            (1.0 - (ndc.y * 0.5 + 0.5)) * viewport.y,
+        )
     }
 
     #[test]
@@ -202,6 +258,97 @@ mod tests {
         assert!(cam.right.dot(cam.up).abs() < 1e-3);
         assert!(cam.right.dot(cam.forward).abs() < 1e-3);
         assert!(cam.up.dot(cam.forward).abs() < 1e-3);
+    }
+
+    /// Unprojection inverts projection: every point along the ray through
+    /// an NDC coordinate projects back to that same coordinate. Uses an
+    /// off-axis pose and a 16:9 viewport so a swapped `right`/`up`, a
+    /// dropped `aspect`, or a sign flip cannot survive.
+    #[test]
+    fn ray_from_ndc_round_trips_through_the_forward_projection() {
+        let viewport = Vec2::new(1600.0, 900.0);
+        let mut camera = Camera::<EuclideanR3>::looking_at(
+            Vec3::new(2.0, 1.0, 4.0),
+            Vec3::new(-1.0, 0.5, -2.0),
+            Vec3::Y,
+            &EuclideanR3,
+        );
+        camera.fov_y = 47.0_f32.to_radians();
+        camera.aspect = viewport.x / viewport.y;
+
+        for x_step in -2..=2 {
+            for y_step in -2..=2 {
+                let ndc = Vec2::new(x_step as f32 * 0.5, y_step as f32 * 0.5);
+                let ray = camera.ray_from_ndc(ndc);
+                assert!((ray.direction.length() - 1.0).abs() < 1e-6);
+                let expected = Vec2::new(
+                    (ndc.x * 0.5 + 0.5) * viewport.x,
+                    (1.0 - (ndc.y * 0.5 + 0.5)) * viewport.y,
+                );
+                for depth in [0.5_f32, 3.0, 25.0] {
+                    let world = ray.origin + ray.direction * depth;
+                    let pixel = project_to_pixel(&camera, world, viewport);
+                    assert!(
+                        (pixel - expected).length() < 1e-2,
+                        "ndc {ndc:?} at depth {depth} projected to {pixel:?}, expected {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The centre of the screen looks where the camera looks, from where
+    /// the camera is, for any fov and any aspect.
+    #[test]
+    fn centre_ndc_ray_is_camera_position_and_forward() {
+        for (fov_y_degrees, aspect) in [(60.0_f32, 1.0_f32), (30.0, 16.0 / 9.0), (95.0, 0.5)] {
+            let mut camera = Camera::<EuclideanR3>::looking_at(
+                Vec3::new(-3.0, 2.0, 1.5),
+                Vec3::new(0.4, -1.0, -2.0),
+                Vec3::Y,
+                &EuclideanR3,
+            );
+            camera.fov_y = fov_y_degrees.to_radians();
+            camera.aspect = aspect;
+            let ray = camera.ray_from_ndc(Vec2::ZERO);
+            close(ray.origin, camera.position, 1e-6);
+            close(ray.direction, camera.forward, 1e-6);
+        }
+    }
+
+    /// Edge rays sit on the frustum half-angles: the vertical one is
+    /// `fov_y/2` whatever the aspect, the horizontal one satisfies
+    /// `tan θ = aspect · tan(fov_y/2)`. Catches a dropped `aspect`, an
+    /// `aspect` applied to the vertical axis, and `fov_y` used where
+    /// `fov_y/2` belongs.
+    #[test]
+    fn edge_ndc_half_angles_track_fov_y_and_aspect() {
+        for aspect in [16.0_f32 / 9.0, 1.0, 9.0 / 16.0] {
+            let mut camera = Camera::<EuclideanR3>::at_origin();
+            camera.fov_y = 42.0_f32.to_radians();
+            camera.aspect = aspect;
+            let tan_half_fov_y = (camera.fov_y * 0.5).tan();
+
+            // Ratio of frame components rather than acos(dot): the tangent
+            // is exactly the projection coefficient being pinned, and acos
+            // loses precision on the near-parallel rays this samples.
+            let top = camera.ray_from_ndc(Vec2::new(0.0, 1.0)).direction;
+            let vertical_tan = top.dot(camera.up) / top.dot(camera.forward);
+            assert!(
+                (vertical_tan - tan_half_fov_y).abs() < 1e-6,
+                "aspect {aspect}: vertical tan {vertical_tan} != {tan_half_fov_y}"
+            );
+            assert!(top.dot(camera.right).abs() < 1e-6, "aspect leaked into y");
+
+            let side = camera.ray_from_ndc(Vec2::new(1.0, 0.0)).direction;
+            let horizontal_tan = side.dot(camera.right) / side.dot(camera.forward);
+            let expected = aspect * tan_half_fov_y;
+            assert!(
+                (horizontal_tan - expected).abs() < 1e-6,
+                "aspect {aspect}: horizontal tan {horizontal_tan} != {expected}"
+            );
+            assert!(side.dot(camera.up).abs() < 1e-6, "x NDC tilted the y axis");
+        }
     }
 
     /// `looking_at` with `position == target` has `log = 0`, no defined
