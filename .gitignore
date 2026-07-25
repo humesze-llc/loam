@@ -44,3 +44,6 @@ scripts/
 # rebuild any time)
 /dist/
 crates/*/dist/
+
+# Stray build/diagnostic logs
+*.log

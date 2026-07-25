@@ -2,14 +2,14 @@
 //!
 //! Parallel to [`loam_egui::UiIntegration`] but without `egui_winit`
 //! (winit's web backend assumes a `web_sys::Window`, which panics in
-//! `WorkerGlobalScope`). Translates [`super::messages::InputMessage`]
+//! `WorkerGlobalScope`). Translates [`super::input_queue::InputMessage`]
 //! directly into `egui::RawInput::events` and mirrors the `begin_frame` +
 //! `paint` lifecycle so `App::ui` works unchanged. No cursor / clipboard
 //! / IME platform-output handling, and no egui pipeline warmup.
 
 use loam_egui::egui;
 
-use super::messages::InputMessage;
+use super::input_queue::InputMessage;
 
 /// Owns the egui-wgpu `Renderer`, `egui::Context`, and a per-frame
 /// `RawInput` accumulator. Constructed once per worker session.

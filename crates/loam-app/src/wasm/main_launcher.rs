@@ -147,6 +147,23 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
             &JsValue::from_str("height"),
             &JsValue::from_f64(height as f64),
         );
+        // Workers have no `window.location`; forward the page query so
+        // `Args::current` works inside `App::setup`.
+        let (search, hash) = web_sys::window()
+            .map(|w| {
+                let loc = w.location();
+                (
+                    loc.search().unwrap_or_default(),
+                    loc.hash().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        let _ = js_sys::Reflect::set(
+            &msg,
+            &JsValue::from_str("search"),
+            &JsValue::from_str(&search),
+        );
+        let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("hash"), &JsValue::from_str(&hash));
 
         let transfer = js_sys::Array::new();
         transfer.push(&offscreen_for_ready);
@@ -188,6 +205,8 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
     install_preview_progress_handler(&worker)?;
     install_preview_ready_handler(&worker, button_id)?;
 
+    install_embed_lifecycle(&worker, host_id, button_id).context("install_embed_lifecycle")?;
+
     // Launch-overlay click handler, spam-click defensive: FnMut + a `fired`
     // Cell make repeat clicks no-ops; post Start before removing the overlay
     // so a failed post leaves the overlay up for retry.
@@ -196,6 +215,7 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
         let overlay_for_click = launch_overlay.clone();
         let worker_ready_for_click = worker_ready.clone();
         let pending_start_for_click = pending_start.clone();
+        let host_for_click = host_id.to_string();
         let fired: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
         let on_click = Closure::wrap(Box::new(move || {
             if fired.get() {
@@ -238,6 +258,7 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
             // Pipelines were warmed before preview_ready, so removing the
             // overlay is the whole transition; no second wait.
             overlay_for_click.remove();
+            dispatch_embed_activated(&host_for_click);
         }) as Box<dyn FnMut()>);
         launch_overlay
             .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())
@@ -247,6 +268,138 @@ fn spawn_worker_for_preview(canvas_id: &str, host_id: &str, button_id: &str) -> 
 
     // Keep the Worker alive: dropping it terminates the worker.
     Box::leak(Box::new(worker));
+
+    Ok(())
+}
+
+/// Dispatched on `document` when an embed activates; detail = host id.
+/// Every embed listens: its own id flips it active, another id while active
+/// deactivates it. One-active-demo-per-page with no shared JS state.
+const EMBED_ACTIVATED_EVENT: &str = "loam-embed-activated";
+
+fn dispatch_embed_activated(host_id: &str) {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let init = web_sys::CustomEventInit::new();
+    init.set_detail(&JsValue::from_str(host_id));
+    match web_sys::CustomEvent::new_with_event_init_dict(EMBED_ACTIVATED_EVENT, &init) {
+        Ok(event) => {
+            let _ = document.dispatch_event(&event);
+        }
+        Err(e) => tracing::error!("loam_app::wasm::worker: create activated event: {e:?}"),
+    }
+}
+
+/// Post-launch lifecycle for one embed: pointerdown outside the host posts
+/// `pause` and restores the blurred overlay; the overlay click posts
+/// `resume` and re-announces; another embed's broadcast deactivates this
+/// one. Starts inactive until the launch click's broadcast.
+fn install_embed_lifecycle(worker: &Worker, host_id: &str, button_id: &str) -> Result<()> {
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or_else(|| anyhow!("no document on global window"))?;
+    let host_el = document
+        .get_element_by_id(host_id)
+        .ok_or_else(|| anyhow!("no host element with id '{host_id}'"))?;
+    let active: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+
+    // One closure shared across pause cycles; the button is recreated each
+    // time, so it re-attaches rather than leaking a closure per cycle.
+    let worker_for_resume = worker.clone();
+    let host_for_resume = host_id.to_string();
+    let button_for_resume = button_id.to_string();
+    let on_resume_click: Rc<Closure<dyn FnMut()>> = Rc::new(Closure::wrap(Box::new(move || {
+        // Post before removing the overlay: on failure the demo stays
+        // paused and the untouched button, listener still attached, is the
+        // retry affordance. Recreating it here would hand back an element
+        // with no listener, wedging the embed.
+        let msg = build_msg("resume");
+        if let Err(e) = worker_for_resume.post_message(&msg) {
+            tracing::error!(
+                "loam_app::wasm::worker: postMessage resume failed: {e:?}; \
+                 overlay retained for retry"
+            );
+            return;
+        }
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            if let Some(button) = doc.get_element_by_id(&button_for_resume) {
+                button.remove();
+            }
+        }
+        dispatch_embed_activated(&host_for_resume);
+    })
+        as Box<dyn FnMut()>));
+
+    let worker_for_deact = worker.clone();
+    let host_for_deact = host_id.to_string();
+    let button_for_deact = button_id.to_string();
+    let active_for_deact = active.clone();
+    let resume_cb = on_resume_click.clone();
+    let deactivate: Rc<dyn Fn()> = Rc::new(move || {
+        if !active_for_deact.replace(false) {
+            return;
+        }
+        let msg = build_msg("pause");
+        if let Err(e) = worker_for_deact.post_message(&msg) {
+            tracing::error!("loam_app::wasm::worker: postMessage pause failed: {e:?}");
+        }
+        match super::launch::show_resume_overlay(&host_for_deact, &button_for_deact) {
+            Ok(button) => {
+                if let Err(e) = button.add_event_listener_with_callback(
+                    "click",
+                    (*resume_cb).as_ref().unchecked_ref(),
+                ) {
+                    tracing::error!("loam_app::wasm::worker: resume click listener: {e:?}");
+                }
+            }
+            Err(e) => tracing::error!("loam_app::wasm::worker: show_resume_overlay: {e:#}"),
+        }
+    });
+
+    let active_for_evt = active.clone();
+    let host_for_evt = host_id.to_string();
+    let deactivate_for_evt = deactivate.clone();
+    let on_activated = Closure::wrap(Box::new(move |event: web_sys::CustomEvent| {
+        if event.detail().as_string().as_deref() == Some(host_for_evt.as_str()) {
+            active_for_evt.set(true);
+        } else {
+            deactivate_for_evt();
+        }
+    }) as Box<dyn FnMut(web_sys::CustomEvent)>);
+    document
+        .add_event_listener_with_callback(
+            EMBED_ACTIVATED_EVENT,
+            on_activated.as_ref().unchecked_ref(),
+        )
+        .map_err(|e| anyhow!("addEventListener('{EMBED_ACTIVATED_EVENT}'): {e:?}"))?;
+    on_activated.forget();
+
+    // Capture phase: page UI that stops propagation must not wedge the demo
+    // active.
+    let active_for_ptr = active.clone();
+    let deactivate_for_ptr = deactivate.clone();
+    let on_pointerdown = Closure::wrap(Box::new(move |event: web_sys::Event| {
+        if !active_for_ptr.get() {
+            return;
+        }
+        let inside = event
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+            .map(|node| host_el.contains(Some(&node)))
+            .unwrap_or(false);
+        if !inside {
+            deactivate_for_ptr();
+        }
+    }) as Box<dyn FnMut(web_sys::Event)>);
+    document
+        .add_event_listener_with_callback_and_bool(
+            "pointerdown",
+            on_pointerdown.as_ref().unchecked_ref(),
+            true,
+        )
+        .map_err(|e| anyhow!("addEventListener('pointerdown'): {e:?}"))?;
+    on_pointerdown.forget();
 
     Ok(())
 }

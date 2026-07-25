@@ -23,7 +23,8 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, OffscreenCanvas};
 
-use super::messages::{self, InputMessage};
+use super::input_queue::{self, InputMessage};
+use super::messages;
 use super::worker_ui::WorkerUi;
 use crate::{App, FrameCtx, RenderCtx, SetupCtx};
 use loam_asset::AssetWatcher;
@@ -111,6 +112,42 @@ where
         }
         return Ok(());
     }
+    if kind.as_deref() == Some("pause") {
+        // Synthetic focus-loss releases buttons held at pause time; drained
+        // on the first resumed frame. Only on the paused edge: a repeat
+        // pause would push onto a queue no frame is draining.
+        if !PAUSED.with(|p| p.replace(true)) {
+            input_queue::enqueue(InputMessage::Focus(false));
+        }
+        tracing::info!("loam_app::wasm::worker: pause received; RAF chain will halt");
+        return Ok(());
+    }
+    if kind.as_deref() == Some("resume") {
+        let was_paused = PAUSED.with(|p| p.replace(false));
+        // Restart only a halted chain: pause+resume within one frame gap
+        // leaves the original RAF pending, and resume before Start must not
+        // bypass the launch flow.
+        if was_paused && LOOP_STARTED.with(|s| s.get()) && !RAF_PENDING.with(|p| p.get()) {
+            RAF_RESTART.with(|r| {
+                if let Some(restart) = r.borrow().as_ref() {
+                    tracing::info!("loam_app::wasm::worker: resume received; restarting RAF");
+                    restart();
+                }
+            });
+        }
+        return Ok(());
+    }
+    // No frame drains the queue while paused: drop pointer/key/wheel so
+    // stale input cannot replay on resume. Resize still queues; the queue's
+    // own cap is what keeps a paused embed's arrivals bounded.
+    if PAUSED.with(|p| p.get())
+        && matches!(
+            kind.as_deref(),
+            Some("mouse_move" | "mouse_button" | "mouse_wheel" | "key")
+        )
+    {
+        return Ok(());
+    }
     if kind.as_deref() == Some("init") {
         let canvas = js_sys::Reflect::get(&data, &JsValue::from_str("canvas"))
             .map_err(|e| anyhow!("init missing 'canvas' field: {e:?}"))?
@@ -126,6 +163,13 @@ where
             .and_then(|v| v.as_f64())
             .map(|f| f as u32)
             .unwrap_or(600);
+        let read_str = |key: &str| {
+            js_sys::Reflect::get(&data, &JsValue::from_str(key))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default()
+        };
+        crate::args::set_query_override(read_str("search"), read_str("hash"));
 
         tracing::info!(
             "loam_app::wasm::worker: received init ({width}x{height}); spawning wgpu setup"
@@ -140,7 +184,7 @@ where
     }
 
     match messages::parse_non_init(&data)? {
-        Some(msg) => messages::enqueue(msg),
+        Some(msg) => input_queue::enqueue(msg),
         None => {
             if let Some(k) = kind {
                 tracing::warn!("loam_app::wasm::worker: unknown message kind '{k}'");
@@ -257,6 +301,11 @@ where
     let runner_for_closure = runner.clone();
 
     *raf_cb.borrow_mut() = Some(Closure::wrap(Box::new(move |_timestamp: f64| {
+        RAF_PENDING.with(|p| p.set(false));
+        // Halted chain keeps the last presented frame as the overlay backdrop.
+        if PAUSED.with(|p| p.get()) {
+            return;
+        }
         if let Err(e) = runner_for_closure.borrow_mut().frame() {
             tracing::error!("loam_app::wasm::worker: frame failed: {e:#}");
             // Stop the loop on error: one log line, not 60 per second.
@@ -264,7 +313,12 @@ where
         }
         let cb_ref = raf_cb_for_closure.borrow();
         if let Some(cb) = cb_ref.as_ref() {
-            let _ = scope_for_closure.request_animation_frame(cb.as_ref().unchecked_ref());
+            if scope_for_closure
+                .request_animation_frame(cb.as_ref().unchecked_ref())
+                .is_ok()
+            {
+                RAF_PENDING.with(|p| p.set(true));
+            }
         }
     }) as Box<dyn FnMut(f64)>));
 
@@ -276,12 +330,31 @@ where
     let kickoff: Box<dyn FnOnce()> = Box::new(move || {
         let cb_ref = raf_cb_for_kickoff.borrow();
         if let Some(cb) = cb_ref.as_ref() {
-            if let Err(e) = scope_for_kickoff.request_animation_frame(cb.as_ref().unchecked_ref()) {
-                tracing::error!("loam_app::wasm::worker: RAF kickoff failed: {e:?}");
+            match scope_for_kickoff.request_animation_frame(cb.as_ref().unchecked_ref()) {
+                Ok(_) => {
+                    LOOP_STARTED.with(|s| s.set(true));
+                    RAF_PENDING.with(|p| p.set(true));
+                }
+                Err(e) => tracing::error!("loam_app::wasm::worker: RAF kickoff failed: {e:?}"),
             }
         }
     });
     RAF_KICKOFF.with(|k| *k.borrow_mut() = Some(kickoff));
+
+    let scope_for_restart = scope.clone();
+    let raf_cb_for_restart = raf_cb.clone();
+    let runner_for_restart = runner.clone();
+    let restart: Box<dyn Fn()> = Box::new(move || {
+        runner_for_restart.borrow_mut().reset_frame_clock();
+        let cb_ref = raf_cb_for_restart.borrow();
+        if let Some(cb) = cb_ref.as_ref() {
+            match scope_for_restart.request_animation_frame(cb.as_ref().unchecked_ref()) {
+                Ok(_) => RAF_PENDING.with(|p| p.set(true)),
+                Err(e) => tracing::error!("loam_app::wasm::worker: RAF restart failed: {e:?}"),
+            }
+        }
+    });
+    RAF_RESTART.with(|r| *r.borrow_mut() = Some(restart));
 
     // If a Start landed during setup (click before wgpu init finished),
     // self-trigger now; otherwise the demo would freeze on the preview
@@ -313,6 +386,21 @@ thread_local! {
     /// Checked at the end of setup so an eager click during the wgpu+egui
     /// setup window still starts the loop instead of freezing the preview.
     static START_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Embed deactivated: the RAF chain halts and input messages drop.
+    static PAUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// A RAF callback is scheduled. Resume must not re-request while the
+    /// original chain is alive (pause+resume within one frame gap), or two
+    /// interleaved chains run forever.
+    static RAF_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Resume before Start must not bypass the launch flow.
+    static LOOP_STARTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Restarts a halted chain on `resume`, re-anchoring the frame clock
+    /// first. Unlike `RAF_KICKOFF`, reusable across pause cycles.
+    static RAF_RESTART: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
 }
 
 /// Per-worker lifecycle state: owns the RenderDevice, the user's App, and
@@ -423,6 +511,15 @@ where
             max_ticks_per_frame: 4,
             _marker: PhantomData,
         })
+    }
+
+    /// Re-anchor after a pause so the first resumed frame sees a normal dt.
+    /// Anchors on `now`, not `None`: `last_update_at == None` doubles as the
+    /// pre-Start preview flag in `apply_message`. `FixedTimestep` needs no
+    /// reset; `advance` bounds catch-up and drains excess itself.
+    fn reset_frame_clock(&mut self) {
+        self.last_update_at = Some(web_time::Instant::now());
+        self.last_redraw_anchor = None;
     }
 
     /// Resize the canvas backing store, reconfigure the surface, and update
@@ -586,7 +683,7 @@ where
         loam_time::frame_trace::begin_frame();
         let _frame_scope = loam_time::frame_trace::scope("frame");
 
-        for msg in messages::drain_messages() {
+        for msg in input_queue::drain_messages() {
             self.apply_message(msg);
         }
 

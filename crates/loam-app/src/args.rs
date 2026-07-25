@@ -64,6 +64,14 @@ impl Args {
                     parse_query_into(&hash, &mut map);
                 }
             }
+            // Workers have no `window`; the init message forwards the page's
+            // query (see set_query_override).
+            QUERY_OVERRIDE.with(|q| {
+                if let Some((search, hash)) = q.borrow().as_ref() {
+                    parse_query_into(search, &mut map);
+                    parse_query_into(hash, &mut map);
+                }
+            });
         }
 
         Self { map }
@@ -112,6 +120,22 @@ impl Args {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.map.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Page query forwarded into a worker via the init message; workers have
+    /// no `window.location`.
+    static QUERY_OVERRIDE: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Stash the page's `location.search` and `location.hash` inside a worker.
+/// Called by the worker entry before `App::setup`; hash wins on collision,
+/// matching the main-thread parse order.
+#[cfg(target_arch = "wasm32")]
+pub fn set_query_override(search: String, hash: String) {
+    QUERY_OVERRIDE.with(|q| *q.borrow_mut() = Some((search, hash)));
 }
 
 /// Parse a query/hash fragment ("?a=1&b=2" or "#a=1") into `map`. Leading

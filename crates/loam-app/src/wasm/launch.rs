@@ -17,9 +17,11 @@
 //! later-cascade stylesheet or pre-creating their own `<button id="...">`,
 //! which [`inject_launch_overlay`] reuses.
 //!
-//! Pause-on-scroll-out is a non-goal here: it belongs in a JS embed wrapper
-//! (an `IntersectionObserver` posting `pause` to the worker), which the
-//! worker's lifecycle hooks already support.
+//! After launch, the embed lifecycle in `main_launcher` enforces
+//! one-active-demo-per-page: clicking outside the host pauses the worker
+//! and restores this overlay via [`show_resume_overlay`]. Pause-on-
+//! scroll-out remains a JS embed-wrapper concern (an `IntersectionObserver`
+//! posting `pause`), which the worker's pause/resume messages support.
 
 use anyhow::{anyhow, Context, Result};
 use wasm_bindgen::prelude::Closure;
@@ -86,6 +88,11 @@ const LAUNCH_OVERLAY_CSS: &str = r#"
 .loam-demo-launch.ready:active {
     background: rgba(14, 14, 18, 0.4);
 }
+
+/* Paused embed. `.resume` composes with `.ready`: a paused demo is warm. */
+.loam-demo-launch.ready.resume::after {
+    content: 'Click to start';
+}
 "#;
 
 const OVERLAY_STYLE_ID: &str = "loam-launch-overlay-styles";
@@ -94,7 +101,34 @@ const OVERLAY_STYLE_ID: &str = "loam-launch-overlay-styles";
 /// carrying [`LAUNCH_OVERLAY_CSS`] into `<head>` (the style is idempotent,
 /// keyed on a fixed id). Returns the button for the caller to wire; reuses
 /// an existing `button_id` element if the demo shipped its own.
+///
+/// No state class: CSS shows only the blurred backdrop until the worker's
+/// `preview_ready` adds `.ready` and reveals the click affordance. The
+/// `#loam-page-loader` element carries the spinner until then.
 pub fn inject_launch_overlay(host_id: &str, button_id: &str) -> Result<HtmlButtonElement> {
+    overlay_button(host_id, button_id, "loam-demo-launch", "Launch demo")
+}
+
+/// (Re)create the overlay as the paused-state affordance (`.ready.resume`:
+/// immediately clickable, a paused demo is warm). The launch flow removed
+/// the original button, so this usually creates a fresh element.
+pub fn show_resume_overlay(host_id: &str, button_id: &str) -> Result<HtmlButtonElement> {
+    overlay_button(
+        host_id,
+        button_id,
+        "loam-demo-launch ready resume",
+        "Resume demo",
+    )
+}
+
+/// Idempotent style injection plus reuse-or-create of `button_id`. A reused
+/// element gets its class list overwritten (launch -> resume transitions).
+fn overlay_button(
+    host_id: &str,
+    button_id: &str,
+    class_name: &str,
+    aria_label: &str,
+) -> Result<HtmlButtonElement> {
     let window = web_sys::window().ok_or_else(|| anyhow!("no global window"))?;
     let document = window
         .document()
@@ -119,9 +153,11 @@ pub fn inject_launch_overlay(host_id: &str, button_id: &str) -> Result<HtmlButto
     }
 
     if let Some(existing) = document.get_element_by_id(button_id) {
-        return existing
+        let button = existing
             .dyn_into::<HtmlButtonElement>()
-            .map_err(|_| anyhow!("element '{button_id}' is not a button"));
+            .map_err(|_| anyhow!("element '{button_id}' is not a button"))?;
+        button.set_class_name(class_name);
+        return Ok(button);
     }
 
     let button = document
@@ -130,13 +166,10 @@ pub fn inject_launch_overlay(host_id: &str, button_id: &str) -> Result<HtmlButto
         .dyn_into::<HtmlButtonElement>()
         .map_err(|_| anyhow!("created element is not HtmlButtonElement"))?;
     button.set_id(button_id);
-    // No state class: CSS shows only the blurred backdrop until the worker's
-    // `preview_ready` adds `.ready` and reveals the click affordance. The
-    // `#loam-page-loader` element carries the spinner until then.
-    button.set_class_name("loam-demo-launch");
+    button.set_class_name(class_name);
     button.set_type("button");
     button
-        .set_attribute("aria-label", "Launch demo")
+        .set_attribute("aria-label", aria_label)
         .map_err(|e| anyhow!("set aria-label: {e:?}"))?;
     host.append_child(&button)
         .map_err(|e| anyhow!("append button to host: {e:?}"))?;

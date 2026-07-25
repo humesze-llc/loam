@@ -63,6 +63,8 @@ pub mod frame_pacing;
 pub mod freecam;
 pub mod keymap;
 pub mod log;
+#[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+mod probe;
 pub mod trace;
 pub mod version;
 pub mod vsync;
@@ -558,7 +560,7 @@ fn setup_after_device<A: App>(
     // scene attachment, since both passes write into the same color attachment and the
     // deferred MSAA resolve happens at the end of the egui paint pass. See
     // [`UiIntegration::paint`]'s `resolve_target` parameter.
-    let mut ui = UiIntegration::new(&rd.device, win, rd.target_format(), rd.sample_count());
+    let mut ui = UiIntegration::new(&rd.device, win, rd.ui_format(), rd.sample_count());
 
     // Runner-side pipeline warming (N3). Forces lazy pipeline compilation for
     // egui-wgpu's shape variants and the browser-WebGPU composite pass during
@@ -576,7 +578,7 @@ fn setup_after_device<A: App>(
         &rd.device,
         &rd.queue,
         win,
-        rd.target_format(),
+        rd.ui_format(),
         rd.sample_count(),
     );
     rd.warm_composite();
@@ -706,6 +708,9 @@ struct Runner<A: App> {
 
     #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
     capture: capture::Capture,
+
+    #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+    probe: Option<probe::Probe>,
 }
 
 impl<A: App> Runner<A> {
@@ -738,6 +743,8 @@ impl<A: App> Runner<A> {
 
             #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
             capture: capture::Capture::new(),
+            #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+            probe: probe::Probe::from_args(),
         }
     }
 
@@ -1329,6 +1336,10 @@ impl<A: App> Runner<A> {
                 let _scope = loam_time::frame_trace::scope("app-ui");
                 let egui_ctx = ui.begin_frame(win.as_ref()).clone();
                 app.ui(&egui_ctx, &mut fctx);
+                #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+                if let Some(probe) = self.probe.as_ref() {
+                    probe.overlay(&egui_ctx);
+                }
             }
         }
 
@@ -1494,13 +1505,23 @@ impl<A: App> Runner<A> {
                 if let Some(ui) = self.ui.as_mut() {
                     let _scope = loam_time::frame_trace::scope("ui-paint");
                     let viewport = (rd.surface_bundle.size.width, rd.surface_bundle.size.height);
-                    let resolve_target = (rd.sample_count() > 1).then_some(&swap_view);
+                    // Direct-to-swapchain paths blend the UI in gamma space via
+                    // non-sRGB reinterpreted views (RenderDevice::ui_format).
+                    // The composite path keeps painting into the scene texture,
+                    // which the later composite pass consumes.
+                    let ui_swap_view =
+                        (rd.scene_view().is_none()).then(|| rd.create_ui_swap_view(&frame));
+                    let (ui_view, ui_resolve) = match (&ui_swap_view, rd.msaa_ui_view()) {
+                        (Some(swap), Some(msaa)) => (msaa, Some(swap)),
+                        (Some(swap), None) => (swap, None),
+                        (None, _) => (render_view, (rd.sample_count() > 1).then_some(&swap_view)),
+                    };
                     ui.paint(
                         &rd.device,
                         &rd.queue,
                         &mut encoder,
-                        render_view,
-                        resolve_target,
+                        ui_view,
+                        ui_resolve,
                         win.as_ref(),
                         viewport,
                     );
@@ -1518,6 +1539,22 @@ impl<A: App> Runner<A> {
                             label: Some("loam-app::frame-post-post-capture"),
                         });
                     capture_consume(&mut self.capture, rd, &frame.texture, false, capture_now);
+                }
+                // Probe tap: same mid-frame submit pattern as the capture taps
+                // so the readback sees the fully composited frame.
+                #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
+                if let Some(probe) = self.probe.as_mut() {
+                    rd.queue.submit(Some(encoder.finish()));
+                    encoder = rd
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("loam-app::frame-post-probe"),
+                        });
+                    if probe.consume(rd, &frame.texture) {
+                        // Probe runs are disposable processes; exit beats
+                        // threading a shutdown request through the runner.
+                        std::process::exit(0);
+                    }
                 }
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 if do_capture {

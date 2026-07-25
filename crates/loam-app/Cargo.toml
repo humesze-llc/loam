@@ -116,4 +116,9 @@ web-sys = { version = "0.3", features = [
     "WheelEvent",
     "FocusEvent",
     "VisibilityState",
+    # Embed lifecycle: CustomEvent broadcasts activation on `document`;
+    # Node for the click-off containment test.
+    "CustomEvent",
+    "CustomEventInit",
+    "Node",
 ] }

@@ -434,7 +434,7 @@ pub(crate) struct Demo {
     /// How the six regular convex 4-polytopes are rendered. Smooth-surface shapes
     /// (Clifford torus, duocylinder) ignore this and always use the SDF.
     pub(crate) surface_mode: SurfaceMode,
-    /// Polytope row from `--shapes` CLI args (or `DEFAULT_ROW`); drives body
+    /// Polytope row from the `shapes` argument (or `DEFAULT_ROW`); drives body
     /// uniforms and per-body label lookups.
     pub(crate) row: Vec<ShapeEntry>,
 
