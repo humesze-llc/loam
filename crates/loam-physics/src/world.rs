@@ -458,8 +458,9 @@ fn solve_normal_then_tangent<S>(
 mod tests {
     use super::*;
     use crate::determinism_fixture::{
-        determinism_scenario_run, first_divergent_step, fnv1a64, ScenarioRun,
-        GOLDEN_TRAJECTORY_HASH,
+        determinism_scenario_run, first_divergent_step, fnv1a64, multi_island_groups,
+        multi_island_scenario_run, multi_island_world, ScenarioRun, GOLDEN_MULTI_ISLAND_HASH,
+        GOLDEN_TRAJECTORY_HASH, MULTI_ISLAND_DT, MULTI_ISLAND_STEPS,
     };
     use crate::euclidean_r3::{halfspace_body_r3, register_default_narrowphase, sphere_body_r3};
     use crate::field::Gravity;
@@ -609,6 +610,167 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `expected` is `canonical` reversed exactly when `order` names `owner`,
+    /// so one helper carries both halves of the contract: the named phase's
+    /// buffer moves, and no other phase's buffer does.
+    fn assert_buffer_matches_policy<T>(
+        order: OrderPolicy,
+        owner: SchedulePhase,
+        buffer: &[T],
+        canonical: &[T],
+    ) where
+        T: Clone + PartialEq + std::fmt::Debug,
+    {
+        let mut expected = canonical.to_vec();
+        if matches!(order, OrderPolicy::Reversed { phase } if phase == owner) {
+            expected.reverse();
+        }
+        assert_eq!(
+            buffer,
+            expected.as_slice(),
+            "under {order:?} the retained {owner:?} buffer is wrong: the policy \
+             either never reached that phase or reached a different one"
+        );
+    }
+
+    /// The invariance axes above compare a canonical run against a canonical
+    /// run whenever a policy fails to reach the buffer its phase executes, so
+    /// on their own they cannot tell "this order does not matter" apart from
+    /// "this order was never applied". This pins the seam directly: after a
+    /// step, each phase's retained buffer is reversed exactly when the policy
+    /// names that phase, and identical to its canonical fill otherwise.
+    ///
+    /// `Reversed` rather than a seeded permutation because its expected buffer
+    /// is computable here without re-implementing `shuffle`.
+    #[test]
+    fn schedule_reordering_reaches_its_named_phase_buffer_determinism() {
+        let dt = 1.0 / 240.0;
+        let settle_steps = 200;
+
+        for order in [
+            OrderPolicy::Canonical,
+            OrderPolicy::Reversed {
+                phase: SchedulePhase::Body,
+            },
+            OrderPolicy::Reversed {
+                phase: SchedulePhase::BroadphasePair,
+            },
+            OrderPolicy::Reversed {
+                phase: SchedulePhase::Constraint,
+            },
+        ] {
+            let mut world = settled_sphere_stack(dt, 0);
+            world.schedule = Schedule { threads: 1, order };
+            for _ in 0..settle_steps {
+                world.step(dt);
+            }
+
+            let canonical_bodies: Vec<usize> = (0..world.bodies.len()).collect();
+            let canonical_pairs = world.broadphase();
+            let canonical_constraints: Vec<PairKey> = world.manifolds.keys().copied().collect();
+            // A buffer of fewer than two units reverses to itself, which would
+            // satisfy every assertion below without the seam existing.
+            assert!(
+                canonical_bodies.len() >= 2
+                    && canonical_pairs.len() >= 2
+                    && canonical_constraints.len() >= 2,
+                "{order:?} left a buffer too short for a reversal to be visible: \
+                 {} bodies, {} pairs, {} constraints",
+                canonical_bodies.len(),
+                canonical_pairs.len(),
+                canonical_constraints.len()
+            );
+
+            assert_buffer_matches_policy(
+                order,
+                SchedulePhase::Body,
+                &world.body_order,
+                &canonical_bodies,
+            );
+            assert_buffer_matches_policy(
+                order,
+                SchedulePhase::BroadphasePair,
+                &world.pair_order,
+                &canonical_pairs,
+            );
+            assert_buffer_matches_policy(
+                order,
+                SchedulePhase::Constraint,
+                &world.constraint_keys,
+                &canonical_constraints,
+            );
+        }
+    }
+
+    /// The multi-island fixture's behaviour pin, on the same terms as the R4
+    /// golden: deterministic-but-changed integration, solve, or contact
+    /// constants move it.
+    #[test]
+    fn multi_island_scenario_matches_golden_determinism_hash() {
+        let hash = fnv1a64(&multi_island_scenario_run(Schedule::default()).trajectory);
+        assert_eq!(
+            hash, GOLDEN_MULTI_ISLAND_HASH,
+            "multi-island trajectory hashed {hash:#018x} against the committed \
+             {GOLDEN_MULTI_ISLAND_HASH:#018x}"
+        );
+    }
+
+    /// The fixture earns its name only if the contact graph really splits into
+    /// the three groups it lays out and the four-body chain really rests as a
+    /// chain. A layout edit that lets two groups touch, or that leaves the
+    /// chain short of four simultaneous contacts, fails here rather than
+    /// silently making the island-order and colour-order axes vacuous on the
+    /// day they land.
+    #[test]
+    fn multi_island_contact_graph_stays_three_disjoint_islands_determinism() {
+        let groups = multi_island_groups();
+        let mut world = multi_island_world(Schedule::default());
+        let start_x: Vec<f32> = world.bodies.iter().map(|b| b.position.x).collect();
+        let mut contacts_per_group = [0usize; 3];
+        let mut chain_contacts_peak = 0usize;
+
+        for _ in 0..MULTI_ISLAND_STEPS {
+            world.step(MULTI_ISLAND_DT);
+            let mut this_step = [0usize; 3];
+            for &(i, j) in world.manifolds.keys() {
+                let a = groups.iter().position(|g| g.contains(&i));
+                let b = groups.iter().position(|g| g.contains(&j));
+                let group = match (a, b) {
+                    (Some(x), Some(y)) => {
+                        assert_eq!(x, y, "contact ({i}, {j}) joined islands {x} and {y}");
+                        x
+                    }
+                    // The floor sits in every island's contact set and merges
+                    // none of them: static, so it transmits no impulse.
+                    (Some(x), None) | (None, Some(x)) => x,
+                    (None, None) => panic!("contact ({i}, {j}) between two static bodies"),
+                };
+                this_step[group] += 1;
+            }
+            for (group, count) in this_step.iter().enumerate() {
+                contacts_per_group[group] += count;
+            }
+            chain_contacts_peak = chain_contacts_peak.max(this_step[0]);
+        }
+
+        for (group, count) in contacts_per_group.iter().enumerate() {
+            assert!(*count > 0, "island {group} never made contact");
+        }
+        assert_eq!(
+            chain_contacts_peak, 4,
+            "the four-body chain never rested as floor-A0, A0-A1, A1-A2, A2-A3"
+        );
+        // Bit equality, not a tolerance: the fixture's claim is that lateral
+        // motion is identically absent, not merely small. A tolerance would let
+        // a slow drift accumulate until the islands do meet.
+        let end_x: Vec<f32> = world.bodies.iter().map(|b| b.position.x).collect();
+        assert_eq!(
+            end_x, start_x,
+            "a body left its group's vertical axis, so the island partition is \
+             not constant by construction"
+        );
     }
 
     const SPHERE_RADIUS: f32 = 0.5;
