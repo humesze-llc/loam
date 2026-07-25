@@ -1401,6 +1401,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "loam-console"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "web-sys",
+]
+
+[[package]]
 name = "loam-egui"
 version = "0.1.0"
 dependencies = [
@@ -1410,8 +1418,8 @@ dependencies = [
  "egui-winit",
  "glam",
  "loam-camera",
+ "loam-console",
  "loam-math",
- "web-sys",
  "wgpu",
  "winit",
 ]
