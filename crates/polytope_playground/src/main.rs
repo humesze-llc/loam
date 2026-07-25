@@ -38,7 +38,7 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 use loam_app::{
     egui,
     freecam::{CursorMode, Freecam},
-    App, Camera, CameraController, FrameCtx, OrbitController, RunConfig, SetupCtx,
+    Camera, CameraController, FrameCtx, OrbitController, RunConfig, SetupCtx,
 };
 use loam_egui::Console;
 use loam_math::WPlane;
@@ -73,6 +73,7 @@ mod projections;
 mod render;
 mod sections;
 mod shapes;
+mod shell;
 mod state;
 mod ui;
 mod wireframe_geom;
@@ -467,10 +468,6 @@ impl Demo {
         // complains. Mouse-wheel orbit-zoom is the scene's zoom.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
-        // Renders first so its docked space is reserved and `content_rect()`
-        // reflects the area below it.
-        self.render_menu_bar(ctx);
-
         // Build label (short git hash + dirty marker), top-right with
         // symmetric padding: `MENU_BAR_PAD + LABEL_INSET` below the menu bar,
         // `-LABEL_INSET` in from the right edge.
@@ -732,7 +729,7 @@ impl Demo {
 }
 
 // ---------------------------------------------------------------------------
-// App wrapper: Demo + Console<Demo>
+// Scene wrapper: Demo + Console<Demo>
 // ---------------------------------------------------------------------------
 //
 // A wrapper, not a `console` field on `Demo`: `Console::ui` takes
@@ -740,18 +737,13 @@ impl Demo {
 // `&mut self.console` + `&mut self` borrow. Separate fields give the
 // dispatch a clean two-field borrow.
 
-struct RotatePolytopesApp {
+pub(crate) struct RotateScene {
     demo: Demo,
     console: Console<Demo>,
-    /// Last frame's `egui::Context::wants_keyboard_input()`. `App::on_event`
-    /// runs before `App::ui`, so this one-frame-stale value gates demo hotkeys
+    /// Last frame's `egui::Context::wants_keyboard_input()`. Key events
+    /// arrive before `ui`, so this one-frame-stale value gates demo hotkeys
     /// (Space / R / arrows): when egui holds keyboard focus they must not fire.
     last_egui_keyboard: bool,
-    /// Capture parameters panel; toggled via `capture panel` or F11.
-    capture_panel: loam_app::capture::CapturePanel,
-    /// F3-toggle live perf overlay (FPS, frame-time, sparkline) from
-    /// `loam_time::frame_trace`. Cheap when hidden.
-    perf: loam_app::trace::PerfOverlay,
 }
 
 /// Lower bound on a visible section-layer fill alpha; below this the cap reads
@@ -806,23 +798,23 @@ fn run_section_alpha(
     Ok(())
 }
 
-impl App for RotatePolytopesApp {
-    type Space = EuclideanR3;
-
-    fn setup(ctx: &mut SetupCtx<'_>) -> Result<Self> {
-        let demo = Demo::new(ctx)?;
-        let console = Self::build_console();
+impl RotateScene {
+    pub(crate) fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
         Ok(Self {
-            demo,
-            console,
+            demo: Demo::new(ctx)?,
+            console: Self::build_console(),
             last_egui_keyboard: false,
-            capture_panel: loam_app::capture::CapturePanel::new(),
-            perf: loam_app::trace::PerfOverlay::new(),
         })
     }
+}
 
+impl shell::Scene for RotateScene {
     fn space(&self) -> &EuclideanR3 {
         self.demo.space()
+    }
+
+    fn menus(&mut self, ui: &mut egui::Ui) {
+        self.demo.menu_contents(ui);
     }
 
     fn update(&mut self, ctx: &mut FrameCtx<'_>) {
@@ -831,8 +823,6 @@ impl App for RotatePolytopesApp {
 
     fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
         self.demo.ui(ctx, frame);
-        self.capture_panel.show(ctx);
-        self.perf.show(ctx);
         // Pump pending tracing events into the scrollback before rendering it,
         // so mirrored log lines show this frame.
         loam_app::log::pump_into(&mut self.console);
@@ -867,7 +857,7 @@ impl App for RotatePolytopesApp {
 fn main() -> Result<()> {
     // `loam_app::run` handles native + wasm dispatch off the page's `data-mode`
     // and WasmConfig IDs; the demo's `index.html` matches the default layout.
-    loam_app::run::<RotatePolytopesApp>(RunConfig {
+    loam_app::run::<shell::ShellApp>(RunConfig {
         window: WindowAttributes::default()
             .with_title("polytope playground")
             .with_visible(false),

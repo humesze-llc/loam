@@ -7,92 +7,9 @@
 //! triggers the one-time async wgpu+App setup).
 
 use anyhow::Result;
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use wasm_bindgen::JsValue;
 
-/// Per-frame inputs the main thread forwards to the worker. Each variant
-/// corresponds to a `kind` string in the postMessage payload.
-#[derive(Debug)]
-pub enum InputMessage {
-    /// New canvas pixel dimensions (DPR-multiplied to physical pixels).
-    /// Triggers a wgpu surface reconfigure on the next frame.
-    Resize { width: u32, height: u32 },
-
-    /// Pointer moved to (x, y) in canvas-local CSS pixels. `buttons` is
-    /// the `MouseEvent.buttons` bitmask. `dx`/`dy` are raw
-    /// `movementX/Y` deltas for FPS mouse-look, valid both before and
-    /// after Pointer Lock engages; coalesced moves sum the dropped
-    /// intermediate deltas.
-    MouseMove {
-        x: f32,
-        y: f32,
-        buttons: u8,
-        dx: f32,
-        dy: f32,
-    },
-
-    /// Pointer button transitioned. `button` is `MouseEvent.button`
-    /// (0=primary, 1=middle, 2=secondary).
-    MouseButton {
-        x: f32,
-        y: f32,
-        button: u8,
-        pressed: bool,
-    },
-
-    /// Wheel delta in lines (normalized on main thread). DOM convention:
-    /// positive = right/down.
-    MouseWheel { dx: f32, dy: f32 },
-
-    /// Keyboard key transitioned. `code` is the physical-key code (for
-    /// hotkey routing via `keymap::keycode_*`); `key` is the logical key
-    /// (for text-input fan-out to egui).
-    Key {
-        code: String,
-        key: String,
-        pressed: bool,
-        repeat: bool,
-        ctrl: bool,
-        shift: bool,
-        alt: bool,
-        meta: bool,
-    },
-
-    /// Window focus state changed.
-    Focus(bool),
-
-    /// Page visibility (tab-in-foreground) state changed.
-    Visibility(bool),
-
-    /// Begin the continuous RAF loop. Sent after the user clicks the
-    /// launch overlay; before it arrives the worker has rendered one
-    /// preview frame for the overlay to blur.
-    Start,
-
-    /// Pointer Lock state mirror from the main thread's
-    /// `pointerlockchange` event. The worker calls
-    /// [`crate::cursor::mark_applied`] so `current_state()` tracks what
-    /// the browser actually has.
-    PointerLockChanged(bool),
-}
-
-thread_local! {
-    /// Per-worker inbound queue, drained each frame by
-    /// `WorkerRunner::frame`. `thread_local` because the message handler
-    /// closure has no handle to the asynchronously-constructed runner.
-    static MESSAGE_QUEUE: RefCell<VecDeque<InputMessage>> = RefCell::new(VecDeque::new());
-}
-
-/// Push a parsed message onto the per-worker queue.
-pub fn enqueue(msg: InputMessage) {
-    MESSAGE_QUEUE.with(|q| q.borrow_mut().push_back(msg));
-}
-
-/// Drain all queued messages in arrival order. Called once per frame.
-pub fn drain_messages() -> Vec<InputMessage> {
-    MESSAGE_QUEUE.with(|q| q.borrow_mut().drain(..).collect())
-}
+use super::input_queue::InputMessage;
 
 /// Parse a non-init postMessage payload into an [`InputMessage`].
 ///
