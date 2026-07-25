@@ -553,7 +553,7 @@ fn setup_after_device<A: App>(
     // scene attachment, since both passes write into the same color attachment and the
     // deferred MSAA resolve happens at the end of the egui paint pass. See
     // [`UiIntegration::paint`]'s `resolve_target` parameter.
-    let mut ui = UiIntegration::new(&rd.device, win, rd.target_format(), rd.sample_count());
+    let mut ui = UiIntegration::new(&rd.device, win, rd.ui_format(), rd.sample_count());
 
     // Runner-side pipeline warming (N3). Forces lazy pipeline compilation for
     // egui-wgpu's shape variants and the browser-WebGPU composite pass during
@@ -571,7 +571,7 @@ fn setup_after_device<A: App>(
         &rd.device,
         &rd.queue,
         win,
-        rd.target_format(),
+        rd.ui_format(),
         rd.sample_count(),
     );
     rd.warm_composite();
@@ -1499,13 +1499,23 @@ impl<A: App> Runner<A> {
                 if let Some(ui) = self.ui.as_mut() {
                     let _scope = loam_time::frame_trace::scope("ui-paint");
                     let viewport = (rd.surface_bundle.size.width, rd.surface_bundle.size.height);
-                    let resolve_target = (rd.sample_count() > 1).then_some(&swap_view);
+                    // Direct-to-swapchain paths blend the UI in gamma space via
+                    // non-sRGB reinterpreted views (RenderDevice::ui_format).
+                    // The composite path keeps painting into the scene texture,
+                    // which the later composite pass consumes.
+                    let ui_swap_view =
+                        (rd.scene_view().is_none()).then(|| rd.create_ui_swap_view(&frame));
+                    let (ui_view, ui_resolve) = match (&ui_swap_view, rd.msaa_ui_view()) {
+                        (Some(swap), Some(msaa)) => (msaa, Some(swap)),
+                        (Some(swap), None) => (swap, None),
+                        (None, _) => (render_view, (rd.sample_count() > 1).then_some(&swap_view)),
+                    };
                     ui.paint(
                         &rd.device,
                         &rd.queue,
                         &mut encoder,
-                        render_view,
-                        resolve_target,
+                        ui_view,
+                        ui_resolve,
                         win.as_ref(),
                         viewport,
                     );
