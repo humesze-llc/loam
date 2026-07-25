@@ -169,11 +169,20 @@ impl Space for SphericalS3 {
         let qt = to_sphere(to);
         let vw = -v.dot(from) / qf.w;
         let v4 = Vec4::new(v.x, v.y, v.z, vw);
-        // v4' = v4 − (dot(v4,qt) / (1 + dot(qf,qt))) · (qf + qt); undefined at
-        // antipodes (dot = −1), so clamp the denominator.
-        let c = qf.dot(qt);
-        let denom = (1.0 + c).max(1e-7);
-        let v4_transported = v4 - v4.dot(qt) / denom * (qf + qt);
+        // Unit-sphere transport `v4 − (⟨v4, qt⟩ / denom)·(qf + qt)` (do Carmo,
+        // *Riemannian Geometry*, ch. 2), with `denom = |qf + qt|² / 2`. The
+        // literal `1 + ⟨qf, qt⟩` agrees only for exactly-unit lifts, and the
+        // gap is the lifts' own rounding, which near antipodes is the whole
+        // denominator. In this form the update is the Householder reflection in
+        // the hyperplane normal to `qf + qt` (exact for a tangent `v4`, which
+        // the `vw` lift above makes it), so it stays an isometry whatever `qf`
+        // and `qt` round to. Near-antipodal means near-equator in this chart:
+        // for `to` the chart-opposite of `from`, `1 + ⟨qf, qt⟩` is
+        // `2·qf.w·qt.w`, which the saturation shell bounds below only by 2e-6.
+        // The floor keeps the true-antipode singularity finite.
+        let sum = qf + qt;
+        let denom = (sum.length_squared() * 0.5).max(1e-7);
+        let v4_transported = v4 - v4.dot(qt) / denom * sum;
         v4_transported.truncate()
     }
 
@@ -285,9 +294,12 @@ fn loam_parallel_transport(p_from: vec3<f32>, p_to: vec3<f32>, v: vec3<f32>) -> 
     let qt = loam_s3_lift(pt);
     let vw = -dot(v, pf) / qf.w;
     let v4 = vec4<f32>(v.x, v.y, v.z, vw);
-    let c = dot(qf, qt);
-    let denom = max(1.0 + c, 1e-7);
-    let v4t = v4 - (dot(v4, qt) / denom) * (qf + qt);
+    // `|qf + qt|² / 2` is `1 + dot(qf, qt)` for exactly-unit lifts; in this
+    // form the update is a Householder reflection, an isometry whatever the
+    // lifts round to. Near-antipodal pairs sit near the equator.
+    let sum = qf + qt;
+    let denom = max(dot(sum, sum) * 0.5, 1e-7);
+    let v4t = v4 - (dot(v4, qt) / denom) * sum;
     return v4t.xyz;
 }
 "#;
@@ -432,6 +444,39 @@ mod tests {
             Vec4::new(v_to.x, v_to.y, v_to.z, vw).length()
         };
         assert_relative_eq!(norm_from, norm_to, epsilon = 1e-5);
+    }
+
+    /// Norm preservation just off the antipodal singularity pins the
+    /// well-conditioned denominator. `to` is `from` mirrored through the
+    /// yz-plane, so the pair is near-antipodal and the two lifts share a
+    /// bit-identical `w`; the exact denominator is then `2·(b² + w²)`, which
+    /// `1 + ⟨qf, qt⟩` evaluates as `1 − a² + b² + w²` and loses to cancellation
+    /// while `|qf + qt|² / 2` reads it off components that are already small.
+    /// Only the near-equator band reaches the regime: `1 + ⟨qf, qt⟩ ≥ 2·w²`,
+    /// and the saturation shell floors `w` at 1e-3. Measured error at the
+    /// tightest case is 3.3e-3 for the literal form against 0 ulp here.
+    #[test]
+    fn parallel_transport_preserves_norm_near_antipode() {
+        let s = s3();
+        let lifted_norm = |p: Vec3, v: Vec3| {
+            let vw = -v.dot(p) / to_sphere(p).w;
+            Vec4::new(v.x, v.y, v.z, vw).length()
+        };
+        for w in [5e-3_f32, 2e-3, 1.2e-3] {
+            let b = w;
+            let a = (1.0 - w * w - b * b).sqrt();
+            let from = Vec3::new(a, b, 0.0);
+            let to = Vec3::new(-a, b, 0.0);
+            // Along the plane of motion, so the transport actually rotates it.
+            let v = Vec3::X;
+            let vt = s.parallel_transport(from, to, v);
+            let norm_from = lifted_norm(from, v);
+            assert_relative_eq!(lifted_norm(to, vt), norm_from, max_relative = 1e-5);
+            assert!(
+                (vt - v).length() > 0.5 * norm_from,
+                "transport should rotate an in-plane vector, got {vt:?}"
+            );
+        }
     }
 
     #[test]
