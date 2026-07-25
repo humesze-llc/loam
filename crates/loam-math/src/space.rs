@@ -121,3 +121,32 @@ pub trait WgslSpace: Space {
     /// constants in and return `Cow::Owned`.
     fn wgsl_impl(&self) -> Cow<'static, str>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Space;
+    use crate::{
+        BlendedSpace, EuclideanR2, EuclideanR3, EuclideanR4, HyperbolicH3, LinearBlendX,
+        SphericalS3, SphericalS3Embedded,
+    };
+
+    /// `is_chart_flat` reports the geometry, and the default `false` is a trap
+    /// for a flat Space that forgets to override it: pin every impl in the
+    /// crate, flat and curved alike.
+    #[test]
+    fn is_chart_flat_holds_exactly_for_the_flat_geometries() {
+        assert!(EuclideanR2.is_chart_flat());
+        assert!(EuclideanR3.is_chart_flat());
+        assert!(EuclideanR4.is_chart_flat());
+
+        assert!(!HyperbolicH3.is_chart_flat());
+        assert!(!SphericalS3.is_chart_flat());
+        assert!(!SphericalS3Embedded.is_chart_flat());
+        // Blending a flat source with a curved one yields a variable metric,
+        // flat nowhere but the pure-A tail.
+        assert!(
+            !BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-1.0, 1.0))
+                .is_chart_flat()
+        );
+    }
+}
