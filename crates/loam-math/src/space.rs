@@ -84,6 +84,20 @@ pub trait Space {
     /// Apply an isometry's differential to a tangent vector at `at`. The result is a tangent
     /// vector at `iso_apply(iso, at)`.
     fn iso_transport(&self, iso: Self::Iso, at: Self::Point, v: Self::Vector) -> Self::Vector;
+
+    // ---- Chart properties ---------------------------------------------
+
+    /// Whether the chart is globally flat: chart-coord arithmetic computes the
+    /// correct geometry without the Riemannian machinery. False for curved
+    /// Spaces (Poincaré ball H³, stereographic S³, `BlendedSpace`).
+    ///
+    /// A statement about the geometry, not about any rendering backend, so it
+    /// lives here rather than on [`WgslSpace`]: the SDF emitter and the CPU SDF
+    /// evaluator both gate chart-coord fast paths on it, and only the former
+    /// speaks WGSL. Defaults to `false` so a new Space must opt in.
+    fn is_chart_flat(&self) -> bool {
+        false
+    }
 }
 
 /// A [`Space`] that additionally exposes its primitives as WGSL for inlining
@@ -106,13 +120,4 @@ pub trait WgslSpace: Space {
     /// Stateless geometries return `Cow::Borrowed`; parametric ones `format!`
     /// constants in and return `Cow::Owned`.
     fn wgsl_impl(&self) -> Cow<'static, str>;
-
-    /// Whether the chart is globally flat: chart-coord arithmetic computes the
-    /// correct geometry without the Riemannian `loam_*` machinery. False for
-    /// curved Spaces (Poincaré ball H³, stereographic S³, `BlendedSpace`).
-    /// Defaults to `false` so a new Space must opt in to chart-coord SDF fast
-    /// paths.
-    fn is_chart_flat(&self) -> bool {
-        false
-    }
 }

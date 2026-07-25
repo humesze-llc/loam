@@ -115,16 +115,17 @@ impl Space for EuclideanR4 {
         // Tangent vectors are unaffected by translation; rotation acts.
         iso.rotation.apply(v)
     }
+
+    /// ℝ⁴ is globally flat: chart-coord 4D SDFs (hyperplanes, hyperboxes) are mathematically
+    /// correct.
+    fn is_chart_flat(&self) -> bool {
+        true
+    }
 }
 
 impl WgslSpace for EuclideanR4 {
     fn wgsl_impl(&self) -> Cow<'static, str> {
         Cow::Borrowed(WGSL_IMPL)
-    }
-    /// ℝ⁴ is globally flat: chart-coord 4D SDFs (hyperplanes, hyperboxes) are mathematically
-    /// correct.
-    fn is_chart_flat(&self) -> bool {
-        true
     }
 }
 

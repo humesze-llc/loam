@@ -1,29 +1,39 @@
-//! `Primitive4`, 4D-SDF emit for the [`loam_shape::Shape`] variants in ℝ⁴.
+//! `Primitive4`, 4D-SDF emit and CPU evaluation for the [`loam_shape::Shape`]
+//! variants in ℝ⁴.
 //!
 //! Counterpart of [`crate::Primitive`] for 4D points; emits
 //! `fn <name>(p: vec4<f32>) -> f32` returning the signed distance to the
-//! shape's surface (positive outside, negative inside, zero on boundary).
+//! shape's surface (positive outside, negative inside, zero on boundary), and
+//! evaluates the same formulas on the CPU.
 //!
 //! ## Variant coverage
 //!
-//! | `Shape` variant | 4D SDF emit | Notes |
+//! | `Shape` variant | 4D SDF | Notes |
 //! |---|---|---|
 //! | [`Shape::HyperSphere4D`] | closed-form | `length(p − center) − radius` |
 //! | [`Shape::HalfSpace4D`] | closed-form | `dot(p, normal) − offset`; honest in flat ℝ⁴ (the only 4D Space today) |
-//! | [`Shape::ConvexPolytope4D`] | sentinel `1e9` | real path is `Hyperslice4DNode`'s per-frame uniforms |
-//! | 3D-only variants | sentinel `1e9` | shouldn't appear in `Scene4` |
+//! | [`Shape::ConvexPolytope4D`] | [`SENTINEL_DISTANCE`] | real path is `Hyperslice4DNode`'s per-frame uniforms |
+//! | 3D-only variants | [`SENTINEL_DISTANCE`] | shouldn't appear in `Scene4` |
 
+use glam::Vec4;
 use loam_shape::Shape;
 
-/// Emit a WGSL 4D signed-distance function. Counterpart of [`crate::Primitive`]
-/// for 4D variants.
+use crate::SENTINEL_DISTANCE;
+
+/// Emit and evaluate a 4D signed-distance function. Counterpart of
+/// [`crate::Primitive`] for 4D variants.
 ///
 /// No `space: &S` parameter today: ℝ⁴ is the only 4D Space and it's flat, so
 /// chart-coord SDFs are correct. A curved 4D Space would add that parameter and
-/// gate `HalfSpace4D` on `WgslSpace::is_chart_flat`, like the 3D counterpart.
+/// gate `HalfSpace4D` on `Space::is_chart_flat`, like the 3D counterpart.
 pub trait Primitive4 {
     /// Emit a WGSL function named `name` taking `vec4<f32>` and returning `f32`.
     fn to_wgsl_4d(&self, name: &str) -> String;
+
+    /// Signed distance from `p` to `self`, the CPU twin of [`Self::to_wgsl_4d`]'s
+    /// emitted body. Exact up to `f32` rounding: the 4D emitter prints constants
+    /// in Rust's shortest round-tripping form, so no decimal truncation enters.
+    fn eval_4d(&self, p: Vec4) -> f32;
 }
 
 impl Primitive4 for Shape {
@@ -43,14 +53,14 @@ impl Primitive4 for Shape {
 
             // Sentinel until the real path lands: face hyperplanes are pose-
             // dependent per frame, so `Hyperslice4DNode` ships them via a uniform
-            // buffer rather than baking constants here. 1e9 renders invisible so
+            // buffer rather than baking constants here. Renders invisible so
             // accidental scene inclusion fails visibly.
             Shape::ConvexPolytope4D { .. } => format!(
                 "fn {name}(_p: vec4<f32>) -> f32 {{\n\
                 \t// ConvexPolytope4D: half-space emit lives in the\n\
                 \t// render node's per-frame uniform path, not here.\n\
                 \t// See Hyperslice4DNode.\n\
-                \treturn 1e9;\n\
+                \treturn {SENTINEL_DISTANCE:e};\n\
                 }}\n",
             ),
 
@@ -75,9 +85,25 @@ impl Primitive4 for Shape {
             | Shape::Polygon2D { .. }
             | Shape::ConvexPolytope3D { .. } => format!(
                 "fn {name}(_p: vec4<f32>) -> f32 {{\n\
-                \treturn 1e9;\n\
+                \treturn {SENTINEL_DISTANCE:e};\n\
                 }}\n",
             ),
+        }
+    }
+
+    fn eval_4d(&self, p: Vec4) -> f32 {
+        match self {
+            Shape::HyperSphere4D { center, radius } => (p - *center).length() - *radius,
+
+            Shape::ConvexPolytope4D { .. } => SENTINEL_DISTANCE,
+
+            Shape::HalfSpace4D { normal, offset } => p.dot(*normal) - *offset,
+
+            Shape::Sphere { .. }
+            | Shape::HalfSpace { .. }
+            | Shape::Box3 { .. }
+            | Shape::Polygon2D { .. }
+            | Shape::ConvexPolytope3D { .. } => SENTINEL_DISTANCE,
         }
     }
 }

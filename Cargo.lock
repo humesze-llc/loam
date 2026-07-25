@@ -1490,6 +1490,7 @@ dependencies = [
  "glam",
  "loam-asset",
  "loam-math",
+ "loam-scene",
  "naga",
  "pollster",
  "tempfile",
