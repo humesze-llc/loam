@@ -1079,6 +1079,95 @@ mod tests {
         );
     }
 
+    /// FNV-1a 64-bit (Fowler/Noll/Vo 1991; reference offset basis and prime,
+    /// <http://www.isthe.com/chongo/tech/comp/fnv/>). `std`'s `DefaultHasher`
+    /// is documented as unstable across releases, so a hash committed as a
+    /// constant needs its own mixer.
+    fn fnv1a64(words: &[u32]) -> u64 {
+        const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = OFFSET_BASIS;
+        for word in words {
+            // Fixed little-endian byte order so the hash does not depend on
+            // host endianness.
+            for byte in word.to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(PRIME);
+            }
+        }
+        hash
+    }
+
+    /// The determinism fixture: 4D gravity, a static floor, and a six-sphere
+    /// stack at fixed offsets landing on it. No RNG, so any run-to-run
+    /// difference is genuine nondeterminism rather than seed noise. Returns the
+    /// full trajectory (every step, every body, linear and angular state) as raw
+    /// f32 bits, so the pins below see the path and not just the endpoint.
+    ///
+    /// Orientation is deliberately not sampled. `Bivector4::exp` routes through
+    /// libm `sin`/`cos`, whose last-ULP results differ between platform libms,
+    /// and for sphere colliders orientation never feeds back into the dynamics.
+    /// Every sampled quantity comes from +, -, *, / and sqrt, which IEEE-754
+    /// rounds exactly, so the trajectory is reproducible wherever glam takes the
+    /// same reduction path.
+    fn determinism_scenario_trajectory() -> Vec<u32> {
+        let mut world = World::new(EuclideanR4);
+        // Contacts are what make the trajectory worth pinning: without a
+        // narrowphase the scenario is free fall and exercises no solver,
+        // manifold, or iteration-order behavior.
+        register_default_narrowphase(&mut world.narrowphase);
+        world.push_field(Box::new(Gravity::new(Vec4::new(0.0, -9.8, 0.0, 0.0))));
+        world.push_body(halfspace4_body_r4(Vec4::Y, 0.0));
+        for i in 0..6u32 {
+            let y = 1.0 + i as f32 * 0.45;
+            let x = ((i % 3) as f32 - 1.0) * 0.05;
+            world.push_body(sphere_body_r4(
+                Vec4::new(x, y, 0.0, 0.0),
+                Vec4::ZERO,
+                0.2,
+                1.0,
+            ));
+        }
+
+        const STEPS: usize = 240;
+        const WORDS_PER_BODY: usize = 14;
+        let dt = 1.0 / 60.0;
+        let mut trajectory = Vec::with_capacity(STEPS * world.bodies.len() * WORDS_PER_BODY);
+        for _ in 0..STEPS {
+            world.step(dt);
+            for body in &world.bodies {
+                let p = body.position;
+                let v = body.velocity;
+                let w = body.angular_velocity;
+                trajectory.extend_from_slice(&[
+                    p.x.to_bits(),
+                    p.y.to_bits(),
+                    p.z.to_bits(),
+                    p.w.to_bits(),
+                    v.x.to_bits(),
+                    v.y.to_bits(),
+                    v.z.to_bits(),
+                    v.w.to_bits(),
+                    w.xy.to_bits(),
+                    w.xz.to_bits(),
+                    w.xw.to_bits(),
+                    w.yz.to_bits(),
+                    w.yw.to_bits(),
+                    w.zw.to_bits(),
+                ]);
+            }
+        }
+        trajectory
+    }
+
+    /// FNV-1a of [`determinism_scenario_trajectory`], recorded on x86_64. This
+    /// pins behavior rather than self-consistency: a deterministic-but-changed
+    /// integrator, solver order, contact constant, or narrowphase moves it.
+    /// Scoped to one architecture family, since glam's SIMD dot reduces in a
+    /// different order than its scalar fallback. When a simulation change is
+    /// intended, replace this with the value the assertion prints.
+    const GOLDEN_TRAJECTORY_HASH: u64 = 0xfcfa_9165_cc85_e57b;
+
     /// Determinism contract: a fixed scenario stepped twice yields bit-identical
     /// state. Same-binary same-architecture replay is the runtime's promise;
     /// this catches any nondeterminism (hash iteration order, uninit, time
@@ -1086,46 +1175,28 @@ mod tests {
     /// runs must agree to the last bit.
     #[test]
     fn fixed_scenario_replay_is_bit_identical_determinism() {
-        fn run() -> Vec<[u32; 4]> {
-            let mut world = World::new(EuclideanR4);
-            world.push_field(Box::new(Gravity::new(Vec4::new(0.0, -9.8, 0.0, 0.0))));
-            world.push_body(halfspace4_body_r4(Vec4::Y, 0.0));
-            // Deterministic stack: fixed offsets, no RNG, so any run-to-run
-            // difference is genuine nondeterminism rather than seed noise.
-            for i in 0..6u32 {
-                let y = 1.0 + i as f32 * 0.45;
-                let x = ((i % 3) as f32 - 1.0) * 0.05;
-                world.push_body(sphere_body_r4(
-                    Vec4::new(x, y, 0.0, 0.0),
-                    Vec4::ZERO,
-                    0.2,
-                    1.0,
-                ));
-            }
-            let dt = 1.0 / 60.0;
-            for _ in 0..240 {
-                world.step(dt);
-            }
-            world
-                .bodies
-                .iter()
-                .map(|b| {
-                    let p = b.position;
-                    [p.x.to_bits(), p.y.to_bits(), p.z.to_bits(), p.w.to_bits()]
-                })
-                .collect()
-        }
-        let first = run();
-        let second = run();
+        let first = determinism_scenario_trajectory();
+        let second = determinism_scenario_trajectory();
         assert_eq!(first, second, "fixed-scenario replay must be bit-identical");
         // Guard against a vacuous pass: the simulation must stay finite.
-        for body in &first {
-            for &bits in body {
-                assert!(
-                    f32::from_bits(bits).is_finite(),
-                    "non-finite state in replay"
-                );
-            }
+        for &bits in &first {
+            assert!(
+                f32::from_bits(bits).is_finite(),
+                "non-finite state in replay"
+            );
         }
+    }
+
+    /// The replay pin above passes for any change that is merely
+    /// self-consistent. This one pins the trajectory itself against a value
+    /// committed to the repository, so a behavior change has to be declared.
+    #[test]
+    fn fixed_scenario_trajectory_matches_golden_determinism_hash() {
+        let hash = fnv1a64(&determinism_scenario_trajectory());
+        assert_eq!(
+            hash, GOLDEN_TRAJECTORY_HASH,
+            "trajectory hash {hash:#018x} does not match the committed golden \
+             {GOLDEN_TRAJECTORY_HASH:#018x}"
+        );
     }
 }
