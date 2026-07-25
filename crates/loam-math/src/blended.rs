@@ -277,8 +277,9 @@ where
 pub const GEODESIC_DEFAULT_STEPS: u32 = 32;
 
 /// Single RK4 step on the geodesic ODE for a conformally flat metric, state
-/// `(p, v)`: ṗ = v, v̇ = |v|²·∇φ(p) - 2·(∇φ·v)·v. Steps by `h` in parameter
-/// time.
+/// `(p, v)`: ṗ = v, v̇ = |v|²·∇φ(p) - 2·(∇φ·v)·v, i.e. -Γ^k_ij·v^i·v^j for the
+/// Christoffel symbols of g = e^(2φ)·δ (Wald, *General Relativity*, 1984,
+/// App. D). Steps by `h` in parameter time.
 fn rk4_geodesic_step<S: ConformallyFlat>(space: &S, p: Vec3, v: Vec3, h: f32) -> (Vec3, Vec3) {
     let rhs = |p: Vec3, v: Vec3| -> (Vec3, Vec3) {
         let grad_phi = space.conformal_log_half_gradient(p);
@@ -336,7 +337,8 @@ pub const PARALLEL_TRANSPORT_DEFAULT_STEPS: u32 = 8;
 
 /// Parallel-transport `v` along the segment `p_from` -> `p_to`, parameterised
 /// linearly over t ∈ [0, 1]. For a conformally flat metric g = e^(2φ)·δ the ODE
-/// is V̇ = -[(∇φ·γ̇)·V + (∇φ·V)·γ̇ - (γ̇·V)·∇φ] with γ̇ = p_to − p_from.
+/// is V̇ = -Γ^k_ij·γ̇^i·V^j = -[(∇φ·γ̇)·V + (∇φ·V)·γ̇ - (γ̇·V)·∇φ] with
+/// γ̇ = p_to − p_from (Wald, *General Relativity*, 1984, App. D).
 pub fn parallel_transport_segment_rk4<S: ConformallyFlat>(
     space: &S,
     p_from: Vec3,
@@ -401,7 +403,10 @@ const LOG_JACOBIAN_EPS: f32 = 1.0e-3;
 
 /// Find the tangent `v` at `from` with `exp_from(v) ≈ to`, by Gauss-Newton
 /// shooting: forward-evaluate `exp`, take the residual, estimate the Jacobian
-/// `∂exp/∂v` by central differences, solve for the Newton update.
+/// `∂exp/∂v` by central differences, solve for the Newton update. Shooting for
+/// the two-point BVP is Press et al., *Numerical Recipes*, 3rd ed., 2007,
+/// §18.1; Gauss-Newton is Nocedal & Wright, *Numerical Optimization*, 2nd ed.,
+/// 2006, ch. 10.
 ///
 /// Returns the best `v` within `max_iters`. A singular Jacobian (e.g. `to` in
 /// the cut locus of `from`) returns the current guess with a `tracing::warn`.
