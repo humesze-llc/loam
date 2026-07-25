@@ -730,22 +730,33 @@ mod tests {
     }
 
     /// `create_view` rejects a format absent from the target's `view_formats`,
-    /// so the UI view descriptors must stay inside what the target descriptors
-    /// registered even when the decision says no reinterpretation.
+    /// so a UI view must request exactly what its target registered: the
+    /// reinterpretation where one was sanctioned, and nothing where none was.
+    /// Both arms are asserted, since a descriptor that stopped requesting
+    /// anything would still satisfy a check that only inspects `Some`.
     #[test]
-    fn ui_views_request_only_a_format_their_target_registered() {
+    fn ui_view_requests_match_their_target_registration_in_both_arms() {
         for surface in SURFACES {
             for downlevel in DOWNLEVELS {
                 let case = format!("{surface:?} {downlevel:?}");
+                // Derived from the flags rather than from `ui_target_formats`,
+                // so a view descriptor cannot drift in step with the decision.
+                let expected = (surface.is_srgb() && downlevel.contains(BOTH))
+                    .then(|| surface.remove_srgb_suffix());
                 let targets = ui_target_formats(surface, downlevel);
+
+                let swap_request = ui_view_descriptor(targets.swap_view_format).format;
+                assert_eq!(swap_request, expected, "swapchain request: {case}");
                 let config =
                     surface_configuration(surface, SIZE, CompositeAlphaMode::Opaque, targets);
-                if let Some(requested) = ui_view_descriptor(targets.swap_view_format).format {
-                    assert!(
-                        config.view_formats.contains(&requested),
-                        "swapchain: {case}"
-                    );
-                }
+                assert_eq!(
+                    config.view_formats,
+                    swap_request.into_iter().collect::<Vec<_>>(),
+                    "swapchain registration: {case}"
+                );
+
+                let msaa_request = ui_view_descriptor(targets.msaa_view_format).format;
+                assert_eq!(msaa_request, expected, "msaa attachment request: {case}");
                 let msaa = msaa_texture_descriptor(
                     surface,
                     SIZE.width,
@@ -753,12 +764,11 @@ mod tests {
                     4,
                     &targets.msaa_view_format,
                 );
-                if let Some(requested) = ui_view_descriptor(targets.msaa_view_format).format {
-                    assert!(
-                        msaa.view_formats.contains(&requested),
-                        "msaa attachment: {case}"
-                    );
-                }
+                assert_eq!(
+                    msaa.view_formats,
+                    msaa_request.into_iter().collect::<Vec<_>>(),
+                    "msaa attachment registration: {case}"
+                );
             }
         }
     }
