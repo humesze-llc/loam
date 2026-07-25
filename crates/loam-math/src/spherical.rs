@@ -536,25 +536,289 @@ mod tests {
         assert!(d2.is_finite() && d2 >= 0.0);
     }
 
-    /// The statements of the shipped `loam_origin_distance`, verbatim. Pinned
-    /// so `wgsl_origin_distance_mirror` cannot drift from the shader it stands
-    /// in for.
-    const WGSL_ORIGIN_DISTANCE_BODY: &str =
-        "    let r2 = min(dot(p, p), LOAM_S3_R2_MAX);\n    return asin(sqrt(r2));\n}";
+    /// Every shipped WGSL function with a CPU twin, pinned to its own
+    /// statements verbatim. A function's pin is split into runs around its
+    /// interior comments, so prose edits do not read as drift, and the first
+    /// run carries the signature, so a run cannot match elsewhere in the
+    /// source.
+    ///
+    /// The pin fails when the shader form moves; the mirror parity tests below
+    /// fail when the CPU form moves. Neither half of a twin can be edited
+    /// alone.
+    const WGSL_BODY_PINS: &[(&str, &[&str])] = &[
+        (
+            "loam_s3_clamp",
+            &[r#"fn loam_s3_clamp(p: vec3<f32>) -> vec3<f32> {
+    let r2 = dot(p, p);
+    if (r2 <= LOAM_S3_R2_MAX) { return p; }
+    return p * (sqrt(LOAM_S3_R2_MAX) / sqrt(r2));
+}"#],
+        ),
+        (
+            "loam_s3_lift",
+            &[r#"fn loam_s3_lift(p: vec3<f32>) -> vec4<f32> {
+    let r2 = min(dot(p, p), LOAM_S3_R2_MAX);
+    return vec4<f32>(p.x, p.y, p.z, sqrt(1.0 - r2));
+}"#],
+        ),
+        (
+            "loam_origin_distance",
+            &[
+                "fn loam_origin_distance(p: vec3<f32>) -> f32 {",
+                r#"    let r2 = min(dot(p, p), LOAM_S3_R2_MAX);
+    return asin(sqrt(r2));
+}"#,
+            ],
+        ),
+        (
+            "loam_distance",
+            &[r#"fn loam_distance(a: vec3<f32>, b: vec3<f32>) -> f32 {
+    let qa = loam_s3_lift(loam_s3_clamp(a));
+    let qb = loam_s3_lift(loam_s3_clamp(b));
+    let half_chord = length(qa - qb) * 0.5;
+    return 2.0 * asin(clamp(half_chord, 0.0, 1.0));
+}"#],
+        ),
+        (
+            "loam_exp",
+            &[r#"fn loam_exp(at: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
+    let p = loam_s3_clamp(at);
+    let n2 = dot(v, v);
+    if (n2 < 1e-14) { return p; }
+    let q = loam_s3_lift(p);
+    let vw = -dot(v, p) / q.w;
+    let v4 = vec4<f32>(v.x, v.y, v.z, vw);
+    let mag = length(v4);
+    if (mag < 1e-7) { return p; }
+    let result4 = normalize(q * cos(mag) + v4 * (sin(mag) / mag));
+    return loam_s3_clamp(result4.xyz);
+}"#],
+        ),
+        (
+            "loam_log",
+            &[
+                r#"fn loam_log(p_from: vec3<f32>, p_to: vec3<f32>) -> vec3<f32> {
+    let qf = loam_s3_lift(loam_s3_clamp(p_from));
+    let qt = loam_s3_lift(loam_s3_clamp(p_to));
+    let d_dot = clamp(dot(qf, qt), -1.0, 1.0);
+    let perp4 = qt - d_dot * qf;
+    let n = length(perp4);
+    if (n < 1e-7) { return vec3<f32>(0.0, 0.0, 0.0); }
+    let half_chord = length(qt - qf) * 0.5;
+    let d = 2.0 * asin(clamp(half_chord, 0.0, 1.0));
+    return perp4.xyz * (d / n);
+}"#,
+            ],
+        ),
+        (
+            "loam_parallel_transport",
+            &[
+                r#"fn loam_parallel_transport(p_from: vec3<f32>, p_to: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
+    let pf = loam_s3_clamp(p_from);
+    let pt = loam_s3_clamp(p_to);
+    let qf = loam_s3_lift(pf);
+    let qt = loam_s3_lift(pt);
+    let vw = -dot(v, pf) / qf.w;
+    let v4 = vec4<f32>(v.x, v.y, v.z, vw);"#,
+                r#"    let sum = qf + qt;
+    let denom = max(dot(sum, sum) * 0.5, 1e-7);
+    let v4t = v4 - (dot(v4, qt) / denom) * sum;
+    return v4t.xyz;
+}"#,
+            ],
+        ),
+    ];
 
-    /// CPU port of the shipped `loam_origin_distance`, expression for
-    /// expression, so GPU/CPU parity is checkable without an adapter.
+    // CPU ports of the shipped WGSL, expression for expression, so parity is
+    // checkable without an adapter. They call each other rather than the
+    // shipped helpers: a mirror that delegated to `to_sphere` would leave that
+    // twin free to drift.
+    fn wgsl_clamp_mirror(p: Vec3) -> Vec3 {
+        let r2 = p.dot(p);
+        if r2 <= SPHERE_R2_MAX {
+            return p;
+        }
+        p * (SPHERE_R2_MAX.sqrt() / r2.sqrt())
+    }
+
+    fn wgsl_lift_mirror(p: Vec3) -> Vec4 {
+        let r2 = p.dot(p).min(SPHERE_R2_MAX);
+        Vec4::new(p.x, p.y, p.z, (1.0 - r2).sqrt())
+    }
+
     fn wgsl_origin_distance_mirror(p: Vec3) -> f32 {
         let r2 = p.length_squared().min(SPHERE_R2_MAX);
         r2.sqrt().asin()
     }
 
+    fn wgsl_distance_mirror(a: Vec3, b: Vec3) -> f32 {
+        let qa = wgsl_lift_mirror(wgsl_clamp_mirror(a));
+        let qb = wgsl_lift_mirror(wgsl_clamp_mirror(b));
+        let half_chord = (qa - qb).length() * 0.5;
+        2.0 * half_chord.clamp(0.0, 1.0).asin()
+    }
+
+    fn wgsl_exp_mirror(at: Vec3, v: Vec3) -> Vec3 {
+        let p = wgsl_clamp_mirror(at);
+        let n2 = v.dot(v);
+        if n2 < 1e-14 {
+            return p;
+        }
+        let q = wgsl_lift_mirror(p);
+        let vw = -v.dot(p) / q.w;
+        let v4 = Vec4::new(v.x, v.y, v.z, vw);
+        let mag = v4.length();
+        if mag < 1e-7 {
+            return p;
+        }
+        let result4 = (q * mag.cos() + v4 * (mag.sin() / mag)).normalize();
+        wgsl_clamp_mirror(result4.truncate())
+    }
+
+    fn wgsl_log_mirror(from: Vec3, to: Vec3) -> Vec3 {
+        let qf = wgsl_lift_mirror(wgsl_clamp_mirror(from));
+        let qt = wgsl_lift_mirror(wgsl_clamp_mirror(to));
+        let d_dot = qf.dot(qt).clamp(-1.0, 1.0);
+        let perp4 = qt - d_dot * qf;
+        let n = perp4.length();
+        if n < 1e-7 {
+            return Vec3::ZERO;
+        }
+        let half_chord = (qt - qf).length() * 0.5;
+        let d = 2.0 * half_chord.clamp(0.0, 1.0).asin();
+        perp4.truncate() * (d / n)
+    }
+
+    fn wgsl_parallel_transport_mirror(from: Vec3, to: Vec3, v: Vec3) -> Vec3 {
+        let pf = wgsl_clamp_mirror(from);
+        let pt = wgsl_clamp_mirror(to);
+        let qf = wgsl_lift_mirror(pf);
+        let qt = wgsl_lift_mirror(pt);
+        let vw = -v.dot(pf) / qf.w;
+        let v4 = Vec4::new(v.x, v.y, v.z, vw);
+        let sum = qf + qt;
+        let denom = (sum.dot(sum) * 0.5).max(1e-7);
+        let v4t = v4 - (v4.dot(qt) / denom) * sum;
+        v4t.truncate()
+    }
+
+    /// Chart fixtures spanning the origin, the interior, the saturation shell,
+    /// and both out-of-domain regimes, so a parity assertion crosses every
+    /// branch a mirror has. `(0.6, -0.48, 0.64)` is a unit vector, so the
+    /// scaled entries have exactly the radius they name; the shell pair is
+    /// mutually antipodal in the chart, which is where the transport
+    /// denominator is worst conditioned.
+    fn parity_points() -> [Vec3; 9] {
+        let unit = Vec3::new(0.6, -0.48, 0.64);
+        let shell = SPHERE_R2_MAX.sqrt();
+        [
+            Vec3::ZERO,
+            Vec3::new(1e-5, 0.0, 0.0),
+            Vec3::new(0.2, -0.3, 0.1),
+            Vec3::new(-0.45, 0.5, 0.35),
+            unit * 0.95,
+            unit * shell,
+            -unit * shell,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, -1.0, 0.5),
+        ]
+    }
+
+    /// Tangent fixtures covering both early-return guards of `exp` and a
+    /// displacement long enough to leave the chart.
+    fn parity_vectors() -> [Vec3; 4] {
+        [
+            Vec3::ZERO,
+            Vec3::new(1e-8, 0.0, 0.0),
+            Vec3::new(0.0, 0.05, 0.0),
+            Vec3::new(-0.3, 0.2, 0.7),
+        ]
+    }
+
     #[test]
-    fn wgsl_origin_distance_body_matches_the_cpu_mirror() {
+    fn wgsl_bodies_match_the_cpu_mirrors() {
+        let src = s3().wgsl_impl();
+        for (name, runs) in WGSL_BODY_PINS {
+            for run in *runs {
+                assert!(
+                    src.contains(run),
+                    "{name} drifted from its CPU mirror; not found verbatim:\n{run}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wgsl_saturation_shell_matches_the_cpu_constant() {
+        let pin = format!("const LOAM_S3_R2_MAX: f32 = {SPHERE_R2_MAX};");
         assert!(
-            s3().wgsl_impl().contains(WGSL_ORIGIN_DISTANCE_BODY),
-            "loam_origin_distance drifted from wgsl_origin_distance_mirror",
+            s3().wgsl_impl().contains(&pin),
+            "LOAM_S3_R2_MAX drifted from SPHERE_R2_MAX; expected `{pin}`"
         );
+    }
+
+    #[test]
+    fn wgsl_clamp_mirror_is_bit_identical_to_cpu_clamp() {
+        for p in parity_points() {
+            assert_eq!(wgsl_clamp_mirror(p), clamp_to_hemisphere(p), "at {p:?}");
+        }
+    }
+
+    #[test]
+    fn wgsl_lift_mirror_is_bit_identical_to_cpu_lift() {
+        for p in parity_points() {
+            assert_eq!(wgsl_lift_mirror(p), to_sphere(p), "at {p:?}");
+        }
+    }
+
+    #[test]
+    fn wgsl_distance_mirror_is_bit_identical_to_cpu_distance() {
+        let s = s3();
+        for a in parity_points() {
+            for b in parity_points() {
+                assert_eq!(wgsl_distance_mirror(a, b), s.distance(a, b), "{a:?} {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wgsl_exp_mirror_is_bit_identical_to_cpu_exp() {
+        let s = s3();
+        for at in parity_points() {
+            for v in parity_vectors() {
+                assert_eq!(wgsl_exp_mirror(at, v), s.exp(at, v), "{at:?} {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wgsl_log_mirror_is_bit_identical_to_cpu_log() {
+        let s = s3();
+        for from in parity_points() {
+            for to in parity_points() {
+                assert_eq!(
+                    wgsl_log_mirror(from, to),
+                    s.log(from, to),
+                    "{from:?} {to:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wgsl_parallel_transport_mirror_is_bit_identical_to_cpu_transport() {
+        let s = s3();
+        for from in parity_points() {
+            for to in parity_points() {
+                for v in parity_vectors() {
+                    assert_eq!(
+                        wgsl_parallel_transport_mirror(from, to, v),
+                        s.parallel_transport(from, to, v),
+                        "{from:?} {to:?} {v:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
