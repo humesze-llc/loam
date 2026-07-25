@@ -26,16 +26,18 @@
 //! - **H**: toggle the bottom-overlay expanded section.
 //! - **Esc**: exit.
 //!
-//! ## CLI
+//! ## Arguments
 //!
-//! - `--shapes name1 name2 ...`: polytopes left-to-right. Accepts the math
-//!   form (`5-cell`, `tesseract`, `16-cell`, `24-cell`, `120-cell`,
-//!   `600-cell`) and Platonic-slice aliases (`tetrahedron`, `cube`,
-//!   `octahedron`, `cuboctahedron`, `dodecahedron`, `icosahedron`).
+//! - `--shapes=name1,name2` natively, `?shapes=name1,name2` in the browser:
+//!   polytopes left-to-right. Accepts the math form (`5-cell`, `tesseract`,
+//!   `16-cell`, `24-cell`, `120-cell`, `600-cell`) and Platonic-slice
+//!   aliases (`tetrahedron`, `cube`, `octahedron`, `cuboctahedron`,
+//!   `dodecahedron`, `icosahedron`).
 
 use anyhow::{anyhow, Result};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use loam_app::{
+    args::Args,
     egui,
     freecam::{CursorMode, Freecam},
     App, Camera, CameraController, FrameCtx, OrbitController, RunConfig, SetupCtx,
@@ -78,7 +80,7 @@ mod ui;
 mod wireframe_geom;
 
 use active::combo_name;
-use catalog::{parse_row_from_args, SHAPE_CATALOG};
+use catalog::{parse_row, SHAPE_CATALOG};
 use color::{unique_edge_palette, w_depth_color};
 #[cfg(test)]
 use consts::SPACE_TESSELLATION_SAMPLES;
@@ -124,10 +126,7 @@ use loam_egui::media::add_button;
 
 impl Demo {
     pub(crate) fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
-        let row = parse_row_from_args()?;
-        if row.is_empty() {
-            return Err(anyhow!("--shapes produced an empty row"));
-        }
+        let row = parse_row(&Args::current())?;
 
         let scene = Scene4::new(SceneNode4::halfspace(Vec4::Y, 0.0));
         // Always include every shape's WGSL so any can be added at runtime.
