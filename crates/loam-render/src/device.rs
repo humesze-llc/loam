@@ -26,6 +26,9 @@ pub struct MsaaTarget {
     #[allow(dead_code)]
     texture: Texture,
     pub view: TextureView,
+    /// Non-sRGB reinterpretation for the gamma-space UI pass, or a second
+    /// handle on the same view as `view` where the adapter cannot reinterpret.
+    pub ui_view: TextureView,
 }
 
 /// Offscreen sRGB render target for the non-sRGB-surface (browser-WebGPU) path:
@@ -37,6 +40,58 @@ pub struct OffscreenTarget {
     #[allow(dead_code)]
     texture: Texture,
     pub view: TextureView,
+}
+
+/// Formats the UI pass renders through, resolved once from the surface format
+/// and the adapter's downlevel capabilities. See [`ui_target_formats`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UiTargetFormats {
+    /// Format the egui pipeline is built against.
+    pub ui_format: TextureFormat,
+    /// Registered as the swapchain's view format and used for the UI pass's
+    /// swapchain view. `None` means the UI uses the swapchain's own format.
+    pub swap_view_format: Option<TextureFormat>,
+    /// Same, for the multisampled color attachment.
+    pub msaa_view_format: Option<TextureFormat>,
+}
+
+/// Decide whether the UI pass may reinterpret the sRGB swapchain (and its MSAA
+/// attachment) as the non-sRGB twin, which is how egui gets the gamma-space
+/// blending its feathering assumes.
+///
+/// wgpu-core gates the two reinterpretations behind separate downlevel flags:
+/// `SURFACE_VIEW_FORMATS` for a swapchain texture's view formats and
+/// `VIEW_FORMATS` for an ordinary texture's. GL/WebGL advertises neither and
+/// Vulkan advertises the surface one only with `VK_KHR_swapchain_mutable_format`,
+/// so an unguarded entry is a validation failure at `surface.configure`, not a
+/// degraded render. Both flags are required together because the UI pass draws
+/// into the MSAA attachment and resolves into the swapchain, so one pipeline
+/// format has to match both attachments whatever the sample count negotiates to.
+fn ui_target_formats(surface_format: TextureFormat, downlevel: DownlevelFlags) -> UiTargetFormats {
+    // Composite path: the UI paints into the offscreen sRGB scene texture and
+    // `CompositeNode` encodes gamma afterwards, so nothing is reinterpreted.
+    // `add_srgb_suffix` is the identity for formats without an sRGB sibling.
+    if !surface_format.is_srgb() {
+        return UiTargetFormats {
+            ui_format: surface_format.add_srgb_suffix(),
+            swap_view_format: None,
+            msaa_view_format: None,
+        };
+    }
+    let reinterpret = DownlevelFlags::SURFACE_VIEW_FORMATS | DownlevelFlags::VIEW_FORMATS;
+    if !downlevel.contains(reinterpret) {
+        return UiTargetFormats {
+            ui_format: surface_format,
+            swap_view_format: None,
+            msaa_view_format: None,
+        };
+    }
+    let gamma = surface_format.remove_srgb_suffix();
+    UiTargetFormats {
+        ui_format: gamma,
+        swap_view_format: Some(gamma),
+        msaa_view_format: Some(gamma),
+    }
 }
 
 /// All wgpu state the engine carries. One per app; not cloneable.
@@ -63,6 +118,7 @@ pub struct RenderDevice {
     /// re-querying `get_surface_capabilities`. Browsers typically advertise only
     /// `Fifo`; native usually all four.
     present_modes: Vec<PresentMode>,
+    ui_targets: UiTargetFormats,
 }
 
 impl RenderDevice {
@@ -149,6 +205,13 @@ impl RenderDevice {
             .find(|m| *m == CompositeAlphaMode::Opaque)
             .unwrap_or(caps.alpha_modes[0]);
 
+        let ui_targets = ui_target_formats(format, adapter.get_downlevel_capabilities().flags);
+        if format.is_srgb() && ui_targets.swap_view_format.is_none() {
+            tracing::warn!(
+                "adapter lacks SURFACE_VIEW_FORMATS/VIEW_FORMATS; UI blends in linear \
+                 space and egui feathering will look thin on hairlines"
+            );
+        }
         let config = SurfaceConfiguration {
             // COPY_SRC keeps headless screenshot readback open at negligible cost.
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
@@ -157,7 +220,7 @@ impl RenderDevice {
             height: size.height,
             present_mode: PresentMode::Fifo,
             alpha_mode,
-            view_formats: vec![],
+            view_formats: ui_targets.swap_view_format.into_iter().collect(),
             desired_maximum_frame_latency: 2,
         };
 
@@ -182,8 +245,16 @@ impl RenderDevice {
         };
 
         let sample_count = negotiate_sample_count(&adapter, format, effective_msaa);
-        let msaa_target = (sample_count > 1)
-            .then(|| create_msaa_target(&device, format, size.width, size.height, sample_count));
+        let msaa_target = (sample_count > 1).then(|| {
+            create_msaa_target(
+                &device,
+                format,
+                size.width,
+                size.height,
+                sample_count,
+                ui_targets.msaa_view_format,
+            )
+        });
 
         let (scene_target, composite, scene_format) = if needs_composite {
             let scene_fmt = format.add_srgb_suffix();
@@ -221,6 +292,7 @@ impl RenderDevice {
             composite,
             scene_format,
             present_modes,
+            ui_targets,
         })
     }
 
@@ -244,6 +316,7 @@ impl RenderDevice {
                 new_size.width,
                 new_size.height,
                 self.sample_count,
+                self.ui_targets.msaa_view_format,
             ));
         }
         if let (Some(scene_fmt), Some(composite)) = (self.scene_format, self.composite.as_mut()) {
@@ -328,6 +401,32 @@ impl RenderDevice {
     pub fn target_format(&self) -> TextureFormat {
         self.scene_format
             .unwrap_or(self.surface_bundle.config.format)
+    }
+
+    /// Format the egui/UI pipeline should target: the swapchain format with the
+    /// sRGB suffix stripped, so blending happens in gamma space as egui's
+    /// feathering assumes. Falls back to the sRGB format where the adapter's
+    /// downlevel capabilities forbid reinterpreting swapchain views. On the
+    /// composite path the UI renders into the scene texture before the
+    /// composite, so this stays `target_format`.
+    pub fn ui_format(&self) -> TextureFormat {
+        self.ui_targets.ui_format
+    }
+
+    /// View of the acquired swapchain texture for the UI pass: the non-sRGB
+    /// reinterpretation where the adapter supports it, the texture's own format
+    /// otherwise.
+    pub fn create_ui_swap_view(&self, frame: &SurfaceTexture) -> TextureView {
+        frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: self.ui_targets.swap_view_format,
+            ..Default::default()
+        })
+    }
+
+    /// UI-pass view of the MSAA attachment, `None` when MSAA is off. Non-sRGB
+    /// where the adapter supports it, the attachment's own format otherwise.
+    pub fn msaa_ui_view(&self) -> Option<&TextureView> {
+        self.msaa_target.as_ref().map(|t| &t.ui_view)
     }
 
     /// Run the final composite pass: sample the scene texture, gamma-encode in the
@@ -430,12 +529,16 @@ fn negotiate_sample_count(adapter: &Adapter, format: TextureFormat, requested: u
     1
 }
 
+/// `ui_view_format` is `UiTargetFormats::msaa_view_format`: `Some` registers the
+/// reinterpretation the UI pass draws through, `None` leaves the attachment
+/// single-format and `ui_view` is then a plain view.
 fn create_msaa_target(
     device: &Device,
     format: TextureFormat,
     width: u32,
     height: u32,
     sample_count: u32,
+    ui_view_format: Option<TextureFormat>,
 ) -> MsaaTarget {
     let texture = device.create_texture(&TextureDescriptor {
         label: Some("loam-render::msaa-color"),
@@ -449,8 +552,102 @@ fn create_msaa_target(
         dimension: TextureDimension::D2,
         format,
         usage: TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
+        view_formats: ui_view_format.as_slice(),
     });
     let view = texture.create_view(&TextureViewDescriptor::default());
-    MsaaTarget { texture, view }
+    let ui_view = texture.create_view(&TextureViewDescriptor {
+        format: ui_view_format,
+        ..Default::default()
+    });
+    MsaaTarget {
+        texture,
+        view,
+        ui_view,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOTH: DownlevelFlags =
+        DownlevelFlags::SURFACE_VIEW_FORMATS.union(DownlevelFlags::VIEW_FORMATS);
+
+    #[test]
+    fn srgb_surface_registers_view_formats_only_with_both_downlevel_flags() {
+        let srgb = TextureFormat::Bgra8UnormSrgb;
+        let gamma = TextureFormat::Bgra8Unorm;
+        let table = [
+            (DownlevelFlags::empty(), None),
+            (DownlevelFlags::SURFACE_VIEW_FORMATS, None),
+            (DownlevelFlags::VIEW_FORMATS, None),
+            (BOTH, Some(gamma)),
+            (DownlevelFlags::all(), Some(gamma)),
+        ];
+        for (downlevel, expected) in table {
+            let targets = ui_target_formats(srgb, downlevel);
+            assert_eq!(targets.swap_view_format, expected, "{downlevel:?}");
+            assert_eq!(targets.msaa_view_format, expected, "{downlevel:?}");
+            assert_eq!(targets.ui_format, expected.unwrap_or(srgb), "{downlevel:?}");
+        }
+    }
+
+    #[test]
+    fn composite_path_registers_no_view_formats_and_targets_the_srgb_scene_format() {
+        let table = [
+            (TextureFormat::Bgra8Unorm, TextureFormat::Bgra8UnormSrgb),
+            (TextureFormat::Rgba8Unorm, TextureFormat::Rgba8UnormSrgb),
+            // No sRGB sibling: the offscreen scene target keeps this format.
+            (TextureFormat::Rgba16Float, TextureFormat::Rgba16Float),
+        ];
+        for (surface, scene) in table {
+            for downlevel in [DownlevelFlags::empty(), DownlevelFlags::all()] {
+                let targets = ui_target_formats(surface, downlevel);
+                assert_eq!(targets.swap_view_format, None, "{surface:?} {downlevel:?}");
+                assert_eq!(targets.msaa_view_format, None, "{surface:?} {downlevel:?}");
+                assert_eq!(targets.ui_format, scene, "{surface:?} {downlevel:?}");
+            }
+        }
+    }
+
+    /// The UI pipeline is built once against `ui_format` and draws into the
+    /// swapchain view (or the MSAA attachment resolving into it), so a plan
+    /// whose formats disagree fails pipeline/attachment validation at paint.
+    #[test]
+    fn ui_format_matches_every_view_the_ui_pass_renders_into() {
+        let surfaces = [
+            TextureFormat::Bgra8UnormSrgb,
+            TextureFormat::Rgba8UnormSrgb,
+            TextureFormat::Bgra8Unorm,
+            TextureFormat::Rgba16Float,
+        ];
+        let downlevels = [
+            DownlevelFlags::empty(),
+            DownlevelFlags::SURFACE_VIEW_FORMATS,
+            DownlevelFlags::VIEW_FORMATS,
+            BOTH,
+            DownlevelFlags::all(),
+        ];
+        for surface in surfaces {
+            for downlevel in downlevels {
+                let targets = ui_target_formats(surface, downlevel);
+                let case = format!("{surface:?} {downlevel:?}");
+                assert_eq!(
+                    targets.swap_view_format.is_some(),
+                    targets.msaa_view_format.is_some(),
+                    "reinterpretations move together: {case}"
+                );
+                if surface.is_srgb() {
+                    // Direct path: the UI writes to the swapchain itself.
+                    let swap = targets.swap_view_format.unwrap_or(surface);
+                    assert_eq!(targets.ui_format, swap, "{case}");
+                    let msaa = targets.msaa_view_format.unwrap_or(surface);
+                    assert_eq!(targets.ui_format, msaa, "{case}");
+                } else {
+                    // Composite path: the UI writes to the offscreen target.
+                    assert_eq!(targets.ui_format, surface.add_srgb_suffix(), "{case}");
+                }
+            }
+        }
+    }
 }

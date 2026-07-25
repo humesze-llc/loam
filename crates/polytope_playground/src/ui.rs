@@ -120,42 +120,39 @@ impl Demo {
         }
     }
 
-    /// Top menu bar: Edit / View. The File menu is absent until persistence and
-    /// `Quit` via `ViewportCommand::Close` are wired.
-    pub(crate) fn render_menu_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("polytope-playground-menu-bar").show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("Edit", |ui| {
-                    if ui.button("Reset orientation").clicked() {
-                        self.rot_state = Rotor4::IDENTITY;
-                        self.write_all(self.rot_state);
-                        ui.close_kind(egui::UiKind::Menu);
-                    }
-                    if ui
-                        .add(egui::Button::new("Reset all").shortcut_text("R"))
-                        .clicked()
-                    {
-                        self.reset();
-                        ui.close_kind(egui::UiKind::Menu);
-                    }
-                });
-                loam_egui::sticky_menu(ui, "View", |ui| {
-                    // Sticky toggles: clicking a checkbox does not close the
-                    // dropdown, so several flags can be flipped without reopening.
-                    ui.checkbox(&mut self.show_controls, "Rotation controls (H)");
-                    ui.checkbox(&mut self.show_formula, "Formula popup");
-                    ui.checkbox(&mut self.example_callout.open, "Example callout");
-                    // Per-projection mode-annotation callouts are unwired (no
-                    // toggle, defaults closed); kept in `render_mode_annotation`.
-                    ui.separator();
-                    // One-shot: open About and fold the menu away via
-                    // `Popup::close_all` (the non-sticky path).
-                    if ui.button("About this program").clicked() {
-                        self.show_help = true;
-                        egui::Popup::close_all(ui.ctx());
-                    }
-                });
-            });
+    /// Edit / View contributions to the shell's menu bar. The File menu is
+    /// absent until persistence and `Quit` via `ViewportCommand::Close` are
+    /// wired.
+    pub(crate) fn menu_contents(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Edit", |ui| {
+            if ui.button("Reset orientation").clicked() {
+                self.rot_state = Rotor4::IDENTITY;
+                self.write_all(self.rot_state);
+                ui.close_kind(egui::UiKind::Menu);
+            }
+            if ui
+                .add(egui::Button::new("Reset all").shortcut_text("R"))
+                .clicked()
+            {
+                self.reset();
+                ui.close_kind(egui::UiKind::Menu);
+            }
+        });
+        loam_egui::sticky_menu(ui, "View", |ui| {
+            // Sticky toggles: clicking a checkbox does not close the
+            // dropdown, so several flags can be flipped without reopening.
+            ui.checkbox(&mut self.show_controls, "Rotation controls (H)");
+            ui.checkbox(&mut self.show_formula, "Formula popup");
+            ui.checkbox(&mut self.example_callout.open, "Example callout");
+            // Per-projection mode-annotation callouts are unwired (no
+            // toggle, defaults closed); kept in `render_mode_annotation`.
+            ui.separator();
+            // One-shot: open About and fold the menu away via
+            // `Popup::close_all` (the non-sticky path).
+            if ui.button("About this program").clicked() {
+                self.show_help = true;
+                egui::Popup::close_all(ui.ctx());
+            }
         });
     }
 

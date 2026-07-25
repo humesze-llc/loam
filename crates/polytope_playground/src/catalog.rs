@@ -1,9 +1,10 @@
 //! 4D shape catalog: the single source of truth for shape names,
 //! colors, and tooltips. Holds per-polytope metadata, the default
 //! startup row, the categorized catalog, the `+`-menu helper, and the
-//! CLI `--shapes` parser.
+//! `shapes` argument parser.
 
 use anyhow::{anyhow, Result};
+use loam_app::args::Args;
 use loam_app::egui;
 use loam_physics::polytope::Polytope4;
 use loam_render::raymarch::RaymarchShape;
@@ -20,7 +21,7 @@ pub(crate) struct ShapeEntry {
     pub(crate) long_name: &'static str,
 }
 
-/// Default row when no `--shapes` is given. 24-cell first (most
+/// Default row when no `shapes` argument is given. 24-cell first (most
 /// 4D-distinct cross-section), then visually contrasting shapes.
 pub(crate) const DEFAULT_ROW: &[ShapeEntry] = &[
     ShapeEntry {
@@ -191,16 +192,45 @@ pub(crate) fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
     })
 }
 
-/// Parse `--shapes name1 name2 ...` from CLI args (consumes the rest).
-/// Returns [`DEFAULT_ROW`] if the flag is absent.
-pub(crate) fn parse_row_from_args() -> Result<Vec<ShapeEntry>> {
-    let args: Vec<String> = std::env::args().collect();
-    let Some(idx) = args.iter().position(|a| a == "--shapes") else {
+/// Parse the comma-separated `shapes` key (`--shapes=a,b` natively,
+/// `?shapes=a,b` in the browser). Returns [`DEFAULT_ROW`] when the key
+/// is absent.
+pub(crate) fn parse_row(args: &Args) -> Result<Vec<ShapeEntry>> {
+    let Some(raw) = args.get("shapes") else {
         return Ok(DEFAULT_ROW.to_vec());
     };
-    let names = &args[idx + 1..];
+    let names = args.get_many("shapes");
     if names.is_empty() {
-        return Err(anyhow!("--shapes flag passed but no shape names followed"));
+        return Err(anyhow!("shapes={raw:?} listed no shape names"));
     }
-    names.iter().map(|n| parse_shape_name(n)).collect()
+    names.into_iter().map(parse_shape_name).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_comes_from_the_args_value_not_the_process_environment() {
+        // The wasm defect this pins: reading the environment yielded
+        // DEFAULT_ROW in the browser no matter what the URL said.
+        assert_eq!(parse_row(&Args::default()).unwrap(), DEFAULT_ROW);
+        assert_eq!(
+            parse_row(&Args::from_pairs([("seed", "42")])).unwrap(),
+            DEFAULT_ROW
+        );
+
+        let row = parse_row(&Args::from_pairs([("shapes", "120-cell,tesseract")])).unwrap();
+        assert_eq!(
+            row.iter().map(|e| e.label).collect::<Vec<_>>(),
+            ["120-cell", "8-cell"]
+        );
+    }
+
+    #[test]
+    fn a_present_but_nameless_or_unknown_shapes_value_is_an_error() {
+        assert!(parse_row(&Args::from_pairs([("shapes", "")])).is_err());
+        assert!(parse_row(&Args::from_pairs([("shapes", ",,")])).is_err());
+        assert!(parse_row(&Args::from_pairs([("shapes", "5-cell,nonesuch")])).is_err());
+    }
 }

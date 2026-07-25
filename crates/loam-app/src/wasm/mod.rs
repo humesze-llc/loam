@@ -24,6 +24,7 @@
 //! message rather than spawning the worker into a hard failure.
 
 pub mod host_action;
+pub mod input_queue;
 pub mod launch;
 pub mod main_launcher;
 pub mod messages;
