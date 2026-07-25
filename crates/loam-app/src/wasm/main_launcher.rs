@@ -310,18 +310,22 @@ fn install_embed_lifecycle(worker: &Worker, host_id: &str, button_id: &str) -> R
     let host_for_resume = host_id.to_string();
     let button_for_resume = button_id.to_string();
     let on_resume_click: Rc<Closure<dyn FnMut()>> = Rc::new(Closure::wrap(Box::new(move || {
+        // Post before removing the overlay: on failure the demo stays
+        // paused and the untouched button, listener still attached, is the
+        // retry affordance. Recreating it here would hand back an element
+        // with no listener, wedging the embed.
+        let msg = build_msg("resume");
+        if let Err(e) = worker_for_resume.post_message(&msg) {
+            tracing::error!(
+                "loam_app::wasm::worker: postMessage resume failed: {e:?}; \
+                 overlay retained for retry"
+            );
+            return;
+        }
         if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
             if let Some(button) = doc.get_element_by_id(&button_for_resume) {
                 button.remove();
             }
-        }
-        // Resume before announcing: a failed post leaves the demo paused
-        // and the restored overlay retries.
-        let msg = build_msg("resume");
-        if let Err(e) = worker_for_resume.post_message(&msg) {
-            tracing::error!("loam_app::wasm::worker: postMessage resume failed: {e:?}");
-            let _ = super::launch::show_resume_overlay(&host_for_resume, &button_for_resume);
-            return;
         }
         dispatch_embed_activated(&host_for_resume);
     })

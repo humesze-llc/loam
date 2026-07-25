@@ -23,7 +23,8 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, OffscreenCanvas};
 
-use super::messages::{self, InputMessage};
+use super::input_queue::{self, InputMessage};
+use super::messages;
 use super::worker_ui::WorkerUi;
 use crate::{App, FrameCtx, RenderCtx, SetupCtx};
 use loam_asset::AssetWatcher;
@@ -112,10 +113,12 @@ where
         return Ok(());
     }
     if kind.as_deref() == Some("pause") {
-        PAUSED.with(|p| p.set(true));
         // Synthetic focus-loss releases buttons held at pause time; drained
-        // on the first resumed frame.
-        messages::enqueue(InputMessage::Focus(false));
+        // on the first resumed frame. Only on the paused edge: a repeat
+        // pause would push onto a queue no frame is draining.
+        if !PAUSED.with(|p| p.replace(true)) {
+            input_queue::enqueue(InputMessage::Focus(false));
+        }
         tracing::info!("loam_app::wasm::worker: pause received; RAF chain will halt");
         return Ok(());
     }
@@ -134,8 +137,9 @@ where
         }
         return Ok(());
     }
-    // No frame drains the queue while paused: drop pointer/key/wheel so it
-    // stays bounded and stale input cannot replay. Resize still queues.
+    // No frame drains the queue while paused: drop pointer/key/wheel so
+    // stale input cannot replay on resume. Resize still queues; the queue's
+    // own cap is what keeps a paused embed's arrivals bounded.
     if PAUSED.with(|p| p.get())
         && matches!(
             kind.as_deref(),
@@ -180,7 +184,7 @@ where
     }
 
     match messages::parse_non_init(&data)? {
-        Some(msg) => messages::enqueue(msg),
+        Some(msg) => input_queue::enqueue(msg),
         None => {
             if let Some(k) = kind {
                 tracing::warn!("loam_app::wasm::worker: unknown message kind '{k}'");
@@ -679,7 +683,7 @@ where
         loam_time::frame_trace::begin_frame();
         let _frame_scope = loam_time::frame_trace::scope("frame");
 
-        for msg in messages::drain_messages() {
+        for msg in input_queue::drain_messages() {
             self.apply_message(msg);
         }
 
