@@ -1461,15 +1461,63 @@ mod tests {
     /// convention the invariant decomposition assigns to `(θ₁, θ₂)`. The
     /// tilted pair spreads each simple part over four components, so a
     /// swapped plane cannot hide in a single coefficient.
-    fn invariant_plane_pairs() -> [(Bivector4, Bivector4); 2] {
+    ///
+    /// Spreading over components is not the same as spreading over the
+    /// self-dual split: both of those pairs still put one eigenpart on a
+    /// single coordinate of that split, which is what
+    /// [`nondegenerate_plane_pairs`] fixes.
+    fn invariant_plane_pairs() -> [(Bivector4, Bivector4); 4] {
         let root_half = 0.5_f32.sqrt();
         let u1 = Vec4::new(root_half, root_half, 0.0, 0.0);
         let v1 = Vec4::new(0.0, 0.0, root_half, root_half);
         let u2 = Vec4::new(root_half, -root_half, 0.0, 0.0);
         let v2 = Vec4::new(0.0, 0.0, root_half, -root_half);
+        let [oblique, orthogonal] = nondegenerate_plane_pairs();
         [
             (Bivector4::basis(0), Bivector4::basis(5)),
             (Bivector4::wedge(u1, v1), Bivector4::wedge(v2, u2)),
+            oblique,
+            orthogonal,
+        ]
+    }
+
+    /// The complementary plane pair whose self-dual split, in the
+    /// coordinates `Rotor4::log` reads it in, is `(sum, +diff)` for the
+    /// first plane and `(sum, −diff)` for the second. Unit `sum` and `diff`
+    /// make both planes simple and unit: `|p|² = (|sum|² + |diff|²)/2 = 1`
+    /// and `wedge_self_coeff(p) = (|sum|² − |diff|²)/2 = 0`. The eigenparts
+    /// of `p1·t₁ + p2·t₂` are then `(t₁+t₂)·sum` and `(t₁−t₂)·diff`, so its
+    /// invariant angles are `t₁` and `t₂` and its `wedge_self_coeff` is
+    /// `2·t₁·t₂`, the orientation the caller's convention requires.
+    fn plane_pair_from_eigenparts(sum: Vec3, diff: Vec3) -> (Bivector4, Bivector4) {
+        let plane = |d: Vec3| Bivector4 {
+            xy: 0.5 * (sum.x + d.x),
+            xz: 0.5 * (sum.y + d.y),
+            xw: 0.5 * (sum.z + d.z),
+            yz: 0.5 * (sum.z - d.z),
+            yw: 0.5 * (d.y - sum.y),
+            zw: 0.5 * (sum.x - d.x),
+        };
+        (plane(diff), plane(-diff))
+    }
+
+    /// Plane pairs that are non-degenerate in the self-dual 3-space: every
+    /// coordinate of both the sum part and the difference part is nonzero,
+    /// and the two directions are not parallel. `log` emits each output
+    /// coefficient as one sum-part coordinate plus or minus one
+    /// difference-part coordinate, so a fixture that zeroes either
+    /// coordinate of a pair cannot see a sign error on that term.
+    ///
+    /// Both directions are unit. The first `diff` is oblique to `sum` and
+    /// the second orthogonal to it, so the two pairs do not share one
+    /// mutual angle between the eigenparts.
+    fn nondegenerate_plane_pairs() -> [(Bivector4, Bivector4); 2] {
+        let sum = Vec3::new(2.0, 3.0, 6.0) / 7.0;
+        let oblique_diff = Vec3::new(9.0, 2.0, 6.0) / 11.0;
+        let orthogonal_diff = Vec3::new(3.0, -6.0, 2.0) / 7.0;
+        [
+            plane_pair_from_eigenparts(sum, oblique_diff),
+            plane_pair_from_eigenparts(sum, orthogonal_diff),
         ]
     }
 
@@ -1512,7 +1560,10 @@ mod tests {
     /// `log ∘ exp` on the same stress table. The tolerance is looser than
     /// the test above because `exp`'s compound branch carries the
     /// discriminant `√(|B|⁴ − (B∧B)²)`, which cancels to noise as the two
-    /// angles converge; that floor is `exp`'s, not the half-angle recovery's.
+    /// angles converge; that floor is `exp`'s, not the half-angle
+    /// recovery's, and it scales with `|B|` rather than sitting at a fixed
+    /// absolute size. The worst case in this table, `(2, 1.999)` on the
+    /// eigenpart-orthogonal pair, measures `1.3e-5·|B|`.
     #[test]
     fn rotor4_log_of_exp_round_trips_at_small_and_near_equal_angles() {
         for (p1, p2) in invariant_plane_pairs() {
@@ -1521,10 +1572,56 @@ mod tests {
                 let back = b.exp().log();
                 let diff = (back + b * (-1.0)).magnitude();
                 assert!(
-                    diff <= 3e-5,
+                    diff <= 2e-5 * b.magnitude(),
                     "log∘exp mismatch at ({t1}, {t2}): {b:?} -> {back:?}"
                 );
             }
+        }
+    }
+
+    /// The fixtures really are invariant plane pairs: each plane simple and
+    /// unit, the two orthogonal to each other, and the pair carrying the
+    /// orientation the angle convention assumes. A fixture that failed this
+    /// would make the round-trip tests above assert against a bivector whose
+    /// invariant angles are not the `(t₁, t₂)` they were built from.
+    #[test]
+    fn invariant_plane_pairs_are_orthogonal_simple_unit_planes() {
+        let (t1, t2) = (1.2_f32, -0.3_f32);
+        for (p1, p2) in invariant_plane_pairs() {
+            for p in [p1, p2] {
+                assert_close(p.magnitude_squared(), 1.0);
+                assert_close(p.wedge_self_coeff(), 0.0);
+            }
+            assert_close(p1.dot(p2), 0.0);
+            assert_close((p1 * t1 + p2 * t2).wedge_self_coeff(), 2.0 * t1 * t2);
+        }
+    }
+
+    /// What makes the last two fixtures discriminating: `log` writes each
+    /// output coefficient as one sum-part coordinate plus or minus one
+    /// difference-part coordinate, so a coordinate sitting at zero absorbs a
+    /// sign error on the term it multiplies.
+    #[test]
+    fn nondegenerate_pairs_populate_every_self_dual_coordinate() {
+        // The angle table scales these two directions by (t₁ + t₂) and
+        // (t₁ − t₂), so a coordinate near zero here is near zero at every
+        // angle pair at once. The bound sits below the smallest coordinate
+        // the fixtures carry (2/11) and far above any f32 residue.
+        const MIN_COORDINATE: f32 = 0.1;
+        for (p1, _) in nondegenerate_plane_pairs() {
+            let sum = Vec3::new(p1.xy + p1.zw, p1.xz - p1.yw, p1.xw + p1.yz);
+            let diff = Vec3::new(p1.xy - p1.zw, p1.xz + p1.yw, p1.xw - p1.yz);
+            for (s, d) in sum.to_array().into_iter().zip(diff.to_array()) {
+                assert!(
+                    s.abs() > MIN_COORDINATE && d.abs() > MIN_COORDINATE,
+                    "eigenpart coordinate too small to pin a sign: {sum:?}, {diff:?}"
+                );
+            }
+            assert!(
+                sum.cross(diff).length() > MIN_COORDINATE,
+                "eigenparts are parallel, so a swap between them stays hidden: \
+                 {sum:?}, {diff:?}"
+            );
         }
     }
 
