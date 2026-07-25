@@ -889,96 +889,61 @@ impl Rotor for Rotor4 {
         Vec4::new(q1, q2, q3, q4)
     }
 
-    /// Inverse of [`Bivector4::exp`], same invariant decomposition: scalar +
-    /// pseudoscalar recover the half-angles, bivector & dual give the planes.
+    /// Inverse of [`Bivector4::exp`]. Both maps are diagonal in the self-dual
+    /// split of Λ²R⁴, which is what collapses the invariant decomposition to
+    /// a single branch-free formula.
+    ///
+    /// Recovers the principal branch: `(θ₁ ± θ₂)/2 ∈ [0, π]`.
     fn log(self) -> Bivector4 {
-        // c = cos(θ₁/2)·cos(θ₂/2), p = sin(θ₁/2)·sin(θ₂/2);
-        // product-to-sum gives c ± p = cos((θ₁ ∓ θ₂)/2).
+        // Write R₂ for the bivector part and R₂* for its Hodge dual. The
+        // combination R₂ ∓ R₂* carries the half-angle h± = (θ₁ ± θ₂)/2 alone:
+        // over the same fixed plane pair U± (an eigenvector of the Hodge
+        // dual, pinned by the rotor's invariant frame),
+        //
+        //     R₂ ∓ R₂* = sin(h±)·U±       B ∓ B* = 2·h±·U±
+        //
+        // so B = (h₊/sin h₊)·(R₂ − R₂*) + (h₋/sin h₋)·(R₂ + R₂*). The dual
+        // pairs the components (xy,zw), (xz,yw), (xw,yz), so each eigenpart
+        // has three independent coefficients, and the vector of those three
+        // has length |sin h±|.
+        //
+        // The cosines come from the scalar and pseudoscalar: with
+        // c = cos(θ₁/2)·cos(θ₂/2) and p = sin(θ₁/2)·sin(θ₂/2), product-to-sum
+        // gives c ∓ p = cos(h±). Taking h± by atan2 against the sine holds
+        // full relative precision where acos(c ∓ p) alone loses half the
+        // mantissa, its argument sitting within an ulp of ±1 near identity
+        // and near the isoclinic locus (Kahan 2006, "How Futile are Mindless
+        // Assessments of Roundoff in Floating-Point Computation?", Mangled
+        // Angles).
         let c = self.s;
         let p = self.xyzw;
-        let hs = (c - p).clamp(-1.0, 1.0).acos(); // (θ₁ + θ₂) / 2
-        let hd = (c + p).clamp(-1.0, 1.0).acos(); // (θ₁ − θ₂) / 2
-        let t1 = hs + hd;
-        let t2 = hs - hd;
-        let s_target = t1 * t1 + t2 * t2;
-        let delta_target = 2.0 * t1 * t2;
+        let sum_part = Vec3::new(self.xy + self.zw, self.xz - self.yw, self.xw + self.yz);
+        let diff_part = Vec3::new(self.xy - self.zw, self.xz + self.yw, self.xw - self.yz);
+        let sin_sum = sum_part.length();
+        let sin_diff = diff_part.length();
 
-        let br = Bivector4 {
-            xy: self.xy,
-            xz: self.xz,
-            xw: self.xw,
-            yz: self.yz,
-            yw: self.yw,
-            zw: self.zw,
+        // h/sin(h) → 1 as h → 0, so the guard covers only the exact 0/0. The
+        // other zero of the sine, h = π, is the branch cut: the eigenpart's
+        // plane is then unrecoverable from the rotor, and scaling the zero
+        // vector by 1 drops that half-turn rather than returning infinities.
+        let k_sum = if sin_sum > 0.0 {
+            sin_sum.atan2(c - p) / sin_sum
+        } else {
+            1.0
         };
-        let br_mag_sq = br.magnitude_squared();
-        if br_mag_sq < 1e-16 {
-            return Bivector4::ZERO;
-        }
+        let k_diff = if sin_diff > 0.0 {
+            sin_diff.atan2(c + p) / sin_diff
+        } else {
+            1.0
+        };
 
-        // Simple case (δ ≈ 0): θ = 2·atan2(|B_r|, c).
-        if delta_target.abs() < 1e-6 * s_target.max(1.0) {
-            let theta = 2.0 * br_mag_sq.sqrt().atan2(c);
-            let k = theta / br_mag_sq.sqrt();
-            return br * k;
-        }
-
-        // Compound case: rebuild the exp-forward coefficients from the
-        // recovered angles, then invert the 2×2 system to
-        // B = (b_coef·R − bstar_coef·R_dual) / (b_coef² − bstar_coef²).
-        let disc_target = (s_target * s_target - delta_target * delta_target)
-            .max(0.0)
-            .sqrt();
-
-        // Isoclinic branch (t₁ ≈ t₂): bstar_coef -> 0, so B = R / b_coef
-        // with the isoclinic b_coef = sin(θ)/(2·θ).
-        if disc_target < 1e-6 * s_target.max(1.0) {
-            let theta = (s_target * 0.5).sqrt();
-            // 1e-8: same sin(θ)/(2θ) cutover as exp's isoclinic branch.
-            let b_coef = if theta > 1e-8 {
-                theta.sin() / (2.0 * theta)
-            } else {
-                0.5
-            };
-            // 1e-12: below this, inverting b_coef amplifies f32 noise past
-            // the correctness bound; treat as zero.
-            if b_coef.abs() < 1e-12 {
-                return Bivector4::ZERO;
-            }
-            return br * (1.0 / b_coef);
-        }
-
-        let t1p = ((s_target + disc_target) * 0.5).max(0.0).sqrt();
-        let t2p = ((s_target - disc_target) * 0.5).max(0.0).sqrt() * delta_target.signum();
-        let half1 = t1p * 0.5;
-        let half2 = t2p * 0.5;
-        let c1 = half1.cos();
-        let s1 = half1.sin();
-        let c2 = half2.cos();
-        let s2 = half2.sin();
-        let s1_t1 = s1 / t1p;
-        let s2_t2 = s2 / t2p;
-
-        let b_coef = (s1_t1 * c2 * (s_target + disc_target)
-            - c1 * s2_t2 * (s_target - disc_target))
-            / (2.0 * disc_target);
-        let bstar_coef = delta_target * (s1_t1 * c2 - c1 * s2_t2) / (2.0 * disc_target);
-
-        let det = b_coef * b_coef - bstar_coef * bstar_coef;
-        if det.abs() < 1e-12 {
-            return Bivector4::ZERO;
-        }
-        let inv_a = b_coef / det;
-        let inv_b = -bstar_coef / det;
-
-        let br_dual = br.dual();
         Bivector4 {
-            xy: inv_a * br.xy + inv_b * br_dual.xy,
-            xz: inv_a * br.xz + inv_b * br_dual.xz,
-            xw: inv_a * br.xw + inv_b * br_dual.xw,
-            yz: inv_a * br.yz + inv_b * br_dual.yz,
-            yw: inv_a * br.yw + inv_b * br_dual.yw,
-            zw: inv_a * br.zw + inv_b * br_dual.zw,
+            xy: k_sum * sum_part.x + k_diff * diff_part.x,
+            xz: k_sum * sum_part.y + k_diff * diff_part.y,
+            xw: k_sum * sum_part.z + k_diff * diff_part.z,
+            yz: k_sum * sum_part.z - k_diff * diff_part.z,
+            yw: k_diff * diff_part.y - k_sum * sum_part.y,
+            zw: k_sum * sum_part.x - k_diff * diff_part.x,
         }
     }
 }
@@ -1488,6 +1453,95 @@ mod tests {
             Vec4::new(1.0, -0.5, 0.3, 0.7),
         ] {
             assert_vec4_close_tol(rotor_a.apply(v), rotor_b.apply(v), 1e-3);
+        }
+    }
+
+    /// Two orthogonal simple planes spanning R⁴, oriented so that
+    /// `(p1·t₁ + p2·t₂).wedge_self_coeff() = 2·t₁·t₂`, which is the sign
+    /// convention the invariant decomposition assigns to `(θ₁, θ₂)`. The
+    /// tilted pair spreads each simple part over four components, so a
+    /// swapped plane cannot hide in a single coefficient.
+    fn invariant_plane_pairs() -> [(Bivector4, Bivector4); 2] {
+        let root_half = 0.5_f32.sqrt();
+        let u1 = Vec4::new(root_half, root_half, 0.0, 0.0);
+        let v1 = Vec4::new(0.0, 0.0, root_half, root_half);
+        let u2 = Vec4::new(root_half, -root_half, 0.0, 0.0);
+        let v2 = Vec4::new(0.0, 0.0, root_half, -root_half);
+        [
+            (Bivector4::basis(0), Bivector4::basis(5)),
+            (Bivector4::wedge(u1, v1), Bivector4::wedge(v2, u2)),
+        ]
+    }
+
+    /// Angle pairs for the half-angle recovery. The small and the near-equal
+    /// pairs put `cos((θ₁ ± θ₂)/2)` within an ulp of 1, which is where
+    /// recovering that half-angle from its cosine alone loses half the
+    /// mantissa; the last two are well-separated controls.
+    const HALF_ANGLE_STRESS_PAIRS: [(f32, f32); 10] = [
+        (1.0e-3, 1.0e-3),
+        (1.0e-3, 5.0e-4),
+        (1.0e-3, -1.0e-3),
+        (1.0e-3, 0.0),
+        (0.7, 0.7),
+        (0.7, 0.6999),
+        (1.0, 0.999),
+        (2.0, 1.999),
+        (1.2, 0.3),
+        (0.5, -0.4),
+    ];
+
+    /// Both invariant angles survive `log`, not just the rotor's action on a
+    /// probe vector. The reference rotor is the product of two simple
+    /// rotors, so it is built entirely from `exp`'s well-conditioned simple
+    /// branch and the residual here is `log`'s alone.
+    #[test]
+    fn rotor4_log_recovers_both_invariant_angles() {
+        for (p1, p2) in invariant_plane_pairs() {
+            for (t1, t2) in HALF_ANGLE_STRESS_PAIRS {
+                let b = p1 * t1 + p2 * t2;
+                let back = ((p1 * t1).exp() * (p2 * t2).exp()).log();
+                let diff = (back + b * (-1.0)).magnitude();
+                assert!(
+                    diff <= 1e-6,
+                    "log mismatch at ({t1}, {t2}): {b:?} -> {back:?}"
+                );
+            }
+        }
+    }
+
+    /// `log ∘ exp` on the same stress table. The tolerance is looser than
+    /// the test above because `exp`'s compound branch carries the
+    /// discriminant `√(|B|⁴ − (B∧B)²)`, which cancels to noise as the two
+    /// angles converge; that floor is `exp`'s, not the half-angle recovery's.
+    #[test]
+    fn rotor4_log_of_exp_round_trips_at_small_and_near_equal_angles() {
+        for (p1, p2) in invariant_plane_pairs() {
+            for (t1, t2) in HALF_ANGLE_STRESS_PAIRS {
+                let b = p1 * t1 + p2 * t2;
+                let back = b.exp().log();
+                let diff = (back + b * (-1.0)).magnitude();
+                assert!(
+                    diff <= 3e-5,
+                    "log∘exp mismatch at ({t1}, {t2}): {b:?} -> {back:?}"
+                );
+            }
+        }
+    }
+
+    /// Branch cut: the isoclinic half-turn has zero bivector part, so its
+    /// plane pair is unrecoverable. The recovered log must still be finite
+    /// and must still exponentiate to that rotation (which is −1 on every
+    /// vector, whatever plane pair it is read on).
+    #[test]
+    fn rotor4_log_stays_finite_at_the_isoclinic_branch_cut() {
+        let rotor = Bivector4::new(PI, 0.0, 0.0, 0.0, 0.0, PI).exp();
+        let back = rotor.log();
+        assert!(
+            back.magnitude_squared().is_finite(),
+            "non-finite log at the branch cut: {back:?}"
+        );
+        for v in [Vec4::X, Vec4::W, Vec4::new(1.0, -0.5, 0.3, 0.7)] {
+            assert_vec4_close_tol(back.exp().apply(v), v * -1.0, 1e-5);
         }
     }
 
