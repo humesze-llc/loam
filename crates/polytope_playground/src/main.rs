@@ -28,11 +28,18 @@
 //!
 //! ## Arguments
 //!
-//! - `--shapes=name1,name2` natively, `?shapes=name1,name2` in the browser:
-//!   polytopes left-to-right. Accepts the math form (`5-cell`, `tesseract`,
-//!   `16-cell`, `24-cell`, `120-cell`, `600-cell`) and Platonic-slice
-//!   aliases (`tetrahedron`, `cube`, `octahedron`, `cuboctahedron`,
-//!   `dodecahedron`, `icosahedron`).
+//! Native form `--key=value`, browser form `?key=value`.
+//!
+//! - `shapes=name1,name2`: polytopes left-to-right. Accepts the math form
+//!   (`5-cell`, `tesseract`, `16-cell`, `24-cell`, `120-cell`, `600-cell`)
+//!   and Platonic-slice aliases (`tetrahedron`, `cube`, `octahedron`,
+//!   `cuboctahedron`, `dodecahedron`, `icosahedron`).
+//! - `scene=slug`: which scene the shell boots. Unknown slugs warn and fall
+//!   back to the first. The `scene` console command lists the registry and
+//!   switches at runtime.
+//! - `embed=1`: hide the shell menu bar for page embeds (any value but `0`
+//!   and `false` enables it). The `scene` command is then the only in-app
+//!   switcher.
 
 use anyhow::{anyhow, Result};
 use glam::{Mat4, Vec2, Vec3, Vec4};
@@ -124,6 +131,18 @@ use consts::{CONTROL_H, CONTROL_W, SHAPE_CARD_WIDTH};
 use loam_egui::dnd::{drag_source_collapsing as dnd_drag_source_collapsing, make_room_gap};
 #[cfg(test)]
 use loam_egui::media::add_button;
+
+/// Boot position of the draggable formula popup: inset from the top-right of
+/// the space the shell's menu-bar panel leaves. `available_rect` and not
+/// `content_rect`, which is the viewport minus OS safe-area insets and does
+/// not shrink for a panel, so seating against it hides the popup's first rows
+/// behind the bar.
+fn formula_popup_seat(ctx: &egui::Context) -> egui::Pos2 {
+    const RIGHT_INSET: f32 = 280.0;
+    const TOP_INSET: f32 = 16.0;
+    let area = ctx.available_rect();
+    egui::pos2(area.right() - RIGHT_INSET, area.top() + TOP_INSET)
+}
 
 impl Demo {
     pub(crate) fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
@@ -497,8 +516,7 @@ impl Demo {
                 None
             };
             let bivec = self.rot_state.log();
-            let screen = ctx.content_rect();
-            let default_pos = egui::pos2(screen.right() - 280.0, screen.top() + 16.0);
+            let default_pos = formula_popup_seat(ctx);
             let popup_frame = egui::Frame::popup(&ctx.style()).inner_margin(8.0);
             // Cap width so a long formula doesn't expand the popup off-screen;
             // the matrix's intrinsic ~280 px is the lower bound.
@@ -1216,6 +1234,40 @@ mod section_command_tests {
         );
         // Bare query reports without mutating.
         assert_eq!(run(0.7, &[]), (0.7, true), "bare query leaves the field");
+    }
+}
+
+#[cfg(test)]
+mod formula_popup_tests {
+    use super::*;
+
+    /// The popup boots clear of the shell's menu-bar panel. Seating it against
+    /// `content_rect` (viewport minus safe-area insets, panel-unaware) put its
+    /// first rows behind the bar.
+    #[test]
+    fn formula_popup_seats_below_the_menu_bar_panel() {
+        let ctx = egui::Context::default();
+        let mut seat = None;
+        let mut bar_bottom = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            // Any bar taller than the popup's top inset separates the two
+            // rects; an exact height keeps that independent of font metrics.
+            bar_bottom = egui::TopBottomPanel::top("shell-menu-bar")
+                .exact_height(64.0)
+                .show(ctx, |ui| {
+                    ui.label("bar");
+                })
+                .response
+                .rect
+                .bottom();
+            seat = Some(formula_popup_seat(ctx));
+        });
+        let seat = seat.expect("run closure sets the seat");
+        assert!(
+            seat.y >= bar_bottom,
+            "popup seat y {} must clear the menu bar bottom {bar_bottom}",
+            seat.y
+        );
     }
 }
 
