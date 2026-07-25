@@ -69,6 +69,10 @@ impl PhysicsSpace for EuclideanR4 {
         }
     }
 
+    fn wedge(&self, a: Vec4, b: Vec4) -> Bivector4 {
+        Bivector4::wedge(a, b)
+    }
+
     fn velocity_at_point(&self, body: &RigidBody<EuclideanR4>, p: Vec4) -> Vec4 {
         let r = p - body.position;
         body.velocity + omega_cross_r(body.angular_velocity, r)
