@@ -536,52 +536,50 @@ mod tests {
         assert!(d2.is_finite() && d2 >= 0.0);
     }
 
-    /// Every shipped WGSL function with a CPU twin, pinned to its own
-    /// statements verbatim. A function's pin is split into runs around its
-    /// interior comments, so prose edits do not read as drift, and the first
-    /// run carries the signature, so a run cannot match elsewhere in the
-    /// source.
+    /// Every shipped WGSL function with a CPU twin, pinned as one contiguous
+    /// statement sequence covering the whole body, signature through closing
+    /// brace. Comments are normalized out of the shipped source before the
+    /// comparison, so prose edits do not read as drift while a statement
+    /// added between two comments does.
     ///
     /// The pin fails when the shader form moves; the mirror parity tests below
     /// fail when the CPU form moves. Neither half of a twin can be edited
     /// alone.
-    const WGSL_BODY_PINS: &[(&str, &[&str])] = &[
+    const WGSL_BODY_PINS: &[(&str, &str)] = &[
         (
             "loam_s3_clamp",
-            &[r#"fn loam_s3_clamp(p: vec3<f32>) -> vec3<f32> {
+            r#"fn loam_s3_clamp(p: vec3<f32>) -> vec3<f32> {
     let r2 = dot(p, p);
     if (r2 <= LOAM_S3_R2_MAX) { return p; }
     return p * (sqrt(LOAM_S3_R2_MAX) / sqrt(r2));
-}"#],
+}"#,
         ),
         (
             "loam_s3_lift",
-            &[r#"fn loam_s3_lift(p: vec3<f32>) -> vec4<f32> {
+            r#"fn loam_s3_lift(p: vec3<f32>) -> vec4<f32> {
     let r2 = min(dot(p, p), LOAM_S3_R2_MAX);
     return vec4<f32>(p.x, p.y, p.z, sqrt(1.0 - r2));
-}"#],
+}"#,
         ),
         (
             "loam_origin_distance",
-            &[
-                "fn loam_origin_distance(p: vec3<f32>) -> f32 {",
-                r#"    let r2 = min(dot(p, p), LOAM_S3_R2_MAX);
+            r#"fn loam_origin_distance(p: vec3<f32>) -> f32 {
+    let r2 = min(dot(p, p), LOAM_S3_R2_MAX);
     return asin(sqrt(r2));
 }"#,
-            ],
         ),
         (
             "loam_distance",
-            &[r#"fn loam_distance(a: vec3<f32>, b: vec3<f32>) -> f32 {
+            r#"fn loam_distance(a: vec3<f32>, b: vec3<f32>) -> f32 {
     let qa = loam_s3_lift(loam_s3_clamp(a));
     let qb = loam_s3_lift(loam_s3_clamp(b));
     let half_chord = length(qa - qb) * 0.5;
     return 2.0 * asin(clamp(half_chord, 0.0, 1.0));
-}"#],
+}"#,
         ),
         (
             "loam_exp",
-            &[r#"fn loam_exp(at: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
+            r#"fn loam_exp(at: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     let p = loam_s3_clamp(at);
     let n2 = dot(v, v);
     if (n2 < 1e-14) { return p; }
@@ -592,12 +590,11 @@ mod tests {
     if (mag < 1e-7) { return p; }
     let result4 = normalize(q * cos(mag) + v4 * (sin(mag) / mag));
     return loam_s3_clamp(result4.xyz);
-}"#],
+}"#,
         ),
         (
             "loam_log",
-            &[
-                r#"fn loam_log(p_from: vec3<f32>, p_to: vec3<f32>) -> vec3<f32> {
+            r#"fn loam_log(p_from: vec3<f32>, p_to: vec3<f32>) -> vec3<f32> {
     let qf = loam_s3_lift(loam_s3_clamp(p_from));
     let qt = loam_s3_lift(loam_s3_clamp(p_to));
     let d_dot = clamp(dot(qf, qt), -1.0, 1.0);
@@ -608,26 +605,44 @@ mod tests {
     let d = 2.0 * asin(clamp(half_chord, 0.0, 1.0));
     return perp4.xyz * (d / n);
 }"#,
-            ],
         ),
         (
             "loam_parallel_transport",
-            &[
-                r#"fn loam_parallel_transport(p_from: vec3<f32>, p_to: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
+            r#"fn loam_parallel_transport(p_from: vec3<f32>, p_to: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     let pf = loam_s3_clamp(p_from);
     let pt = loam_s3_clamp(p_to);
     let qf = loam_s3_lift(pf);
     let qt = loam_s3_lift(pt);
     let vw = -dot(v, pf) / qf.w;
-    let v4 = vec4<f32>(v.x, v.y, v.z, vw);"#,
-                r#"    let sum = qf + qt;
+    let v4 = vec4<f32>(v.x, v.y, v.z, vw);
+    let sum = qf + qt;
     let denom = max(dot(sum, sum) * 0.5, 1e-7);
     let v4t = v4 - (dot(v4, qt) / denom) * sum;
     return v4t.xyz;
 }"#,
-            ],
         ),
     ];
+
+    /// `fn name` in `src`, signature through the closing brace in column 0,
+    /// with comments stripped and blank lines dropped. WGSL has no string
+    /// literals, so cutting each line at its first `//` cannot eat code.
+    /// A missing or unterminated function panics: a pin that cannot find its
+    /// target is drift, not a pass.
+    fn wgsl_function_source(src: &str, name: &str) -> String {
+        let start = src
+            .find(&format!("\nfn {name}("))
+            .unwrap_or_else(|| panic!("{name} is not in the shipped WGSL"))
+            + 1;
+        let end = src[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{name} has no closing brace in column 0"));
+        src[start..start + end + 2]
+            .lines()
+            .map(|line| line.split("//").next().unwrap().trim_end())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     // CPU ports of the shipped WGSL, expression for expression, so parity is
     // checkable without an adapter. They call each other rather than the
@@ -702,34 +717,49 @@ mod tests {
         v4t.truncate()
     }
 
+    /// Shared direction for the point and tangent fixtures, unit length so a
+    /// scaled entry has exactly the radius it names. Sharing it makes the
+    /// band tangents radial at the shell points, which is what exercises the
+    /// `vw` amplification below.
+    const PARITY_DIR: Vec3 = Vec3::new(0.6, -0.48, 0.64);
+
     /// Chart fixtures spanning the origin, the interior, the saturation shell,
     /// and both out-of-domain regimes, so a parity assertion crosses every
-    /// branch a mirror has. `(0.6, -0.48, 0.64)` is a unit vector, so the
-    /// scaled entries have exactly the radius they name; the shell pair is
-    /// mutually antipodal in the chart, which is where the transport
-    /// denominator is worst conditioned.
+    /// branch a mirror has. The shell pair is mutually antipodal in the chart,
+    /// which is where the transport denominator is worst conditioned.
     fn parity_points() -> [Vec3; 9] {
-        let unit = Vec3::new(0.6, -0.48, 0.64);
         let shell = SPHERE_R2_MAX.sqrt();
         [
             Vec3::ZERO,
             Vec3::new(1e-5, 0.0, 0.0),
             Vec3::new(0.2, -0.3, 0.1),
             Vec3::new(-0.45, 0.5, 0.35),
-            unit * 0.95,
-            unit * shell,
-            -unit * shell,
+            PARITY_DIR * 0.95,
+            PARITY_DIR * shell,
+            -PARITY_DIR * shell,
             Vec3::new(1.0, 0.0, 0.0),
             Vec3::new(2.0, -1.0, 0.5),
         ]
     }
 
-    /// Tangent fixtures covering both early-return guards of `exp` and a
+    /// Tangent fixtures bracketing the early-return guards of `exp` and a
     /// displacement long enough to leave the chart.
-    fn parity_vectors() -> [Vec3; 4] {
+    ///
+    /// The two `PARITY_DIR` entries bracket the first guard, `|v|² < 1e-14`,
+    /// from either side within a factor of two, so shifting its threshold
+    /// changes what at least one fixture returns. They discriminate the two
+    /// guards because they are radial: at a shell base point the lift
+    /// `vw = −dot(v, p)/w` amplifies by `1/w ≈ 1e3`, so `9.9e-8` clears the
+    /// second guard's `mag < 1e-7` while failing the first, and dropping the
+    /// first guard would let a nonzero step through. Without amplification
+    /// the guards share a threshold (`|v4| ≥ |v|`) and the second one masks
+    /// every edit to the first.
+    fn parity_vectors() -> [Vec3; 6] {
         [
             Vec3::ZERO,
             Vec3::new(1e-8, 0.0, 0.0),
+            PARITY_DIR * 9.9e-8,
+            PARITY_DIR * 2e-7,
             Vec3::new(0.0, 0.05, 0.0),
             Vec3::new(-0.3, 0.2, 0.7),
         ]
@@ -738,13 +768,12 @@ mod tests {
     #[test]
     fn wgsl_bodies_match_the_cpu_mirrors() {
         let src = s3().wgsl_impl();
-        for (name, runs) in WGSL_BODY_PINS {
-            for run in *runs {
-                assert!(
-                    src.contains(run),
-                    "{name} drifted from its CPU mirror; not found verbatim:\n{run}"
-                );
-            }
+        for (name, pin) in WGSL_BODY_PINS {
+            assert_eq!(
+                wgsl_function_source(&src, name),
+                *pin,
+                "{name} drifted from its CPU mirror"
+            );
         }
     }
 
