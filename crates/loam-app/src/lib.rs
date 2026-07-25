@@ -204,17 +204,18 @@ pub trait App: Sized + 'static {
 // Context structs
 // ---------------------------------------------------------------------------
 
-/// Setup-phase context. Available during [`App::setup`] and [`App::on_shader_reload`].
 /// Run one frame's fixed-timestep ticks: advance the accumulator, cap the
 /// catch-up at `max_ticks`, and call `App::tick` for each, bumping `tick_index`.
 /// Shared by the native runner and the wasm worker so the determinism-critical
 /// sim cadence has a single definition and cannot drift between platforms.
 /// Returns the capped tick count (for `FrameCtx::n_ticks`).
+///
+/// `now` reaches the wall clock only through the accumulator, which decides
+/// *how many* ticks run. What each tick sees is a pure function of its index.
 pub(crate) fn drive_fixed_ticks<A: App>(
     app: &mut A,
     timestep: &mut FixedTimestep,
     tick_index: &mut u64,
-    start: Instant,
     now: Instant,
     fixed_hz: u32,
     max_ticks: usize,
@@ -224,7 +225,7 @@ pub(crate) fn drive_fixed_ticks<A: App>(
     let dt = 1.0 / fixed_hz as f32;
     for _ in 0..n_capped {
         let mut tctx = TickCtx {
-            time: start.elapsed().as_secs_f32(),
+            time: *tick_index as f32 * dt,
             tick: *tick_index,
         };
         app.tick(dt, &mut tctx);
@@ -233,6 +234,7 @@ pub(crate) fn drive_fixed_ticks<A: App>(
     n_capped
 }
 
+/// Setup-phase context. Available during [`App::setup`] and [`App::on_shader_reload`].
 pub struct SetupCtx<'a> {
     pub rd: &'a RenderDevice,
     pub shader_db: &'a mut ShaderDb,
@@ -246,6 +248,11 @@ pub struct SetupCtx<'a> {
 /// Per-tick context. Visible to [`App::tick`]. Deliberately GPU-free so sim code stays
 /// bit-deterministic.
 pub struct TickCtx {
+    /// Sim time in seconds: `tick` scaled by the fixed timestep
+    /// (`1.0 / RunConfig::fixed_hz`). Derived from the tick index rather than
+    /// read from the clock, so replaying the same tick range yields the same
+    /// bits however the frames were paced. Wall-clock time lives on
+    /// [`FrameCtx::time`], outside the determinism boundary.
     pub time: f32,
     pub tick: u64,
 }
@@ -1271,7 +1278,6 @@ impl<A: App> Runner<A> {
                 app,
                 &mut self.timestep,
                 &mut self.tick_index,
-                self.start,
                 Instant::now(),
                 self.config.fixed_hz,
                 self.config.max_ticks_per_frame,
@@ -1636,5 +1642,92 @@ impl<A: App> Runner<A> {
         // very end of redraw); the surrounding block scope ensures that ordering.
         drop(_frame_scope);
         loam_time::frame_trace::end_frame();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loam_math::EuclideanR3;
+    use std::time::Duration;
+
+    /// One tick of the 60 Hz accumulator, as `FixedTimestep` stores it
+    /// (nanoseconds derived from the target Hz, truncated).
+    const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+    #[derive(Default)]
+    struct TickRecorder {
+        space: EuclideanR3,
+        times: Vec<f32>,
+    }
+
+    impl App for TickRecorder {
+        type Space = EuclideanR3;
+
+        fn setup(_ctx: &mut SetupCtx<'_>) -> anyhow::Result<Self> {
+            Ok(Self::default())
+        }
+
+        fn space(&self) -> &Self::Space {
+            &self.space
+        }
+
+        fn tick(&mut self, _dt: f32, ctx: &mut TickCtx) {
+            self.times.push(ctx.time);
+        }
+    }
+
+    /// Drive frames whose wall-clock instants are `base + offsets[i]` and return
+    /// every `TickCtx::time` the app observed. The first offset only primes the
+    /// accumulator.
+    fn tick_times(base: Instant, offsets: &[Duration], max_ticks: usize) -> Vec<f32> {
+        let mut app = TickRecorder::default();
+        let mut timestep = FixedTimestep::new(60);
+        let mut tick_index = 0u64;
+        for offset in offsets {
+            drive_fixed_ticks(
+                &mut app,
+                &mut timestep,
+                &mut tick_index,
+                base + *offset,
+                60,
+                max_ticks,
+            );
+        }
+        app.times
+    }
+
+    #[test]
+    fn tick_time_sequence_is_independent_of_wall_clock_offset() {
+        let offsets: Vec<Duration> = (0..=20).map(|k| TICK * k).collect();
+        let early = tick_times(Instant::now(), &offsets, 8);
+        let late = tick_times(Instant::now() + Duration::from_secs(3_600), &offsets, 8);
+
+        assert_eq!(
+            early.len(),
+            20,
+            "one tick per frame after the priming frame"
+        );
+        assert_eq!(
+            early, late,
+            "tick time must not shift with the run's wall-clock origin"
+        );
+    }
+
+    #[test]
+    fn tick_time_sequence_is_independent_of_frame_pacing() {
+        let base = Instant::now();
+        let one_per_frame: Vec<Duration> = (0..=60).map(|k| TICK * k).collect();
+        let ten_per_frame: Vec<Duration> = (0..=6).map(|k| TICK * (k * 10)).collect();
+
+        let smooth = tick_times(base, &one_per_frame, 10);
+        let stuttered = tick_times(base, &ten_per_frame, 10);
+
+        let expected: Vec<f32> = (0..60).map(|i| i as f32 * (1.0 / 60.0)).collect();
+        assert_eq!(smooth, expected, "tick time is tick_index * dt from zero");
+        assert_eq!(
+            stuttered, expected,
+            "catching up ten ticks in one frame must yield the same time sequence"
+        );
     }
 }
