@@ -1,18 +1,50 @@
 //! What the sort-and-sweep broadphase costs and what it prunes, at three body
 //! counts. `cargo bench -p loam-physics`.
 //!
-//! Two numbers per size, because the sweep pays off in two different places.
-//! `scan/sweep` is the phase's own speedup against a brute-force scan of the
-//! same candidate predicate, with bounding radii hoisted so the comparison is
-//! acceleration structure against no acceleration structure and not one loop
-//! forgetting to hoist. `quadratic/emitted` is the factor by which the
-//! narrowphase's input shrinks, which is where the larger win lives: the
-//! narrowphase runs GJK per emitted pair.
+//! Three timings per size, because "the sweep is Nx faster" means two different
+//! things depending on the denominator.
 //!
-//! Both sides return an owned `Vec<PairKey>` and both compute their radii
-//! inside the timed region, so neither is handed work the other pays for.
-//! Emission is asserted equal before timing, so a run that reports a speedup
-//! is reporting one over identical output.
+//! `allpairs_ns` is the broadphase the sweep replaced: every pair that is not
+//! two static bodies, with no distance test and no sort. A speedup claim for
+//! the sweep is a claim over this, and it is also what the narrowphase used to
+//! be handed, so `allpairs/emitted` is the factor by which the narrowphase's
+//! input shrank. That is where the larger win lives, since the narrowphase runs
+//! GJK per emitted pair.
+//!
+//! `scan_ns` is the harder denominator: the sweep's own candidate predicate
+//! with no acceleration structure, radii hoisted out of the quadratic loop so
+//! the comparison is structure against no structure and not one loop forgetting
+//! to hoist. The scan already does the culling the sweep is credited for above,
+//! so `scan/sweep` isolates what the sort buys over identical output.
+//!
+//! All three grow an owned `Vec<PairKey>` inside the timed region. The sweep is
+//! not otherwise handed the same deal: `World::broadphase` allocates the two
+//! sweep scratch buffers per call where the step reuses buffers the world
+//! retains, so `sweep_ns` is an upper bound on what a step pays. The sweep's
+//! output is asserted equal to the scan's and contained in the all-pairs set,
+//! the only relation that holds against a denominator with no distance test.
+//!
+//! Measured on a 13th Gen Intel Core i9-13980HX, Windows 11 Pro 10.0.26200,
+//! rustc 1.95.0, `cargo bench` (opt-level 3, no debug assertions). Each cell is
+//! the median over seven process runs: the within-run median still leaves
+//! `allpairs_ns` at 101 bodies bimodal, observed anywhere from 12 to 55
+//! microseconds, where the 201 and 401 rows hold to within 1.7x and 1.2x. Read
+//! the 101 ratios as an order of magnitude, not a figure.
+//!
+//! ```text
+//! bodies emitted allpairs sweep_ns scan_ns allpairs_ns scan/sweep allpairs/sweep allpairs/emitted
+//!    101     160     5050     9946    6907       31698       0.7x           3.2x              32x
+//!    201     312    20100    26848   24770       95717       0.9x           3.6x              64x
+//!    401     611    80200    74506   89880      563359       1.2x           7.6x             131x
+//! ```
+//!
+//! The sweep's win over the broadphase it replaced grows with the body count,
+//! 3.2x to 7.6x over a 4x range, so what it buys is the acceleration structure
+//! and not a fixed overhead difference. Against the identical-predicate scan it
+//! is behind at 101 bodies and only crosses over near 401, so at these sizes
+//! the sweep's lead is the pairs it never emits and not the pairs it never
+//! tests. Whether the interval sort or the active-list churn dominates that
+//! overhead is unmeasured.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -40,6 +72,8 @@ const GRAVITY_Y: f32 = -9.8;
 /// Arbitrary but fixed, so a run reproduces.
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 const REPS: u32 = 200;
+/// Odd, so the reported median is a batch that was actually observed.
+const BATCHES: usize = 9;
 
 /// xorshift64 (Marsaglia 2003, "Xorshift RNGs", J. Stat. Soft. 8(14), the
 /// 13/7/17 triple).
@@ -145,6 +179,24 @@ fn scan(world: &World<EuclideanR3>) -> Vec<PairKey> {
     pairs
 }
 
+/// The broadphase the sweep replaced: every pair that is not two static bodies,
+/// with no bounding test and no sort. The scene never despawns, so handles
+/// ascend with storage order and this emission is already sorted; dropping the
+/// sort is faithful to the original rather than a head start.
+fn all_pairs(world: &World<EuclideanR3>) -> Vec<PairKey> {
+    let mut pairs = Vec::new();
+    let n = world.bodies.len();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if world.bodies[i].inv_mass == 0.0 && world.bodies[j].inv_mass == 0.0 {
+                continue;
+            }
+            pairs.push(canonical(world.bodies.id_at(i), world.bodies.id_at(j)));
+        }
+    }
+    pairs
+}
+
 fn canonical(a: BodyId, b: BodyId) -> PairKey {
     if a < b {
         (a, b)
@@ -153,16 +205,29 @@ fn canonical(a: BodyId, b: BodyId) -> PairKey {
     }
 }
 
-fn mean_nanos(mut body: impl FnMut()) -> f64 {
-    let start = Instant::now();
-    for _ in 0..REPS {
-        body();
+/// Median batch mean. A single batch mean is not reportable here: the all-pairs
+/// emitter grows its output `Vec` from empty on every call, and the mean of one
+/// batch of that moved by 4x between process runs. Taking the median across
+/// batches holds 201 and 401 bodies to 1.7x and 1.2x; 101 stays bimodal, so the
+/// spread there is stated with the number rather than averaged away.
+fn median_nanos(mut body: impl FnMut()) -> f64 {
+    let mut batches = [0.0_f64; BATCHES];
+    for batch in &mut batches {
+        let start = Instant::now();
+        for _ in 0..REPS {
+            body();
+        }
+        *batch = start.elapsed().as_nanos() as f64 / f64::from(REPS);
     }
-    start.elapsed().as_nanos() as f64 / f64::from(REPS)
+    batches.sort_unstable_by(f64::total_cmp);
+    batches[BATCHES / 2]
 }
 
 fn main() {
-    println!("bodies emitted quadratic sweep_ns scan_ns scan/sweep quadratic/emitted");
+    println!(
+        "bodies emitted allpairs sweep_ns scan_ns allpairs_ns \
+         scan/sweep allpairs/sweep allpairs/emitted"
+    );
     for count in BODY_COUNTS {
         let world = settled_scene(count);
         let emitted = world.broadphase();
@@ -173,25 +238,47 @@ fn main() {
              compare different work"
         );
 
+        let mut baseline = all_pairs(&world);
+        let n = world.bodies.len();
+        assert_eq!(
+            baseline.len(),
+            n * (n - 1) / 2,
+            "{count}: the baseline dropped a pair, so it is culling and is no \
+             longer the unaccelerated denominator"
+        );
+        baseline.sort_unstable();
+        assert!(
+            emitted
+                .iter()
+                .all(|key| baseline.binary_search(key).is_ok()),
+            "{count}: the sweep emits a pair the baseline never did, so the \
+             ratio below is not a pruning factor"
+        );
+
         // One untimed pass each, so the timed loop measures a warm cache and
         // not the scene's first-touch faults.
         black_box(world.broadphase());
         black_box(scan(&world));
+        black_box(all_pairs(&world));
 
-        let sweep_ns = mean_nanos(|| {
+        let sweep_ns = median_nanos(|| {
             black_box(world.broadphase());
         });
-        let scan_ns = mean_nanos(|| {
+        let scan_ns = median_nanos(|| {
             black_box(scan(&world));
         });
+        let allpairs_ns = median_nanos(|| {
+            black_box(all_pairs(&world));
+        });
 
-        let n = world.bodies.len();
-        let quadratic = n * (n - 1) / 2;
         println!(
-            "{n:6} {:7} {quadratic:9} {sweep_ns:8.0} {scan_ns:7.0} {:10.1}x {:16.0}x",
+            "{n:6} {:7} {:8} {sweep_ns:8.0} {scan_ns:7.0} {allpairs_ns:11.0} \
+             {:9.1}x {:13.1}x {:15.0}x",
             emitted.len(),
+            baseline.len(),
             scan_ns / sweep_ns,
-            quadratic as f64 / emitted.len() as f64,
+            allpairs_ns / sweep_ns,
+            baseline.len() as f64 / emitted.len() as f64,
         );
     }
 }
