@@ -3,8 +3,20 @@
 //! [`RenderDevice::new`] picks a high-performance adapter and an sRGB surface
 //! format when available, optionally allocating a multisampled color
 //! attachment. [`RenderDevice::begin_frame`] returns the per-frame
-//! `(SurfaceTexture, TextureView)`; under MSAA, [`RenderDevice::msaa_view`] is
-//! the render target and the swapchain view is the resolve target.
+//! `(SurfaceTexture, TextureView)`.
+//!
+//! Each color attachment is addressed through two views: the scene pass draws
+//! through the sRGB one ([`RenderDevice::msaa_view`], else the `begin_frame`
+//! view), the UI pass through the non-sRGB reinterpretation
+//! ([`RenderDevice::msaa_ui_view`], [`RenderDevice::create_ui_swap_view`]) so
+//! egui blends in gamma space. Under MSAA the UI pass runs last and so carries
+//! the resolve into the swapchain. Where the adapter forbids the
+//! reinterpretation (see `ui_target_formats`) both views of a pair carry the
+//! target's own format, leaving the topology otherwise unchanged.
+//!
+//! A non-sRGB surface takes the composite path instead: MSAA off, both passes
+//! draw into [`OffscreenTarget`], and [`crate::composite::CompositeNode`]
+//! gamma-encodes that into the swapchain.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -19,8 +31,10 @@ pub struct SurfaceBundle {
     pub size: winit::dpi::PhysicalSize<u32>,
 }
 
-/// Multisampled color attachment, allocated when the sample count is > 1.
-/// [`MsaaTarget::view`] is the render target; the swapchain view resolves it.
+/// Multisampled color attachment, allocated when the sample count is > 1. The
+/// scene pass draws into [`MsaaTarget::view`] and the UI pass into
+/// [`MsaaTarget::ui_view`]; the UI pass, running last, resolves the attachment
+/// into the swapchain.
 pub struct MsaaTarget {
     // Keeps the GPU allocation alive for the lifetime of `view`.
     #[allow(dead_code)]
@@ -250,21 +264,15 @@ impl RenderDevice {
 
         // sRGB swapchains render directly; linear ones (browser-WebGPU) need an
         // offscreen sRGB scene texture plus a gamma-encoding composite pass.
-        // MSAA doesn't compose with the offscreen target yet, so the composite
-        // path forces sample_count = 1.
         let needs_composite = !format.is_srgb();
-        let effective_msaa = if needs_composite {
-            if requested_msaa_samples > 1 {
-                tracing::warn!(
-                    "MSAA={requested_msaa_samples}x ignored: composite pass for sRGB \
-                     gamma encoding (browser-WebGPU linear surface) is incompatible \
-                     with MSAA in v1; falling back to sample_count=1",
-                );
-            }
-            1
-        } else {
-            requested_msaa_samples
-        };
+        let effective_msaa = surface_msaa_request(format, requested_msaa_samples);
+        if effective_msaa < requested_msaa_samples {
+            tracing::warn!(
+                "MSAA={requested_msaa_samples}x ignored: composite pass for sRGB \
+                 gamma encoding (browser-WebGPU linear surface) is incompatible \
+                 with MSAA in v1; falling back to sample_count=1",
+            );
+        }
 
         let sample_count = negotiate_sample_count(&adapter, format, effective_msaa);
         let msaa_target = (sample_count > 1).then(|| {
@@ -351,8 +359,10 @@ impl RenderDevice {
 
     /// Acquire the next swapchain texture and its default view. Returns the
     /// wgpu surface error directly so callers can branch on `Lost` / `Outdated`
-    /// / `Timeout`. Under MSAA the swapchain view is the resolve target, not the
-    /// render target; see [`RenderDevice::msaa_view`].
+    /// / `Timeout`. Only the scene pass renders into this view, and only when
+    /// MSAA and the composite path are both off; the UI pass never does, it
+    /// takes [`RenderDevice::create_ui_swap_view`] or, on the composite path,
+    /// [`RenderDevice::scene_view`].
     pub fn begin_frame(
         &self,
     ) -> std::result::Result<(SurfaceTexture, TextureView), wgpu::SurfaceError> {
@@ -403,15 +413,17 @@ impl RenderDevice {
         Ok(())
     }
 
-    /// View into the multisampled color attachment, or `None` when MSAA is off.
-    /// Use as the color attachment, resolving to the swapchain on the final pass.
+    /// sRGB view of the multisampled color attachment for the scene pass, or
+    /// `None` when MSAA is off. The resolve into the swapchain is attached by
+    /// the frame's last pass, the UI pass; see [`RenderDevice::msaa_ui_view`].
     pub fn msaa_view(&self) -> Option<&TextureView> {
         self.msaa_target.as_ref().map(|t| &t.view)
     }
 
     /// View into the offscreen sRGB scene texture on the composite path, or
-    /// `None` on native. Runner render-target priority: `msaa_view()`, then
-    /// `scene_view()`, then the swapchain view directly.
+    /// `None` on native. Scene-pass target priority: `msaa_view()`, then
+    /// `scene_view()`, then the swapchain view directly. The UI pass paints
+    /// here too on this path, since the composite is what reaches the swapchain.
     pub fn scene_view(&self) -> Option<&TextureView> {
         self.scene_target.as_ref().map(|t| &t.view)
     }
@@ -517,6 +529,18 @@ fn create_scene_target(
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     OffscreenTarget { texture, view }
+}
+
+/// MSAA request the surface's own path can honor, before adapter negotiation
+/// lowers it further. The composite path has no multisampled input, so a
+/// non-sRGB surface renders single-sampled and [`MsaaTarget`] (hence
+/// [`RenderDevice::msaa_ui_view`]) stays `None` there.
+fn surface_msaa_request(surface_format: TextureFormat, requested: u32) -> u32 {
+    if surface_format.is_srgb() {
+        requested
+    } else {
+        1
+    }
 }
 
 /// Highest adapter-supported sample count `<= requested` for `format`, or 1.
@@ -691,6 +715,25 @@ mod tests {
                 } else {
                     // Composite path: the UI writes to the offscreen target.
                     assert_eq!(targets.ui_format, surface.add_srgb_suffix(), "{case}");
+                }
+            }
+        }
+    }
+
+    /// The composite path resolves nothing: its consumers paint into the
+    /// single-sampled offscreen texture and attach no resolve target, which is
+    /// sound only while a non-sRGB surface can never negotiate a multisampled
+    /// attachment, whatever the caller requested.
+    #[test]
+    fn composite_path_never_requests_multisampling() {
+        for surface in SURFACES {
+            for requested in [1u32, 2, 4, 8, 16, u32::MAX] {
+                let effective = surface_msaa_request(surface, requested);
+                let case = format!("{surface:?} {requested}");
+                if surface.is_srgb() {
+                    assert_eq!(effective, requested, "{case}");
+                } else {
+                    assert_eq!(effective, 1, "{case}");
                 }
             }
         }
