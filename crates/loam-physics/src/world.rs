@@ -24,7 +24,7 @@
 //! of independent work and leaves the solve bit-identical; it is what makes an
 //! island the unit a parallel solver can take whole.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use crate::body::{BodyArena, BodyId, RigidBody};
 use crate::collider::Collider;
@@ -59,6 +59,11 @@ fn canonical_pair(a: BodyId, b: BodyId) -> PairKey {
 /// Membership is over dynamic bodies only. A static body absorbs no impulse and
 /// its state is invariant under the solve, so two groups resting on one floor
 /// are two islands rather than one.
+///
+/// Instrumentation, on [`Schedule`]'s terms: the partition is the claim that a
+/// parallel solver can take one island whole, and the three fields below are
+/// the readout that checks it, so both ship in the binary the claim is about
+/// rather than behind `cfg(test)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Island {
     /// Lowest handle among [`Self::bodies`]. A function of the partition alone,
@@ -202,6 +207,19 @@ fn max_norm(norms_squared: impl Iterator<Item = f32>) -> f32 {
     norms_squared.fold(0.0_f32, f32::max).sqrt()
 }
 
+/// One constraint as the solve phases consume it. `island` is the grouping key
+/// and `dense` the storage positions of `key`'s two bodies, both derived once
+/// in [`World::collect_constraints`]: nothing between there and the last PGS
+/// sweep spawns, despawns, inserts a manifold or removes one, so a slot-table
+/// probe per sweep would re-derive a value that cannot have moved.
+#[derive(Clone, Copy)]
+struct ConstraintUnit {
+    island: BodyId,
+    key: PairKey,
+    /// Positions of `key.0` and `key.1`, in the key's order.
+    dense: (usize, usize),
+}
+
 /// What each phase loop actually iterated, pushed from the loop's own control
 /// variable. Reading the retained buffer instead would agree with the schedule
 /// by construction and could not catch a loop head that walks a freshly built
@@ -242,12 +260,14 @@ pub struct World<S: PhysicsSpace> {
     /// what keeps the allocation while the loop holds `&mut self`.
     body_order: Vec<usize>,
     pair_order: Vec<PairKey>,
-    constraint_keys: Vec<PairKey>,
-    /// Broadphase scratch: the sweep's sorted intervals and its active list.
-    /// Retained on the same terms as the work-unit buffers above, so a step
-    /// with a steady body count never reaches the allocator.
+    constraints: Vec<ConstraintUnit>,
+    /// Broadphase and manifold-maintenance scratch: the sweep's sorted
+    /// intervals, its active list, and the ascending keys the narrowphase
+    /// reported a contact for this step. Retained on the same terms as the
+    /// work-unit buffers above.
     broadphase_intervals: Vec<RadialInterval>,
     broadphase_active: Vec<u32>,
+    touched_pairs: Vec<PairKey>,
     /// Island scratch: the union-find forest and the per-body island label,
     /// both indexed by dense position and both retained for the same reason.
     island_parent: Vec<u32>,
@@ -269,9 +289,10 @@ impl<S: PhysicsSpace> World<S> {
             schedule: Schedule::default(),
             body_order: Vec::new(),
             pair_order: Vec::new(),
-            constraint_keys: Vec::new(),
+            constraints: Vec::new(),
             broadphase_intervals: Vec::new(),
             broadphase_active: Vec::new(),
+            touched_pairs: Vec::new(),
             island_parent: Vec::new(),
             island_labels: Vec::new(),
             #[cfg(test)]
@@ -289,6 +310,10 @@ impl<S: PhysicsSpace> World<S> {
     /// for the next step's eviction keeps `manifolds` free of keys that name
     /// no live body, so a caller inspecting it between steps sees the world it
     /// actually has.
+    ///
+    /// API, not instrumentation: it is the inverse of [`Self::push_body`] and
+    /// the only removal that leaves the world's own state consistent, so a
+    /// caller that can spawn has to be able to reach it.
     pub fn despawn_body(&mut self, id: BodyId) -> bool {
         if self.bodies.despawn(id).is_none() {
             return false;
@@ -391,7 +416,8 @@ impl<S: PhysicsSpace> World<S> {
         self.schedule
             .order
             .apply(SchedulePhase::BroadphasePair, &mut pairs);
-        let mut touched: HashSet<PairKey> = HashSet::with_capacity(pairs.len());
+        let mut touched = std::mem::take(&mut self.touched_pairs);
+        touched.clear();
         #[cfg(test)]
         self.visit_log.update_manifolds.clear();
 
@@ -399,11 +425,11 @@ impl<S: PhysicsSpace> World<S> {
             #[cfg(test)]
             self.visit_log.update_manifolds.push(key);
             let (i, j) = self.dense_pair(key);
-            let (a, b) = split_two_mut(&mut self.bodies, i, j);
+            let (a, b) = split_two_mut(self.bodies.dense_mut(), i, j);
             let Some(contact) = self.narrowphase.test(a, b, &self.space) else {
                 continue;
             };
-            touched.insert(key);
+            touched.push(key);
             let restitution = contact.restitution;
             let manifold = self
                 .manifolds
@@ -412,7 +438,13 @@ impl<S: PhysicsSpace> World<S> {
             manifold.add_or_update(contact);
         }
 
-        self.manifolds.retain(|k, _| touched.contains(k));
+        // Sorted rather than hashed so the eviction membership test runs out of
+        // a retained buffer; the schedule may have handed the loop its pairs in
+        // any order, so insertion order is not already ascending.
+        touched.sort_unstable();
+        self.manifolds
+            .retain(|k, _| touched.binary_search(k).is_ok());
+        self.touched_pairs = touched;
         self.pair_order = pairs;
     }
 
@@ -435,16 +467,26 @@ impl<S: PhysicsSpace> World<S> {
             &mut parent,
             &mut labels,
         );
-        self.constraint_keys.clear();
-        self.constraint_keys.extend(self.manifolds.keys().copied());
-        let bodies = &self.bodies;
-        self.constraint_keys
-            .sort_unstable_by_key(|&key| (constraint_island(bodies, &labels, key), key));
+        let mut units = std::mem::take(&mut self.constraints);
+        units.clear();
+        units.extend(self.manifolds.keys().map(|&key| {
+            let dense = self.dense_pair(key);
+            ConstraintUnit {
+                island: constraint_island(&self.bodies, &labels, dense),
+                key,
+                dense,
+            }
+        }));
+        // Sorting records rather than keys keeps the comparator to field reads:
+        // a key-only sort re-derives the island through the slot table once per
+        // comparison.
+        units.sort_unstable_by_key(|unit| (unit.island, unit.key));
         self.island_parent = parent;
         self.island_labels = labels;
         self.schedule
             .order
-            .apply(SchedulePhase::Constraint, &mut self.constraint_keys);
+            .apply(SchedulePhase::Constraint, &mut units);
+        self.constraints = units;
     }
 
     /// Snapshot per-contact `velocity_bias` (restitution + Baumgarte) and reset
@@ -457,13 +499,16 @@ impl<S: PhysicsSpace> World<S> {
     {
         #[cfg(test)]
         self.visit_log.prepare_solve.clear();
-        let keys = std::mem::take(&mut self.constraint_keys);
-        for key in &keys {
+        let units = std::mem::take(&mut self.constraints);
+        for unit in &units {
             #[cfg(test)]
-            self.visit_log.prepare_solve.push(*key);
-            let (i, j) = self.dense_pair(*key);
-            let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
-            let (a, b) = split_two_mut(&mut self.bodies, i, j);
+            self.visit_log.prepare_solve.push(unit.key);
+            let (i, j) = unit.dense;
+            let manifold = self
+                .manifolds
+                .get_mut(&unit.key)
+                .expect(STALE_CONSTRAINT_KEY);
+            let (a, b) = split_two_mut(self.bodies.dense_mut(), i, j);
             for cp in &mut manifold.points {
                 let v_rel = self.space.velocity_at_point(b, cp.world_point)
                     - self.space.velocity_at_point(a, cp.world_point);
@@ -490,7 +535,7 @@ impl<S: PhysicsSpace> World<S> {
                 cp.tangent_dir = VectorOps::zero();
             }
         }
-        self.constraint_keys = keys;
+        self.constraints = units;
     }
 
     /// Re-apply each contact's previous-frame normal impulse. Tangent was reset
@@ -501,13 +546,13 @@ impl<S: PhysicsSpace> World<S> {
     {
         #[cfg(test)]
         self.visit_log.warm_start.clear();
-        let keys = std::mem::take(&mut self.constraint_keys);
-        for key in &keys {
+        let units = std::mem::take(&mut self.constraints);
+        for unit in &units {
             #[cfg(test)]
-            self.visit_log.warm_start.push(*key);
-            let (i, j) = self.dense_pair(*key);
-            let manifold = self.manifolds.get(key).expect(STALE_CONSTRAINT_KEY);
-            let (a, b) = split_two_mut(&mut self.bodies, i, j);
+            self.visit_log.warm_start.push(unit.key);
+            let (i, j) = unit.dense;
+            let manifold = self.manifolds.get(&unit.key).expect(STALE_CONSTRAINT_KEY);
+            let (a, b) = split_two_mut(self.bodies.dense_mut(), i, j);
             for cp in &manifold.points {
                 if cp.normal_impulse > 0.0 {
                     self.space.apply_contact_impulse(
@@ -520,7 +565,7 @@ impl<S: PhysicsSpace> World<S> {
                 }
             }
         }
-        self.constraint_keys = keys;
+        self.constraints = units;
     }
 
     /// PGS solve: `pgs_iters` passes of clamped incremental normal-then-tangent
@@ -532,20 +577,23 @@ impl<S: PhysicsSpace> World<S> {
     {
         #[cfg(test)]
         self.visit_log.solve_sweeps.clear();
-        let keys = std::mem::take(&mut self.constraint_keys);
+        let units = std::mem::take(&mut self.constraints);
         for _ in 0..self.pgs_iters {
-            for key in &keys {
+            for unit in &units {
                 #[cfg(test)]
-                self.visit_log.solve_sweeps.push(*key);
-                let (i, j) = self.dense_pair(*key);
-                let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
-                let (a, b) = split_two_mut(&mut self.bodies, i, j);
+                self.visit_log.solve_sweeps.push(unit.key);
+                let (i, j) = unit.dense;
+                let manifold = self
+                    .manifolds
+                    .get_mut(&unit.key)
+                    .expect(STALE_CONSTRAINT_KEY);
+                let (a, b) = split_two_mut(self.bodies.dense_mut(), i, j);
                 for cp in &mut manifold.points {
                     solve_normal_then_tangent(&self.space, a, b, cp);
                 }
             }
         }
-        self.constraint_keys = keys;
+        self.constraints = units;
     }
 
     /// Candidate pairs for the current body configuration: one canonical
@@ -648,7 +696,13 @@ impl<S: PhysicsSpace> World<S> {
 
     /// The islands of the current manifold set, ascending by island id.
     /// Allocating form, for callers outside the step loop; the step groups its
-    /// constraint buffer through the same partition without allocating.
+    /// constraint buffer through the same partition without allocating. Public
+    /// as the read side of [`Island`]'s instrumentation, not as a step API.
+    ///
+    /// Panics if `manifolds` names a body the arena no longer holds, which is
+    /// reachable only between a bare [`BodyArena::despawn`] and the next
+    /// [`Self::step`]; [`Self::despawn_body`] is the entry point that keeps the
+    /// two consistent.
     pub fn islands(&self) -> Vec<Island> {
         let mut parent = Vec::new();
         let mut labels = Vec::new();
@@ -661,7 +715,7 @@ impl<S: PhysicsSpace> World<S> {
 
         let mut by_id: BTreeMap<BodyId, Island> = BTreeMap::new();
         for &key in self.manifolds.keys() {
-            let id = constraint_island(&self.bodies, &labels, key);
+            let id = constraint_island(&self.bodies, &labels, self.dense_pair(key));
             let island = by_id.entry(id).or_insert_with(|| Island {
                 id,
                 bodies: Vec::new(),
@@ -731,9 +785,17 @@ impl<S: PhysicsSpace> World<S> {
     }
 
     /// Storage positions of a key's two bodies, in the key's own order. Both
-    /// resolve: a manifold outlives neither its bodies (`despawn_body` drops
-    /// it) nor the step that stopped touching it (`update_manifolds` evicts
-    /// it).
+    /// resolve, but as a property of the four callers rather than of the
+    /// manifold map: `update_manifolds` passes keys its own broadphase minted
+    /// from the live arena this step, and the three solve phases pass
+    /// `constraint_keys`, filled after that phase evicted every key it did not
+    /// touch.
+    ///
+    /// The map itself carries no such guarantee. `despawn_body` prunes it, but
+    /// [`BodyArena::despawn`] is reachable on `bodies` directly and does not,
+    /// so between one of those and the next `update_manifolds` the map can name
+    /// a dead body. Nothing in that window reaches here; [`Self::islands`],
+    /// which walks the map, is where it surfaces as a panic.
     fn dense_pair(&self, key: PairKey) -> (usize, usize) {
         (
             self.bodies.dense_index(key.0).expect(STALE_MANIFOLD_BODY),
@@ -758,12 +820,9 @@ fn find_root(parent: &mut [u32], mut dense: usize) -> usize {
 fn constraint_island<S: PhysicsSpace>(
     bodies: &BodyArena<S>,
     labels: &[BodyId],
-    key: PairKey,
+    dense: (usize, usize),
 ) -> BodyId {
-    let (i, j) = (
-        bodies.dense_index(key.0).expect(STALE_MANIFOLD_BODY),
-        bodies.dense_index(key.1).expect(STALE_MANIFOLD_BODY),
-    );
+    let (i, j) = dense;
     debug_assert!(
         bodies[i].inv_mass != 0.0 || bodies[j].inv_mass != 0.0,
         "a contact between two static bodies has no island to solve in",
@@ -876,6 +935,12 @@ mod tests {
 
     /// Arbitrary but fixed, so a failure is reproducible from its message.
     const PERMUTATION_SEEDS: [u64; 4] = [1, 0x9e37_79b9_7f4a_7c15, 0xdead_beef_cafe_f00d, 424_242];
+
+    /// The solve order as keys, which is the form every constraint-order
+    /// assertion below is stated in.
+    fn constraint_order<S: PhysicsSpace>(world: &World<S>) -> Vec<PairKey> {
+        world.constraints.iter().map(|unit| unit.key).collect()
+    }
 
     /// Counts what the thread running a probe asks of the allocator. The test
     /// runner gives each test its own thread, so a probe never sees a
@@ -1146,7 +1211,7 @@ mod tests {
             assert_buffer_matches_policy(
                 order,
                 SchedulePhase::Constraint,
-                &world.constraint_keys,
+                &constraint_order(&world),
                 &canonical_constraints,
             );
         }
@@ -1240,12 +1305,13 @@ mod tests {
 
             // The two single-pass Constraint consumers. Each takes the buffer
             // for its own loop, so either can stop reading it alone.
+            let solve_order = constraint_order(&world);
             for (phase, visited) in [
                 ("prepare_solve", &world.visit_log.prepare_solve),
                 ("warm_start", &world.visit_log.warm_start),
             ] {
                 assert_eq!(
-                    visited, &world.constraint_keys,
+                    visited, &solve_order,
                     "{phase} under {order:?} visited a list other than the \
                      ordered constraint buffer"
                 );
@@ -1257,7 +1323,7 @@ mod tests {
                 );
             }
 
-            let sweep_len = world.constraint_keys.len();
+            let sweep_len = solve_order.len();
             assert_eq!(
                 world.visit_log.solve_sweeps.len(),
                 sweep_len * world.pgs_iters,
@@ -1273,7 +1339,7 @@ mod tests {
             {
                 assert_eq!(
                     visited,
-                    world.constraint_keys.as_slice(),
+                    solve_order.as_slice(),
                     "solve sweep {sweep} under {order:?} visited a list other \
                      than the ordered constraint buffer"
                 );
@@ -1581,6 +1647,59 @@ mod tests {
             .iter()
             .map(|cp| cp.normal_impulse)
             .collect()
+    }
+
+    /// `dense_pair` states its precondition as a property of its callers, not
+    /// of `manifolds`, because [`BodyArena::despawn`] is reachable on `bodies`
+    /// and prunes nothing. This pins the consequence the doc names: the map
+    /// keeps naming the dead body, `islands` panics on it, and the next step's
+    /// eviction is what clears it. `despawn_body` is the control, and the pair
+    /// of them is what would fail if either half of the doc drifted.
+    #[test]
+    fn bare_arena_despawn_strands_a_manifold_key_until_the_next_step() {
+        let dt = 1.0 / 240.0;
+        let settle_steps = 400;
+        let (mut world, floor, spheres) = settled_islands(dt, settle_steps);
+        let doomed = spheres[1];
+        assert!(
+            world.manifolds.contains_key(&(floor, doomed)),
+            "fixture has no manifold on the doomed body, so nothing is stranded"
+        );
+
+        assert!(world.bodies.despawn(doomed).is_some());
+        assert!(
+            world.manifolds.contains_key(&(floor, doomed)),
+            "the arena despawn pruned manifolds, so despawn_body is no longer \
+             the only removal that keeps the world consistent"
+        );
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.islands()));
+        assert!(
+            resolved.is_err(),
+            "islands resolved a key naming a despawned body"
+        );
+
+        world.step(dt);
+        assert!(
+            !world
+                .manifolds
+                .keys()
+                .any(|&(a, b)| a == doomed || b == doomed),
+            "the step did not evict the stranded key"
+        );
+        assert_eq!(
+            world.islands().len(),
+            ISLAND_X.len() - 1,
+            "the eviction did not close the panic window"
+        );
+
+        // The control: the same removal through the world drops the manifold
+        // with the body, so no window exists in the first place.
+        let (mut control, control_floor, control_spheres) = settled_islands(dt, settle_steps);
+        assert!(control.despawn_body(control_spheres[1]));
+        assert!(!control
+            .manifolds
+            .contains_key(&(control_floor, control_spheres[1])));
+        assert_eq!(control.islands().len(), ISLAND_X.len() - 1);
     }
 
     /// The property positional indices cannot have: despawning a body
@@ -2148,6 +2267,62 @@ mod tests {
         );
     }
 
+    /// The cull's boundary, which every seeded fixture above misses: at
+    /// continuous positions exact tangency has measure zero, so `gap <= reach`
+    /// and `gap < reach` agree on all of them. Two unit-diameter spheres one
+    /// unit apart put `gap` and `reach` on the same f32, and the pair is a
+    /// candidate: `d(a, b) ≤ r_a + r_b` is closed, matching the narrowphases,
+    /// which report a contact at zero separation.
+    #[test]
+    fn exactly_tangent_spheres_are_a_candidate_pair() {
+        const RADIUS: f32 = 0.5;
+        let mut world = World::new(EuclideanR3);
+        let anchor = world.push_body(sphere_body_r3(Vec3::ZERO, Vec3::ZERO, RADIUS, 1.0));
+        let tangent = world.push_body(sphere_body_r3(Vec3::X, Vec3::ZERO, RADIUS, 1.0));
+        // One ulp past tangency, so the assertion below pins the closed side of
+        // the boundary rather than a widened one.
+        let separated = world.push_body(sphere_body_r3(
+            Vec3::new(-(1.0 + f32::EPSILON), 0.0, 0.0),
+            Vec3::ZERO,
+            RADIUS,
+            1.0,
+        ));
+
+        let position = |id: BodyId| {
+            let dense = world.bodies.dense_index(id).expect("nothing despawned");
+            world.bodies[dense].position
+        };
+        assert_eq!(
+            world.space.distance(position(anchor), position(tangent)),
+            RADIUS + RADIUS,
+            "the fixture is not exactly tangent, so it cannot state the boundary"
+        );
+        assert!(
+            world.space.distance(position(anchor), position(separated)) > RADIUS + RADIUS,
+            "the separated sphere is not past the boundary"
+        );
+
+        assert_eq!(world.broadphase(), vec![canonical_pair(anchor, tangent)]);
+    }
+
+    /// The only configuration that reaches the active-list cull's `hi >=
+    /// entry.lo` boundary, and therefore the only one that can pin it. For a
+    /// pair of positive-radius bodies `hi_a == entry.lo` expands to
+    /// `d_b − d_a = r_a + r_b + slack_a + slack_b`, so the triangle inequality
+    /// puts `gap` above `reach` by both slack terms and the pair was never a
+    /// candidate to lose; that margin is what
+    /// [`BROADPHASE_TRIANGLE_SLACK`] buys. Both slacks vanish only at the
+    /// anchor itself, which needs two point colliders sharing the anchor's
+    /// position, and there `d(a, b) ≤ r_a + r_b` reads `0 ≤ 0` and the pair is
+    /// a candidate.
+    #[test]
+    fn coincident_point_colliders_are_a_candidate_pair() {
+        let mut world = World::new(EuclideanR3);
+        let a = world.push_body(sphere_body_r3(Vec3::ZERO, Vec3::ZERO, 0.0, 1.0));
+        let b = world.push_body(sphere_body_r3(Vec3::ZERO, Vec3::ZERO, 0.0, 1.0));
+        assert_eq!(world.broadphase(), vec![canonical_pair(a, b)]);
+    }
+
     /// The bound the cull rests on: no posed vertex of a collider can lie
     /// further from the body position than its bounding radius, at any
     /// orientation. A bound that under-reported would cull contacting pairs.
@@ -2569,7 +2744,8 @@ mod tests {
         let ascending: Vec<PairKey> = world.manifolds.keys().copied().collect();
         assert!(ascending.len() > 1, "too few constraints to be ordered");
         assert_eq!(
-            world.constraint_keys, ascending,
+            constraint_order(&world),
+            ascending,
             "grouping moved a constraint in a world with a single island"
         );
         assert_eq!(islands[0].constraints, ascending);
@@ -2604,7 +2780,8 @@ mod tests {
             .flat_map(|island| island.constraints.iter().copied())
             .collect();
         assert_eq!(
-            world.constraint_keys, grouped,
+            constraint_order(&world),
+            grouped,
             "the solved buffer is not the islands in order"
         );
 
@@ -2625,7 +2802,7 @@ mod tests {
         for _ in 0..2 {
             world.collect_constraints();
         }
-        assert!(world.constraint_keys.len() > 1);
+        assert!(world.constraints.len() > 1);
 
         let bytes = alloc_probe::bytes_allocated_by(|| {
             for _ in 0..16 {
@@ -2637,6 +2814,175 @@ mod tests {
             "16 island passes over a steady contact set asked the allocator for \
              {bytes} bytes"
         );
+    }
+
+    /// The manifold pass runs out of retained buffers on the same terms. The
+    /// eviction set was a fresh `HashSet` per step, so a world that had reached
+    /// a steady contact set still paid the allocator once a frame for it.
+    #[test]
+    fn manifold_update_allocates_nothing_after_the_first_pass() {
+        let mut world = settled_columns(PERMUTATION_SEEDS[0]);
+        for _ in 0..2 {
+            world.update_manifolds();
+        }
+        assert!(
+            world.manifolds.len() > 1,
+            "the fixture holds too few contacts to exercise the eviction pass"
+        );
+
+        let bytes = alloc_probe::bytes_allocated_by(|| {
+            for _ in 0..16 {
+                world.update_manifolds();
+            }
+        });
+        assert_eq!(
+            bytes, 0,
+            "16 manifold passes over a steady contact set asked the allocator \
+             for {bytes} bytes"
+        );
+    }
+
+    /// Body counts the measurement harness reports along. Density is held
+    /// constant across them, so the candidate set stays O(n) while the
+    /// quadratic pair count grows as O(n²).
+    const MEASUREMENT_BODY_COUNTS: [usize; 3] = [100, 200, 400];
+    /// Half-width of the spawn box at 100 bodies; scaled as the cube root of
+    /// the count to hold density.
+    const MEASUREMENT_SPREAD: f32 = 6.0;
+    const MEASUREMENT_SETTLE_STEPS: usize = 240;
+    const MEASUREMENT_REPS: u32 = 200;
+
+    fn mean_nanos(mut body: impl FnMut()) -> f64 {
+        let start = std::time::Instant::now();
+        for _ in 0..MEASUREMENT_REPS {
+            body();
+        }
+        start.elapsed().as_nanos() as f64 / f64::from(MEASUREMENT_REPS)
+    }
+
+    /// Seeded spheres over one static floor, settled, with no despawns: the
+    /// measurement wants the steady-state contact set a running scene solves,
+    /// and storage-order adversity is a determinism concern that costs nothing
+    /// to reproduce here. Spheres only, so a polytope narrowphase does not
+    /// dominate the step being timed.
+    fn settled_sphere_scene(seed: u64, count: usize) -> World<EuclideanR3> {
+        let spread = MEASUREMENT_SPREAD * (count as f32 / 100.0).cbrt();
+        let mut rng = Xorshift::new(seed);
+        let mut world = World::new(EuclideanR3);
+        register_default_narrowphase(&mut world.narrowphase);
+        world.push_field(Box::new(Gravity::new(Vec3::new(0.0, GRAVITY_Y, 0.0))));
+        world.push_body(halfspace_body_r3(Vec3::Y, 0.0));
+
+        for _ in 0..count {
+            let position = Vec3::new(
+                rng.range(-spread, spread),
+                rng.range(0.5, spread + 0.5),
+                rng.range(-spread, spread),
+            );
+            let id = world.push_body(sphere_body_r3(
+                position,
+                Vec3::ZERO,
+                rng.range(0.2, 0.8),
+                1.0,
+            ));
+            world.bodies[id].restitution = 0.0;
+        }
+        for _ in 0..MEASUREMENT_SETTLE_STEPS {
+            world.step(1.0 / 240.0);
+        }
+        world
+    }
+
+    /// What the step path pays per phase, on the retained buffers the step
+    /// actually uses rather than the allocating public forms `benches/`
+    /// measures. Reported rather than asserted: a wall-clock threshold would
+    /// pin the machine it was recorded on, and what these owe is a number a
+    /// later change, in particular the parallel solver the island partition
+    /// exists for, can be measured against.
+    ///
+    /// `sweep` against `scan` is the sort-and-sweep's own speedup over a
+    /// brute-force pass of the same candidate predicate, both with their
+    /// buffers already grown. `grouped` against `ungrouped` is what the island
+    /// partition adds to a phase that used to copy the manifold keys and stop:
+    /// two O(n_bodies) union-find passes, a `find_root` walk per body, and a
+    /// sort where `BTreeMap` order was already the answer.
+    #[test]
+    #[ignore = "measurement; run with --release -- --ignored --nocapture"]
+    fn step_phase_cost_measurement() {
+        println!("bodies pairs constraints sweep_ns scan_ns grouped_ns ungrouped_ns");
+        for count in MEASUREMENT_BODY_COUNTS {
+            let mut world = settled_sphere_scene(PERMUTATION_SEEDS[0], count);
+            world.collect_constraints();
+            let bodies = world.bodies.len();
+            let constraints = world.constraints.len();
+
+            let mut intervals = Vec::new();
+            let mut active = Vec::new();
+            let mut pairs = Vec::new();
+            let mut radii = Vec::new();
+            let mut scanned = Vec::new();
+            for _ in 0..2 {
+                World::fill_broadphase(
+                    &world.bodies,
+                    &world.space,
+                    &mut intervals,
+                    &mut active,
+                    &mut pairs,
+                );
+                scan_broadphase(&world, &mut radii, &mut scanned);
+            }
+            assert_eq!(pairs, scanned, "the sweep and the scan disagree");
+
+            let sweep_ns = mean_nanos(|| {
+                World::fill_broadphase(
+                    &world.bodies,
+                    &world.space,
+                    &mut intervals,
+                    &mut active,
+                    &mut pairs,
+                );
+            });
+            let scan_ns = mean_nanos(|| {
+                scan_broadphase(&world, &mut radii, &mut scanned);
+            });
+
+            let grouped_ns = mean_nanos(|| {
+                world.collect_constraints();
+            });
+            // The pre-island collect: `BTreeMap` order is already the ascending
+            // key order the solve ran in, so it copied and stopped.
+            let mut ungrouped: Vec<PairKey> = Vec::with_capacity(constraints);
+            let ungrouped_ns = mean_nanos(|| {
+                ungrouped.clear();
+                ungrouped.extend(world.manifolds.keys().copied());
+            });
+
+            let emitted = pairs.len();
+            print!("{bodies:6} {emitted:5} {constraints:11}");
+            println!(" {sweep_ns:8.0} {scan_ns:7.0} {grouped_ns:10.0} {ungrouped_ns:12.0}");
+        }
+    }
+
+    /// The candidate definition with no acceleration structure and its buffers
+    /// hoisted, so the comparison above is structure against no structure and
+    /// not one loop forgetting to hoist.
+    fn scan_broadphase(world: &World<EuclideanR3>, radii: &mut Vec<f32>, pairs: &mut Vec<PairKey>) {
+        radii.clear();
+        radii.extend(world.bodies.iter().map(|b| bounding_radius(&b.collider)));
+        pairs.clear();
+        let n = world.bodies.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (a, b) = (&world.bodies[i], &world.bodies[j]);
+                if a.inv_mass == 0.0 && b.inv_mass == 0.0 {
+                    continue;
+                }
+                if world.space.distance(a.position, b.position) <= radii[i] + radii[j] {
+                    pairs.push(canonical_pair(world.bodies.id_at(i), world.bodies.id_at(j)));
+                }
+            }
+        }
+        pairs.sort_unstable();
     }
 
     /// Discard the cached normal impulses so the next step solves from zero.

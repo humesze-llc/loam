@@ -1039,7 +1039,7 @@ mod tests {
         ));
         // Zero-mass tesseract is static; we test detection, not solver response.
         let pair_found = {
-            let (a, b) = world.bodies.split_at_mut(1);
+            let (a, b) = world.bodies.dense_mut().split_at_mut(1);
             world.narrowphase.test(&a[0], &b[0], &EuclideanR4).is_some()
         };
         assert!(
@@ -1066,7 +1066,7 @@ mod tests {
             pentatope_vertices(1.0),
             1.0,
         ));
-        let (a, b) = world.bodies.split_at_mut(1);
+        let (a, b) = world.bodies.dense_mut().split_at_mut(1);
         assert!(world.narrowphase.test(&a[0], &b[0], &EuclideanR4).is_none());
     }
 

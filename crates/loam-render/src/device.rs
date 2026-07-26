@@ -18,7 +18,11 @@
 //! A non-sRGB surface takes the composite path instead: MSAA off, one view per
 //! attachment, scene and UI both drawing into [`OffscreenTarget`], and
 //! [`crate::composite::CompositeNode`] gamma-encoding that into the swapchain
-//! view. Nothing is reinterpreted there, so the UI blends in linear space.
+//! view. Nothing is reinterpreted there; the offscreen target takes the
+//! surface format's sRGB sibling, so the UI blends in linear space for every
+//! format that has one. A format with no sibling (`Rgba16Float`) keeps its own
+//! format and so lands egui on the gamma-framebuffer path instead, whose
+//! already-encoded output the composite encodes again.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -47,10 +51,11 @@ pub struct MsaaTarget {
     pub ui_view: TextureView,
 }
 
-/// Offscreen sRGB render target for the non-sRGB-surface (browser-WebGPU) path:
+/// Offscreen render target for the non-sRGB-surface (browser-WebGPU) path:
 /// scene + UI render here, then [`crate::composite::CompositeNode`]
-/// gamma-encodes into the linear swapchain. Separate from [`MsaaTarget`] for
-/// branch readability.
+/// gamma-encodes into the linear swapchain. Carries the surface format's sRGB
+/// sibling, or the surface format itself where it has none. Separate from
+/// [`MsaaTarget`] for branch readability.
 pub struct OffscreenTarget {
     // Keeps the GPU allocation alive for the lifetime of `view`.
     #[allow(dead_code)]
@@ -84,7 +89,7 @@ pub(crate) struct UiTargetFormats {
 /// into the MSAA attachment and resolves into the swapchain, so one pipeline
 /// format has to match both attachments whatever the sample count negotiates to.
 fn ui_target_formats(surface_format: TextureFormat, downlevel: DownlevelFlags) -> UiTargetFormats {
-    // Composite path: the UI paints into the offscreen sRGB scene texture and
+    // Composite path: the UI paints into the offscreen scene texture and
     // `CompositeNode` encodes gamma afterwards, so nothing is reinterpreted.
     // `add_srgb_suffix` is the identity for formats without an sRGB sibling.
     if !surface_format.is_srgb() {
@@ -155,12 +160,13 @@ pub struct RenderDevice {
     /// advertised the timestamp features and we requested them. The runner owns
     /// the per-frame lifecycle; apps can reach in for sub-pass instrumentation.
     pub gpu_timer: Option<crate::gpu_timer::GpuTimer>,
-    /// Offscreen sRGB scene texture + composite, present only on the non-sRGB
+    /// Offscreen scene texture + composite, present only on the non-sRGB
     /// swapchain path. `None` on native (swapchain is sRGB).
     scene_target: Option<OffscreenTarget>,
     composite: Option<crate::composite::CompositeNode>,
-    /// sRGB sibling of the surface format, so resize can recreate the scene
-    /// target. `None` when `scene_target` is `None`.
+    /// Format of the offscreen scene texture, so resize can recreate it: the
+    /// surface format's sRGB sibling where it has one, else the surface format.
+    /// `None` when `scene_target` is `None`.
     scene_format: Option<TextureFormat>,
     /// Advertised present modes, cached so the `vsync` command validates without
     /// re-querying `get_surface_capabilities`. Browsers typically advertise only
@@ -265,7 +271,7 @@ impl RenderDevice {
         surface.configure(&device, &config);
 
         // sRGB swapchains render directly; linear ones (browser-WebGPU) need an
-        // offscreen sRGB scene texture plus a gamma-encoding composite pass.
+        // offscreen scene texture plus a gamma-encoding composite pass.
         let needs_composite = !format.is_srgb();
         let effective_msaa = surface_msaa_request(format, requested_msaa_samples);
         if effective_msaa < requested_msaa_samples {
@@ -424,7 +430,7 @@ impl RenderDevice {
         self.msaa_target.as_ref().map(|t| &t.view)
     }
 
-    /// View into the offscreen sRGB scene texture on the composite path, or
+    /// View into the offscreen scene texture on the composite path, or
     /// `None` on native. Scene-pass target priority: `msaa_view()`, then
     /// `scene_view()`, then the swapchain view directly. The UI pass paints
     /// here too on this path, since the composite is what reaches the swapchain.
@@ -433,9 +439,9 @@ impl RenderDevice {
     }
 
     /// Format scene + UI render pipelines should target. On the composite path
-    /// this is the offscreen sRGB texture's format, not the linear swap format.
-    /// Use this in pipeline constructors instead of reading the surface format
-    /// directly.
+    /// this is the offscreen texture's format: the surface format's sRGB
+    /// sibling where it has one, else the surface format itself. Use this in
+    /// pipeline constructors instead of reading the surface format directly.
     pub fn target_format(&self) -> TextureFormat {
         self.scene_format
             .unwrap_or(self.surface_bundle.config.format)
@@ -511,7 +517,7 @@ impl RenderDevice {
     }
 }
 
-/// Allocate the offscreen scene-target texture for the sRGB composite path.
+/// Allocate the offscreen scene-target texture for the composite path.
 /// `RENDER_ATTACHMENT` to draw into, `TEXTURE_BINDING` for the composite sample.
 fn create_scene_target(
     device: &Device,
@@ -681,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_path_registers_no_view_formats_and_targets_the_srgb_scene_format() {
+    fn composite_path_registers_no_view_formats_and_targets_the_scene_format() {
         let table = [
             (TextureFormat::Bgra8Unorm, TextureFormat::Bgra8UnormSrgb),
             (TextureFormat::Rgba8Unorm, TextureFormat::Rgba8UnormSrgb),

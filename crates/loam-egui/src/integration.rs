@@ -28,10 +28,11 @@ impl UiIntegration {
     ///
     /// An sRGB format selects egui-wgpu's linear-framebuffer fragment entry
     /// point (and its warning), blending the feathered alpha ramp in linear
-    /// space so hairlines read thin. That is the composite path, whose
-    /// offscreen target is sRGB, and the fallback where the adapter cannot
-    /// reinterpret a view; the direct-to-swapchain path passes the non-sRGB
-    /// twin and gets gamma-space blending.
+    /// space so hairlines read thin. That is the fallback where the adapter
+    /// cannot reinterpret a view, and the composite path for every surface
+    /// format whose offscreen target has an sRGB sibling to take; the
+    /// direct-to-swapchain path passes the non-sRGB twin and gets gamma-space
+    /// blending.
     pub fn new(
         device: &wgpu::Device,
         window: &Arc<Window>,

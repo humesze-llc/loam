@@ -16,3 +16,6 @@ bytemuck  = { workspace = true }
 ab_glyph  = "0.2"
 anyhow    = { workspace = true }
 tracing   = { workspace = true }
+
+[dev-dependencies]
+pollster = "0.3"

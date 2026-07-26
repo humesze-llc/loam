@@ -342,13 +342,18 @@ pub(crate) fn sdf_body_uniform(
 // Rendered-row pose seam
 // ---------------------------------------------------------------------------
 
-/// One frame's rendered row as every render path sees it: which shape sits in
-/// which slot, where the bodies actually are, and how 4D maps to R³.
+/// One frame's rendered row (which shape sits in which slot, where the bodies
+/// actually are, how 4D maps to R³) as its readers see it: the three raster
+/// passes (section caps, wireframe overlay, point sprites) and the egui
+/// overlay anchors. The SDF upload is the Shapes-view path that does NOT read
+/// it; [`sdf_body_uniform`] takes the same poses from the same
+/// [`PlaygroundPhysics`] directly. Filmstrip has no body behind it at all (see
+/// [`crate::physics`]).
 ///
-/// A value cannot exist without a [`PlaygroundPhysics`], and each render path
-/// takes ALL of its per-body geometry from one, so no pass can quietly fall
-/// back to the authored spin over the static layout while the others follow
-/// the thrown bodies. [`Demo::row_frame`] is the only production constructor.
+/// A value cannot exist without a [`PlaygroundPhysics`], and each reader takes
+/// ALL of its per-body geometry from one, so no pass can quietly fall back to
+/// the authored spin over the static layout while the others follow the thrown
+/// bodies. [`Demo::row_frame`] is the only production constructor.
 pub(crate) struct RowFrame<'a> {
     pub(crate) physics: &'a PlaygroundPhysics,
     /// The rendered row (see [`render_row_entries`]); its length is the slot
@@ -757,9 +762,12 @@ impl Demo {
         render_row_entries(self.view_mode, &self.row, &self.strip_subject)
     }
 
-    /// This frame's [`RowFrame`]: the one seam a render path reads a body pose
-    /// through. Cheap enough to build per pass (the Schlegel branch of
-    /// [`Self::resolved_wireframe_projection`] is the only arithmetic).
+    /// This frame's [`RowFrame`]: the seam its readers take a body pose
+    /// through. Rebuilt per pass rather than cached; the arithmetic is
+    /// [`Self::effective_body_size`]'s multiply,
+    /// [`Self::camera_distance_to_focus`]'s subtract and square root, and,
+    /// under Schlegel, [`Self::resolved_wireframe_projection`]'s rotated normal
+    /// and basis plus its two body-size scalings.
     pub(crate) fn row_frame(&self) -> RowFrame<'_> {
         RowFrame {
             physics: &self.physics,

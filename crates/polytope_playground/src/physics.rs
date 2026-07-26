@@ -1,7 +1,11 @@
 //! The playground's rigid-body layer: a [`World<EuclideanR4>`] holding one
-//! dynamic body per rendered row slot. Every render path sources its pose
-//! here, so the SDF, the section caps, and the wireframe cannot disagree
-//! about where a body is.
+//! dynamic body per rendered row slot. The four Shapes-view render paths (SDF
+//! upload, section caps, wireframe overlay, point sprites) source their pose
+//! here, so they cannot disagree about where a body is.
+//!
+//! Filmstrip is outside the seam: its cells are a w/t sweep of a single
+//! subject drawn at a fixed centre from the UI spin rotor alone, with no body
+//! behind them.
 //!
 //! The chamber is zero-g and empty of static geometry: no [`ForceField`] is
 //! registered, so a body only moves once something throws it.
@@ -55,6 +59,15 @@ impl BodyPose {
     /// `size`, then offset by the body's `w`. The `w` offset is what keeps the
     /// world `w_slice` cutting the body where physics put it instead of always
     /// through its centre; it is exactly zero for a body on the layout.
+    ///
+    /// Precondition of the wireframe's S³ arc path (`blend > 0` in
+    /// [`crate::wireframe_geom::push_blended_edge`]): `position.w == 0`. That
+    /// path reads each endpoint's `length()` as its circumradius, which holds
+    /// only while the frame is origin-centred; the `w` offset moves the body
+    /// off the origin, so the endpoints stop sharing a radius and the interior
+    /// bows onto a sphere the body is not on. Dormant until something throws a
+    /// body off the slice, and the fix is to arc in the body's own centred
+    /// frame rather than to drop the offset (the section cut needs it).
     pub(crate) fn body_local(&self, canonical: Vec4, size: f32) -> Vec4 {
         size * self.rotor.apply(canonical) + Vec4::W * self.position.w
     }
@@ -110,8 +123,9 @@ impl PlaygroundPhysics {
 
     /// True while no body carries motion. Exact zero rather than a sleep
     /// threshold: with no force field and no damping the resting row is an
-    /// exact fixpoint of the integrator, so this reads as "nothing has been
-    /// thrown yet".
+    /// exact fixpoint of the integrator, so this reads as "nothing is moving
+    /// right now". It is not a record of whether anything was ever thrown; a
+    /// throw the contact solver has fully cancelled reads at rest again.
     pub(crate) fn at_rest(&self) -> bool {
         self.world
             .bodies
