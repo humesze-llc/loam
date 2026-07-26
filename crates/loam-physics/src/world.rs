@@ -114,6 +114,18 @@ fn shuffle<T>(units: &mut [T], seed: u64) {
 
 const STALE_CONSTRAINT_KEY: &str = "constraint buffer outlived its manifold";
 
+/// What each phase loop actually iterated, pushed from the loop's own control
+/// variable. Reading the retained buffer instead would agree with the schedule
+/// by construction and could not catch a loop head that walks a freshly built
+/// list, which is the failure the buffer-level pin cannot see.
+#[cfg(test)]
+#[derive(Default)]
+struct VisitLog {
+    apply_forces: Vec<usize>,
+    integrate: Vec<usize>,
+    update_manifolds: Vec<PairKey>,
+}
+
 pub struct World<S: PhysicsSpace> {
     pub space: S,
     pub bodies: Vec<RigidBody<S>>,
@@ -135,6 +147,8 @@ pub struct World<S: PhysicsSpace> {
     body_order: Vec<usize>,
     pair_order: Vec<PairKey>,
     constraint_keys: Vec<PairKey>,
+    #[cfg(test)]
+    visit_log: VisitLog,
 }
 
 impl<S: PhysicsSpace> World<S> {
@@ -151,6 +165,8 @@ impl<S: PhysicsSpace> World<S> {
             body_order: Vec::new(),
             pair_order: Vec::new(),
             constraint_keys: Vec::new(),
+            #[cfg(test)]
+            visit_log: VisitLog::default(),
         }
     }
 
@@ -199,8 +215,12 @@ impl<S: PhysicsSpace> World<S> {
     where
         S::Vector: VectorOps,
     {
+        #[cfg(test)]
+        self.visit_log.apply_forces.clear();
         let order = std::mem::take(&mut self.body_order);
         for &i in &order {
+            #[cfg(test)]
+            self.visit_log.apply_forces.push(i);
             let body = &mut self.bodies[i];
             if body.inv_mass == 0.0 {
                 continue;
@@ -217,8 +237,12 @@ impl<S: PhysicsSpace> World<S> {
     where
         S::Vector: VectorOps,
     {
+        #[cfg(test)]
+        self.visit_log.integrate.clear();
         let order = std::mem::take(&mut self.body_order);
         for &i in &order {
+            #[cfg(test)]
+            self.visit_log.integrate.push(i);
             integrate_body(&self.space, &mut self.bodies[i], dt);
         }
         self.body_order = order;
@@ -238,8 +262,12 @@ impl<S: PhysicsSpace> World<S> {
             .order
             .apply(SchedulePhase::BroadphasePair, &mut pairs);
         let mut touched: HashSet<PairKey> = HashSet::with_capacity(pairs.len());
+        #[cfg(test)]
+        self.visit_log.update_manifolds.clear();
 
         for &(i, j) in &pairs {
+            #[cfg(test)]
+            self.visit_log.update_manifolds.push((i, j));
             let (a, b) = split_two_mut(&mut self.bodies, i, j);
             let Some(contact) = self.narrowphase.test(a, b, &self.space) else {
                 continue;
@@ -700,6 +728,80 @@ mod tests {
                 SchedulePhase::Constraint,
                 &world.constraint_keys,
                 &canonical_constraints,
+            );
+        }
+    }
+
+    /// [`schedule_reordering_reaches_its_named_phase_buffer_determinism`] shows
+    /// the retained buffer was reordered, not that the phase loop read it. A
+    /// loop head swapped for a freshly built list
+    /// (`let pairs = self.broadphase();` in `update_manifolds`, `0..len` in
+    /// `apply_forces` or `integrate`) leaves that pin and every invariance axis
+    /// green while the ordered buffer goes unread. [`VisitLog`] records each
+    /// loop's own control variable, so the visit order is observed from inside
+    /// the loop and cannot agree with the buffer by construction.
+    ///
+    /// `Reversed` for the same reason as that pin: the expected order is
+    /// computable here without re-implementing `shuffle`.
+    #[test]
+    fn phase_loops_visit_the_buffer_the_schedule_ordered_determinism() {
+        let dt = 1.0 / 240.0;
+        let settle_steps = 200;
+
+        for order in [
+            OrderPolicy::Canonical,
+            OrderPolicy::Reversed {
+                phase: SchedulePhase::Body,
+            },
+            OrderPolicy::Reversed {
+                phase: SchedulePhase::BroadphasePair,
+            },
+        ] {
+            let mut world = settled_sphere_stack(dt, 0);
+            world.schedule = Schedule { threads: 1, order };
+            for _ in 0..settle_steps {
+                world.step(dt);
+            }
+
+            let canonical_bodies: Vec<usize> = (0..world.bodies.len()).collect();
+            let canonical_pairs = world.broadphase();
+            assert!(
+                canonical_bodies.len() >= 2 && canonical_pairs.len() >= 2,
+                "{order:?} left a buffer too short for a reversal to be visible: \
+                 {} bodies, {} pairs",
+                canonical_bodies.len(),
+                canonical_pairs.len()
+            );
+
+            // Both Body-phase consumers, because each holds the buffer through
+            // its own loop and either one can stop reading it alone.
+            for (phase, visited) in [
+                ("apply_forces", &world.visit_log.apply_forces),
+                ("integrate", &world.visit_log.integrate),
+            ] {
+                assert_eq!(
+                    visited, &world.body_order,
+                    "{phase} under {order:?} visited a list other than the \
+                     ordered body buffer"
+                );
+                assert_buffer_matches_policy(
+                    order,
+                    SchedulePhase::Body,
+                    visited,
+                    &canonical_bodies,
+                );
+            }
+
+            assert_eq!(
+                world.visit_log.update_manifolds, world.pair_order,
+                "update_manifolds under {order:?} visited a list other than the \
+                 ordered pair buffer"
+            );
+            assert_buffer_matches_policy(
+                order,
+                SchedulePhase::BroadphasePair,
+                &world.visit_log.update_manifolds,
+                &canonical_pairs,
             );
         }
     }
