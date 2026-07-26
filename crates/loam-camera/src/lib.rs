@@ -50,7 +50,7 @@ pub struct CameraView {
 }
 
 // ---------------------------------------------------------------------------
-// Orbit camera (extracted from examples/fractal/camera.rs)
+// Orbit camera
 // ---------------------------------------------------------------------------
 
 /// Spherical-coordinate orbit camera that circles a target point.

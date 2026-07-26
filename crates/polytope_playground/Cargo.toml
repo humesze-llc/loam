@@ -10,12 +10,9 @@ description = "Polytope Playground: interactive 4D rotation over Polytope4 with 
 keywords = ["4d", "polytope", "rotation", "demo", "wgpu"]
 categories = ["game-development", "graphics", "visualization"]
 
-# Promoted from `examples/polytope_playground/` to a workspace member crate so it can
-# be built as a `[[bin]]` target (a requirement for Trunk's wasm pipeline; Trunk can't
-# target `[[example]]`). The `cargo run --example polytope_playground` workflow is
-# replaced by `cargo run -p polytope_playground` (or just `cargo run --bin
-# polytope_playground` from the workspace root); the index.html lives at
-# `crates/polytope_playground/index.html` and is the Trunk entry point.
+# A workspace member crate rather than a cargo example, because Trunk's wasm
+# pipeline can only target `[[bin]]`. Run with `cargo run -p polytope_playground`;
+# `crates/polytope_playground/index.html` is the Trunk entry point.
 
 [dependencies]
 anyhow.workspace = true

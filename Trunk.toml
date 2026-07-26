@@ -22,13 +22,12 @@
 # dispatch in `crates/loam-app/src/lib.rs` and `crates/loam-app/src/capture_stub.rs`
 # keeps the public API surface identical.
 #
-# We promoted `polytope_playground` from `examples/` to a workspace member crate
-# because Trunk's wasm pipeline can only target `[[bin]]`, not `[[example]]`. Other
-# loam demos that need browser builds will follow the same pattern.
+# Demos are workspace member crates rather than cargo examples because Trunk's wasm
+# pipeline can only target `[[bin]]`, not `[[example]]`.
 
 [build]
-# Per-build output directory. Each example writes its bundle into
-# `dist/<index-html-parent-folder>` so artifacts from different examples don't
+# Per-build output directory. Each demo writes its bundle into
+# `dist/<index-html-parent-folder>` so artifacts from different demos don't
 # clobber each other.
 dist = "dist"
 

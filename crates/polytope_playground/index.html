@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
     <title>Polytope Playground &middot; Loam</title>
 
-    <!-- `polytope_playground` is a workspace member crate (promoted from the
-         `examples/` tree because Trunk's wasm pipeline can only target `[[bin]]`,
-         not `[[example]]`). The local `Cargo.toml` declares an implicit binary
+    <!-- `polytope_playground` is a workspace member crate rather than a cargo
+         example, because Trunk's wasm pipeline can only target `[[bin]]`, not
+         `[[example]]`. The local `Cargo.toml` declares an implicit binary
          from `src/main.rs`; Trunk picks it up automatically. The
          `data-cargo-no-default-features` flag drops the `capture` feature on wasm
          so the native-only encoder crates (image, gif, color_quant, png) stay out
