@@ -77,6 +77,12 @@ trait SpaceFixture {
     /// it.
     const ISOMETRY_GROUP_IS_TRIVIAL: bool = false;
 
+    /// Whether `parallel_transport` follows the geodesic from `a` to `b`.
+    /// `Space` leaves the path implementation-defined, so a fixture whose impl
+    /// walks some other path declares `false` and the geodesic-tangent item
+    /// asserts the exemption is still earned instead of skipping.
+    const TRANSPORT_FOLLOWS_THE_GEODESIC: bool = true;
+
     fn space(&self) -> Self::S;
 
     /// In-domain samples. The fixture owns the count and the seed; the harness
@@ -661,6 +667,44 @@ mod invariants {
         }
     }
 
+    /// `PT(a, b, log(a, b))` is the forward tangent at `b`, which points along
+    /// `-log(b, a)`: a geodesic's own velocity field is parallel along it. This
+    /// is the item that sees the rotation. Norm, linearity and polyline
+    /// consistency are the only other things the suite asks of transport, and
+    /// the identity map satisfies all three wherever the metric agrees at the
+    /// two endpoints, which for the ambient S³ fixture is every pair it
+    /// samples. In a flat chart both sides reduce to the same expression, so
+    /// there the item is a tautology and correctly so: the identity is the
+    /// transport.
+    ///
+    /// Coincident and near-coincident pairs need no guard: both sides vanish
+    /// with the separation, and the budget below is absolute for separations
+    /// under one metric unit. Worst measured residual over the curved fixtures
+    /// is 1.7e-2 of the budget; the identity map lands at 1.8e3 (H³) to 4.9e4
+    /// (ambient S³) and swapping the gyration's operands at 3.1e3, so the item
+    /// separates by five decades rather than by a margin.
+    pub fn parallel_transport_carries_a_geodesic_tangent_along_its_own_geodesic<F: SpaceFixture>(
+        f: &F,
+    ) {
+        let (ratio, a, b) = worst_geodesic_tangent_ratio(f);
+        if !F::TRANSPORT_FOLLOWS_THE_GEODESIC {
+            assert!(
+                ratio > 1.0,
+                "the fixture declares a non-geodesic transport path but the \
+                 worst sampled pair misses the geodesic tangent by only \
+                 {ratio} of the vector budget: the exemption is stale",
+            );
+            return;
+        }
+        assert!(
+            ratio <= 1.0,
+            "transport of log(a, b) misses the forward tangent at b by \
+             {ratio} of the vector budget at {:?} {:?}",
+            f.point_components(a),
+            f.point_components(b)
+        );
+    }
+
     /// Gauss-Bonnet on a small geodesic triangle: the angle excess is
     /// `K * area` (do Carmo, *Differential Geometry of Curves and Surfaces*,
     /// 1976, §4.5). This is what independently cross-checks a fixture's
@@ -843,6 +887,35 @@ mod invariants {
         true
     }
 
+    /// Worst `|PT(a, b, log(a, b)) - (-log(b, a))|_b` over the sampled pairs,
+    /// as a multiple of the fixture's vector budget, with the pair that
+    /// attained it. Shared so the geodesic-tangent item and its staleness check
+    /// measure the same quantity.
+    ///
+    /// The residual carries the magnitudes rather than comparing unit
+    /// directions: `|log|` is pinned against `distance` by its own item, and
+    /// normalizing here would divide the transport's error by a separation
+    /// that goes to zero on the diagonal.
+    fn worst_geodesic_tangent_ratio<F: SpaceFixture>(f: &F) -> (f32, F::Point, F::Point) {
+        let s = f.space();
+        let tol = f.tol();
+        let points = f.points();
+        let mut worst = (0.0, points[0], points[0]);
+        for &a in &points {
+            for &b in &points {
+                let reverse = s.log(b, a);
+                let forward = f.combine(reverse, -1.0, reverse, 0.0);
+                let transported = s.parallel_transport(a, b, s.log(a, b));
+                let residual = metric_residual(f, b, transported, forward);
+                let ratio = residual / (tol.vector * metric_norm(f, b, forward).max(1.0));
+                if ratio > worst.0 {
+                    worst = (ratio, a, b);
+                }
+            }
+        }
+        worst
+    }
+
     /// Two metric-orthonormal tangents at `at`, Gram-Schmidt over the fixture's
     /// `inner` (do Carmo, *Differential Geometry of Curves and Surfaces*, 1976,
     /// §1.4). The harness can build them generically only because it has the
@@ -953,6 +1026,7 @@ macro_rules! conformance_suite {
                 parallel_transport_preserves_the_metric_norm,
                 parallel_transport_is_linear_in_the_transported_vector,
                 parallel_transport_along_one_segment_matches_parallel_transport,
+                parallel_transport_carries_a_geodesic_tangent_along_its_own_geodesic,
                 geodesic_triangle_angle_excess_matches_gauss_bonnet,
                 degenerate_inputs_stay_finite,
                 sampled_calls_are_bit_reproducible,
@@ -1550,6 +1624,16 @@ impl SpaceFixture for BlendedSpaceFixture {
     /// this suite exists to close, and this one blocks face-pairing
     /// identifications on composed spaces.
     const ISOMETRY_GROUP_IS_TRIVIAL: bool = true;
+
+    /// `parallel_transport` integrates the transport ODE along the
+    /// chart-coordinate straight line, which is not this Space's geodesic; the
+    /// impl names the geodesic path's cost (~7x) at that callsite. So
+    /// `PT(a, b, log(a, b))` is not the forward tangent at `b` here, and the
+    /// item that pins that everywhere else would be pinning the wrong map.
+    /// Declared rather than omitted: the exemption is one fixture's and not the
+    /// suite's, and its own item asserts the miss is real, 4.9 budgets at the
+    /// worst sampled pair.
+    const TRANSPORT_FOLLOWS_THE_GEODESIC: bool = false;
 
     fn space(&self) -> Self::S {
         BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-0.15, 0.15))
