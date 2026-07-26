@@ -124,6 +124,14 @@ struct VisitLog {
     apply_forces: Vec<usize>,
     integrate: Vec<usize>,
     update_manifolds: Vec<PairKey>,
+    prepare_solve: Vec<PairKey>,
+    warm_start: Vec<PairKey>,
+    /// Every PGS sweep, concatenated, rather than one sampled sweep: a loop
+    /// head that reads the ordered buffer on the first pass and a rebuilt list
+    /// afterwards is a live failure mode that a first-only or last-only log
+    /// cannot see. Sweep boundaries are recoverable from the key count, so a
+    /// flat buffer avoids a per-sweep allocation.
+    solve_sweeps: Vec<PairKey>,
 }
 
 pub struct World<S: PhysicsSpace> {
@@ -307,8 +315,12 @@ impl<S: PhysicsSpace> World<S> {
     where
         S::Vector: VectorOps,
     {
+        #[cfg(test)]
+        self.visit_log.prepare_solve.clear();
         let keys = std::mem::take(&mut self.constraint_keys);
         for key in &keys {
+            #[cfg(test)]
+            self.visit_log.prepare_solve.push(*key);
             let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
             let (a, b) = split_two_mut(&mut self.bodies, manifold.body_a, manifold.body_b);
             for cp in &mut manifold.points {
@@ -346,8 +358,12 @@ impl<S: PhysicsSpace> World<S> {
     where
         S::Vector: VectorOps,
     {
+        #[cfg(test)]
+        self.visit_log.warm_start.clear();
         let keys = std::mem::take(&mut self.constraint_keys);
         for key in &keys {
+            #[cfg(test)]
+            self.visit_log.warm_start.push(*key);
             let manifold = self.manifolds.get(key).expect(STALE_CONSTRAINT_KEY);
             let (a, b) = split_two_mut(&mut self.bodies, manifold.body_a, manifold.body_b);
             for cp in &manifold.points {
@@ -372,9 +388,13 @@ impl<S: PhysicsSpace> World<S> {
     where
         S::Vector: VectorOps,
     {
+        #[cfg(test)]
+        self.visit_log.solve_sweeps.clear();
         let keys = std::mem::take(&mut self.constraint_keys);
         for _ in 0..self.pgs_iters {
             for key in &keys {
+                #[cfg(test)]
+                self.visit_log.solve_sweeps.push(*key);
                 let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
                 let (a, b) = split_two_mut(&mut self.bodies, manifold.body_a, manifold.body_b);
                 for cp in &mut manifold.points {
@@ -743,6 +763,13 @@ mod tests {
     ///
     /// `Reversed` for the same reason as that pin: the expected order is
     /// computable here without re-implementing `shuffle`.
+    ///
+    /// The Constraint consumers are where the hole actually costs something:
+    /// PGS is Gauss-Seidel, so a rebuilt key list there silently restores
+    /// `BTreeMap` order and changes the converged answer. `solve` is checked on
+    /// every sweep, not the first or the last, because a head that reads the
+    /// ordered buffer once and rebuilds on later passes is exactly the
+    /// half-broken case a sampled sweep would clear.
     #[test]
     fn phase_loops_visit_the_buffer_the_schedule_ordered_determinism() {
         let dt = 1.0 / 240.0;
@@ -756,6 +783,9 @@ mod tests {
             OrderPolicy::Reversed {
                 phase: SchedulePhase::BroadphasePair,
             },
+            OrderPolicy::Reversed {
+                phase: SchedulePhase::Constraint,
+            },
         ] {
             let mut world = settled_sphere_stack(dt, 0);
             world.schedule = Schedule { threads: 1, order };
@@ -765,12 +795,16 @@ mod tests {
 
             let canonical_bodies: Vec<usize> = (0..world.bodies.len()).collect();
             let canonical_pairs = world.broadphase();
+            let canonical_constraints: Vec<PairKey> = world.manifolds.keys().copied().collect();
             assert!(
-                canonical_bodies.len() >= 2 && canonical_pairs.len() >= 2,
+                canonical_bodies.len() >= 2
+                    && canonical_pairs.len() >= 2
+                    && canonical_constraints.len() >= 2,
                 "{order:?} left a buffer too short for a reversal to be visible: \
-                 {} bodies, {} pairs",
+                 {} bodies, {} pairs, {} constraints",
                 canonical_bodies.len(),
-                canonical_pairs.len()
+                canonical_pairs.len(),
+                canonical_constraints.len()
             );
 
             // Both Body-phase consumers, because each holds the buffer through
@@ -803,6 +837,53 @@ mod tests {
                 &world.visit_log.update_manifolds,
                 &canonical_pairs,
             );
+
+            // The two single-pass Constraint consumers. Each takes the buffer
+            // for its own loop, so either can stop reading it alone.
+            for (phase, visited) in [
+                ("prepare_solve", &world.visit_log.prepare_solve),
+                ("warm_start", &world.visit_log.warm_start),
+            ] {
+                assert_eq!(
+                    visited, &world.constraint_keys,
+                    "{phase} under {order:?} visited a list other than the \
+                     ordered constraint buffer"
+                );
+                assert_buffer_matches_policy(
+                    order,
+                    SchedulePhase::Constraint,
+                    visited,
+                    &canonical_constraints,
+                );
+            }
+
+            let sweep_len = world.constraint_keys.len();
+            assert_eq!(
+                world.visit_log.solve_sweeps.len(),
+                sweep_len * world.pgs_iters,
+                "solve under {order:?} logged {} visits, not {} sweeps of {sweep_len}",
+                world.visit_log.solve_sweeps.len(),
+                world.pgs_iters
+            );
+            for (sweep, visited) in world
+                .visit_log
+                .solve_sweeps
+                .chunks_exact(sweep_len)
+                .enumerate()
+            {
+                assert_eq!(
+                    visited,
+                    world.constraint_keys.as_slice(),
+                    "solve sweep {sweep} under {order:?} visited a list other \
+                     than the ordered constraint buffer"
+                );
+                assert_buffer_matches_policy(
+                    order,
+                    SchedulePhase::Constraint,
+                    visited,
+                    &canonical_constraints,
+                );
+            }
         }
     }
 
