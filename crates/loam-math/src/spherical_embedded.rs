@@ -88,8 +88,7 @@ impl Space for SphericalS3Embedded {
         // `⟨from, to⟩ -> −1`; computed from the same `from + to` the numerator
         // needs, the transported norm holds to f32 epsilon up to the floor (the
         // `2·cos²(θ/2)` half-angle identity, same principle as the chord-form
-        // distance). Deliberate divergence from the sibling
-        // `SphericalS3::parallel_transport`; fold back when that is hardened.
+        // distance).
         let sum = from + to;
         let denom = (sum.length_squared() * 0.5).max(GEODESIC_EPSILON);
         v - (v.dot(to) / denom) * sum

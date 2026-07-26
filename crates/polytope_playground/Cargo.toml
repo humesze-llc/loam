@@ -2,10 +2,13 @@
 name = "polytope_playground"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Polytope Playground: interactive 4D rotation over Polytope4 with active-set and composer rotor UIs. Native + wasm32."
+keywords = ["4d", "polytope", "rotation", "demo", "wgpu"]
+categories = ["game-development", "graphics", "visualization"]
 
 # Promoted from `examples/polytope_playground/` to a workspace member crate so it can
 # be built as a `[[bin]]` target (a requirement for Trunk's wasm pipeline; Trunk can't

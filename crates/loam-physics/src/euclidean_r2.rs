@@ -48,6 +48,10 @@ impl PhysicsSpace for EuclideanR2 {
         }
     }
 
+    fn wedge(&self, a: Vec2, b: Vec2) -> Bivector2 {
+        Bivector2(cross2d(a, b))
+    }
+
     fn velocity_at_point(&self, body: &RigidBody<EuclideanR2>, p: Vec2) -> Vec2 {
         // v(r) = v_lin + ω × r; in 2D ω is scalar and ω × r = (-ω·r.y, ω·r.x).
         let r = p - body.position;

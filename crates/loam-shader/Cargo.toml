@@ -2,10 +2,13 @@
 name = "loam-shader"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam shader system: WGSL loading, Space intrinsic injection, hot reload."
+keywords = ["wgsl", "shader", "wgpu", "hot-reload", "graphics"]
+categories = ["graphics", "rendering", "game-development"]
 
 [dependencies]
 loam-math  = { path = "../loam-math" }
@@ -18,6 +21,10 @@ tracing.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+# Tier 3 depending on tier 2 for tests only: the scene/GPU parity probe needs a
+# real `Scene` emit, and the inverse (wgpu in loam-scene) is the wrong direction.
+loam-scene = { path = "../loam-scene" }
+
 bytemuck.workspace = true
 glam.workspace = true
 pollster = "0.3"

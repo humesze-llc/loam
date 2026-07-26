@@ -113,6 +113,12 @@ impl Space for EuclideanR2 {
         // Translation drops out for tangent vectors; rotation acts.
         iso.rotation.apply(v)
     }
+
+    /// ℝ² is globally flat: chart-coord SDFs (half-planes, axis-aligned boxes) are
+    /// mathematically correct.
+    fn is_chart_flat(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

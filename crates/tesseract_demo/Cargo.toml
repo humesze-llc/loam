@@ -2,10 +2,13 @@
 name = "tesseract_demo"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Tesseract w-depth projection + free-roam camera: focused single-pipeline demo. Validates the small-demo perf hypothesis for blog embeds (vs the kitchen-sink polytope_playground)."
+description = "Tesseract w-depth projection + free-roam camera: focused single-pipeline 4D demo."
+keywords = ["4d", "tesseract", "demo", "wgpu", "graphics"]
+categories = ["game-development", "graphics", "visualization"]
 
 # Deliberately minimal dep set:
 # - No `loam-render` raymarch types: rasterized wireframe only via LineRasterNode.

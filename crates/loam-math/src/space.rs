@@ -84,6 +84,20 @@ pub trait Space {
     /// Apply an isometry's differential to a tangent vector at `at`. The result is a tangent
     /// vector at `iso_apply(iso, at)`.
     fn iso_transport(&self, iso: Self::Iso, at: Self::Point, v: Self::Vector) -> Self::Vector;
+
+    // ---- Chart properties ---------------------------------------------
+
+    /// Whether the chart is globally flat: chart-coord arithmetic computes the
+    /// correct geometry without the Riemannian machinery. False for curved
+    /// Spaces (Poincaré ball H³, stereographic S³, `BlendedSpace`).
+    ///
+    /// A statement about the geometry, not about any rendering backend, so it
+    /// lives here rather than on [`WgslSpace`]: the SDF emitter and the CPU SDF
+    /// evaluator both gate chart-coord fast paths on it, and only the former
+    /// speaks WGSL. Defaults to `false` so a new Space must opt in.
+    fn is_chart_flat(&self) -> bool {
+        false
+    }
 }
 
 /// A [`Space`] that additionally exposes its primitives as WGSL for inlining
@@ -106,13 +120,33 @@ pub trait WgslSpace: Space {
     /// Stateless geometries return `Cow::Borrowed`; parametric ones `format!`
     /// constants in and return `Cow::Owned`.
     fn wgsl_impl(&self) -> Cow<'static, str>;
+}
 
-    /// Whether the chart is globally flat: chart-coord arithmetic computes the
-    /// correct geometry without the Riemannian `loam_*` machinery. False for
-    /// curved Spaces (Poincaré ball H³, stereographic S³, `BlendedSpace`).
-    /// Defaults to `false` so a new Space must opt in to chart-coord SDF fast
-    /// paths.
-    fn is_chart_flat(&self) -> bool {
-        false
+#[cfg(test)]
+mod tests {
+    use super::Space;
+    use crate::{
+        BlendedSpace, EuclideanR2, EuclideanR3, EuclideanR4, HyperbolicH3, LinearBlendX,
+        SphericalS3, SphericalS3Embedded,
+    };
+
+    /// `is_chart_flat` reports the geometry, and the default `false` is a trap
+    /// for a flat Space that forgets to override it: pin every impl in the
+    /// crate, flat and curved alike.
+    #[test]
+    fn is_chart_flat_holds_exactly_for_the_flat_geometries() {
+        assert!(EuclideanR2.is_chart_flat());
+        assert!(EuclideanR3.is_chart_flat());
+        assert!(EuclideanR4.is_chart_flat());
+
+        assert!(!HyperbolicH3.is_chart_flat());
+        assert!(!SphericalS3.is_chart_flat());
+        assert!(!SphericalS3Embedded.is_chart_flat());
+        // Blending a flat source with a curved one yields a variable metric,
+        // flat nowhere but the pure-A tail.
+        assert!(
+            !BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-1.0, 1.0))
+                .is_chart_flat()
+        );
     }
 }

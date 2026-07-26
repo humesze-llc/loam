@@ -401,6 +401,25 @@ fn main() {
         validate_wgsl(&src).expect("SphericalS3 + geodesic kernel should validate");
     }
 
+    /// The boundary escape splits its numbers across two crates: `LOAM_MAX_ARC`
+    /// and `LOAM_S3_R2_MAX` are loam-math prelude data, `0.92` is kernel policy
+    /// buffering the S3 chart's saturating `loam_origin_distance`. The escape
+    /// can only fire if their product stays under the largest arc that chart
+    /// reports, `asin(√LOAM_S3_R2_MAX)`; above it a ray leaves the domain and
+    /// only the arc budget terminates the march. Every literal below is read
+    /// back out of one of the three pinned strings, so neither crate can move
+    /// its number without failing here.
+    #[test]
+    fn spherical_boundary_escape_fires_below_the_saturated_chart_radius() {
+        let prelude = SphericalS3.wgsl_impl();
+        assert!(prelude.contains("const LOAM_MAX_ARC: f32 = 1.5;"));
+        assert!(prelude.contains("const LOAM_S3_R2_MAX: f32 = 0.999999;"));
+        assert!(
+            crate::GEODESIC_MARCH_KERNEL.contains("loam_origin_distance(p) > LOAM_MAX_ARC * 0.92")
+        );
+        assert!(0.92_f32 * 1.5 < 0.999999_f32.sqrt().asin());
+    }
+
     #[test]
     fn blended_e3_h3_prelude_validates_against_abi_probe() {
         let bs = BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-2.0, 2.0));
@@ -416,13 +435,55 @@ fn main() {
             .expect("BlendedSpace<E3,H3,LinearBlendX> + geodesic kernel should validate");
     }
 
+    // `loam_origin_distance` as the Space preludes ship it, verbatim. The S3
+    // saturation constant is pinned next to the body because the body only names
+    // it: the two live on different lines of the prelude and could otherwise
+    // drift apart at the shell without either pin noticing.
+    const R3_ORIGIN_DISTANCE_FN: &str =
+        "fn loam_origin_distance(p: vec3<f32>) -> f32 { return length(p); }";
+    const S3_R2_MAX_DECL: &str = "const LOAM_S3_R2_MAX: f32 = 0.999999;";
+    const S3_ORIGIN_DISTANCE_BODY: &str =
+        "    let r2 = min(dot(p, p), LOAM_S3_R2_MAX);\n    return asin(sqrt(r2));\n}";
+    const S3_R2_MAX: f32 = 0.999999;
+
+    /// CPU port of `EuclideanR3`'s shipped `loam_origin_distance`.
+    ///
+    /// The text pin lives in the constructor rather than in a standalone test so
+    /// that a prelude which moves out from under the port fails the `cpu_march_*`
+    /// tests themselves; a port that can silently stop mirroring the shader is
+    /// the defect this indirection exists to prevent.
+    fn euclidean_origin_distance_mirror() -> impl Fn(Vec3) -> f32 {
+        assert!(
+            EuclideanR3.wgsl_impl().contains(R3_ORIGIN_DISTANCE_FN),
+            "EuclideanR3 loam_origin_distance drifted from its CPU port",
+        );
+        |p: Vec3| p.length()
+    }
+
+    /// CPU port of `SphericalS3`'s shipped `loam_origin_distance`, expression for
+    /// expression. See [`euclidean_origin_distance_mirror`] for why the pin runs
+    /// here.
+    fn spherical_origin_distance_mirror() -> impl Fn(Vec3) -> f32 {
+        let prelude = SphericalS3.wgsl_impl();
+        assert!(
+            prelude.contains(S3_R2_MAX_DECL) && prelude.contains(S3_ORIGIN_DISTANCE_BODY),
+            "SphericalS3 loam_origin_distance drifted from its CPU port",
+        );
+        |p: Vec3| {
+            let r2 = p.length_squared().min(S3_R2_MAX);
+            r2.sqrt().asin()
+        }
+    }
+
     // CPU port of `kernel.wgsl::loam_march_geodesic`, mirrored line-for-line, so
     // the `cpu_march_*` tests can check hit points against a known SDF without a
-    // GPU adapter. `loam_max_arc` is a parameter here (the kernel reads it as a
-    // prelude constant) so each test pins the value it exercises.
+    // GPU adapter. `loam_origin_distance` and `loam_max_arc` are parameters here
+    // (the kernel reads both from the Space prelude) so each test supplies the
+    // pinned mirror of the one and the value it exercises for the other.
     fn march_geodesic_cpu<S: Space<Point = Vec3, Vector = Vec3>>(
         space: &S,
         sdf: impl Fn(Vec3) -> f32,
+        origin_distance: impl Fn(Vec3) -> f32,
         ro: Vec3,
         rd: Vec3,
         ball_scale: f32,
@@ -443,9 +504,7 @@ fn main() {
         let min_step = 0.0001 * scale;
 
         for _ in 0..256 {
-            // `loam_origin_distance(p)` in the kernel; Riemannian distance from
-            // origin to p for every Space shipped today.
-            if space.distance(Vec3::ZERO, p) > loam_max_arc * 0.92 {
+            if origin_distance(p) > loam_max_arc * 0.92 {
                 return None;
             }
             let d = sdf(p);
@@ -478,8 +537,16 @@ fn main() {
         let sdf = |p: Vec3| p.length() - sphere_radius;
         let ro = Vec3::new(0.0, 0.0, 2.0);
         let rd = Vec3::new(0.0, 0.0, -1.0);
-        let (hit, t) = march_geodesic_cpu(&space, sdf, ro, rd, 1.0, 1.0e9)
-            .expect("ray should hit centered sphere");
+        let (hit, t) = march_geodesic_cpu(
+            &space,
+            sdf,
+            euclidean_origin_distance_mirror(),
+            ro,
+            rd,
+            1.0,
+            1.0e9,
+        )
+        .expect("ray should hit centered sphere");
 
         // Front of the sphere along -Z: (0, 0, 0.5).
         let expected = Vec3::new(0.0, 0.0, sphere_radius);
@@ -506,10 +573,62 @@ fn main() {
         let sdf = |p: Vec3| p.length() - 0.5;
         let ro = Vec3::new(0.0, 0.0, 2.0);
         let rd = Vec3::new(0.0, 0.0, 1.0); // away from sphere
-        let result = march_geodesic_cpu(&space, sdf, ro, rd, 1.0, 1.0e9);
+        let result = march_geodesic_cpu(
+            &space,
+            sdf,
+            euclidean_origin_distance_mirror(),
+            ro,
+            rd,
+            1.0,
+            1.0e9,
+        );
         assert!(
             result.is_none(),
             "ray pointing away from sphere should miss; got {result:?}",
+        );
+    }
+
+    /// The kernel tests the boundary escape before it samples the scene, so
+    /// against an everywhere-solid SDF the arc budget alone decides hit vs miss
+    /// and the march reports exactly what `loam_origin_distance` told it.
+    ///
+    /// |p| = 1e-4 sits below the ≈1.73e-4 radius where `acos(√(1−|p|²))`
+    /// collapses to exactly 0 in f32, so the escape is pinned in the regime
+    /// where an ill-conditioned origin distance reads as "at the origin" and the
+    /// boundary silently never fires.
+    #[test]
+    fn cpu_march_arc_escape_tracks_origin_distance_near_the_s3_origin() {
+        let solid = |_: Vec3| -1.0_f32;
+        let ro = Vec3::new(0.0, 0.0, 1e-4);
+        let rd = Vec3::new(0.0, 0.0, -1.0);
+
+        let escaped = march_geodesic_cpu(
+            &SphericalS3,
+            solid,
+            spherical_origin_distance_mirror(),
+            ro,
+            rd,
+            1.0,
+            1e-4,
+        );
+        assert!(
+            escaped.is_none(),
+            "|p| = 1e-4 is past a 1e-4 arc budget (0.92 buffer); \
+             the march must escape before sampling, got {escaped:?}",
+        );
+
+        let inside = march_geodesic_cpu(
+            &SphericalS3,
+            solid,
+            spherical_origin_distance_mirror(),
+            ro,
+            rd,
+            1.0,
+            1.0,
+        );
+        assert!(
+            inside.is_some(),
+            "|p| = 1e-4 is well inside a 1.0 arc budget; the march must sample the scene",
         );
     }
 
@@ -634,6 +753,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         space: &S,
         cases: &[GpuCase],
     ) -> Result<Vec<GpuOut>, String> {
+        run_compute_probe(
+            &assemble_source(&space.wgsl_impl(), GPU_PROBE),
+            "loam-space-gpu-probe",
+            cases,
+        )
+        .await
+    }
+
+    /// Dispatch one workgroup per element of `inputs` against a two-binding
+    /// compute shader (`read` at 0, `read_write` at 1) and read the output back.
+    /// Shared by the Space-ABI probe and the scene-SDF probe.
+    async fn run_compute_probe<In: Pod, Out: Pod>(
+        source: &str,
+        label: &str,
+        inputs: &[In],
+    ) -> Result<Vec<Out>, String> {
         let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -646,7 +781,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("loam-space-gpu-probe"),
+                label: Some(label),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::default(),
@@ -656,18 +791,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .await
             .map_err(|e| format!("request_device failed: {e}"))?;
 
-        let source = assemble_source(&space.wgsl_impl(), GPU_PROBE);
-        validate_wgsl(&source).map_err(|e| e.to_string())?;
+        validate_wgsl(source).map_err(|e| e.to_string())?;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("loam-space-gpu-probe"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(source.to_owned().into()),
         });
 
-        let input_size = std::mem::size_of_val(cases) as u64;
-        let output_size = (cases.len() * std::mem::size_of::<GpuOut>()) as u64;
+        let input_size = std::mem::size_of_val(inputs) as u64;
+        let output_size = (inputs.len() * std::mem::size_of::<Out>()) as u64;
 
         let input = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("loam-space-gpu-probe-input"),
+            label: Some(&format!("{label}-input")),
             size: input_size,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: true,
@@ -675,24 +809,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         input
             .slice(..)
             .get_mapped_range_mut()
-            .copy_from_slice(bytemuck::cast_slice(cases));
+            .copy_from_slice(bytemuck::cast_slice(inputs));
         input.unmap();
 
         let output = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("loam-space-gpu-probe-output"),
+            label: Some(&format!("{label}-output")),
             size: output_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("loam-space-gpu-probe-staging"),
+            label: Some(&format!("{label}-staging")),
             size: output_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("loam-space-gpu-probe-bgl"),
+            label: Some(&format!("{label}-bgl")),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -717,7 +851,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("loam-space-gpu-probe-bg"),
+            label: Some(&format!("{label}-bg")),
             layout: &bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -731,12 +865,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("loam-space-gpu-probe-layout"),
+            label: Some(&format!("{label}-layout")),
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("loam-space-gpu-probe-pipeline"),
+            label: Some(&format!("{label}-pipeline")),
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("main"),
@@ -745,16 +879,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         });
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("loam-space-gpu-probe-encoder"),
+            label: Some(&format!("{label}-encoder")),
         });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("loam-space-gpu-probe-pass"),
+                label: Some(&format!("{label}-pass")),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(cases.len() as u32, 1, 1);
+            pass.dispatch_workgroups(inputs.len() as u32, 1, 1);
         }
         encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, output_size);
         queue.submit(Some(encoder.finish()));
@@ -777,7 +911,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .map_err(|e| e.to_string())?;
 
         let data = slice.get_mapped_range();
-        let rows = bytemuck::cast_slice::<u8, GpuOut>(&data).to_vec();
+        let rows = bytemuck::cast_slice::<u8, Out>(&data).to_vec();
         drop(data);
         staging.unmap();
         Ok(rows)
@@ -894,6 +1028,247 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 "BlendedSpace transport parity failed at a={a:?} b={b:?} v={v:?}: cpu={cpu:?} gpu={gpu:?} diff={diff}",
             );
         }
+    }
+
+    // ---- Scene SDF: CPU evaluator vs emitted shader -----------------------
+
+    /// Writes `loam_scene_sdf(p.xyz)` per sample point. Assembled as
+    /// prelude + `Scene::to_wgsl` + this.
+    const SCENE_SDF_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> points: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    out[i] = vec4<f32>(loam_scene_sdf(points[i].xyz), 0.0, 0.0, 0.0);
+}
+"#;
+
+    /// 4D counterpart: writes both fields of `loam_scene_at`, so the probe
+    /// covers `Scene4::eval_at`'s kind tracking and not only its distance.
+    const SCENE4_HIT_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> points: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let hit = loam_scene_at(points[i].xyz);
+    out[i] = vec4<f32>(hit.dist, f32(hit.kind), 0.0, 0.0);
+}
+"#;
+
+    // Geometry shared by the probe scenes and the explicit boundary sample
+    // points, so "on the surface" and "in the blend band" stay true when a
+    // constant is retuned.
+    const PROBE_BALL_A: (Vec3, f32) = (Vec3::new(0.10, 0.00, 0.05), 0.22);
+    const PROBE_BALL_B: (Vec3, f32) = (Vec3::new(-0.15, 0.08, 0.00), 0.18);
+    const PROBE_BOX_HALF_EXTENTS: Vec3 = Vec3::new(0.20, 0.15, 0.25);
+    const PROBE_PLANE_OFFSET: f32 = -0.30;
+    /// The two smooth-union blend radii, an order of magnitude apart, so the
+    /// probe sees both a wide active band and a nearly hard `min`.
+    const PROBE_SMOOTH_K: [f32; 2] = [0.12, 0.012];
+
+    /// One scene per emit feature so a parity failure localises to a single
+    /// combinator or leaf rather than to "the tree walk".
+    fn probe_scenes() -> Vec<(&'static str, loam_scene::Scene)> {
+        use loam_scene::{Scene, SceneNode};
+        let ball_a = || SceneNode::sphere(PROBE_BALL_A.0, PROBE_BALL_A.1);
+        let ball_b = || SceneNode::sphere(PROBE_BALL_B.0, PROBE_BALL_B.1);
+        let box3 = || SceneNode::box_(PROBE_BOX_HALF_EXTENTS);
+        let plane = || SceneNode::plane(Vec3::Y, PROBE_PLANE_OFFSET);
+        vec![
+            ("sphere", Scene::new(ball_a())),
+            ("sphere union plane", Scene::new(ball_a().union(plane()))),
+            (
+                "sphere intersect box",
+                Scene::new(ball_a().intersect(box3())),
+            ),
+            (
+                "sphere minus sphere",
+                Scene::new(ball_a().subtract(ball_b())),
+            ),
+            (
+                "smooth union k=0.12",
+                Scene::new(ball_a().smooth_union(ball_b(), PROBE_SMOOTH_K[0])),
+            ),
+            (
+                "smooth union k=0.012",
+                Scene::new(ball_a().smooth_union(ball_b(), PROBE_SMOOTH_K[1])),
+            ),
+            (
+                "three-deep nested tree",
+                Scene::new(
+                    ball_a()
+                        .smooth_union(box3(), PROBE_SMOOTH_K[0])
+                        .union(ball_b().subtract(plane()))
+                        .intersect(SceneNode::cube(0.6)),
+                ),
+            ),
+        ]
+    }
+
+    /// Seeded lattice plus the analytically interesting points: leaf centres
+    /// (where a sphere reads `-r`), leaf surfaces, the `Difference` seam, the
+    /// midpoint of the two balls (inside every blend band), and the box corner.
+    /// `extent` shrinks the random cloud for charts with a boundary shell.
+    fn scene_probe_points(extent: f32) -> Vec<[f32; 4]> {
+        let mut points: Vec<Vec3> = vec![
+            Vec3::ZERO,
+            PROBE_BALL_A.0,
+            PROBE_BALL_B.0,
+            PROBE_BALL_A.0 + Vec3::X * PROBE_BALL_A.1,
+            PROBE_BALL_A.0 - Vec3::Y * PROBE_BALL_A.1,
+            PROBE_BALL_B.0 + Vec3::Z * PROBE_BALL_B.1,
+            (PROBE_BALL_A.0 + PROBE_BALL_B.0) * 0.5,
+            PROBE_BOX_HALF_EXTENTS,
+            PROBE_BOX_HALF_EXTENTS * Vec3::new(1.0, -1.0, 1.0),
+            Vec3::new(0.0, PROBE_PLANE_OFFSET, 0.0),
+        ];
+        let mut state: u32 = 0x517E_5DF0;
+        let mut next_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for _ in 0..118 {
+            points.push(Vec3::new(
+                next_f32() * extent,
+                next_f32() * extent,
+                next_f32() * extent,
+            ));
+        }
+        points
+            .into_iter()
+            .map(|p| p.extend(0.0).to_array())
+            .collect()
+    }
+
+    /// Run every probe scene through the GPU and against `Scene::eval`,
+    /// returning the largest absolute residual seen. Fails on the first sample
+    /// exceeding `tolerance`.
+    fn assert_scene_parity<S>(space: &S, label: &str, extent: f32, tolerance: f32) -> f32
+    where
+        S: WgslSpace + Space<Point = Vec3, Vector = Vec3>,
+    {
+        let points = scene_probe_points(extent);
+        let mut worst = 0.0_f32;
+        for (name, scene) in probe_scenes() {
+            let source = assemble_source_with_scene(
+                &space.wgsl_impl(),
+                Some(&scene.to_wgsl(space)),
+                SCENE_SDF_PROBE,
+            );
+            let rows: Vec<[f32; 4]> =
+                pollster::block_on(run_compute_probe(&source, "loam-scene-gpu-probe", &points))
+                    .expect("scene GPU probe");
+            for (point, row) in points.iter().zip(&rows) {
+                let p = Vec3::new(point[0], point[1], point[2]);
+                let cpu = scene.eval(space, p);
+                let residual = (cpu - row[0]).abs();
+                worst = worst.max(residual);
+                assert!(
+                    residual <= tolerance,
+                    "{label}/{name}: CPU {cpu} vs GPU {} at {p:?} differ by {residual} \
+                     (tolerance {tolerance})",
+                    row[0],
+                );
+            }
+        }
+        worst
+    }
+
+    /// Flat chart, so the only structural gap is the emitter's `{:.6}` constant
+    /// rounding (bounded near 5e-7) plus GPU rounding. Tolerance matches the
+    /// Space-ABI probe's `EuclideanR3` figure.
+    #[test]
+    #[ignore = "requires a working wgpu adapter; run manually when changing scene emit or eval"]
+    fn scene_sdf_gpu_probe_matches_cpu_in_euclidean_r3() {
+        let worst = assert_scene_parity(&EuclideanR3, "EuclideanR3", 0.9, 1e-5);
+        println!("EuclideanR3 scene parity: worst residual {worst}");
+    }
+
+    /// Curved chart: `Sphere` routes through `loam_distance` on the GPU and
+    /// `Space::distance` on the CPU, which agree by construction for H³, so the
+    /// residual is the artanh/Möbius rounding difference between the two
+    /// implementations. Tolerance matches the Space-ABI probe's H³ figure.
+    #[test]
+    #[ignore = "requires a working wgpu adapter; run manually when changing scene emit or eval"]
+    fn scene_sdf_gpu_probe_matches_cpu_in_hyperbolic_h3() {
+        let worst = assert_scene_parity(&HyperbolicH3, "HyperbolicH3", 0.30, 2e-4);
+        println!("HyperbolicH3 scene parity: worst residual {worst}");
+    }
+
+    #[test]
+    #[ignore = "requires a working wgpu adapter; run manually when changing scene emit or eval"]
+    fn scene_sdf_gpu_probe_matches_cpu_in_spherical_s3() {
+        let worst = assert_scene_parity(&SphericalS3, "SphericalS3", 0.30, 2e-4);
+        println!("SphericalS3 scene parity: worst residual {worst}");
+    }
+
+    /// `BlendedSpace` is the one Space whose Rust `distance` (Gauss-Newton
+    /// shooting `log` plus conformal rescale) and WGSL `loam_distance` (midpoint
+    /// chord metric, first-order accurate for nearby points) are deliberately
+    /// different functions. The CPU evaluator is built on the Rust side because
+    /// that is the validated reference; the consequence is that the CPU and GPU
+    /// scene SDFs are different scalar fields here. This test therefore records
+    /// a bound rather than gating on agreement: the number it prints is the
+    /// input to "can a baked collider serve this Space".
+    #[test]
+    #[ignore = "requires a working wgpu adapter; records the BlendedSpace CPU/GPU divergence"]
+    fn scene_sdf_gpu_probe_records_blended_space_divergence() {
+        let space = BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-0.5, 0.5));
+        let worst = assert_scene_parity(&space, "BlendedSpace<E3,H3>", 0.30, 5e-2);
+        println!("BlendedSpace<E3,H3> scene parity: worst residual {worst}");
+    }
+
+    /// The hyperslice path, asserting both fields of `LoamSceneHit`. `w_slice`
+    /// is baked as a literal so the probe needs no uniform buffer. The Space
+    /// prelude is unused by a `Scene4` module but `assemble_source_with_scene`
+    /// wants one.
+    #[test]
+    #[ignore = "requires a working wgpu adapter; run manually when changing scene4 emit or eval"]
+    fn scene4_hyperslice_gpu_probe_matches_cpu() {
+        use glam::Vec4;
+        use loam_scene::{Scene4, SceneNode4};
+
+        const W_SLICE: f32 = 0.25;
+        let scene = Scene4::new(
+            SceneNode4::hypersphere(Vec4::new(0.1, 0.0, -0.05, 0.0), 0.5)
+                .union(SceneNode4::halfspace(Vec4::Y, -0.4))
+                .subtract(SceneNode4::hypersphere(Vec4::new(0.3, 0.1, 0.0, 0.1), 0.2))
+                .intersect(SceneNode4::hypersphere(Vec4::ZERO, 1.2)),
+        );
+        let source = assemble_source_with_scene(
+            &EuclideanR3.wgsl_impl(),
+            Some(&scene.to_hyperslice_wgsl(&format!("{W_SLICE}"))),
+            SCENE4_HIT_PROBE,
+        );
+        let points = scene_probe_points(0.9);
+        let rows: Vec<[f32; 4]> =
+            pollster::block_on(run_compute_probe(&source, "loam-scene4-gpu-probe", &points))
+                .expect("scene4 GPU probe");
+
+        let mut worst = 0.0_f32;
+        for (point, row) in points.iter().zip(&rows) {
+            let p = Vec3::new(point[0], point[1], point[2]);
+            let (cpu_dist, cpu_kind) = scene.eval_at(p, W_SLICE, true);
+            let residual = (cpu_dist - row[0]).abs();
+            worst = worst.max(residual);
+            assert!(
+                residual <= 1e-5,
+                "scene4: CPU {cpu_dist} vs GPU {} at {p:?} differ by {residual}",
+                row[0],
+            );
+            assert_eq!(
+                cpu_kind, row[1] as u32,
+                "scene4: kind mismatch at {p:?} (CPU {cpu_kind}, GPU {})",
+                row[1],
+            );
+        }
+        println!("Scene4 hyperslice parity: worst residual {worst}");
     }
 
     fn assert_vec3_near(actual: [f32; 4], expected: Vec3, eps: f32) {

@@ -1,11 +1,14 @@
-//! Console command registration (the `wireframe`, `pole`, `section`,
-//! `surface`, `camera`, `floor` commands).
+//! Console command registration (the `scene`, `wireframe`, `pole`,
+//! `section`, `surface`, `camera`, `floor` commands).
 
 use crate::*;
 
 impl RotateScene {
     pub(crate) fn build_console() -> Console<Demo> {
         let mut c = Console::<Demo>::new();
+        // Shell-provided scene switcher. The only in-app switcher under
+        // `--embed=1` / `?embed=1`, where the menu bar is hidden.
+        shell::register_scene_command(&mut c);
         c.register(loam_egui::cmd(
             "reset",
             "full reset (R)",
@@ -679,5 +682,18 @@ impl RotateScene {
         );
 
         c
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under `--embed=1` the menu bar is hidden, so the console is the only
+    /// way to reach another scene: losing this registration strands an embed
+    /// on its boot scene.
+    #[test]
+    fn console_exposes_the_scene_switcher() {
+        assert!(RotateScene::build_console().has_command("scene"));
     }
 }

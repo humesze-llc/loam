@@ -17,7 +17,9 @@ use egui::{
     TextEdit, TextWrapMode,
 };
 
-use super::{Console, HistoryLine, LineKind, PANEL_HEIGHT_FRACTION};
+use loam_console::{Console, HistoryLine, LineKind};
+
+use super::PANEL_HEIGHT_FRACTION;
 use crate::media::dock_chevrons;
 
 const COLOR_BG: Color32 = Color32::from_rgba_premultiplied(12, 12, 16, 230);
@@ -45,7 +47,7 @@ pub(super) fn draw<Ctx: 'static>(
     app_ctx: &mut Ctx,
     progress: f32,
 ) {
-    if console.detached {
+    if console.is_detached() {
         draw_detached(console, ctx, app_ctx);
     } else {
         draw_docked(console, ctx, app_ctx, progress);
@@ -73,7 +75,7 @@ fn draw_docked<Ctx: 'static>(
     let pointer_pressed = ctx.input(|i| i.pointer.any_pressed());
     if pointer_pressed {
         if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-            console.user_defocused = !panel_rect.contains(pos);
+            console.set_user_defocused(!panel_rect.contains(pos));
         }
     }
 
@@ -153,7 +155,7 @@ fn draw_content<Ctx: 'static>(
     draw_input_row(ui, console, app_ctx, width);
 }
 
-fn draw_title_row<Ctx>(ui: &mut egui::Ui, console: &mut Console<Ctx>, width: f32) {
+fn draw_title_row<Ctx: 'static>(ui: &mut egui::Ui, console: &mut Console<Ctx>, width: f32) {
     ui.allocate_ui_with_layout(
         egui::vec2(width, ROW_TITLE_HEIGHT),
         Layout::left_to_right(egui::Align::Center),
@@ -167,18 +169,23 @@ fn draw_title_row<Ctx>(ui: &mut egui::Ui, console: &mut Console<Ctx>, width: f32
             );
             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
-                let tip = if console.detached {
+                let detached = console.is_detached();
+                let tip = if detached {
                     "Re-attach as the half-screen drop-down"
                 } else {
                     "Detach as a draggable window"
                 };
-                if dock_chevrons(ui, egui::vec2(12.0, 16.0), console.detached, tip).clicked() {
-                    console.detached = !console.detached;
+                if dock_chevrons(ui, egui::vec2(12.0, 16.0), detached, tip).clicked() {
+                    if detached {
+                        console.dock();
+                    } else {
+                        console.detach();
+                    }
                 }
                 ui.add_space(8.0);
-                if !console.status.is_empty() {
+                if !console.status().is_empty() {
                     ui.label(
-                        RichText::new(&console.status)
+                        RichText::new(console.status())
                             .color(COLOR_TITLE)
                             .font(FontId::monospace(FONT_SIZE)),
                     );
@@ -197,7 +204,12 @@ fn draw_separator(ui: &mut egui::Ui, width: f32) {
     );
 }
 
-fn draw_scrollback<Ctx>(ui: &mut egui::Ui, console: &Console<Ctx>, height: f32, width: f32) {
+fn draw_scrollback<Ctx: 'static>(
+    ui: &mut egui::Ui,
+    console: &Console<Ctx>,
+    height: f32,
+    width: f32,
+) {
     // Word-wrap relies on the label inheriting the vertical ScrollArea's content
     // width (no `ui.horizontal()`, which leaves the area unbounded and defeats the
     // wrap heuristic) plus an explicit `TextWrapMode::Wrap` (default elides). Side
@@ -226,7 +238,7 @@ fn draw_scrollback<Ctx>(ui: &mut egui::Ui, console: &Console<Ctx>, height: f32, 
                             // real text. Per-line Labels broke browser copy (selection
                             // highlighted rasterized pixels with no text behind them).
                             ui.add(
-                                Label::new(scrollback_layout_job(&console.history))
+                                Label::new(scrollback_layout_job(console.history()))
                                     .wrap_mode(TextWrapMode::Wrap)
                                     .selectable(true),
                             );
@@ -293,12 +305,12 @@ fn draw_input_row<Ctx: 'static>(
             let enter_pressed =
                 ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
 
-            let prev_input = console.input.clone();
+            let prev_input = console.input().to_string();
             let ghost = console.tab_preview();
             // `TextEdit::show` returns the real galley origin so the ghost lands
             // exactly where input ends; a separate layout mis-measured the TextEdit's
             // internal padding by a few pixels.
-            let output = TextEdit::singleline(&mut console.input)
+            let output = TextEdit::singleline(console.input_mut())
                 .font(FontId::monospace(FONT_SIZE))
                 .frame(false)
                 .desired_width(width - 32.0)
@@ -319,35 +331,31 @@ fn draw_input_row<Ctx: 'static>(
 
             // After tab-complete / history nav replaces the buffer, snap the cursor
             // to the end; otherwise it stays at byte 0.
-            if console.pending_cursor_to_end {
+            if console.take_pending_cursor_to_end() {
                 let mut state = output.state;
-                let end = egui::text::CCursor::new(console.input.chars().count());
+                let end = egui::text::CCursor::new(console.input().chars().count());
                 state
                     .cursor
                     .set_char_range(Some(egui::text::CCursorRange::one(end)));
                 state.store(ui.ctx(), response.id);
-                console.pending_cursor_to_end = false;
             }
 
             // Any input change outside tab-cycling invalidates tab-completion state.
-            if console.input != prev_input {
-                console.tab = None;
+            if console.input() != prev_input {
+                console.cancel_tab_cycle();
             }
 
-            // Focus: `pending_focus` is a one-shot request on open (both modes).
-            // Docked re-requests every frame to stay modal, unless `user_defocused`
-            // (clicked out to the app). Detached leaves focus alone after the initial
-            // request so the user can click out.
-            if console.pending_focus {
-                response.request_focus();
-                console.pending_focus = false;
-            } else if !console.detached && !console.user_defocused && !response.has_focus() {
+            // Focus: the open request is one-shot in both modes, so take it before
+            // the persistent arm can short-circuit past it. Docked re-requests every
+            // frame to stay modal, unless the user clicked out to the app; detached
+            // leaves focus alone after the initial request so the user can click out.
+            let opened_this_frame = console.take_pending_focus();
+            if opened_this_frame || (console.wants_persistent_focus() && !response.has_focus()) {
                 response.request_focus();
             }
 
             if enter_pressed {
-                let line = std::mem::take(&mut console.input);
-                console.execute(&line, app_ctx);
+                console.submit(app_ctx);
                 response.request_focus();
             }
         },

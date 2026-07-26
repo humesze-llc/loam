@@ -2,10 +2,13 @@
 name = "loam-egui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam + egui integration: ApplicationHandler glue, wgpu paint pass, world-anchored label helper. Wraps egui rather than abstracting over UI frameworks; the name reflects that."
+keywords = ["egui", "gui", "wgpu", "winit", "gamedev"]
+categories = ["game-development", "gui"]
 
 [dependencies]
 anyhow.workspace = true
@@ -18,8 +21,9 @@ winit.workspace = true
 egui = "0.33"
 egui-wgpu = { version = "0.33", default-features = false, features = ["winit"] }
 
-loam-camera = { path = "../loam-camera" }
-loam-math   = { path = "../loam-math" }
+loam-camera  = { path = "../loam-camera" }
+loam-console = { path = "../loam-console" }
+loam-math    = { path = "../loam-math" }
 
 # `clipboard` pulls in `arboard`, which doesn't build on wasm32 (no native clipboard
 # crate compiles for the browser); the browser exposes its own clipboard API through
@@ -31,12 +35,6 @@ egui-winit = { version = "0.33", default-features = false, features = ["clipboar
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 egui-winit = { version = "0.33", default-features = false, features = ["links"] }
-# `web-sys` (with the `console` feature) is used by the Console's optional
-# scrollback echo path (`log echo on`): `web_sys::console::log_1` lets the
-# in-canvas console mirror its lines to the browser's DevTools console
-# without routing through `tracing` (which would create a feedback loop with
-# `loam_app::log`'s tracing -> scrollback mirror).
-web-sys = { version = "0.3", features = ["console"] }
 
 [dev-dependencies]
 glam = { workspace = true }

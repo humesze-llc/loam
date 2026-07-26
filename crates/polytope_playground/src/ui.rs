@@ -1,8 +1,8 @@
-//! Cross-cutting overlay UI: top menu bar, help window, the
-//! `BottomOverlay` (rotation tabs, mode-specific body dispatcher,
-//! always-visible w/t sliders, rate row), and the deferred-mutation
-//! drain that fires after the overlay's two-pass measure-then-render
-//! finishes.
+//! Cross-cutting overlay UI: this scene's Edit / View contributions to the
+//! shell-owned menu bar, the help window, the `BottomOverlay` (rotation
+//! tabs, mode-specific body dispatcher, always-visible w/t sliders, rate
+//! row), and the deferred-mutation drain that fires after the overlay's
+//! two-pass measure-then-render finishes.
 //!
 //! The mode-specific bodies (active / composer / filmstrip / shapes)
 //! and the formula popup live in their own modules; this file owns the

@@ -3,8 +3,7 @@
 //!
 //! - [`BlendingField`] trait + [`LinearBlendX`] (axis-aligned smooth-step
 //!   zone).
-//! - [`ConformallyFlat`] trait + impls for `EuclideanR3`, `HyperbolicH3`,
-//!   `SphericalS3`.
+//! - [`ConformallyFlat`] trait + impls for `EuclideanR3`, `HyperbolicH3`.
 //! - [`BlendedSpace<A, B, F>`] implementing `Space` via RK4 geodesic
 //!   integration, Gauss-Newton `log` shooting, and RK4 parallel transport for
 //!   the conformally-flat fast path.
@@ -27,7 +26,11 @@ use crate::space::{Space, WgslSpace};
 ///
 /// - [`crate::EuclideanR3`]: f ≡ 1.
 /// - [`crate::HyperbolicH3`] (Poincaré ball): f(p) = 4/(1-|p|²)², for |p| < 1.
-/// - [`crate::SphericalS3`] (stereographic): f(p) = 4/(1+|p|²)².
+///
+/// The claim is about the chart a `Space` ships, not about its manifold: every
+/// constant-curvature 3-manifold is conformally flat in *some* chart, but the
+/// integrator works in the coordinates `Space::Point` actually carries, so only
+/// that chart's metric counts.
 ///
 /// Separate trait, not a `Space` method: not every Space is conformally flat
 /// (Sol³, Nil³ have anisotropic metrics). When both sources are conformally
@@ -133,27 +136,6 @@ impl ConformallyFlat for crate::HyperbolicH3 {
     fn scalar_curvature(&self, _p: Vec3) -> f32 {
         // Constant K = -1 in 3D: R = n(n−1)K = −6.
         -6.0
-    }
-}
-
-// SphericalS3 (stereographic from north pole): f(p) = 4/(1+|p|²)².
-impl ConformallyFlat for crate::SphericalS3 {
-    fn conformal_factor(&self, p: Vec3) -> f32 {
-        let r2 = p.length_squared();
-        4.0 / (1.0 + r2).powi(2)
-    }
-    fn conformal_log_half(&self, p: Vec3) -> f32 {
-        // ln 2 − ln(1 + |p|²).
-        std::f32::consts::LN_2 - (1.0 + p.length_squared()).ln()
-    }
-    fn conformal_log_half_gradient(&self, p: Vec3) -> Vec3 {
-        // ∇φ = -2p / (1 + |p|²).
-        let r2 = p.length_squared();
-        p * (-2.0 / (1.0 + r2))
-    }
-    fn scalar_curvature(&self, _p: Vec3) -> f32 {
-        // Constant K = +1 in 3D: R = n(n−1)K = +6.
-        6.0
     }
 }
 
@@ -277,8 +259,9 @@ where
 pub const GEODESIC_DEFAULT_STEPS: u32 = 32;
 
 /// Single RK4 step on the geodesic ODE for a conformally flat metric, state
-/// `(p, v)`: ṗ = v, v̇ = |v|²·∇φ(p) - 2·(∇φ·v)·v. Steps by `h` in parameter
-/// time.
+/// `(p, v)`: ṗ = v, v̇ = |v|²·∇φ(p) - 2·(∇φ·v)·v, i.e. -Γ^k_ij·v^i·v^j for the
+/// Christoffel symbols of g = e^(2φ)·δ (Wald, *General Relativity*, 1984,
+/// App. D). Steps by `h` in parameter time.
 fn rk4_geodesic_step<S: ConformallyFlat>(space: &S, p: Vec3, v: Vec3, h: f32) -> (Vec3, Vec3) {
     let rhs = |p: Vec3, v: Vec3| -> (Vec3, Vec3) {
         let grad_phi = space.conformal_log_half_gradient(p);
@@ -336,7 +319,9 @@ pub const PARALLEL_TRANSPORT_DEFAULT_STEPS: u32 = 8;
 
 /// Parallel-transport `v` along the segment `p_from` -> `p_to`, parameterised
 /// linearly over t ∈ [0, 1]. For a conformally flat metric g = e^(2φ)·δ the ODE
-/// is V̇ = -[(∇φ·γ̇)·V + (∇φ·V)·γ̇ - (γ̇·V)·∇φ] with γ̇ = p_to − p_from.
+/// is V̇ = -Γ^k_ij·γ̇^i·V^j
+///        = -[(∇φ·γ̇)·V + (∇φ·V)·γ̇ - (γ̇·V)·∇φ] with
+/// γ̇ = p_to − p_from (Wald, *General Relativity*, 1984, App. D).
 pub fn parallel_transport_segment_rk4<S: ConformallyFlat>(
     space: &S,
     p_from: Vec3,
@@ -401,7 +386,10 @@ const LOG_JACOBIAN_EPS: f32 = 1.0e-3;
 
 /// Find the tangent `v` at `from` with `exp_from(v) ≈ to`, by Gauss-Newton
 /// shooting: forward-evaluate `exp`, take the residual, estimate the Jacobian
-/// `∂exp/∂v` by central differences, solve for the Newton update.
+/// `∂exp/∂v` by central differences, solve for the Newton update. Shooting for
+/// the two-point BVP is Press et al., *Numerical Recipes*, 3rd ed., 2007,
+/// §18.1; Gauss-Newton is Nocedal & Wright, *Numerical Optimization*, 2nd ed.,
+/// 2006, ch. 10.
 ///
 /// Returns the best `v` within `max_iters`. A singular Jacobian (e.g. `to` in
 /// the cut locus of `from`) returns the current guess with a `tracing::warn`.
@@ -961,16 +949,88 @@ mod tests {
         }
     }
 
-    /// SphericalS3 conformal factor 4/(1+|p|²)² at origin and a generic point.
+    /// Step for the forward difference against `Space::distance`. Small enough
+    /// that the O(ε) truncation below stays ~10⁻³ relative, large enough that
+    /// forming `p + ε·u` in f32 costs only ~|p|/ε ≈ 10³ ulps.
+    const METRIC_PROBE_EPS: f32 = 1.0e-3;
+
+    /// Relative slack on the metric probe: the O(ε²) remainder of the length
+    /// functional plus the ~10³ ulps lost forming `p + ε·u`.
+    const METRIC_PROBE_SLACK: f32 = 1.0e-3;
+
+    /// Euclidean-unit probe directions at `p`: radial, two tangential, one
+    /// oblique. At the origin the radial split degenerates, so anchor on X.
+    fn metric_probe_directions(p: Vec3) -> [Vec3; 4] {
+        let radial = if p.length_squared() > 0.0 {
+            p.normalize()
+        } else {
+            Vec3::X
+        };
+        let tangential_a = radial.any_orthonormal_vector();
+        let tangential_b = radial.cross(tangential_a).normalize();
+        let oblique = (radial + tangential_a + tangential_b).normalize();
+        [radial, tangential_a, tangential_b, oblique]
+    }
+
+    /// The trait contract, checked against the implementing Space's own metric:
+    /// g = f·δ means `d(p, p+ε·u) = √f(p)·ε + O(ε²)` for *every* Euclidean-unit
+    /// `u`. Isotropy is the load-bearing half; an anisotropic chart fails it no
+    /// matter which scalar is offered.
+    fn assert_conformal_factor_matches_metric<S>(space: &S, samples: &[Vec3])
+    where
+        S: ConformallyFlat<Point = Vec3, Vector = Vec3>,
+    {
+        for &p in samples {
+            let root_f = space.conformal_factor(p).sqrt();
+            // d(p, p+εu) = √f(p)·ε·[1 + ½(∇φ(p)·u)·ε + O(ε²)], so the leading
+            // gap scales with the sample's own √f and |∇φ| rather than with a
+            // global constant.
+            let truncation = 0.5 * space.conformal_log_half_gradient(p).length() * METRIC_PROBE_EPS;
+            let tol = root_f * (truncation + METRIC_PROBE_SLACK);
+            for u in metric_probe_directions(p) {
+                let measured = space.distance(p, p + u * METRIC_PROBE_EPS) / METRIC_PROBE_EPS;
+                assert!(
+                    (measured - root_f).abs() <= tol,
+                    "conformal factor disagrees with the metric at p = {p:?} along \
+                     u = {u:?}: measured {measured}, √f = {root_f} (tol {tol})"
+                );
+            }
+        }
+    }
+
     #[test]
-    fn spherical_s3_conformal_factor_pin_values() {
-        use crate::SphericalS3;
-        let s = SphericalS3;
-        close(s.conformal_factor(Vec3::ZERO), 4.0, 1e-6);
-        // |p|² = 1: f = 1.
-        close(s.conformal_factor(Vec3::new(1.0, 0.0, 0.0)), 1.0, 1e-6);
-        // |p|² = 3: f = 0.25.
-        close(s.conformal_factor(Vec3::new(1.0, 1.0, 1.0)), 0.25, 1e-6);
+    fn conformal_factor_reproduces_the_space_metric_in_every_direction() {
+        use crate::{EuclideanR3, HyperbolicH3};
+
+        assert_conformal_factor_matches_metric(
+            &EuclideanR3,
+            &[
+                Vec3::ZERO,
+                Vec3::new(0.25, -0.4, 0.1),
+                Vec3::new(1.0, 0.5, -0.75),
+            ],
+        );
+
+        // Kept off the ideal boundary: the forward difference's O(ε) truncation
+        // grows as 2|p|/(1−|p|²)² and swamps the assertion near |p| = 1.
+        assert_conformal_factor_matches_metric(
+            &HyperbolicH3,
+            &[
+                Vec3::ZERO,
+                Vec3::new(0.2, 0.0, 0.0),
+                Vec3::new(0.3, -0.2, 0.1),
+                Vec3::new(0.4, 0.3, -0.2),
+            ],
+        );
+
+        // Zone extremes only. Inside the zone `BlendedSpace::distance` is itself
+        // defined as √f·|log|, so the probe would restate its own input; at the
+        // extremes `distance` delegates to the source Space and the check has
+        // content, pinning that the blended factor reduces to the source's.
+        assert_conformal_factor_matches_metric(
+            &BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-0.5, 0.5)),
+            &[Vec3::new(-0.7, 0.1, 0.0), Vec3::new(0.55, 0.15, -0.1)],
+        );
     }
 
     // ------ BlendedSpace conformally-flat overrides ------
@@ -1384,20 +1444,6 @@ mod tests {
             Vec3::new(0.3, 0.2, -0.1),
         ] {
             close(h3.scalar_curvature(p), -6.0, 1e-6);
-        }
-    }
-
-    /// SphericalS3 scalar curvature is +6 (constant K = +1 in 3D).
-    #[test]
-    fn spherical_s3_scalar_curvature_is_constant_plus_six() {
-        use crate::SphericalS3;
-        let s3 = SphericalS3;
-        for p in [
-            Vec3::ZERO,
-            Vec3::new(0.1, 0.0, 0.0),
-            Vec3::new(0.5, -0.3, 0.2),
-        ] {
-            close(s3.scalar_curvature(p), 6.0, 1e-6);
         }
     }
 

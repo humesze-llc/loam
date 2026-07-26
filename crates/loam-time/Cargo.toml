@@ -2,10 +2,13 @@
 name = "loam-time"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam time primitives: deterministic fixed-timestep accumulator and tick counter."
+keywords = ["fixed-timestep", "determinism", "timing", "gamedev"]
+categories = ["game-development", "date-and-time"]
 
 [features]
 # Frame-timing instrumentation. Default-on for dev builds; disable with

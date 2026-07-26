@@ -284,7 +284,8 @@ fn artanh(x: f32) -> f32 {
 }
 
 /// Möbius addition `a ⊕ b` in the Poincaré ball, K = -1. Non-associative; the
-/// failure of associativity is the gyration.
+/// failure of associativity is the gyration. (Ungar, *From Möbius to
+/// Gyrogroups*, Amer. Math. Monthly 115, 2008, §4, Def. 3.)
 fn mobius_add(a: Vec3, b: Vec3) -> Vec3 {
     let ab = a.dot(b);
     let aa = a.length_squared();
@@ -298,7 +299,9 @@ fn mobius_add(a: Vec3, b: Vec3) -> Vec3 {
     }
 }
 
-/// Möbius gyration `gyr[a, b] v`, the rotation from Möbius non-associativity.
+/// Möbius gyration `gyr[a, b] v`, the rotation from Möbius non-associativity
+/// (Ungar, *From Möbius to Gyrogroups*, Amer. Math. Monthly 115, 2008, §4,
+/// Def. 4).
 fn gyr_apply(a: Vec3, b: Vec3, v: Vec3) -> Vec3 {
     let ab = mobius_add(a, b);
     let bv = mobius_add(b, v);

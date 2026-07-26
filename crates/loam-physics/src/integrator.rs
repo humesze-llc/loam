@@ -32,6 +32,11 @@ pub trait PhysicsSpace: Space {
     /// Apply the inverse inertia to a torque-bivector. Used by the solver for `ω += I⁻¹τ dt`.
     fn apply_inv_inertia(&self, inertia: Self::Inertia, torque: Self::AngVel) -> Self::AngVel;
 
+    /// Wedge product `a ∧ b` of two tangent vectors, as an angular-velocity
+    /// bivector. The angular half of an impulse response is built from it:
+    /// an impulse `J` at body offset `r` gives `ω += I⁻¹(r ∧ J)`.
+    fn wedge(&self, a: Self::Vector, b: Self::Vector) -> Self::AngVel;
+
     /// World-space velocity of `body` at world point `p`: linear plus the
     /// angular contribution `ω × (p − body.position)`.
     fn velocity_at_point(&self, body: &RigidBody<Self>, p: Self::Point) -> Self::Vector

@@ -1,0 +1,18 @@
+[package]
+name = "loam-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Quake-style developer console: command registry, scrollback, tokenizer, tab completion and key binds, with no UI-framework dependency. Frontends (see loam-egui) drive it and paint it."
+
+[dependencies]
+anyhow.workspace = true
+
+# `web-sys` (with the `console` feature) backs the optional scrollback echo
+# path (`log echo on`): `web_sys::console::log_1` mirrors lines to the browser
+# DevTools console without routing through `tracing`, which would feed back
+# into `loam_app::log`'s tracing -> scrollback mirror.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["console"] }

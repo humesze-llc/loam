@@ -99,16 +99,17 @@ impl Space for EuclideanR3 {
         // Translation drops out for tangent vectors; rotation acts.
         iso.rotation * v
     }
+
+    /// ℝ³ is globally flat: chart-coord SDFs (planes, axis-aligned boxes) are mathematically
+    /// correct.
+    fn is_chart_flat(&self) -> bool {
+        true
+    }
 }
 
 impl WgslSpace for EuclideanR3 {
     fn wgsl_impl(&self) -> Cow<'static, str> {
         Cow::Borrowed(WGSL_IMPL)
-    }
-    /// ℝ³ is globally flat: chart-coord SDFs (planes, axis-aligned boxes) are mathematically
-    /// correct.
-    fn is_chart_flat(&self) -> bool {
-        true
     }
 }
 

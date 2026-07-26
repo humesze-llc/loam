@@ -26,7 +26,7 @@ cargo run --release -p polytope_playground               # native
 cd crates/polytope_playground && trunk serve --release   # browser (local)
 ```
 
-Stable Rust; any wgpu backend (Vulkan, DX12, Metal, WebGPU). The browser build needs [trunk](https://trunkrs.dev/). Controls live in the on-screen panels; backtick opens the debug console (`trace summary` prints per-section frame timings).
+Stable Rust 1.95 or newer; any wgpu backend (Vulkan, DX12, Metal, WebGPU). The browser build needs [trunk](https://trunkrs.dev/). Controls live in the on-screen panels; backtick opens the debug console (`trace summary` prints per-section frame timings).
 
 <!-- 600-CELL SLOT: assets/readme/600-cell.webp
      The 600-cell rotating through the exact cross-section path, wireframe

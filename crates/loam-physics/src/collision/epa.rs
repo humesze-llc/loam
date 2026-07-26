@@ -315,13 +315,8 @@ mod tests {
 
         let info = run(&a, &b, Vec3::new(1.5, 0.0, 0.0));
         assert!(
-            info.normal.dot(Vec3::X).abs() > 0.99,
-            "normal: {:?}",
-            info.normal
-        );
-        assert!(
-            info.normal.dot(Vec3::X) > 0.0,
-            "normal not A->B: {:?}",
+            info.normal.dot(Vec3::X) > 0.99,
+            "normal must run from A toward B along +x, got {:?}",
             info.normal
         );
         assert_close(info.penetration, 0.5, 1e-3);
@@ -350,14 +345,22 @@ mod tests {
         assert_close(info.penetration, 0.5 - 3.0_f32.sqrt() * 0.2, 1e-2);
     }
 
+    /// Boxes nested deeply enough that separating along the shallowest axis is a
+    /// translation of nearly a full body width. The difference body of two unit
+    /// half-extent boxes is the half-extent-2 box, so the depth is
+    /// `min_i (2 − |t_i|)` and the normal is that axis: `2 − 0.3` along `+x̂`.
     #[test]
-    fn deeply_nested_boxes_report_positive_penetration() {
+    fn deeply_nested_boxes_contact_matches_shallowest_axis() {
         let va = box_vertices(Vec3::ZERO, Vec3::ONE);
         let vb = box_vertices(Vec3::new(0.3, 0.1, 0.2), Vec3::ONE);
         let a = ConvexHull { vertices: &va };
         let b = ConvexHull { vertices: &vb };
         let info = run(&a, &b, Vec3::new(0.3, 0.1, 0.2));
-        assert!(info.penetration > 0.0, "penetration: {}", info.penetration);
-        assert!(info.penetration.is_finite());
+        assert_close(info.penetration, 2.0 - 0.3, EPA_TOLERANCE);
+        assert!(
+            info.normal.dot(Vec3::X) > 0.999,
+            "normal must run from A toward B along +x, got {:?}",
+            info.normal
+        );
     }
 }

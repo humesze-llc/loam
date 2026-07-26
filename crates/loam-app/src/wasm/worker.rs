@@ -702,7 +702,6 @@ where
             &mut self.app,
             &mut self.timestep,
             &mut self.tick_index,
-            self.start,
             now,
             60,
             self.max_ticks_per_frame,

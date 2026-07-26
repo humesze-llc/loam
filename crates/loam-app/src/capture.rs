@@ -1561,9 +1561,9 @@ fn parse_format<'a>(args: &'a [&'a str]) -> (CaptureFormat, &'a [&'a str]) {
 /// - `F9`:  `capture toggle gif post` (press to start a GIF, again to stop)
 /// - `F11`: `capture panel` (toggle the parameters UI)
 pub fn bind_default_hotkeys<Ctx: 'static>(console: &mut Console<Ctx>) {
-    console.bind(loam_egui::egui::Key::F12, "capture png post");
-    console.bind(loam_egui::egui::Key::F9, "capture toggle gif post");
-    console.bind(loam_egui::egui::Key::F11, "capture panel");
+    console.bind(loam_egui::Key::F12, "capture png post");
+    console.bind(loam_egui::Key::F9, "capture toggle gif post");
+    console.bind(loam_egui::Key::F11, "capture panel");
 }
 
 // ---------------------------------------------------------------------------

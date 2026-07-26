@@ -18,7 +18,7 @@ use loam_app::{
 #[global_allocator]
 static GLOBAL: loam_time::alloc::CountingAllocator<std::alloc::System> =
     loam_time::alloc::CountingAllocator::new(std::alloc::System);
-use loam_egui::Console;
+use loam_egui::{Console, ConsoleUi};
 use loam_math::{Bivector, Bivector4, EuclideanR3, Rotor4};
 use loam_physics::polytope::Polytope4;
 use loam_render::device::RenderDevice;

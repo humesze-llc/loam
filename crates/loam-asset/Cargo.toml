@@ -2,10 +2,13 @@
 name = "loam-asset"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam asset system: filesystem watching and hot-reload event stream."
+keywords = ["hot-reload", "assets", "watch", "gamedev"]
+categories = ["game-development", "filesystem"]
 
 [dependencies]
 anyhow.workspace = true

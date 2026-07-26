@@ -2,10 +2,13 @@
 name = "loam-scene"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Loam scene composition: typed primitives, scene tree, WGSL emission. Renamed from loam-sdf 2026-05-18; will hold mixed SDF + mesh primitives as the rasterization tier lands."
+description = "Loam scene composition: typed primitives, scene tree, WGSL emission."
+keywords = ["sdf", "scene", "wgsl", "raymarching", "gamedev"]
+categories = ["graphics", "rendering", "game-development"]
 
 [dependencies]
 loam-math  = { path = "../loam-math" }
@@ -13,3 +16,6 @@ loam-shape = { path = "../loam-shape" }
 glam.workspace = true
 serde.workspace = true
 ron.workspace = true
+
+[dev-dependencies]
+naga.workspace = true
