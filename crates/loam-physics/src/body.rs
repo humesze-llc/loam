@@ -176,8 +176,12 @@ struct Slot {
 /// it would hand out every reordering method on `[RigidBody<S>]`, and a
 /// permutation the slot table does not follow leaves `slots[ids[d].slot].dense
 /// != d`, silently rebinding each manifold's accumulated impulses to the wrong
-/// pair. Mutation runs through [`Self::get_mut`], the [`IndexMut`] impls, and
-/// [`Self::iter_mut`], none of which can move a body between positions.
+/// pair. What that removes is the accidental reorder: `swap`, `reverse`,
+/// `sort_unstable_by_key` and the rest no longer resolve on an arena, and
+/// neither [`Self::get_mut`] nor the [`IndexMut`] impls can stand in for
+/// them, each holding the arena borrowed for as long as the body it returns.
+/// A deliberate reorder survives, through two [`Self::iter_mut`] items held
+/// at once; that method documents it.
 ///
 /// The three `compile_fail` blocks below share the hidden setup of the passing
 /// one, so each fails on its visible line and not on its fixture.
@@ -322,8 +326,14 @@ impl<S: PhysicsSpace> BodyArena<S> {
         }
     }
 
-    /// Mutable iteration in dense order: per-body edits without a handle on the
-    /// slice the ordering invariant lives in.
+    /// Mutable iteration in dense order: per-body edits without a handle.
+    ///
+    /// Edit bodies in place; do not move them between items. The items
+    /// borrow the slice, not the iterator, so two can be held at once and
+    /// swapped, and that permutes the dense slice without the slot table
+    /// following, which is the desynchronization [`BodyArena`] describes.
+    /// Dropping [`DerefMut`] made that deliberate rather than a one-token
+    /// slip; it did not make it impossible.
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, RigidBody<S>> {
         self.dense.iter_mut()
     }
@@ -683,6 +693,33 @@ mod tests {
         assert_consistent(&arena);
         let restitutions: Vec<f32> = arena.iter().map(|b| b.restitution).collect();
         assert_eq!(restitutions, vec![0.0, 1.0, 2.0]);
+    }
+
+    /// The residual [`BodyArena::iter_mut`] names, over the public surface a
+    /// caller has: its items borrow the slice, not the iterator, so two
+    /// coexist and swap, and the arena cannot observe the permutation. Pins
+    /// the doc against re-inflating into a seal it does not provide; work
+    /// that does close the hole fails here and has to rewrite both.
+    #[test]
+    fn swapping_two_iter_mut_items_desynchronizes_handles_from_storage() {
+        let mut arena = BodyArena::new();
+        let first = arena.spawn(body_r3(Vec3::X, 1.0, 1.0));
+        let second = arena.spawn(body_r3(Vec3::Y, 1.0, 1.0));
+
+        let mut items = arena.iter_mut();
+        let a = items.next().unwrap();
+        let b = items.next().unwrap();
+        std::mem::swap(a, b);
+
+        assert_eq!(arena.dense_index(first), Some(0));
+        assert_eq!(arena.id_at(0), first);
+        assert_eq!(
+            arena[first].position,
+            Vec3::Y,
+            "the handle stopped naming the body it was minted for, and no \
+             arena query reports it"
+        );
+        assert_eq!(arena[second].position, Vec3::X);
     }
 
     /// Handle allocation is part of the determinism contract: two arenas
