@@ -206,8 +206,10 @@ pub trait App: Sized + 'static {
 
 /// Run one frame's fixed-timestep ticks: advance the accumulator and call
 /// `App::tick` for every tick it yields. Shared by the native runner and the
-/// wasm worker so the determinism-critical sim cadence has a single definition
-/// and cannot drift between platforms. Returns the tick count (for
+/// wasm worker so what a tick observes has a single definition and cannot
+/// drift between platforms. How many ticks a stalled frame yields belongs to
+/// the caller's accumulator and does differ; see
+/// [`DEFAULT_MAX_TICKS_PER_FRAME`]. Returns the tick count (for
 /// `FrameCtx::n_ticks`).
 ///
 /// The catch-up cap lives solely in the `FixedTimestep`
@@ -316,10 +318,15 @@ pub struct FrameCtx<'a> {
 // RunConfig
 // ---------------------------------------------------------------------------
 
-/// Catch-up ticks a single frame may run before the accumulator's excess is
-/// dropped. The one definition of the cap: the native runner reads it through
-/// [`RunConfig::max_ticks_per_frame`] and the wasm worker uses it directly, so
-/// both platforms simulate the same tick cadence under a stall.
+/// Default catch-up ticks a single frame may run before the accumulator's
+/// excess is dropped. The native runner reads
+/// [`RunConfig::max_ticks_per_frame`], which starts here; the wasm worker
+/// hardcodes this constant, since `RunConfig` never crosses the worker's init
+/// message, so overriding the cap changes the native stall cadence only.
+///
+/// Not the only cap constant: [`loam_time::DEFAULT_MAX_CATCH_UP`] is
+/// `FixedTimestep`'s own default at a different value, and both runners
+/// override it, so it is never the effective cap here.
 pub const DEFAULT_MAX_TICKS_PER_FRAME: u32 = 4;
 
 /// Runtime knobs. New fields land with defaults so adding configuration is non-breaking.
@@ -1295,7 +1302,7 @@ impl<A: App> Runner<A> {
         let _frame_scope = loam_time::frame_trace::scope("frame");
 
         // 1. Fixed-timestep ticks (shared with the wasm worker via
-        // `drive_fixed_ticks` so the sim cadence stays identical across platforms).
+        // `drive_fixed_ticks` so a tick sees the same dt and time on both).
         let n_ticks = if let Some(app) = self.app.as_mut() {
             drive_fixed_ticks(
                 app,
@@ -1783,20 +1790,19 @@ mod tests {
 
     #[test]
     fn executed_ticks_equal_ticks_charged_to_the_accumulator() {
-        // Prime, then a frame arriving ten ticks late. The cap is the
-        // accumulator's own default, so all ten are charged and all ten must
-        // run: a second cap inside the tick loop would book six of them
-        // without simulating them.
-        let offsets = [Duration::ZERO, TICK * 10];
-        let (times, timestep, tick_index) =
-            drive(Instant::now(), &offsets, loam_time::DEFAULT_MAX_CATCH_UP);
+        // Prime, then a frame arriving ten ticks late under a cap of exactly
+        // ten, so all ten are charged and all ten must run: any second cap
+        // inside the tick loop books ticks it never simulates.
+        const BACKLOG: u32 = 10;
+        let offsets = [Duration::ZERO, TICK * BACKLOG];
+        let (times, timestep, tick_index) = drive(Instant::now(), &offsets, BACKLOG);
 
         assert_eq!(
             times.len() as u64,
             timestep.tick(),
             "every tick charged to the accumulator must have run App::tick"
         );
-        assert_eq!(times.len(), loam_time::DEFAULT_MAX_CATCH_UP as usize);
+        assert_eq!(times.len(), BACKLOG as usize);
         assert_eq!(tick_index, timestep.tick());
     }
 
@@ -1820,8 +1826,8 @@ mod tests {
 
     #[test]
     fn timestep_tick_and_runner_index_stay_equal_across_a_stall() {
-        // Both caps in production use: the app default and the accumulator's
-        // own. The larger one is what exposes a cap re-applied downstream.
+        // Two cap sizes, since a cap re-applied downstream stays invisible
+        // whenever the accumulator's own cap is the smaller of the two.
         for cap in [DEFAULT_MAX_TICKS_PER_FRAME, loam_time::DEFAULT_MAX_CATCH_UP] {
             let base = Instant::now();
             let mut app = TickRecorder::default();

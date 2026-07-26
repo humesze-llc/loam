@@ -1,5 +1,5 @@
-//! Final composite pass for browser-WebGPU: sample an sRGB offscreen scene
-//! texture and write gamma-encoded values to a linear swapchain.
+//! Final composite pass for browser-WebGPU: sample the offscreen scene texture
+//! and write gamma-encoded values to a linear swapchain.
 //!
 //! Native (D3D/Vulkan/Metal) swapchains advertise sRGB formats, so the GPU
 //! encodes linear output on write and no pass is needed; `RenderDevice::new`

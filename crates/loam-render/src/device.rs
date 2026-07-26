@@ -18,7 +18,11 @@
 //! A non-sRGB surface takes the composite path instead: MSAA off, one view per
 //! attachment, scene and UI both drawing into [`OffscreenTarget`], and
 //! [`crate::composite::CompositeNode`] gamma-encoding that into the swapchain
-//! view. Nothing is reinterpreted there, so the UI blends in linear space.
+//! view. Nothing is reinterpreted there; the offscreen target takes the
+//! surface format's sRGB sibling, so the UI blends in linear space for every
+//! format that has one. A format with no sibling (`Rgba16Float`) keeps its own
+//! format and so lands egui on the gamma-framebuffer path instead, whose
+//! already-encoded output the composite encodes again.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -722,6 +726,26 @@ mod tests {
                     // Composite path: the UI writes to the offscreen target.
                     assert_eq!(targets.ui_format, surface.add_srgb_suffix(), "{case}");
                 }
+            }
+        }
+    }
+
+    /// egui picks its fragment entry point off the target format's sRGB-ness,
+    /// so the composite path only blends the UI in linear space where
+    /// `add_srgb_suffix` actually promotes. On a format with no sRGB sibling
+    /// it does not, and the UI blends in gamma space, which the composite then
+    /// encodes again.
+    #[test]
+    fn composite_path_blends_ui_in_linear_space_only_where_an_srgb_sibling_exists() {
+        for surface in SURFACES.into_iter().filter(|f| !f.is_srgb()) {
+            let has_sibling = surface.add_srgb_suffix() != surface;
+            for downlevel in DOWNLEVELS {
+                let targets = ui_target_formats(surface, downlevel);
+                assert_eq!(
+                    targets.ui_format.is_srgb(),
+                    has_sibling,
+                    "{surface:?} {downlevel:?}"
+                );
             }
         }
     }
