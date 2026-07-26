@@ -100,7 +100,8 @@ use consts::{
 use loam_physics::polytope::Polytope4;
 use physics::PlaygroundPhysics;
 use state::{
-    CameraMode, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode, WireframeProjection,
+    CameraMode, Demo, RotationMode, RowFrame, SurfaceMode, ViewMode, WireframeColorMode,
+    WireframeProjection,
 };
 use wireframe_geom::*;
 
@@ -585,18 +586,16 @@ impl Demo {
         };
 
         // Anchor: the leading polychoron's body center in world R³.
-        let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
-        let Some((slot, _entry)) = render_row
+        let row_frame = self.row_frame();
+        let Some((slot, _entry)) = row_frame
+            .row
             .iter()
             .enumerate()
             .find(|(_, e)| e.shape.polytope4().is_some())
         else {
             return;
         };
-        let world_pos = self
-            .physics
-            .pose(slot, render_row.len(), self.rot_state)
-            .position_r3();
+        let world_pos = row_frame.pose(slot).position_r3();
 
         let view_dir = self.camera.view();
         let cfg = &frame.rd.surface_bundle.config;
@@ -635,8 +634,9 @@ impl Demo {
             return;
         }
         // First polychoron in the rendered row; its vertex 0 is the anchor.
-        let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
-        let Some((slot, entry)) = render_row
+        let row_frame = self.row_frame();
+        let Some((slot, entry)) = row_frame
+            .row
             .iter()
             .enumerate()
             .find(|(_, e)| e.shape.polytope4().is_some())
@@ -644,15 +644,10 @@ impl Demo {
             return;
         };
         let polytope = entry.shape.polytope4().expect("filter guarantees Some");
-        let topo = polytope.topology();
-        let canonical_v0 = topo.vertices[0];
-        let pose = self.physics.pose(slot, render_row.len(), self.rot_state);
-        let v_local_4d = pose.body_local(canonical_v0, self.effective_body_size());
-        let v_local_r3 = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
-            v_local_4d,
-            &self.resolved_wireframe_projection(),
-        );
-        let world_pos = v_local_r3 + pose.position_r3();
+        let label = entry.label;
+        // Through the same seam the raster passes use, so the leader line lands
+        // on the vertex the wireframe drew rather than on the layout.
+        let world_pos = row_frame.anchor_r3(slot, polytope.topology().vertices[0]);
 
         // Reproject world R³ -> screen pixels via the rasterizer's camera;
         // `None` (anchor offscreen) draws nothing.
@@ -672,7 +667,7 @@ impl Demo {
             return;
         };
 
-        let title = format!("{} vertex 0", entry.label);
+        let title = format!("{label} vertex 0");
         loam_egui::callout(
             ctx,
             "polytope-playground-example-callout",

@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use glam::{Vec3, Vec4};
 use loam_app::{freecam::Freecam, Camera, OrbitController};
 use loam_math::{Bivector, Bivector4, EuclideanR3, Plane4, Projection, Rotor, Rotor4};
 use loam_physics::polytope::Polytope4;
@@ -15,7 +16,7 @@ use loam_render::raymarch::{BodyUniform, Hyperslice4DNode};
 
 use crate::catalog::ShapeEntry;
 use crate::consts::{BASE_ROTATION_RATE, BODY_SIZE, BODY_X_SPACING, BODY_Y, T_SLIDER_INITIAL};
-use crate::physics::PlaygroundPhysics;
+use crate::physics::{BodyPose, PlaygroundPhysics};
 
 // Projection modes live in `projections.rs`; re-export so `impl Demo`, the test
 // module, and the other playground modules keep importing them from `state`.
@@ -335,6 +336,64 @@ pub(crate) fn sdf_body_uniform(
         pose.rotor,
         entry.body_color,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Rendered-row pose seam
+// ---------------------------------------------------------------------------
+
+/// One frame's rendered row as every render path sees it: which shape sits in
+/// which slot, where the bodies actually are, and how 4D maps to R³.
+///
+/// A value cannot exist without a [`PlaygroundPhysics`], and each render path
+/// takes ALL of its per-body geometry from one, so no pass can quietly fall
+/// back to the authored spin over the static layout while the others follow
+/// the thrown bodies. [`Demo::row_frame`] is the only production constructor.
+pub(crate) struct RowFrame<'a> {
+    pub(crate) physics: &'a PlaygroundPhysics,
+    /// The rendered row (see [`render_row_entries`]); its length is the slot
+    /// count [`PlaygroundPhysics::pose`] checks the world against.
+    pub(crate) row: &'a [ShapeEntry],
+    /// UI spin, applied before each body's physics orientation.
+    pub(crate) spin: Rotor4,
+    pub(crate) body_size: f32,
+    /// The live 4D -> R³ map ([`Demo::resolved_wireframe_projection`]).
+    pub(crate) projection: Projection<4>,
+    pub(crate) w_slice: f32,
+    /// Eye-to-focus distance; only the stereographic clip radius reads it.
+    pub(crate) camera_distance: f32,
+}
+
+impl RowFrame<'_> {
+    /// Live pose of `slot`.
+    pub(crate) fn pose(&self, slot: usize) -> BodyPose {
+        self.physics.pose(slot, self.row.len(), self.spin)
+    }
+
+    /// `canonical` carried into `slot`'s live body frame at `scale` (refilling
+    /// `out`), returning the R³ translate to apply AFTER projection. See
+    /// [`PlaygroundPhysics::body_frame`].
+    pub(crate) fn body_local(
+        &self,
+        slot: usize,
+        canonical: &[Vec4],
+        scale: f32,
+        out: &mut Vec<Vec4>,
+    ) -> Vec3 {
+        self.physics
+            .body_frame(slot, self.row.len(), self.spin, canonical, scale, out)
+    }
+
+    /// World-R³ anchor for one canonical point of `slot`: body frame, then
+    /// projection, then translate. Same order as the raster passes, so a
+    /// callout's leader line lands on the vertex the wireframe drew.
+    pub(crate) fn anchor_r3(&self, slot: usize, canonical: Vec4) -> Vec3 {
+        let pose = self.pose(slot);
+        <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
+            pose.body_local(canonical, self.body_size),
+            &self.projection,
+        ) + pose.position_r3()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +755,21 @@ impl Demo {
     /// render path and the SDF upload read this. See [`render_row_entries`].
     pub(crate) fn render_row(&self) -> &[ShapeEntry] {
         render_row_entries(self.view_mode, &self.row, &self.strip_subject)
+    }
+
+    /// This frame's [`RowFrame`]: the one seam a render path reads a body pose
+    /// through. Cheap enough to build per pass (the Schlegel branch of
+    /// [`Self::resolved_wireframe_projection`] is the only arithmetic).
+    pub(crate) fn row_frame(&self) -> RowFrame<'_> {
+        RowFrame {
+            physics: &self.physics,
+            row: self.render_row(),
+            spin: self.rot_state,
+            body_size: self.effective_body_size(),
+            projection: self.resolved_wireframe_projection(),
+            w_slice: self.w_slice,
+            camera_distance: self.camera_distance_to_focus(),
+        }
     }
 
     /// The polytope a Schlegel cell index refers to: the first polychoron in the
@@ -1712,6 +1786,42 @@ mod tests {
         );
         assert_eq!(uniform.position, body_position(2, slots));
         assert_eq!(uniform.rotor, <[f32; 8]>::from(spin));
+    }
+
+    /// A callout anchor rides the live body: body frame, then projection, then
+    /// the live R³ centre. Hand-rolling it from the authored spin over the
+    /// static layout, which is what unwiring the callout means, lands the
+    /// leader line on a vertex nothing drew.
+    #[test]
+    fn row_frame_anchor_reads_the_live_pose_not_the_authored_spin() {
+        let slots = 3;
+        let physics = tumbling(slots);
+        let row = [entry(RaymarchShape::Polytope(Polytope4::Cell24)); 3];
+        let spin = (Plane4::Xy.unit_bivector() * 0.7).exp().normalize();
+        let frame = super::RowFrame {
+            physics: &physics,
+            row: &row,
+            spin,
+            body_size: BODY_SIZE,
+            projection: Projection::Identity,
+            w_slice: 0.0,
+            camera_distance: 4.0,
+        };
+
+        let canonical = Polytope4::Cell24.topology().vertices[0];
+        let pose = physics.pose(1, slots, spin);
+        // Drop-w projection, so the anchor is the body-local vertex truncated
+        // and then carried by the body's R³ centre.
+        assert_eq!(
+            frame.anchor_r3(1, canonical),
+            pose.body_local(canonical, BODY_SIZE).truncate() + pose.position_r3()
+        );
+        assert_ne!(
+            frame.anchor_r3(1, canonical),
+            (BODY_SIZE * spin.apply(canonical)).truncate()
+                + Vec4::from_array(body_position(1, slots)).truncate(),
+            "anchor still reads the authored spin over the static layout"
+        );
     }
 
     /// The polychora opt-out survives the pose plumbing: the 120/600-cell go
