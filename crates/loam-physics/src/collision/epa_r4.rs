@@ -14,7 +14,7 @@
 use glam::Vec4;
 
 use super::gjk_r4::{minkowski_support_r4, MinkowskiPoint4, SupportFn4};
-use super::simplex_r4::closest_to_origin;
+use super::simplex_r4::project_origin_onto_affine_hull;
 
 const EPA_MAX_ITERATIONS: u32 = 96;
 const EPA_TOLERANCE: f32 = 1e-3;
@@ -320,32 +320,48 @@ fn det4(r0: Vec4, r1: Vec4, r2: Vec4, r3: Vec4) -> f32 {
 }
 
 fn contact_from_face(polytope: &Polytope4, face: Face4) -> Option<ContactInfo4> {
-    let v0 = polytope.vertices[face.v[0]];
-    let v1 = polytope.vertices[face.v[1]];
-    let v2 = polytope.vertices[face.v[2]];
-    let v3 = polytope.vertices[face.v[3]];
+    let tetra = face.v.map(|i| polytope.vertices[i]);
 
     // Closest point on the face hyperplane to the origin, in Minkowski-diff space.
     let closest = face.normal * face.distance;
+    let weights = face_barycentrics(&tetra.map(|p| p.point), closest);
 
-    // Barycentric weights of `closest` on the tetra via Gram-matrix projection.
-    let simplex_points = [v0.point, v1.point, v2.point, v3.point];
-    let proj = closest_to_origin(
-        &simplex_points
-            .iter()
-            .map(|p| *p - closest)
-            .collect::<Vec<_>>(),
-    );
-    let weights = &proj.weights;
-
-    let point_a = v0.sa * weights[0] + v1.sa * weights[1] + v2.sa * weights[2] + v3.sa * weights[3];
-    let point_b = v0.sb * weights[0] + v1.sb * weights[1] + v2.sb * weights[2] + v3.sb * weights[3];
+    let mut point_a = Vec4::ZERO;
+    let mut point_b = Vec4::ZERO;
+    for (vertex, w) in tetra.iter().zip(weights) {
+        point_a += vertex.sa * w;
+        point_b += vertex.sb * w;
+    }
 
     Some(ContactInfo4 {
         normal: face.normal,
         penetration: face.distance,
         point: (point_a + point_b) * 0.5,
     })
+}
+
+/// Barycentric weights of `closest` on all four vertices of the face tetra.
+///
+/// The face plane is the tetra's affine hull, so `closest` lies in it by
+/// construction and the affine solve reproduces it: `Σ wᵢ·vᵢ = closest`, which
+/// is what makes the reconstructed witnesses satisfy
+/// `point_a − point_b = normal·penetration`. Weights go negative when the
+/// projection leaves the tetra, which happens whenever a Minkowski-difference
+/// facet is tiled by several coplanar faces (see [`FACE_COPLANAR_EPS`]) and the
+/// projection lands on a neighbouring tile. Clamping to the nearest point of
+/// this tile instead, as `simplex_r4::closest_to_origin` does, drops vertices
+/// from the combination and breaks the identity.
+///
+/// The tetra centroid is the fallback for a singular Gram system. `build_face`
+/// floors the tetra's 3-volume, so reaching it takes a face anisotropic enough
+/// to lose a pivot in f32, where no decomposition of the plane point would be
+/// trustworthy.
+fn face_barycentrics(points: &[Vec4; 4], closest: Vec4) -> [f32; 4] {
+    let shifted = points.map(|p| p - closest);
+    match project_origin_onto_affine_hull(&[0, 1, 2, 3], &shifted) {
+        Some((_, w)) => [w[0], w[1], w[2], w[3]],
+        None => [0.25; 4],
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +445,74 @@ mod tests {
         assert!(contact.point.y.abs() < 0.1);
         assert!(contact.point.z.abs() < 0.1);
         assert!(contact.point.w.abs() < 0.1);
+    }
+
+    /// A face whose plane projection falls outside its own tetra, nearest one
+    /// edge. The contact must be the affine combination that realizes the
+    /// projection over all four vertices, so the witnesses keep
+    /// `point_a − point_b = normal·penetration`; clamping to the edge rebuilds
+    /// the contact from two vertices and breaks that identity.
+    #[test]
+    fn contact_from_face_realizes_the_plane_projection_outside_the_tetra() {
+        use super::super::simplex_r4::closest_to_origin;
+
+        // Tetra in the hyperplane x = 1, so the plane projection is x̂. Every
+        // vertex satisfies y + z ≥ 1, which puts x̂ outside the tetra.
+        let points = [
+            Vec4::new(1.0, 1.0, 0.0, 0.0),
+            Vec4::new(1.0, 0.0, 1.0, 0.0),
+            Vec4::new(1.0, 2.0, 2.0, 0.0),
+            Vec4::new(1.0, 1.0, 1.0, 2.0),
+        ];
+        let pre_images_b = [
+            Vec4::ZERO,
+            Vec4::new(0.0, 0.0, 0.0, 3.0),
+            Vec4::new(0.0, 0.0, 3.0, 0.0),
+            Vec4::new(0.0, 3.0, 0.0, 0.0),
+        ];
+        let vertices: Vec<MinkowskiPoint4> = points
+            .iter()
+            .zip(pre_images_b)
+            .map(|(&point, sb)| MinkowskiPoint4 {
+                point,
+                sa: point + sb,
+                sb,
+            })
+            .collect();
+
+        // Fixture premise: the convex solve lands on the edge v₀v₁ and keeps
+        // two of the four vertices.
+        let clamped = closest_to_origin(&points.map(|p| p - Vec4::X));
+        assert_eq!(clamped.kept, vec![0, 1]);
+
+        // Affine coordinates of x̂ on the tetra: the w-row forces w₃ = 0, the
+        // y- and z-rows give w₀ = w₁ = −2·w₂, and Σ wᵢ = 1 closes it.
+        let weights = [2.0 / 3.0, 2.0 / 3.0, -1.0 / 3.0, 0.0];
+        let realized = points
+            .iter()
+            .zip(weights)
+            .fold(Vec4::ZERO, |acc, (&p, w)| acc + p * w);
+        assert!((realized - Vec4::X).length() < 1e-6, "{realized:?}");
+
+        let centroid = (points[0] + points[1] + points[2] + points[3]) * 0.25;
+        let face = build_face(&vertices, 0, 1, 2, 3, centroid).expect("tetra is non-degenerate");
+        assert_close(face.distance, 1.0, 1e-6);
+
+        let polytope = Polytope4 {
+            vertices,
+            faces: vec![face],
+            centroid,
+        };
+        let contact = contact_from_face(&polytope, face).expect("face resolves a contact");
+
+        // Σ wᵢ·saᵢ = (1, 0, −1, 2) and Σ wᵢ·sbᵢ = (0, 0, −1, 2): the witnesses
+        // differ by x̂ = normal·penetration, and the contact is their midpoint.
+        let expected = Vec4::new(0.5, 0.0, -1.0, 2.0);
+        assert!(
+            (contact.point - expected).length() < 1e-5,
+            "contact {:?} should be {expected:?}",
+            contact.point
+        );
     }
 
     // The polytope fixtures below all take `B = A + t`, so the Minkowski
