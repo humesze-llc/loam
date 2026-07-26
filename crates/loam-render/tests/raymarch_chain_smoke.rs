@@ -12,6 +12,7 @@
 
 use glam::Vec3;
 use loam_math::{EuclideanR3, WgslSpace};
+use loam_render::device::RenderDevice;
 use loam_render::{GeodesicRayMarchNode, RayMarchNode, RayMarchUniforms};
 use loam_scene::{Scene, SceneNode};
 use loam_shader::{validate_wgsl, ShaderDb, GEODESIC_MARCH_KERNEL};
@@ -100,10 +101,34 @@ fn assemble(space_wgsl: &str, scene_wgsl: &str, user_wgsl: &str) -> String {
 
 /// The uniform buffer is the 96 bytes `UNIFORMS_WGSL` lays out: four 16-byte
 /// vec3 slots (the last packing `fov_y_tan`), one holding resolution/time/tick,
-/// then `params`. Growing the Rust struct without growing the mirror lands here.
+/// then `params`. The offsets are the mirror's, assigned by std140 in WGSL
+/// declaration order, so reordering the Rust fields lands here too; size alone
+/// would not, and a swapped `camera_right`/`camera_up` draws every frame with
+/// the axes exchanged.
 #[test]
-fn uniforms_stay_96_bytes_matching_the_wgsl_mirror() {
+fn uniforms_match_the_wgsl_mirror_layout() {
+    use std::mem::offset_of;
     assert_eq!(std::mem::size_of::<RayMarchUniforms>(), 96);
+    assert_eq!(offset_of!(RayMarchUniforms, camera_pos), 0);
+    assert_eq!(offset_of!(RayMarchUniforms, camera_forward), 16);
+    assert_eq!(offset_of!(RayMarchUniforms, camera_right), 32);
+    assert_eq!(offset_of!(RayMarchUniforms, camera_up), 48);
+    assert_eq!(offset_of!(RayMarchUniforms, fov_y_tan), 60);
+    assert_eq!(offset_of!(RayMarchUniforms, resolution), 64);
+    assert_eq!(offset_of!(RayMarchUniforms, time), 72);
+    assert_eq!(offset_of!(RayMarchUniforms, tick), 76);
+    assert_eq!(offset_of!(RayMarchUniforms, params), 80);
+}
+
+/// `execute_panel` is the multi-panel draw entry point on both nodes and has no
+/// caller in the workspace. It needs a `RenderDevice`, which needs a real
+/// surface, so the coercion pins the signature where a call cannot.
+#[test]
+fn panel_draw_entry_points_keep_their_signature() {
+    type ExecutePanel<N> =
+        fn(&mut N, &RenderDevice, &wgpu::TextureView, bool, [u32; 4]) -> anyhow::Result<()>;
+    let _: ExecutePanel<RayMarchNode> = RayMarchNode::execute_panel;
+    let _: ExecutePanel<GeodesicRayMarchNode> = GeodesicRayMarchNode::execute_panel;
 }
 
 /// Space prelude + `Scene::to_wgsl` + geodesic kernel + a shader carrying the

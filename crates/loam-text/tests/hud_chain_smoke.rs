@@ -26,16 +26,20 @@ fn draw_hud_frame(
     text.render(device, queue, view, VIEWPORT)
 }
 
-/// First readable TTF from the well-known system font directories, or `None`.
-/// The crate ships no font asset, so a machine without one skips rather than
-/// fails: the compile-time pin is the point, the execution is the bonus.
-fn system_font() -> Option<Vec<u8>> {
+/// First readable TTF from the well-known system font directories. The crate
+/// ships no font asset, so a machine without one panics naming the paths it
+/// probed: libtest reports an early return as a pass, which would leave this
+/// test green while asserting nothing.
+fn system_font() -> Vec<u8> {
     const CANDIDATES: &[&str] = &[
         r"C:\Windows\Fonts\arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/System/Library/Fonts/Supplemental/Arial.ttf",
     ];
-    CANDIDATES.iter().find_map(|p| std::fs::read(p).ok())
+    CANDIDATES
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .unwrap_or_else(|| panic!("no readable system font; probed {CANDIDATES:?}"))
 }
 
 async fn request_device() -> Result<(Device, Queue), String> {
@@ -67,10 +71,7 @@ async fn request_device() -> Result<(Device, Queue), String> {
 #[test]
 #[ignore = "requires a working wgpu adapter; run with --include-ignored"]
 fn hud_frame_renders_into_an_offscreen_target_gpu_probe() {
-    let Some(font_bytes) = system_font() else {
-        eprintln!("skip: no system font found");
-        return;
-    };
+    let font_bytes = system_font();
     let (device, queue) = pollster::block_on(request_device()).expect("wgpu device");
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
