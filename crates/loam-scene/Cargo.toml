@@ -13,3 +13,6 @@ loam-shape = { path = "../loam-shape" }
 glam.workspace = true
 serde.workspace = true
 ron.workspace = true
+
+[dev-dependencies]
+naga.workspace = true

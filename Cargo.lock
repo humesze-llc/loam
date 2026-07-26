@@ -1477,6 +1477,7 @@ dependencies = [
  "glam",
  "loam-math",
  "loam-shape",
+ "naga",
  "ron",
  "serde",
 ]

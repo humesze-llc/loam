@@ -27,6 +27,8 @@
 use loam_math::WgslSpace;
 use loam_shape::Shape;
 
+use crate::literal::wgsl_f32;
+
 /// Extension trait on [`Shape`] that emits its signed-distance function as WGSL.
 ///
 /// Emits `fn {name}(p: vec3<f32>) -> f32`. Trait rule: SDFs call only `loam_*`
@@ -47,10 +49,10 @@ impl Primitive for Shape {
                  \treturn loam_distance(p, vec3<f32>({cx}, {cy}, {cz})) - ({r});\n\
                  }}\n",
                 name = name,
-                cx = center.x,
-                cy = center.y,
-                cz = center.z,
-                r = radius,
+                cx = wgsl_f32(center.x),
+                cy = wgsl_f32(center.y),
+                cz = wgsl_f32(center.z),
+                r = wgsl_f32(*radius),
             ),
             Shape::Box3 { half_extents } => format!(
                 "fn {name}(p: vec3<f32>) -> f32 {{\n\
@@ -59,19 +61,19 @@ impl Primitive for Shape {
                  \treturn length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);\n\
                  }}\n",
                 name = name,
-                hx = half_extents.x,
-                hy = half_extents.y,
-                hz = half_extents.z,
+                hx = wgsl_f32(half_extents.x),
+                hy = wgsl_f32(half_extents.y),
+                hz = wgsl_f32(half_extents.z),
             ),
             Shape::HalfSpace { normal, offset } if space.is_chart_flat() => format!(
                 "fn {name}(p: vec3<f32>) -> f32 {{\n\
                  \treturn dot(p, vec3<f32>({nx}, {ny}, {nz})) - ({d});\n\
                  }}\n",
                 name = name,
-                nx = normal.x,
-                ny = normal.y,
-                nz = normal.z,
-                d = offset,
+                nx = wgsl_f32(normal.x),
+                ny = wgsl_f32(normal.y),
+                nz = wgsl_f32(normal.z),
+                d = wgsl_f32(*offset),
             ),
             Shape::HalfSpace { .. }
             | Shape::HalfSpace4D { .. }

@@ -8,6 +8,8 @@
 //! `loam_distance`-based SDF functions, so they are correct in E³, H³, and S³ without
 //! modification.
 
+use crate::literal::wgsl_f32;
+
 /// Emit a WGSL expression for the union (minimum) of two distances.
 ///
 /// `da` and `db` must be WGSL `f32` expressions (ideally simple variable names, not function
@@ -38,6 +40,7 @@ pub fn difference_expr(da: &str, db: &str) -> String {
 /// `0.000000`, dividing by zero on the GPU while a CPU evaluation of the same
 /// scene stays finite.
 pub fn smooth_min_fn(name: &str, k: f32) -> String {
+    let k = wgsl_f32(k);
     format!(
         "fn {name}(a: f32, b: f32) -> f32 {{\n\
          \tlet h = clamp(0.5 + 0.5 * (b - a) / ({k}), 0.0, 1.0);\n\

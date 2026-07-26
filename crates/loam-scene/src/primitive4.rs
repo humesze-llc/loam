@@ -15,6 +15,8 @@
 
 use loam_shape::Shape;
 
+use crate::literal::wgsl_f32;
+
 /// Emit a WGSL 4D signed-distance function. Counterpart of [`crate::Primitive`]
 /// for 4D variants.
 ///
@@ -34,11 +36,11 @@ impl Primitive4 for Shape {
                 \treturn length(p - vec4<f32>({cx}, {cy}, {cz}, {cw})) - ({radius});\n\
                 }}\n",
                 name = name,
-                cx = center.x,
-                cy = center.y,
-                cz = center.z,
-                cw = center.w,
-                radius = radius,
+                cx = wgsl_f32(center.x),
+                cy = wgsl_f32(center.y),
+                cz = wgsl_f32(center.z),
+                cw = wgsl_f32(center.w),
+                radius = wgsl_f32(*radius),
             ),
 
             // Sentinel until the real path lands: face hyperplanes are pose-
@@ -60,11 +62,11 @@ impl Primitive4 for Shape {
                 \treturn dot(p, vec4<f32>({nx}, {ny}, {nz}, {nw})) - ({offset});\n\
                 }}\n",
                 name = name,
-                nx = normal.x,
-                ny = normal.y,
-                nz = normal.z,
-                nw = normal.w,
-                offset = offset,
+                nx = wgsl_f32(normal.x),
+                ny = wgsl_f32(normal.y),
+                nz = wgsl_f32(normal.z),
+                nw = wgsl_f32(normal.w),
+                offset = wgsl_f32(*offset),
             ),
 
             // 2D/3D variants don't belong in a 4D scene; sentinel keeps the trait
@@ -95,7 +97,7 @@ mod tests {
         };
         let wgsl = s.to_wgsl_4d("ball");
         assert!(wgsl.contains("fn ball(p: vec4<f32>) -> f32"));
-        assert!(wgsl.contains("length(p - vec4<f32>(1, 2, 3, 4))"));
+        assert!(wgsl.contains("length(p - vec4<f32>(1.0, 2.0, 3.0, 4.0))"));
         assert!(wgsl.contains("- (0.5)"));
     }
 
@@ -107,8 +109,8 @@ mod tests {
         };
         let wgsl = s.to_wgsl_4d("floor4");
         assert!(wgsl.contains("fn floor4(p: vec4<f32>) -> f32"));
-        assert!(wgsl.contains("dot(p, vec4<f32>(0, 1, 0, 0))"));
-        assert!(wgsl.contains("- (0)"));
+        assert!(wgsl.contains("dot(p, vec4<f32>(0.0, 1.0, 0.0, 0.0))"));
+        assert!(wgsl.contains("- (0.0)"));
     }
 
     #[test]

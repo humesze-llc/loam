@@ -7,12 +7,14 @@
 //! [`combinator`] provides Space-agnostic combinators (union, intersection,
 //! smooth-min) over the scalar distances returned by primitive SDFs.
 //!
-//! Emit contract, shared by the 3D and 4D paths: every baked constant is printed
-//! with `Display`, which is shortest-round-trip for `f32`. Parsing the emitted
-//! literal recovers the exact input bits, so the emitter contributes no floor to
-//! CPU/GPU parity and no divisor collapses to zero.
+//! Emit contract, shared by the 3D and 4D paths: every baked constant goes
+//! through `literal::wgsl_f32`, which is shortest-round-trip and always
+//! carries a decimal point or an exponent. Parsing the emitted literal recovers
+//! the exact input bits, so the emitter contributes no floor to CPU/GPU parity
+//! and no divisor collapses to zero.
 
 pub mod combinator;
+mod literal;
 pub mod primitive;
 pub mod primitive4;
 pub mod scene;
@@ -178,7 +180,7 @@ mod tests {
         use loam_math::EuclideanR3;
         let scene = Scene::new(SceneNode::sphere(Vec3::new(0.5, 0.0, 0.0), 0.1));
         let src = scene.to_wgsl(&EuclideanR3);
-        assert!(src.contains("vec3<f32>(0.5, 0, 0)"));
+        assert!(src.contains("vec3<f32>(0.5, 0.0, 0.0)"));
     }
 
     /// A tangent vector exped through H³ compresses below its E³ coordinate, so
@@ -191,7 +193,7 @@ mod tests {
         let src = scene.to_wgsl(&HyperbolicH3);
         // tanh(0.25) ≈ 0.2449, well under 0.5.
         assert!(p.x < 0.5);
-        assert!(!src.contains("vec3<f32>(0.5, 0, 0)"));
+        assert!(!src.contains("vec3<f32>(0.5, 0.0, 0.0)"));
     }
 
     // ---- Semantic-SDF correctness + Lipschitz-bound tests ------------------
@@ -395,5 +397,80 @@ mod tests {
             .abs();
             assert!(lhs <= dist_ab * (1.0 + 1e-5));
         }
+    }
+
+    // ---- Emitted-WGSL acceptance -------------------------------------------
+
+    /// A magnitude past 2^63, where a bare digit run overflows WGSL's
+    /// `AbstractInt` (i64) range. 1e19 is used rather than 2^63 itself because
+    /// the shortest round-trip decimal for 2^63 is 9223372000000000000, which
+    /// still fits.
+    const BEYOND_ABSTRACT_INT: f32 = 1.0e19;
+
+    fn assert_naga_accepts(source: &str) {
+        let module = naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|e| panic!("WGSL parse failed: {e}\n--- source ---\n{source}"));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("WGSL validation failed: {e:?}\n--- source ---\n{source}"));
+    }
+
+    /// Every constant a 3D scene bakes (sphere centre and radius, box half-
+    /// extents, half-space normal and offset, smooth-min blend radius) must
+    /// still parse as WGSL at magnitudes past 2^63. Under a bare `{}` print
+    /// each one becomes a digit run that naga rejects as "numeric literal not
+    /// representable by target type".
+    #[test]
+    fn scene3_beyond_abstract_int_range_emits_wgsl_naga_accepts() {
+        use loam_math::{EuclideanR3, WgslSpace};
+        let magnitude = BEYOND_ABSTRACT_INT;
+        let scene = Scene::new(
+            SceneNode::sphere(Vec3::new(magnitude, -magnitude, 0.0), magnitude)
+                .union(SceneNode::plane(Vec3::Y, -magnitude))
+                .smooth_union(SceneNode::box_(Vec3::splat(magnitude)), magnitude),
+        );
+        let probe = format!(
+            "{prelude}\n{scene}\n\
+             @compute @workgroup_size(1) fn main() {{\n\
+             \t_ = loam_scene_sdf(vec3<f32>(0.0));\n\
+             }}\n",
+            prelude = EuclideanR3.wgsl_impl(),
+            scene = scene.to_wgsl(&EuclideanR3),
+        );
+        assert_naga_accepts(&probe);
+    }
+
+    /// The 4D emit surface has its own constants (hypersphere centre and
+    /// radius, 4D half-space normal and offset, plus the offset re-printed in
+    /// the `loam_scene_max_t` ray-plane bound), so it is pinned separately.
+    #[test]
+    fn scene4_beyond_abstract_int_range_emits_wgsl_naga_accepts() {
+        use glam::Vec4;
+        let magnitude = BEYOND_ABSTRACT_INT;
+        let scene = Scene4::new(
+            SceneNode4::hypersphere(Vec4::splat(magnitude), magnitude)
+                .union(SceneNode4::halfspace(Vec4::Y, -magnitude)),
+        );
+        let native = format!(
+            "{scene}\n\
+             @compute @workgroup_size(1) fn main() {{\n\
+             \t_ = loam_scene_sdf_4d(vec4<f32>(0.0));\n\
+             }}\n",
+            scene = scene.to_wgsl_4d(),
+        );
+        assert_naga_accepts(&native);
+
+        let hyperslice = format!(
+            "{scene}\n\
+             @compute @workgroup_size(1) fn main() {{\n\
+             \t_ = loam_scene_sdf(vec3<f32>(0.0));\n\
+             \t_ = loam_scene_max_t(vec3<f32>(0.0), vec3<f32>(0.0, -1.0, 0.0));\n\
+             }}\n",
+            scene = scene.to_hyperslice_wgsl("0.0"),
+        );
+        assert_naga_accepts(&hyperslice);
     }
 }
