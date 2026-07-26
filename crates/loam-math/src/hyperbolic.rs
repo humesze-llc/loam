@@ -526,6 +526,10 @@ mod tests {
     /// represents without clamping (`|p|² < 1 - 1e-7`). Fixed, not sampled: the
     /// failure this covers is radial, so a seeded sampler would only make the
     /// coverage harder to read.
+    ///
+    /// 11 radii by 5 directions, so 55 points, of which the 5 at `r = 0`
+    /// coincide at the origin. The norm sweeps cross those with the 3
+    /// `SWEEP_TANGENTS`.
     fn ball_sweep() -> Vec<Vec3> {
         let radii = [
             0.0f32, 0.1, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 0.9999,
@@ -553,6 +557,16 @@ mod tests {
         // space, so nothing here may depend on `|v| < 1`.
         Vec3::new(2.0, -1.0, 0.5),
     ];
+
+    /// Chord between unit vectors, so it reads as an angle directly: a twist of
+    /// `θ` about the direction of travel registers as `2 sin(θ/2)`, and 0.1 rad
+    /// registers as 9.99e-2, two decades above this bound.
+    ///
+    /// The bound is set by the radial case, measured worst 2.6e-5 against 1.9e-7
+    /// for the plane normal. There the gyration axis `b × a` vanishes in exact
+    /// arithmetic but not in f32, and its rounding is divided by the scalar part
+    /// `1 - a·b`, which falls to 2e-4 between the two outermost shells.
+    const TWIST_CHORD_TOLERANCE: f32 = 1e-3;
 
     /// The closed form is Ungar's gyration and not merely something
     /// norm-preserving. Compared where the four-addition definition is still
@@ -645,6 +659,99 @@ mod tests {
                     (transported - forward).length() <= 1e-3,
                     "transported direction {transported:?} misses the forward \
                      tangent {forward:?} at {a:?} -> {b:?}"
+                );
+            }
+        }
+    }
+
+    /// The metric-norm pin and the geodesic-tangent pin are both blind to a
+    /// rotation about the direction of travel: it preserves every norm and it
+    /// fixes the tangent it turns about, which is the one they check. The plane
+    /// spanned by `a`, `b` and the ball origin contains the geodesic through
+    /// `a` and `b`, and reflection in that plane is an isometry of the ball
+    /// fixing that geodesic pointwise. Transport is
+    /// natural under isometries, so the transported normal has to sit in the
+    /// reflection's `-1` eigenspace, which is the normal's own line; a twist of
+    /// angle `θ` tilts it off by `2 sin(θ/2)`.
+    #[test]
+    fn parallel_transport_fixes_the_normal_of_the_geodesic_plane() {
+        let s = h3();
+        let points = ball_sweep();
+        for &a in &points {
+            for &b in &points {
+                // Radial pairs span no plane. Their stronger pin, over the
+                // whole orthogonal complement, is the next test.
+                let spread = a.normalize_or_zero().cross(b.normalize_or_zero());
+                if spread.length() < 1e-3 {
+                    continue;
+                }
+                let normal = a.cross(b).normalize();
+                let transported = s.parallel_transport(a, b, normal).normalize();
+                assert!(
+                    (transported - normal).length() <= TWIST_CHORD_TOLERANCE,
+                    "transport {a:?} -> {b:?} tilted the plane normal \
+                     {normal:?} to {transported:?}"
+                );
+            }
+        }
+    }
+
+    /// When `a` and `b` share a line through the origin every plane containing
+    /// that line carries the reflection argument, so transport fixes the whole
+    /// orthogonal complement pointwise and not merely one distinguished normal.
+    /// A twist about the direction of travel rotates that complement inside
+    /// itself, which is exactly the motion no norm or tangency assertion sees.
+    #[test]
+    fn parallel_transport_along_a_radial_geodesic_fixes_the_orthogonal_plane() {
+        let s = h3();
+        let points = ball_sweep();
+        for &a in &points {
+            for &b in &points {
+                let (ua, ub) = (a.normalize_or_zero(), b.normalize_or_zero());
+                if ua.cross(ub).length() >= 1e-3 || s.distance(a, b) < 1e-3 {
+                    continue;
+                }
+                // `normalize_or_zero` returns either a unit vector or zero, so
+                // this picks the endpoint that actually names the line.
+                let line = if ua.length_squared() < 0.5 { ub } else { ua };
+                let (w0, w1) = line.any_orthonormal_pair();
+                for w in [w0, w1] {
+                    let transported = s.parallel_transport(a, b, w).normalize();
+                    assert!(
+                        (transported - w).length() <= TWIST_CHORD_TOLERANCE,
+                        "radial transport {a:?} -> {b:?} spun {w:?} to \
+                         {transported:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The last degree of freedom of the transported frame. Norm, geodesic
+    /// tangent and plane normal are all fixed by the reflection through the
+    /// plane those last two span, so they admit a mirrored frame; the sign of
+    /// the determinant does not. Transport is a rotation scaled by the positive
+    /// conformal ratio, so the determinant is that ratio cubed. Measured worst
+    /// 3.3e-7 relative over a sweep whose determinants span 23 decades; the
+    /// bound is loose against that because the sign is the property here and
+    /// the norm sweep already owns the magnitude.
+    #[test]
+    fn parallel_transport_preserves_tangent_orientation() {
+        let s = h3();
+        let points = ball_sweep();
+        for &a in &points {
+            for &b in &points {
+                let frame = glam::Mat3::from_cols(
+                    s.parallel_transport(a, b, Vec3::X),
+                    s.parallel_transport(a, b, Vec3::Y),
+                    s.parallel_transport(a, b, Vec3::Z),
+                );
+                let expected = ((1.0 - b.length_squared()) / (1.0 - a.length_squared())).powi(3);
+                assert!(
+                    (frame.determinant() - expected).abs() <= 1e-4 * expected,
+                    "transport {a:?} -> {b:?} has frame determinant {} against \
+                     the conformal ratio cubed {expected}",
+                    frame.determinant()
                 );
             }
         }
