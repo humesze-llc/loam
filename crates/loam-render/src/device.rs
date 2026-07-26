@@ -94,6 +94,38 @@ fn ui_target_formats(surface_format: TextureFormat, downlevel: DownlevelFlags) -
     }
 }
 
+/// Swapchain configuration for a surface of `size`. Split out of
+/// [`RenderDevice::from_surface`] so the `view_formats` registration, the field
+/// wgpu validates against the downlevel flags, is checkable without a device.
+fn surface_configuration(
+    format: TextureFormat,
+    size: winit::dpi::PhysicalSize<u32>,
+    alpha_mode: CompositeAlphaMode,
+    ui_targets: UiTargetFormats,
+) -> SurfaceConfiguration {
+    SurfaceConfiguration {
+        // COPY_SRC keeps headless screenshot readback open at negligible cost.
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        format,
+        width: size.width,
+        height: size.height,
+        present_mode: PresentMode::Fifo,
+        alpha_mode,
+        view_formats: ui_targets.swap_view_format.into_iter().collect(),
+        desired_maximum_frame_latency: 2,
+    }
+}
+
+/// UI-pass view of a target that registered `ui_view_format` as its
+/// reinterpretation. `None` requests the target's own format, which is the only
+/// legal request when nothing was registered.
+fn ui_view_descriptor(ui_view_format: Option<TextureFormat>) -> TextureViewDescriptor<'static> {
+    TextureViewDescriptor {
+        format: ui_view_format,
+        ..Default::default()
+    }
+}
+
 /// All wgpu state the engine carries. One per app; not cloneable.
 pub struct RenderDevice {
     pub instance: Instance,
@@ -212,17 +244,7 @@ impl RenderDevice {
                  space and egui feathering will look thin on hairlines"
             );
         }
-        let config = SurfaceConfiguration {
-            // COPY_SRC keeps headless screenshot readback open at negligible cost.
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-            format,
-            width: size.width,
-            height: size.height,
-            present_mode: PresentMode::Fifo,
-            alpha_mode,
-            view_formats: ui_targets.swap_view_format.into_iter().collect(),
-            desired_maximum_frame_latency: 2,
-        };
+        let config = surface_configuration(format, size, alpha_mode, ui_targets);
 
         surface.configure(&device, &config);
 
@@ -417,10 +439,9 @@ impl RenderDevice {
     /// reinterpretation where the adapter supports it, the texture's own format
     /// otherwise.
     pub fn create_ui_swap_view(&self, frame: &SurfaceTexture) -> TextureView {
-        frame.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: self.ui_targets.swap_view_format,
-            ..Default::default()
-        })
+        frame
+            .texture
+            .create_view(&ui_view_descriptor(self.ui_targets.swap_view_format))
     }
 
     /// UI-pass view of the MSAA attachment, `None` when MSAA is off. Non-sRGB
@@ -529,18 +550,18 @@ fn negotiate_sample_count(adapter: &Adapter, format: TextureFormat, requested: u
     1
 }
 
-/// `ui_view_format` is `UiTargetFormats::msaa_view_format`: `Some` registers the
-/// reinterpretation the UI pass draws through, `None` leaves the attachment
-/// single-format and `ui_view` is then a plain view.
-fn create_msaa_target(
-    device: &Device,
+/// `ui_view_format` is [`UiTargetFormats::msaa_view_format`]: `Some` registers
+/// the reinterpretation the UI pass draws through, `None` leaves the attachment
+/// single-format. Taken by reference so the descriptor's `view_formats` slice
+/// can borrow it, which also keeps the descriptor checkable without a device.
+fn msaa_texture_descriptor(
     format: TextureFormat,
     width: u32,
     height: u32,
     sample_count: u32,
-    ui_view_format: Option<TextureFormat>,
-) -> MsaaTarget {
-    let texture = device.create_texture(&TextureDescriptor {
+    ui_view_format: &Option<TextureFormat>,
+) -> TextureDescriptor<'_> {
+    TextureDescriptor {
         label: Some("loam-render::msaa-color"),
         size: Extent3d {
             width,
@@ -553,12 +574,26 @@ fn create_msaa_target(
         format,
         usage: TextureUsages::RENDER_ATTACHMENT,
         view_formats: ui_view_format.as_slice(),
-    });
+    }
+}
+
+fn create_msaa_target(
+    device: &Device,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+    ui_view_format: Option<TextureFormat>,
+) -> MsaaTarget {
+    let texture = device.create_texture(&msaa_texture_descriptor(
+        format,
+        width,
+        height,
+        sample_count,
+        &ui_view_format,
+    ));
     let view = texture.create_view(&TextureViewDescriptor::default());
-    let ui_view = texture.create_view(&TextureViewDescriptor {
-        format: ui_view_format,
-        ..Default::default()
-    });
+    let ui_view = texture.create_view(&ui_view_descriptor(ui_view_format));
     MsaaTarget {
         texture,
         view,
@@ -572,6 +607,29 @@ mod tests {
 
     const BOTH: DownlevelFlags =
         DownlevelFlags::SURFACE_VIEW_FORMATS.union(DownlevelFlags::VIEW_FORMATS);
+
+    /// Both swapchain paths (sRGB direct, linear composite) and a format with
+    /// no sRGB sibling.
+    const SURFACES: [TextureFormat; 4] = [
+        TextureFormat::Bgra8UnormSrgb,
+        TextureFormat::Rgba8UnormSrgb,
+        TextureFormat::Bgra8Unorm,
+        TextureFormat::Rgba16Float,
+    ];
+
+    /// Neither flag, each alone, both, and everything.
+    const DOWNLEVELS: [DownlevelFlags; 5] = [
+        DownlevelFlags::empty(),
+        DownlevelFlags::SURFACE_VIEW_FORMATS,
+        DownlevelFlags::VIEW_FORMATS,
+        BOTH,
+        DownlevelFlags::all(),
+    ];
+
+    const SIZE: winit::dpi::PhysicalSize<u32> = winit::dpi::PhysicalSize {
+        width: 800,
+        height: 600,
+    };
 
     #[test]
     fn srgb_surface_registers_view_formats_only_with_both_downlevel_flags() {
@@ -615,21 +673,8 @@ mod tests {
     /// whose formats disagree fails pipeline/attachment validation at paint.
     #[test]
     fn ui_format_matches_every_view_the_ui_pass_renders_into() {
-        let surfaces = [
-            TextureFormat::Bgra8UnormSrgb,
-            TextureFormat::Rgba8UnormSrgb,
-            TextureFormat::Bgra8Unorm,
-            TextureFormat::Rgba16Float,
-        ];
-        let downlevels = [
-            DownlevelFlags::empty(),
-            DownlevelFlags::SURFACE_VIEW_FORMATS,
-            DownlevelFlags::VIEW_FORMATS,
-            BOTH,
-            DownlevelFlags::all(),
-        ];
-        for surface in surfaces {
-            for downlevel in downlevels {
+        for surface in SURFACES {
+            for downlevel in DOWNLEVELS {
                 let targets = ui_target_formats(surface, downlevel);
                 let case = format!("{surface:?} {downlevel:?}");
                 assert_eq!(
@@ -647,6 +692,83 @@ mod tests {
                     // Composite path: the UI writes to the offscreen target.
                     assert_eq!(targets.ui_format, surface.add_srgb_suffix(), "{case}");
                 }
+            }
+        }
+    }
+
+    /// The guard lives in `ui_target_formats`, but wgpu only ever sees the
+    /// descriptors. A descriptor that recomputes the non-sRGB twin itself
+    /// registers a view format the adapter may reject outright, which is the
+    /// failure the guard exists to prevent.
+    #[test]
+    fn descriptors_register_only_the_sanctioned_reinterpretation() {
+        for surface in SURFACES {
+            for downlevel in DOWNLEVELS {
+                let case = format!("{surface:?} {downlevel:?}");
+                // Derived from the flags rather than from `ui_target_formats`,
+                // so a descriptor cannot drift in step with the decision.
+                let sanctioned: Vec<TextureFormat> =
+                    if surface.is_srgb() && downlevel.contains(BOTH) {
+                        vec![surface.remove_srgb_suffix()]
+                    } else {
+                        vec![]
+                    };
+                let targets = ui_target_formats(surface, downlevel);
+                let config =
+                    surface_configuration(surface, SIZE, CompositeAlphaMode::Opaque, targets);
+                assert_eq!(config.view_formats, sanctioned, "swapchain: {case}");
+                let msaa = msaa_texture_descriptor(
+                    surface,
+                    SIZE.width,
+                    SIZE.height,
+                    4,
+                    &targets.msaa_view_format,
+                );
+                assert_eq!(msaa.view_formats, sanctioned, "msaa attachment: {case}");
+            }
+        }
+    }
+
+    /// `create_view` rejects a format absent from the target's `view_formats`,
+    /// so a UI view must request exactly what its target registered: the
+    /// reinterpretation where one was sanctioned, and nothing where none was.
+    /// Both arms are asserted, since a descriptor that stopped requesting
+    /// anything would still satisfy a check that only inspects `Some`.
+    #[test]
+    fn ui_view_requests_match_their_target_registration_in_both_arms() {
+        for surface in SURFACES {
+            for downlevel in DOWNLEVELS {
+                let case = format!("{surface:?} {downlevel:?}");
+                // Derived from the flags rather than from `ui_target_formats`,
+                // so a view descriptor cannot drift in step with the decision.
+                let expected = (surface.is_srgb() && downlevel.contains(BOTH))
+                    .then(|| surface.remove_srgb_suffix());
+                let targets = ui_target_formats(surface, downlevel);
+
+                let swap_request = ui_view_descriptor(targets.swap_view_format).format;
+                assert_eq!(swap_request, expected, "swapchain request: {case}");
+                let config =
+                    surface_configuration(surface, SIZE, CompositeAlphaMode::Opaque, targets);
+                assert_eq!(
+                    config.view_formats,
+                    swap_request.into_iter().collect::<Vec<_>>(),
+                    "swapchain registration: {case}"
+                );
+
+                let msaa_request = ui_view_descriptor(targets.msaa_view_format).format;
+                assert_eq!(msaa_request, expected, "msaa attachment request: {case}");
+                let msaa = msaa_texture_descriptor(
+                    surface,
+                    SIZE.width,
+                    SIZE.height,
+                    4,
+                    &targets.msaa_view_format,
+                );
+                assert_eq!(
+                    msaa.view_formats,
+                    msaa_request.into_iter().collect::<Vec<_>>(),
+                    "msaa attachment registration: {case}"
+                );
             }
         }
     }
