@@ -431,7 +431,9 @@ impl<S: PhysicsSpace> World<S> {
         self.constraint_keys = keys;
     }
 
-    /// All-pairs broadphase. Returns `(i, j)` pairs with `i < j`.
+    /// All-pairs broadphase: one canonical [`PairKey`] per candidate pair,
+    /// ordered by [`BodyId`] and not by storage position. Pairs of two static
+    /// bodies are skipped.
     pub fn broadphase(&self) -> Vec<PairKey> {
         let mut pairs = Vec::new();
         self.fill_broadphase(&mut pairs);
@@ -553,7 +555,9 @@ mod tests {
         multi_island_scenario_run, multi_island_world, ScenarioRun, GOLDEN_MULTI_ISLAND_HASH,
         GOLDEN_TRAJECTORY_HASH, MULTI_ISLAND_DT, MULTI_ISLAND_STEPS,
     };
-    use crate::euclidean_r3::{halfspace_body_r3, register_default_narrowphase, sphere_body_r3};
+    use crate::euclidean_r3::{
+        box_body, halfspace_body_r3, register_default_narrowphase, sphere_body_r3,
+    };
     use crate::field::Gravity;
     use glam::Vec3;
     use loam_math::{Bivector3, EuclideanR3};
@@ -1365,6 +1369,160 @@ mod tests {
         assert!(
             !world.manifolds.contains_key(&(floor, doomed)),
             "a manifold keyed on the despawned body came back with the slot"
+        );
+    }
+
+    /// `dense_pair` hands back two storage positions in its key's order, so
+    /// the caller's first index has to come back as the first borrow whichever
+    /// side of the split it lands on.
+    #[test]
+    fn split_two_mut_returns_borrows_in_argument_order() {
+        let mut slice = [0u32, 1, 2, 3];
+        for (i, j) in [(1usize, 3usize), (3, 1)] {
+            let (a, b) = split_two_mut(&mut slice, i, j);
+            assert_eq!((*a, *b), (i as u32, j as u32), "split_two_mut({i}, {j})");
+        }
+    }
+
+    /// Two dynamic boxes resting on the static floor, plus a disjoint fourth
+    /// body whose despawn decides the surviving pair's storage order: spawned
+    /// before the pair, it sits below them and its removal swaps the upper box
+    /// down past the lower one; spawned after, its removal moves nothing.
+    /// Either way the world ends up holding the same three bodies in the same
+    /// configuration, so storage order is the only variable between the two.
+    ///
+    /// Boxes rather than spheres because the box pair runs GJK + EPA, whose
+    /// result depends on which hull is the Minkowski minuend. The sphere
+    /// narrowphases and the impulse response are exactly antisymmetric under an
+    /// operand swap, so a sphere pair would settle to the same state either way
+    /// and could not tell the two orders apart.
+    fn stacked_pair_world(doomed_first: bool) -> (World<EuclideanR3>, BodyId, BodyId, BodyId) {
+        const LOWER_HALF_EXTENT: f32 = 0.5;
+        const UPPER_HALF_EXTENT: f32 = 0.35;
+        const DOOMED_X: f32 = -6.0;
+
+        let mut world = World::new(EuclideanR3);
+        register_default_narrowphase(&mut world.narrowphase);
+        world.push_field(Box::new(Gravity::new(Vec3::new(0.0, GRAVITY_Y, 0.0))));
+
+        let floor = world.push_body(halfspace_body_r3(Vec3::Y, 0.0));
+        world.bodies[floor].restitution = 0.0;
+
+        let spawned_first = doomed_first.then(|| world.push_body(island_sphere(DOOMED_X)));
+        let lower = world.push_body(box_body(
+            Vec3::new(0.0, LOWER_HALF_EXTENT, 0.0),
+            Vec3::ZERO,
+            Vec3::splat(LOWER_HALF_EXTENT),
+            1.0,
+        ));
+        let upper = world.push_body(box_body(
+            Vec3::new(0.0, 2.0 * LOWER_HALF_EXTENT + UPPER_HALF_EXTENT, 0.0),
+            Vec3::ZERO,
+            Vec3::splat(UPPER_HALF_EXTENT),
+            3.0,
+        ));
+        let doomed = spawned_first.unwrap_or_else(|| world.push_body(island_sphere(DOOMED_X)));
+
+        for id in [lower, upper, doomed] {
+            world.bodies[id].restitution = 0.0;
+        }
+        (world, lower, upper, doomed)
+    }
+
+    /// Settle the pair, drop the fourth body, and return the world with the
+    /// pair's key. Asserts the pair is in contact and that the despawn left
+    /// storage order in the state the caller asked for, so a fixture that stops
+    /// reaching the disagreeing case fails instead of going quiet.
+    fn despawned_pair_world(
+        doomed_first: bool,
+        dt: f32,
+    ) -> (World<EuclideanR3>, BodyId, BodyId, PairKey) {
+        const SETTLE_STEPS: usize = 40;
+
+        let (mut world, lower, upper, doomed) = stacked_pair_world(doomed_first);
+        for _ in 0..SETTLE_STEPS {
+            world.step(dt);
+        }
+
+        let key = canonical_pair(lower, upper);
+        assert!(
+            world.manifolds.contains_key(&key),
+            "the two dynamic bodies never settled into contact"
+        );
+        assert!(world.despawn_body(doomed));
+
+        let (i, j) = world.dense_pair(key);
+        assert_eq!(
+            i > j,
+            doomed_first,
+            "the pair is stored at {i}, {j}, which is not the order this fixture \
+             was built to produce"
+        );
+        (world, lower, upper, key)
+    }
+
+    /// A manifold's contact normal is documented as pointing from `body_a`
+    /// toward `body_b`, and `body_a` is its key's low handle. Nothing ties the
+    /// key to storage, so taking the pair in storage order flips every normal a
+    /// manifold carries whenever a despawn has moved one body below its
+    /// partner.
+    #[test]
+    fn contact_normal_points_from_the_pair_key_low_body_to_the_high_one() {
+        let dt = 1.0 / 240.0;
+        for doomed_first in [false, true] {
+            let (mut world, _, _, key) = despawned_pair_world(doomed_first, dt);
+            world.step(dt);
+
+            let manifold = world.manifolds.get(&key).expect("the pair separated");
+            let key_axis = world.bodies[key.1].position - world.bodies[key.0].position;
+            assert!(!manifold.points.is_empty(), "manifold carries no contact");
+            for cp in &manifold.points {
+                assert!(
+                    cp.normal.dot(key_axis) > 0.0,
+                    "normal {} points back toward the key's low body",
+                    cp.normal
+                );
+            }
+        }
+    }
+
+    /// Which slot the arena happens to store a body in is not physics, so it
+    /// must not reach the pair's state at all. Bit equality against the
+    /// control, not a tolerance: both worlds run the same arithmetic on the
+    /// same inputs, so a correct solver leaves no error term to bound.
+    #[test]
+    fn storage_order_does_not_reach_a_contacting_pairs_trajectory() {
+        let dt = 1.0 / 240.0;
+        let steps = 120;
+        let mut trajectories = Vec::new();
+        for doomed_first in [false, true] {
+            let (mut world, lower, upper, key) = despawned_pair_world(doomed_first, dt);
+            let mut contact_steps = 0;
+            let mut trajectory = Vec::with_capacity(steps);
+            for _ in 0..steps {
+                world.step(dt);
+                if world.manifolds.contains_key(&key) {
+                    contact_steps += 1;
+                }
+                trajectory.push((body_state(&world, lower), body_state(&world, upper)));
+            }
+            // A pair that separates stops reaching the solver, and the rest of
+            // the comparison is then two ballistic arcs agreeing for free.
+            assert_eq!(
+                contact_steps, steps,
+                "the pair held contact for only {contact_steps} of {steps} steps"
+            );
+            trajectories.push(trajectory);
+        }
+
+        let step = trajectories[0]
+            .iter()
+            .zip(&trajectories[1])
+            .position(|(a, b)| a != b);
+        assert!(
+            step.is_none(),
+            "storage order reached the solve: the pair diverged from the control \
+             at step {step:?}"
         );
     }
 
