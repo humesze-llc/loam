@@ -1467,16 +1467,29 @@ mod tests {
     /// The Hyperslice cull keeps exactly the edges some containing cell carries
     /// across the slab, in edge order. Inverting the predicate keeps the
     /// complement: a different mesh, not a thinner one.
+    ///
+    /// The spin must tilt w into R³ (`Zw`, not the w-preserving `Xz` the other
+    /// fixtures use): under a w-preserving spin drop-w sends the 16-cell's
+    /// `+e_w` and `-e_w` to the same R³ point, the keep set and its complement
+    /// are congruent, and an inverted predicate emits a mesh this pin cannot
+    /// tell from the right one. The `assert_ne` below holds the fixture to it.
     #[test]
     fn hyperslice_keeps_the_edges_whose_cells_cross_the_slab() {
         const THICKNESS: f32 = 0.2;
+        const TILT: f32 = 0.5;
+        // Slab `[0.4, 0.6]`: above the tilted `e_z` w-extent
+        // (`BODY_SIZE · sin TILT` = 0.34) and below the `e_w` one
+        // (`BODY_SIZE · cos TILT` = 0.61), so a cell's w-range straddles the
+        // near boundary exactly when the cell holds `+e_w`, and the edges
+        // reaching only `-e_w` cells are the ones culled.
+        const SLAB_CENTRE_W: f32 = 0.5;
         let physics = PlaygroundPhysics::new(1, BODY_SIZE);
         let frame = frame_of(
             &physics,
             ROW_16,
-            rotor_at(Plane4::Xz, 0.5),
+            rotor_at(Plane4::Zw, TILT),
             Projection::Identity,
-            SLICE_W,
+            SLAB_CENTRE_W,
             CAMERA_DISTANCE,
         );
         let mut style = slice_colored_style();
@@ -1487,29 +1500,39 @@ mod tests {
         let centre = frame.body_local(0, topo.vertices, BODY_SIZE, &mut local);
         // Drop-w and a flat blend, so a kept edge is exactly its two projected
         // endpoints and the whole mesh is an ordered function of the keep set.
-        let expected: Vec<([f32; 3], [f32; 3])> = topo
-            .edges
-            .iter()
-            .filter(|[i, j]| {
-                topo.cells.iter().any(|cell| {
-                    cell.contains(i) && cell.contains(j) && {
-                        let (w_min, w_max) = cell_w_range(cell, &local);
-                        slab_overlaps(w_min, w_max, SLICE_W, THICKNESS)
-                    }
+        // `keep` reads the cell's slab overlap, so the mesh an inverted cull
+        // would emit is one more call.
+        let mesh_under = |keep: fn(bool) -> bool| -> Vec<([f32; 3], [f32; 3])> {
+            topo.edges
+                .iter()
+                .filter(|[i, j]| {
+                    topo.cells.iter().any(|cell| {
+                        cell.contains(i) && cell.contains(j) && {
+                            let (w_min, w_max) = cell_w_range(cell, &local);
+                            keep(slab_overlaps(w_min, w_max, SLAB_CENTRE_W, THICKNESS))
+                        }
+                    })
                 })
-            })
-            .map(|&[i, j]| {
-                (
-                    (local[i as usize].truncate() + centre).to_array(),
-                    (local[j as usize].truncate() + centre).to_array(),
-                )
-            })
-            .collect();
+                .map(|&[i, j]| {
+                    (
+                        (local[i as usize].truncate() + centre).to_array(),
+                        (local[j as usize].truncate() + centre).to_array(),
+                    )
+                })
+                .collect()
+        };
+        let expected = mesh_under(|overlaps| overlaps);
         assert!(
             !expected.is_empty() && expected.len() < topo.edges.len(),
             "the slab kept {} of {} edges, so the cull is not under test",
             expected.len(),
             topo.edges.len()
+        );
+        assert_ne!(
+            mesh_under(|overlaps| !overlaps),
+            expected,
+            "the inverted cull emits the same mesh here, so the pin below \
+             cannot see the predicate's polarity"
         );
 
         let mut slerp_scratch = Vec::new();
