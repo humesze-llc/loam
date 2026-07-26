@@ -12,10 +12,10 @@
 //! line of HTML instead of the button markup + CSS. The wasm download happens
 //! regardless; click-to-start only defers the per-frame wgpu work.
 //!
-//! The `<style>` is keyed on a fixed id so multiple demos insert the CSS once;
-//! v1 ships single-demo embedding only. Demos theme by shipping a
-//! later-cascade stylesheet or pre-creating their own `<button id="...">`,
-//! which [`inject_launch_overlay`] reuses.
+//! The `<style>` is keyed on a fixed id so several embeds on one page share
+//! one copy. Demos theme by shipping a later-cascade stylesheet or
+//! pre-creating their own `<button id="...">`, which
+//! [`inject_launch_overlay`] reuses.
 //!
 //! After launch, the embed lifecycle in `main_launcher` enforces
 //! one-active-demo-per-page: clicking outside the host pauses the worker
