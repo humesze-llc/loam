@@ -950,6 +950,31 @@ mod tests {
         long_name: "pentachoron",
     }];
 
+    /// The 16-cell is the fixture shape wherever a pin needs a known image:
+    /// its vertices are `±e_i`, so twelve of its edges lie exactly in `w = 0`
+    /// (drop-w loses nothing there) and its w-slices shrink with `|w|` (so a
+    /// cut at the wrong slice is a different cap, not the same one). It is also
+    /// the only polytope `stereographic_view_radius` clips.
+    const CELL16: ShapeEntry = ShapeEntry {
+        shape: RaymarchShape::Polytope(Polytope4::Cell16),
+        body_color: [0.30, 0.70, 0.95],
+        label: "16-cell",
+        long_name: "hexadecachoron",
+    };
+    const ROW_16: &[ShapeEntry] = &[CELL16];
+    /// Two slots of the same shape: each half of any mesh is the same geometry
+    /// at the other slot's layout position, so a builder that read slot 0's
+    /// pose for every slot collapses the halves onto each other.
+    const ROW_16_PAIR: &[ShapeEntry] = &[CELL16, CELL16];
+
+    /// A slice off `w = 0`, inside the 16-cell's w-extent (`±BODY_SIZE`) so the
+    /// cut is non-degenerate. A builder that substituted `0.0` for the frame's
+    /// own `w_slice` cuts a visibly different cap here.
+    const SLICE_W: f32 = 0.2;
+
+    /// Eye-to-focus distance for the fixtures that do not vary it.
+    const CAMERA_DISTANCE: f32 = 4.0;
+
     /// Tolerance for "the same mesh, translated": the pins compare
     /// `p + (centre + d)` against `(p + centre) + d`, and f32 addition does not
     /// associate. Four orders of magnitude below the throw's own displacement,
@@ -973,7 +998,7 @@ mod tests {
     }
 
     fn translated_pair() -> TranslatedPair {
-        let spin = (Plane4::Xy.unit_bivector() * 0.7).exp().normalize();
+        let spin = rotor_at(Plane4::Xy, 0.7);
         let mut thrown = PlaygroundPhysics::new(1, BODY_SIZE);
         let layout = Vec4::from_array(body_position(0, 1));
         thrown.world.bodies[0].apply_impulse_at_point(
@@ -1009,17 +1034,168 @@ mod tests {
         }
     }
 
-    /// Drop-w and a fixed camera: the builders' clip and scale paths then
-    /// depend on the body pose alone.
+    /// Drop-w, on the `w = 0` slice, fixed camera: the builders' clip and scale
+    /// paths then depend on the body pose alone.
     fn frame(physics: &PlaygroundPhysics, spin: Rotor4) -> RowFrame<'_> {
+        frame_of(
+            physics,
+            ROW,
+            spin,
+            Projection::Identity,
+            0.0,
+            CAMERA_DISTANCE,
+        )
+    }
+
+    /// Every field of the seam a fixture might vary, spelled out.
+    fn frame_of<'a>(
+        physics: &'a PlaygroundPhysics,
+        row: &'a [ShapeEntry],
+        spin: Rotor4,
+        projection: Projection<4>,
+        w_slice: f32,
+        camera_distance: f32,
+    ) -> RowFrame<'a> {
         RowFrame {
             physics,
-            row: ROW,
+            row,
             spin,
             body_size: BODY_SIZE,
-            projection: Projection::Identity,
-            w_slice: 0.0,
-            camera_distance: 4.0,
+            projection,
+            w_slice,
+            camera_distance,
+        }
+    }
+
+    fn rotor_at(plane: Plane4, angle: f32) -> Rotor4 {
+        (plane.unit_bivector() * angle).exp().normalize()
+    }
+
+    /// Flat chords, no Hyperslice cull, `Active` coloring. `Active` is the one
+    /// color mode derived from `w_slice`, so a pin that compares colors covers
+    /// the slice as well as the pose.
+    fn slice_colored_style() -> WireframeStyle {
+        WireframeStyle {
+            color_mode: WireframeColorMode::Active,
+            alpha: 1.0,
+            width_px: 1.8,
+            nearest_active: false,
+            space_blend: 0.0,
+            hyperslice: None,
+        }
+    }
+
+    /// Everything the three mesh builders emit for one frame, as world-R³
+    /// points in build order. Taking all of them at once is what keeps a
+    /// fixture from pinning whichever path it happened to pick.
+    struct BuiltRow {
+        edges: Vec<[f32; 3]>,
+        /// Cross-section perimeter then projected-cap perimeter, per slot.
+        perimeter: Vec<[f32; 3]>,
+        sprites: Vec<[f32; 3]>,
+        sprite_colors: Vec<[f32; 4]>,
+        cross_caps: Vec<[f32; 3]>,
+        projected_caps: Vec<[f32; 3]>,
+        /// The cap fill's surviving triangles. The near-pole clip drops these
+        /// and leaves the vertices behind, so it is invisible in
+        /// [`Self::projected_caps`].
+        projected_cap_triangles: Vec<[u32; 3]>,
+        cross_cap_triangles: Vec<[u32; 3]>,
+    }
+
+    /// Both section layers visible and both sprite kinds on, so no branch of a
+    /// builder sits outside the pins.
+    fn build_row(frame: &RowFrame<'_>, style: &WireframeStyle) -> BuiltRow {
+        let cross = SectionLayer::CROSS_SECTION_DEFAULT;
+        let cap = SectionLayer {
+            perimeter: true,
+            surface_alpha: 0.5,
+        };
+        let mut palette_cache = std::collections::HashMap::new();
+        let mut slerp_scratch = Vec::new();
+        let (perimeter, edges) = build_wireframe_meshes(
+            frame,
+            style,
+            cross,
+            cap,
+            &mut palette_cache,
+            &mut slerp_scratch,
+        );
+
+        let points_style = PointsStyle {
+            color_mode: style.color_mode,
+            show_vertices: true,
+            show_cell_centers: true,
+            size_px: 6.0,
+        };
+        let mut sprites = loam_shape::PointMesh::<3>::default();
+        build_points_mesh(frame, &points_style, &mut sprites);
+
+        let mut local_vertices = Vec::new();
+        let mut proj_scratch = Vec::new();
+        let mut cross_mesh = loam_shape::TriangleMesh::<3>::default();
+        let mut cap_mesh = loam_shape::TriangleMesh::<3>::default();
+        build_section_layer_meshes(
+            frame,
+            cross,
+            cap,
+            &mut local_vertices,
+            &mut proj_scratch,
+            &mut cross_mesh,
+            &mut cap_mesh,
+        );
+
+        BuiltRow {
+            edges: segment_points(&edges),
+            perimeter: segment_points(&perimeter),
+            sprites: sprites.positions,
+            sprite_colors: sprites.colors,
+            cross_caps: cross_mesh.vertices,
+            projected_caps: cap_mesh.vertices,
+            projected_cap_triangles: cap_mesh.indices,
+            cross_cap_triangles: cross_mesh.indices,
+        }
+    }
+
+    impl BuiltRow {
+        /// Each mesh in build order, so a pin covers every path at once.
+        fn meshes(&self) -> [(&str, &[[f32; 3]]); 5] {
+            [
+                ("parent wireframe", &self.edges),
+                ("section perimeter", &self.perimeter),
+                ("point sprites", &self.sprites),
+                ("cross-section caps", &self.cross_caps),
+                ("projected caps", &self.projected_caps),
+            ]
+        }
+
+        /// Every mesh is `rest`'s carried by `delta`, with the coloring
+        /// untouched: the whole seam moved with the body and nothing else did.
+        fn assert_carried_from(&self, rest: &BuiltRow, delta: Vec3) {
+            for ((what, live), (_, at_rest)) in self.meshes().iter().zip(rest.meshes().iter()) {
+                assert_translated(live, at_rest, delta, what);
+            }
+            assert_eq!(
+                self.sprite_colors, rest.sprite_colors,
+                "sprite coloring diverged between the two worlds"
+            );
+            assert_eq!(
+                (&self.cross_cap_triangles, &self.projected_cap_triangles),
+                (&rest.cross_cap_triangles, &rest.projected_cap_triangles),
+                "cap triangulation diverged, so the vertex pins compare unrelated points"
+            );
+        }
+
+        /// The row's two slots emitted the same geometry, separated by `delta`.
+        fn assert_slots_separated_by(&self, delta: Vec3) {
+            for (what, all) in self.meshes() {
+                assert!(
+                    !all.is_empty(),
+                    "{what}: nothing was emitted, so the pin is vacuous"
+                );
+                let (first, second) = all.split_at(all.len() / 2);
+                assert_translated(second, first, delta, what);
+            }
         }
     }
 
@@ -1178,5 +1354,380 @@ mod tests {
             live_cross.indices, rest_cross.indices,
             "cap triangulation diverged, so the vertex pin above compares unrelated points"
         );
+    }
+
+    /// Every slot renders at its OWN body. A two-slot row of one shape emits
+    /// the same geometry twice, separated by the layout spacing; a builder that
+    /// read slot 0's pose for the whole row collapses the two halves onto each
+    /// other.
+    #[test]
+    fn each_slot_renders_at_its_own_body() {
+        let physics = PlaygroundPhysics::new(2, BODY_SIZE);
+        let frame = frame_of(
+            &physics,
+            ROW_16_PAIR,
+            rotor_at(Plane4::Xz, 0.5),
+            Projection::Identity,
+            SLICE_W,
+            CAMERA_DISTANCE,
+        );
+        let built = build_row(&frame, &slice_colored_style());
+
+        let layout = Vec4::from_array(body_position(1, 2)).truncate()
+            - Vec4::from_array(body_position(0, 2)).truncate();
+        assert!(layout.length() > 0.5, "the two slots share a position");
+        built.assert_slots_separated_by(layout);
+        let (first, second) = built.sprite_colors.split_at(built.sprite_colors.len() / 2);
+        assert_eq!(
+            first, second,
+            "the two slots colored the same shape differently"
+        );
+    }
+
+    /// A body physics threw off the slice is cut where it now IS. The same body
+    /// lifted to `w = lift` and cut at `w_slice + lift` renders exactly what the
+    /// unmoved body cut at `w_slice` does: `BodyPose::body_local`'s `w` term and
+    /// the frame's own `w_slice` are the two halves of that, and dropping
+    /// either one breaks the equality.
+    #[test]
+    fn a_body_lifted_off_the_slice_is_cut_where_physics_put_it() {
+        let (lifted, lift) = thrown_along_w();
+        let spin = rotor_at(Plane4::Xz, 0.5);
+        let at_rest = PlaygroundPhysics::new(1, BODY_SIZE);
+        let style = slice_colored_style();
+        let build_at = |physics, w_slice| {
+            build_row(
+                &frame_of(
+                    physics,
+                    ROW_16,
+                    spin,
+                    Projection::Identity,
+                    w_slice,
+                    CAMERA_DISTANCE,
+                ),
+                &style,
+            )
+        };
+
+        let live = build_at(&lifted, SLICE_W + lift);
+        let rest = build_at(&at_rest, SLICE_W);
+        // The lift is along +w alone, so the R³ centre never moved.
+        live.assert_carried_from(&rest, Vec3::ZERO);
+
+        // The same lifted body at the UNSHIFTED slice is a different cut;
+        // without this the pin above would also hold for a build that ignored
+        // the lift and the slice together.
+        let off_slice = build_at(&lifted, SLICE_W);
+        assert_ne!(
+            off_slice.cross_caps, rest.cross_caps,
+            "the cap did not move with the slice, so the pin above is vacuous"
+        );
+    }
+
+    /// The honest cross-section ignores the active projection; the projected
+    /// cap follows it. Under Perspective4D at a slice off `w = 0` the cap is
+    /// the cross-section scaled about the body centre by
+    /// `focal / (focal - w_slice)`, so swapping the two layers' projections
+    /// swaps which mesh carries the scale.
+    #[test]
+    fn the_honest_layer_ignores_the_projection_the_cap_scales_by_it() {
+        const FOCAL: f32 = 2.0;
+        let physics = PlaygroundPhysics::new(1, BODY_SIZE);
+        let frame = frame_of(
+            &physics,
+            ROW_16,
+            rotor_at(Plane4::Xz, 0.5),
+            Projection::Perspective4D {
+                focal_distance: FOCAL,
+            },
+            SLICE_W,
+            CAMERA_DISTANCE,
+        );
+        let built = build_row(&frame, &slice_colored_style());
+
+        let scale = FOCAL / (FOCAL - SLICE_W);
+        assert!(
+            (scale - 1.0).abs() > 0.1,
+            "the two layers would coincide at this focal distance"
+        );
+        let centre = Vec4::from_array(body_position(0, 1)).truncate();
+        assert_scaled_about(
+            &built.projected_caps,
+            &built.cross_caps,
+            centre,
+            scale,
+            "section cap fill",
+        );
+        // The perimeter mesh is the honest outline followed by the cap outline,
+        // one slot, so its halves stand in the same relation.
+        let (honest, cap) = built.perimeter.split_at(built.perimeter.len() / 2);
+        assert_scaled_about(cap, honest, centre, scale, "section perimeter");
+    }
+
+    /// The Hyperslice cull keeps exactly the edges some containing cell carries
+    /// across the slab, in edge order. Inverting the predicate keeps the
+    /// complement: a different mesh, not a thinner one.
+    ///
+    /// The spin must tilt w into R³ (`Zw`, not the w-preserving `Xz` the other
+    /// fixtures use): under a w-preserving spin drop-w sends the 16-cell's
+    /// `+e_w` and `-e_w` to the same R³ point, the keep set and its complement
+    /// are congruent, and an inverted predicate emits a mesh this pin cannot
+    /// tell from the right one. The `assert_ne` below holds the fixture to it.
+    #[test]
+    fn hyperslice_keeps_the_edges_whose_cells_cross_the_slab() {
+        const THICKNESS: f32 = 0.2;
+        const TILT: f32 = 0.5;
+        // Slab `[0.4, 0.6]`: above the tilted `e_z` w-extent
+        // (`BODY_SIZE · sin TILT` = 0.34) and below the `e_w` one
+        // (`BODY_SIZE · cos TILT` = 0.61), so a cell's w-range straddles the
+        // near boundary exactly when the cell holds `+e_w`, and the edges
+        // reaching only `-e_w` cells are the ones culled.
+        const SLAB_CENTRE_W: f32 = 0.5;
+        let physics = PlaygroundPhysics::new(1, BODY_SIZE);
+        let frame = frame_of(
+            &physics,
+            ROW_16,
+            rotor_at(Plane4::Zw, TILT),
+            Projection::Identity,
+            SLAB_CENTRE_W,
+            CAMERA_DISTANCE,
+        );
+        let mut style = slice_colored_style();
+        style.hyperslice = Some(THICKNESS);
+
+        let topo = Polytope4::Cell16.topology();
+        let mut local = Vec::new();
+        let centre = frame.body_local(0, topo.vertices, BODY_SIZE, &mut local);
+        // Drop-w and a flat blend, so a kept edge is exactly its two projected
+        // endpoints and the whole mesh is an ordered function of the keep set.
+        // `keep` reads the cell's slab overlap, so the mesh an inverted cull
+        // would emit is one more call.
+        let mesh_under = |keep: fn(bool) -> bool| -> Vec<([f32; 3], [f32; 3])> {
+            topo.edges
+                .iter()
+                .filter(|[i, j]| {
+                    topo.cells.iter().any(|cell| {
+                        cell.contains(i) && cell.contains(j) && {
+                            let (w_min, w_max) = cell_w_range(cell, &local);
+                            keep(slab_overlaps(w_min, w_max, SLAB_CENTRE_W, THICKNESS))
+                        }
+                    })
+                })
+                .map(|&[i, j]| {
+                    (
+                        (local[i as usize].truncate() + centre).to_array(),
+                        (local[j as usize].truncate() + centre).to_array(),
+                    )
+                })
+                .collect()
+        };
+        let expected = mesh_under(|overlaps| overlaps);
+        assert!(
+            !expected.is_empty() && expected.len() < topo.edges.len(),
+            "the slab kept {} of {} edges, so the cull is not under test",
+            expected.len(),
+            topo.edges.len()
+        );
+        assert_ne!(
+            mesh_under(|overlaps| !overlaps),
+            expected,
+            "the inverted cull emits the same mesh here, so the pin below \
+             cannot see the predicate's polarity"
+        );
+
+        let mut slerp_scratch = Vec::new();
+        let mut palette_cache = std::collections::HashMap::new();
+        let (_perimeter, edges) = build_wireframe_meshes(
+            &frame,
+            &style,
+            SectionLayer::CROSS_SECTION_DEFAULT,
+            SectionLayer::PROJECTED_CAP_DEFAULT,
+            &mut palette_cache,
+            &mut slerp_scratch,
+        );
+        assert_eq!(
+            edges.segments, expected,
+            "the cull kept a different edge set than the slab crosses"
+        );
+    }
+
+    /// `space_blend = 1` renders an edge as the S³ great-circle arc rather than
+    /// the chord: one sub-segment per tessellation sample, and for an edge lying
+    /// in `w = 0` (where drop-w loses nothing) every sample sits on the body's
+    /// circumsphere instead of cutting across it.
+    #[test]
+    fn space_blend_one_bows_edges_onto_the_circumsphere() {
+        let physics = PlaygroundPhysics::new(1, BODY_SIZE);
+        // Identity spin, so the body-local vertices are the canonical `±e_i`
+        // scaled by `BODY_SIZE` and the `w = 0` edges are exact.
+        let frame = frame_of(
+            &physics,
+            ROW_16,
+            Rotor4::IDENTITY,
+            Projection::Identity,
+            SLICE_W,
+            CAMERA_DISTANCE,
+        );
+        let topo = Polytope4::Cell16.topology();
+        let centre = Vec4::from_array(body_position(0, 1)).truncate();
+
+        let mut chord_style = slice_colored_style();
+        chord_style.space_blend = 0.0;
+        let chords = build_row(&frame, &chord_style).edges;
+        assert_eq!(chords.len(), topo.edges.len() * 2);
+
+        let mut arc_style = slice_colored_style();
+        arc_style.space_blend = 1.0;
+        let arcs = build_row(&frame, &arc_style).edges;
+        assert_eq!(
+            arcs.len(),
+            topo.edges.len() * SPACE_TESSELLATION_SAMPLES * 2,
+            "blend 1 did not subdivide the edges"
+        );
+
+        let equatorial: Vec<usize> = topo
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, &[i, j])| {
+                topo.vertices[i as usize].w == 0.0 && topo.vertices[j as usize].w == 0.0
+            })
+            .map(|(e, _)| e)
+            .collect();
+        assert!(!equatorial.is_empty(), "no edge lies in w = 0");
+        // Endpoints per edge, edges emitted in topology order.
+        let block = SPACE_TESSELLATION_SAMPLES * 2;
+        for e in equatorial {
+            for (k, p) in arcs[e * block..(e + 1) * block].iter().enumerate() {
+                let radius = (Vec3::from_array(*p) - centre).length();
+                assert!(
+                    (radius - BODY_SIZE).abs() < 1e-4,
+                    "edge {e} sample {k} sits at {radius}, off the circumsphere {BODY_SIZE}"
+                );
+            }
+            // The chord through the same edge cuts inside: without this the pin
+            // above would pass for a build that never left the endpoints.
+            let mid = (Vec3::from_array(chords[e * 2]) + Vec3::from_array(chords[e * 2 + 1])) * 0.5;
+            assert!(
+                (mid - centre).length() < BODY_SIZE - 0.05,
+                "edge {e}'s chord already lies on the circumsphere"
+            );
+        }
+    }
+
+    /// The near-pole clip radius is a fraction of the LIVE camera distance, so
+    /// pulling the camera in clips the 16-cell harder: no sample survives past
+    /// the radius that distance implies, and the far view keeps samples the
+    /// near view drops. A builder reading a fixed distance clips both views
+    /// identically.
+    #[test]
+    fn a_nearer_camera_clips_the_16cell_harder() {
+        const NEAR: f32 = 4.0;
+        const FAR: f32 = 12.0;
+        let near_radius = stereographic_view_radius(Polytope4::Cell16, NEAR);
+        let far_radius = stereographic_view_radius(Polytope4::Cell16, FAR);
+        assert!(
+            near_radius < far_radius,
+            "both distances resolve to the same clip radius"
+        );
+
+        let physics = PlaygroundPhysics::new(1, BODY_SIZE);
+        // A Zw spin swings a vertex toward the +w pole, where the conformal
+        // image runs out past the near radius but stays inside the far one.
+        let spin = rotor_at(Plane4::Zw, 1.1);
+        let built_at = |camera_distance| {
+            build_row(
+                &frame_of(
+                    &physics,
+                    ROW_16,
+                    spin,
+                    Projection::Stereographic { pole: Vec4::W },
+                    0.45,
+                    camera_distance,
+                ),
+                &slice_colored_style(),
+            )
+        };
+        let near = built_at(NEAR);
+        let far = built_at(FAR);
+        let centre = Vec4::from_array(body_position(0, 1)).truncate();
+
+        for (what, near_mesh, far_mesh) in [
+            ("parent wireframe", &near.edges, &far.edges),
+            ("section perimeter", &near.perimeter, &far.perimeter),
+            ("point sprites", &near.sprites, &far.sprites),
+        ] {
+            let near_max = max_local_radius(near_mesh, centre);
+            let far_max = max_local_radius(far_mesh, centre);
+            assert!(
+                near_max <= near_radius,
+                "{what}: kept a sample at {near_max}, past the near clip {near_radius}"
+            );
+            assert!(
+                far_max > near_radius && far_max <= far_radius,
+                "{what}: the far view's {far_max} is not between the two clip radii"
+            );
+        }
+        // The cap fill clips at triangle granularity and leaves its dropped
+        // vertices in the mesh, so its count is the only witness.
+        assert!(
+            near.projected_cap_triangles.len() < far.projected_cap_triangles.len(),
+            "the near camera dropped no cap triangles"
+        );
+    }
+
+    /// Largest body-local projected magnitude in `points`: what the near-pole
+    /// clip radius bounds.
+    fn max_local_radius(points: &[[f32; 3]], centre: Vec3) -> f32 {
+        points
+            .iter()
+            .map(|p| (Vec3::from_array(*p) - centre).length())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// One slot, at rest, thrown straight along `+w`: the body leaves the slice
+    /// without rotating or moving in R³, so a world built from it differs from
+    /// the layout in `w` alone. Returns the `w` it reached.
+    fn thrown_along_w() -> (PlaygroundPhysics, f32) {
+        let mut physics = PlaygroundPhysics::new(1, BODY_SIZE);
+        physics.world.bodies[0].apply_impulse(Vec4::W);
+        physics.step(15);
+        let pose = physics.pose(0, 1, Rotor4::IDENTITY);
+        let layout = Vec4::from_array(body_position(0, 1));
+        assert_eq!(pose.rotor, Rotor4::IDENTITY, "the throw rotated the body");
+        assert_eq!(pose.position.truncate(), layout.truncate());
+        assert!(
+            pose.position.w > 0.05 && pose.position.w < BODY_SIZE,
+            "lift {} left the body's own w-extent",
+            pose.position.w
+        );
+        let lift = pose.position.w;
+        (physics, lift)
+    }
+
+    /// `scaled` is `base` scaled about `centre` by `scale`, point for point.
+    fn assert_scaled_about(
+        scaled: &[[f32; 3]],
+        base: &[[f32; 3]],
+        centre: Vec3,
+        scale: f32,
+        what: &str,
+    ) {
+        assert!(
+            !base.is_empty(),
+            "{what}: nothing was emitted, so the pin is vacuous"
+        );
+        assert_eq!(
+            scaled.len(),
+            base.len(),
+            "{what}: the two layers emitted different geometry"
+        );
+        for (i, (s, b)) in scaled.iter().zip(base).enumerate() {
+            let expected = (Vec3::from_array(*b) - centre) * scale + centre;
+            assert!(
+                (Vec3::from_array(*s) - expected).length() < TRANSLATE_TOL,
+                "{what} point {i}: {s:?} is not {b:?} scaled by {scale} about {centre:?}"
+            );
+        }
     }
 }
