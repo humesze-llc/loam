@@ -435,13 +435,55 @@ fn main() {
             .expect("BlendedSpace<E3,H3,LinearBlendX> + geodesic kernel should validate");
     }
 
+    // `loam_origin_distance` as the Space preludes ship it, verbatim. The S3
+    // saturation constant is pinned next to the body because the body only names
+    // it: the two live on different lines of the prelude and could otherwise
+    // drift apart at the shell without either pin noticing.
+    const R3_ORIGIN_DISTANCE_FN: &str =
+        "fn loam_origin_distance(p: vec3<f32>) -> f32 { return length(p); }";
+    const S3_R2_MAX_DECL: &str = "const LOAM_S3_R2_MAX: f32 = 0.999999;";
+    const S3_ORIGIN_DISTANCE_BODY: &str =
+        "    let r2 = min(dot(p, p), LOAM_S3_R2_MAX);\n    return asin(sqrt(r2));\n}";
+    const S3_R2_MAX: f32 = 0.999999;
+
+    /// CPU port of `EuclideanR3`'s shipped `loam_origin_distance`.
+    ///
+    /// The text pin lives in the constructor rather than in a standalone test so
+    /// that a prelude which moves out from under the port fails the `cpu_march_*`
+    /// tests themselves; a port that can silently stop mirroring the shader is
+    /// the defect this indirection exists to prevent.
+    fn euclidean_origin_distance_mirror() -> impl Fn(Vec3) -> f32 {
+        assert!(
+            EuclideanR3.wgsl_impl().contains(R3_ORIGIN_DISTANCE_FN),
+            "EuclideanR3 loam_origin_distance drifted from its CPU port",
+        );
+        |p: Vec3| p.length()
+    }
+
+    /// CPU port of `SphericalS3`'s shipped `loam_origin_distance`, expression for
+    /// expression. See [`euclidean_origin_distance_mirror`] for why the pin runs
+    /// here.
+    fn spherical_origin_distance_mirror() -> impl Fn(Vec3) -> f32 {
+        let prelude = SphericalS3.wgsl_impl();
+        assert!(
+            prelude.contains(S3_R2_MAX_DECL) && prelude.contains(S3_ORIGIN_DISTANCE_BODY),
+            "SphericalS3 loam_origin_distance drifted from its CPU port",
+        );
+        |p: Vec3| {
+            let r2 = p.length_squared().min(S3_R2_MAX);
+            r2.sqrt().asin()
+        }
+    }
+
     // CPU port of `kernel.wgsl::loam_march_geodesic`, mirrored line-for-line, so
     // the `cpu_march_*` tests can check hit points against a known SDF without a
-    // GPU adapter. `loam_max_arc` is a parameter here (the kernel reads it as a
-    // prelude constant) so each test pins the value it exercises.
+    // GPU adapter. `loam_origin_distance` and `loam_max_arc` are parameters here
+    // (the kernel reads both from the Space prelude) so each test supplies the
+    // pinned mirror of the one and the value it exercises for the other.
     fn march_geodesic_cpu<S: Space<Point = Vec3, Vector = Vec3>>(
         space: &S,
         sdf: impl Fn(Vec3) -> f32,
+        origin_distance: impl Fn(Vec3) -> f32,
         ro: Vec3,
         rd: Vec3,
         ball_scale: f32,
@@ -462,9 +504,7 @@ fn main() {
         let min_step = 0.0001 * scale;
 
         for _ in 0..256 {
-            // `loam_origin_distance(p)` in the kernel; Riemannian distance from
-            // origin to p for every Space shipped today.
-            if space.distance(Vec3::ZERO, p) > loam_max_arc * 0.92 {
+            if origin_distance(p) > loam_max_arc * 0.92 {
                 return None;
             }
             let d = sdf(p);
@@ -497,8 +537,16 @@ fn main() {
         let sdf = |p: Vec3| p.length() - sphere_radius;
         let ro = Vec3::new(0.0, 0.0, 2.0);
         let rd = Vec3::new(0.0, 0.0, -1.0);
-        let (hit, t) = march_geodesic_cpu(&space, sdf, ro, rd, 1.0, 1.0e9)
-            .expect("ray should hit centered sphere");
+        let (hit, t) = march_geodesic_cpu(
+            &space,
+            sdf,
+            euclidean_origin_distance_mirror(),
+            ro,
+            rd,
+            1.0,
+            1.0e9,
+        )
+        .expect("ray should hit centered sphere");
 
         // Front of the sphere along -Z: (0, 0, 0.5).
         let expected = Vec3::new(0.0, 0.0, sphere_radius);
@@ -525,10 +573,62 @@ fn main() {
         let sdf = |p: Vec3| p.length() - 0.5;
         let ro = Vec3::new(0.0, 0.0, 2.0);
         let rd = Vec3::new(0.0, 0.0, 1.0); // away from sphere
-        let result = march_geodesic_cpu(&space, sdf, ro, rd, 1.0, 1.0e9);
+        let result = march_geodesic_cpu(
+            &space,
+            sdf,
+            euclidean_origin_distance_mirror(),
+            ro,
+            rd,
+            1.0,
+            1.0e9,
+        );
         assert!(
             result.is_none(),
             "ray pointing away from sphere should miss; got {result:?}",
+        );
+    }
+
+    /// The kernel tests the boundary escape before it samples the scene, so
+    /// against an everywhere-solid SDF the arc budget alone decides hit vs miss
+    /// and the march reports exactly what `loam_origin_distance` told it.
+    ///
+    /// |p| = 1e-4 sits below the ≈1.73e-4 radius where `acos(√(1−|p|²))`
+    /// collapses to exactly 0 in f32, so the escape is pinned in the regime
+    /// where an ill-conditioned origin distance reads as "at the origin" and the
+    /// boundary silently never fires.
+    #[test]
+    fn cpu_march_arc_escape_tracks_origin_distance_near_the_s3_origin() {
+        let solid = |_: Vec3| -1.0_f32;
+        let ro = Vec3::new(0.0, 0.0, 1e-4);
+        let rd = Vec3::new(0.0, 0.0, -1.0);
+
+        let escaped = march_geodesic_cpu(
+            &SphericalS3,
+            solid,
+            spherical_origin_distance_mirror(),
+            ro,
+            rd,
+            1.0,
+            1e-4,
+        );
+        assert!(
+            escaped.is_none(),
+            "|p| = 1e-4 is past a 1e-4 arc budget (0.92 buffer); \
+             the march must escape before sampling, got {escaped:?}",
+        );
+
+        let inside = march_geodesic_cpu(
+            &SphericalS3,
+            solid,
+            spherical_origin_distance_mirror(),
+            ro,
+            rd,
+            1.0,
+            1.0,
+        );
+        assert!(
+            inside.is_some(),
+            "|p| = 1e-4 is well inside a 1.0 arc budget; the march must sample the scene",
         );
     }
 
