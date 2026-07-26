@@ -49,7 +49,7 @@ use loam_app::{
     freecam::{CursorMode, Freecam},
     Camera, CameraController, FrameCtx, OrbitController, RunConfig, SetupCtx,
 };
-use loam_egui::Console;
+use loam_egui::{Console, ConsoleUi};
 use loam_math::WPlane;
 use loam_math::{Bivector, EuclideanR3, Rotor, Rotor4};
 use loam_physics::polytope::{
