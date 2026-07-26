@@ -21,6 +21,13 @@ use crate::space::{Space, WgslSpace};
 /// keeps `λ ≲ 2 × 10⁷`, well inside f32 dynamic range.
 const POINCARE_R2_MAX: f32 = 1.0 - 1e-7;
 
+/// Degeneracy floor on the squared norm of the gyration quaternion `1 - ab`.
+/// [`clamp_to_ball`] bounds `a·b` by `POINCARE_R2_MAX`, so the scalar part
+/// `1 + a·b` is at least `1e-7` and the squared norm at least `1e-14` for any
+/// clamped pair; `1e-20` sits six decades below that and eighteen above f32's
+/// denormal floor, so it fires only for input the clamp could not repair.
+const GYRATION_NORM2_MIN: f32 = 1e-20;
+
 /// Clamp an out-of-domain point onto the saturation shell. Never NaN or panic.
 fn clamp_to_ball(p: Vec3) -> Vec3 {
     let r2 = p.length_squared();
@@ -176,11 +183,17 @@ impl Space for HyperbolicH3 {
     }
 
     fn iso_transport(&self, iso: Iso3H, at: Vec3, v: Vec3) -> Vec3 {
-        // M_*v = log(M·at, M·exp(at, v)). Exact since M is an isometry.
-        let target = self.exp(at, v);
-        let m_at = self.iso_apply(iso, at);
-        let m_target = self.iso_apply(iso, target);
-        self.log(m_at, m_target)
+        // The differential of `iso_apply`, taken on the hyperboloid where the
+        // action is the linear map `iso.matrix` and therefore an exact Lorentz
+        // isometry of the tangent. `log(M·at, M·exp(at, v))` is the same map in
+        // exact arithmetic, but it pays `exp`'s tanh saturation and `log`'s
+        // artanh conditioning once each, and both worsen with `|v|` as well as
+        // with `|at|`: the round trip misstates the metric norm by 23% at
+        // `|at| = 0.8` and by 220% past 0.99.
+        let at = clamp_to_ball(at);
+        let h = poincare_to_hyperboloid(at);
+        let dh = poincare_to_hyperboloid_tangent(at, v);
+        hyperboloid_to_poincare_tangent(iso.matrix * h, iso.matrix * dh)
     }
 }
 
@@ -197,6 +210,7 @@ const WGSL_IMPL: &str = r#"
 // loam-math :: HyperbolicH3 (v0 Space WGSL ABI)
 const LOAM_MAX_ARC: f32 = 1e9;
 const LOAM_H3_R2_MAX: f32 = 0.9999999;
+const LOAM_H3_GYR_N2_MIN: f32 = 1e-20;
 
 fn loam_artanh(x: f32) -> f32 {
     return 0.5 * log((1.0 + x) / (1.0 - x));
@@ -223,10 +237,16 @@ fn loam_mobius_add(a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
 }
 
 fn loam_gyr_apply(a: vec3<f32>, b: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
-    let ab = loam_mobius_add(a, b);
-    let bv = loam_mobius_add(b, v);
-    let abv = loam_mobius_add(a, bv);
-    return loam_mobius_add(-ab, abv);
+    // Conjugation by the quaternion 1 - ab, not Ungar's four Mobius
+    // additions: the defining form subtracts two points that agree to
+    // within |v| and loses the result near the ideal boundary.
+    let scalar = 1.0 + dot(a, b);
+    let axis = -cross(a, b);
+    let norm2 = scalar * scalar + dot(axis, axis);
+    if (norm2 < LOAM_H3_GYR_N2_MIN) {
+        return v;
+    }
+    return v + (2.0 / norm2) * (scalar * cross(axis, v) + cross(axis, cross(axis, v)));
 }
 
 fn loam_origin_distance(p: vec3<f32>) -> f32 {
@@ -301,12 +321,28 @@ fn mobius_add(a: Vec3, b: Vec3) -> Vec3 {
 
 /// Möbius gyration `gyr[a, b] v`, the rotation from Möbius non-associativity
 /// (Ungar, *From Möbius to Gyrogroups*, Amer. Math. Monthly 115, 2008, §4,
-/// Def. 4).
+/// Def. 4), evaluated as the rotation it is: conjugation by the quaternion
+/// `1 - ab` for pure-imaginary `a`, `b`, whose scalar part is `1 + a·b` and
+/// whose vector part is `-(a × b)`, applied by Rodrigues.
+///
+/// Ungar's defining form `⊖(a ⊕ b) ⊕ (a ⊕ (b ⊕ v))` subtracts two points that
+/// agree to within the size of `v`, and its Möbius denominator
+/// `1 + 2a·b + |a|²|b|²` falls off like `(1 - |a|²)²` as the operands approach
+/// the ideal boundary together, so the surviving mantissa shrinks with the
+/// distance to the boundary rather than with the answer. It also feeds `v`
+/// through `mobius_add`, which is defined only for ball elements while a
+/// tangent has no norm bound. Conjugation is orthogonal by construction, so
+/// the transported norm survives at any radius, and it is linear in `v`.
+/// `gyration_matches_ungars_four_addition_definition` pins the two forms
+/// against each other where the defining form is still trustworthy.
 fn gyr_apply(a: Vec3, b: Vec3, v: Vec3) -> Vec3 {
-    let ab = mobius_add(a, b);
-    let bv = mobius_add(b, v);
-    let abv = mobius_add(a, bv);
-    mobius_add(-ab, abv)
+    let scalar = 1.0 + a.dot(b);
+    let axis = -a.cross(b);
+    let norm2 = scalar * scalar + axis.length_squared();
+    if norm2 < GYRATION_NORM2_MIN {
+        return v;
+    }
+    v + (2.0 / norm2) * (scalar * axis.cross(v) + axis.cross(axis.cross(v)))
 }
 
 /// Lift a Poincaré point (`|p|² = r²`) to the hyperboloid:
@@ -327,6 +363,26 @@ fn poincare_to_hyperboloid(p: Vec3) -> Vec4 {
 fn hyperboloid_to_poincare(h: Vec4) -> Vec3 {
     let den = (1.0 + h.w).max(1e-7);
     Vec3::new(h.x / den, h.y / den, h.z / den)
+}
+
+/// Differential of [`poincare_to_hyperboloid`] at `p`, applied to `v`. The
+/// time-like component and the radial part of the space-like one share the
+/// factor `4 (p·v) / (1 - r²)²`.
+fn poincare_to_hyperboloid_tangent(p: Vec3, v: Vec3) -> Vec4 {
+    let r2 = p.length_squared().min(POINCARE_R2_MAX);
+    let den = 1.0 - r2;
+    let radial = 4.0 * p.dot(v) / (den * den);
+    let space = (2.0 / den) * v + radial * p;
+    Vec4::new(space.x, space.y, space.z, radial)
+}
+
+/// Differential of [`hyperboloid_to_poincare`] at `h`, applied to `dh`. Same
+/// floor on `1 + w`, for the same reason.
+fn hyperboloid_to_poincare_tangent(h: Vec4, dh: Vec4) -> Vec3 {
+    let den = (1.0 + h.w).max(1e-7);
+    let space = Vec3::new(h.x, h.y, h.z);
+    let d_space = Vec3::new(dh.x, dh.y, dh.z);
+    d_space / den - space * (dh.w / (den * den))
 }
 
 #[cfg(test)]
@@ -464,6 +520,172 @@ mod tests {
         assert!(src.contains("fn loam_exp"));
         assert!(src.contains("fn loam_log"));
         assert!(src.contains("fn loam_parallel_transport"));
+    }
+
+    /// Radii and directions spanning the ball out to the last shell the chart
+    /// represents without clamping (`|p|² < 1 - 1e-7`). Fixed, not sampled: the
+    /// failure this covers is radial, so a seeded sampler would only make the
+    /// coverage harder to read.
+    fn ball_sweep() -> Vec<Vec3> {
+        let radii = [
+            0.0f32, 0.1, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 0.9999,
+        ];
+        let directions = [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.577, 0.577, 0.577),
+            Vec3::new(0.3, -0.9, 0.2),
+        ];
+        let mut out = Vec::new();
+        for r in radii {
+            for d in directions {
+                out.push(d.normalize_or_zero() * r);
+            }
+        }
+        out
+    }
+
+    const SWEEP_TANGENTS: [Vec3; 3] = [
+        Vec3::new(0.06, 0.0, 0.0),
+        Vec3::new(0.0, 0.05, 0.02),
+        // A tangent past the unit ball: `gyr` is a linear map on the tangent
+        // space, so nothing here may depend on `|v| < 1`.
+        Vec3::new(2.0, -1.0, 0.5),
+    ];
+
+    /// The closed form is Ungar's gyration and not merely something
+    /// norm-preserving. Compared where the four-addition definition is still
+    /// trustworthy, which is what the closed form exists to escape.
+    #[test]
+    fn gyration_matches_ungars_four_addition_definition() {
+        let four_addition = |a: Vec3, b: Vec3, v: Vec3| {
+            let ab = mobius_add(a, b);
+            let bv = mobius_add(b, v);
+            mobius_add(-ab, mobius_add(a, bv))
+        };
+        let cases = [
+            (
+                Vec3::new(0.2, 0.1, -0.05),
+                Vec3::new(-0.1, 0.25, 0.05),
+                Vec3::new(0.03, -0.02, 0.04),
+            ),
+            (
+                Vec3::new(0.3, 0.0, 0.0),
+                Vec3::new(0.0, 0.3, 0.0),
+                Vec3::new(0.0, 0.0, 0.05),
+            ),
+            (
+                Vec3::new(0.05, -0.4, 0.1),
+                Vec3::new(0.15, 0.05, -0.3),
+                Vec3::new(0.06, 0.01, -0.02),
+            ),
+        ];
+        for (a, b, v) in cases {
+            let residual = (gyr_apply(a, b, v) - four_addition(a, b, v)).length();
+            // Measured worst 1.3e-6 relative, which is the four Möbius
+            // additions' own accumulated rounding at these radii, not a
+            // disagreement between the two formulas.
+            assert!(
+                residual <= 1e-5 * v.length(),
+                "gyr[{a:?}, {b:?}] disagrees with its definition by {residual}"
+            );
+        }
+    }
+
+    /// Parallel transport is an isometry of the tangent spaces at every radius
+    /// the chart represents, not only at the shell the conformance fixture
+    /// samples. Evaluating the gyration by Ungar's four Möbius additions
+    /// misstates the norm by a factor of 19 at `|p| = 0.99`.
+    #[test]
+    fn parallel_transport_preserves_the_metric_norm_across_the_whole_ball() {
+        let s = h3();
+        let points = ball_sweep();
+        for &a in &points {
+            for &b in &points {
+                for v in SWEEP_TANGENTS {
+                    let before = lambda(a) * v.length();
+                    let after = lambda(b) * s.parallel_transport(a, b, v).length();
+                    assert!(
+                        (after - before).abs() <= 1e-5 * before,
+                        "transport {a:?} -> {b:?} took the norm of {v:?} \
+                         from {before} to {after}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A geodesic's own velocity field is parallel along it, so transporting
+    /// `log(a, b)` from `a` must land on the forward tangent at `b`, which
+    /// points along `-log(b, a)`. This is the half a norm assertion cannot see,
+    /// the rotation: with the four-addition gyration the transported direction
+    /// comes back exactly reversed at the outer shells.
+    ///
+    /// Directions only. `log`'s magnitude saturates against `artanh` near the
+    /// ideal boundary independently of transport, and folding that in would
+    /// make this item report the chart's conditioning instead of the
+    /// gyration's.
+    #[test]
+    fn parallel_transport_carries_a_geodesic_tangent_along_its_own_geodesic() {
+        let s = h3();
+        let points = ball_sweep();
+        for &a in &points {
+            for &b in &points {
+                // Below this the two logs are their own rounding and neither
+                // has a direction to compare.
+                if s.distance(a, b) < 1e-3 {
+                    continue;
+                }
+                let forward = (-s.log(b, a)).normalize();
+                let transported = s.parallel_transport(a, b, s.log(a, b)).normalize();
+                // Measured worst 2.6e-5 as a chord between unit vectors; the
+                // four-addition form reaches 2.0, the antipode.
+                assert!(
+                    (transported - forward).length() <= 1e-3,
+                    "transported direction {transported:?} misses the forward \
+                     tangent {forward:?} at {a:?} -> {b:?}"
+                );
+            }
+        }
+    }
+
+    /// The differential of an isometry is a linear isometry of tangent spaces,
+    /// and it stays one out to the last shell the chart represents. Routing it
+    /// through `log(M·at, M·exp(at, v))` instead inherits `exp`'s saturation
+    /// and `log`'s conditioning: that form is off by 23% of the norm at
+    /// `|at| = 0.8` and by more than the vector itself past 0.99.
+    ///
+    /// The residual bound is the derived one, not a flat number. The lift's
+    /// radial term carries `(1 - |at|²)⁻²` against the tangent's `(1 - |at|²)⁻¹`
+    /// and the two are summed, so the relative error grows like the conformal
+    /// factor `λ = 2/(1 - |at|²)`. Measured worst over this sweep is
+    /// `7.6 λ ε`; `16 λ ε` is that with a factor of two, which at the outermost
+    /// shell (`λ = 10⁴`) still admits only 2%.
+    #[test]
+    fn iso_transport_norm_error_stays_within_the_conformal_factor() {
+        let s = h3();
+        let isos = [
+            Iso3H::from_translation(Vec3::new(0.15, 0.0, 0.0)),
+            Iso3H::from_rotation(Quat::from_rotation_z(0.4)),
+            Iso3H::from_translation(Vec3::new(-0.05, 0.2, 0.1)),
+            Iso3H::from_translation(Vec3::new(0.7, -0.2, 0.1)),
+        ];
+        for at in ball_sweep() {
+            let budget = 16.0 * lambda(at) * f32::EPSILON;
+            for iso in isos {
+                let moved = s.iso_apply(iso, at);
+                for v in SWEEP_TANGENTS {
+                    let before = lambda(at) * v.length();
+                    let after = lambda(moved) * s.iso_transport(iso, at, v).length();
+                    assert!(
+                        (after - before).abs() <= budget * before,
+                        "iso_transport at {at:?} took the norm of {v:?} \
+                         from {before} to {after}, past the {budget} budget"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

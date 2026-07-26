@@ -365,8 +365,8 @@ mod invariants {
         }
     }
 
-    /// `d(g.a, g.b) = d(a, b)`, called the load-bearing test by the
-    /// adding-a-space checklist and absent from two impls before this suite.
+    /// `d(g.a, g.b) = d(a, b)`. The one item that ties the isometry surface to
+    /// the metric: without it an `Iso` can be any invertible map at all.
     pub fn distance_is_invariant_under_isometry<F: SpaceFixture>(f: &F) {
         if declared_trivial_group(f) {
             return;
@@ -751,8 +751,8 @@ mod invariants {
 
     /// Same binary, same inputs, same bits. Compared with `to_bits`, not with a
     /// tolerance; no golden constant, because every curved impl here is built
-    /// on libm transcendentals that are not bit-portable across targets, which
-    /// the determinism ADR explicitly drops as a goal.
+    /// on libm transcendentals that are not bit-portable across targets, and
+    /// cross-target bit-identity is not part of the determinism contract.
     pub fn sampled_calls_are_bit_reproducible<F: SpaceFixture>(f: &F) {
         let s = f.space();
         let points = f.points();
@@ -1280,13 +1280,11 @@ impl SpaceFixture for HyperbolicH3Fixture {
     fn degenerate_pairs(&self) -> Vec<(Vec3, Vec3)> {
         let interior = Vec3::new(0.3, 0.0, 0.0);
         // H³ has no cut locus; its conditioning hazard is the ideal boundary.
-        // The mirrored pair at |p| = 0.85 spans 5.0 hyperbolic units, the far
-        // edge of the regime where the gyration chain in `parallel_transport`
-        // still holds a norm: it is four Möbius additions whose operands
-        // approach the boundary together, and the surviving digits fall off
-        // like the separation. Measured worst norm error over these tangents:
-        // 4.3e-5 at |p| = 0.80, 3.2e-4 here, 2.3e-3 at 0.90, 6.2e-2 at 0.95,
-        // and the whole vector at 0.99.
+        // The mirrored pair at |p| = 0.85 spans 5.0 hyperbolic units and is the
+        // one place transport can be checked against an exactly known answer:
+        // the gyration's axis `to × -from` vanishes identically for antipodal
+        // arguments and the conformal ratio is a value over itself, so the
+        // transported vector is bit-identical to the input on any IEEE target.
         let near_boundary = Vec3::new(0.85, 0.0, 0.0);
         vec![
             (interior, interior),
@@ -1306,9 +1304,10 @@ impl SpaceFixture for HyperbolicH3Fixture {
             point: 1e-4,
             vector: 1e-4,
             scalar: 1e-4,
-            // Measured 3.2e-4 on the mirrored near-boundary pair above; 1e-3 is
-            // that with margin, not a number chosen to make the item pass.
-            degenerate: 1e-3,
+            // Every declared pair on which the metric is defined transports
+            // exactly, per the note on `degenerate_pairs`; 1e-6 matches the
+            // flat fixtures rather than reserving room the impl does not use.
+            degenerate: 1e-6,
         }
     }
 
