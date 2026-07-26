@@ -2,7 +2,7 @@
 //! [`BodyArena<S>`], the generational storage that gives it an identity
 //! independent of where it currently sits in memory.
 
-use std::ops::{Add, Deref, DerefMut, Index, IndexMut, Mul};
+use std::ops::{Add, Deref, Index, IndexMut, Mul};
 
 use loam_math::Bivector;
 
@@ -171,6 +171,59 @@ struct Slot {
 /// invisible to a caller holding a [`BodyId`], which is the whole point of the
 /// indirection; manifold keys, island membership, and warm-start caches key on
 /// the handle and survive it.
+///
+/// [`Deref`] exposes the shared slice. There is deliberately no [`DerefMut`]:
+/// it would hand out every reordering method on `[RigidBody<S>]`, and a
+/// permutation the slot table does not follow leaves `slots[ids[d].slot].dense
+/// != d`, silently rebinding each manifold's accumulated impulses to the wrong
+/// pair. Mutation runs through [`Self::get_mut`], the [`IndexMut`] impls, and
+/// [`Self::iter_mut`], none of which can move a body between positions.
+///
+/// The three `compile_fail` blocks below share the hidden setup of the passing
+/// one, so each fails on its visible line and not on its fixture.
+///
+/// ```
+/// # use glam::Vec3;
+/// # use loam_physics::euclidean_r3::sphere_body_r3;
+/// # use loam_physics::BodyArena;
+/// # let mut arena = BodyArena::new();
+/// # let first = arena.spawn(sphere_body_r3(Vec3::ZERO, Vec3::ZERO, 0.5, 1.0));
+/// # arena.spawn(sphere_body_r3(Vec3::X, Vec3::ZERO, 0.5, 1.0));
+/// for body in arena.iter_mut() {
+///     body.restitution = 0.0;
+/// }
+/// # assert_eq!(arena.id_at(0), first);
+/// ```
+///
+/// ```compile_fail
+/// # use glam::Vec3;
+/// # use loam_physics::euclidean_r3::sphere_body_r3;
+/// # use loam_physics::BodyArena;
+/// # let mut arena = BodyArena::new();
+/// # arena.spawn(sphere_body_r3(Vec3::ZERO, Vec3::ZERO, 0.5, 1.0));
+/// # arena.spawn(sphere_body_r3(Vec3::X, Vec3::ZERO, 0.5, 1.0));
+/// arena.swap(0, 1);
+/// ```
+///
+/// ```compile_fail
+/// # use glam::Vec3;
+/// # use loam_physics::euclidean_r3::sphere_body_r3;
+/// # use loam_physics::BodyArena;
+/// # let mut arena = BodyArena::new();
+/// # arena.spawn(sphere_body_r3(Vec3::ZERO, Vec3::ZERO, 0.5, 1.0));
+/// # arena.spawn(sphere_body_r3(Vec3::X, Vec3::ZERO, 0.5, 1.0));
+/// arena.reverse();
+/// ```
+///
+/// ```compile_fail
+/// # use glam::Vec3;
+/// # use loam_physics::euclidean_r3::sphere_body_r3;
+/// # use loam_physics::BodyArena;
+/// # let mut arena = BodyArena::new();
+/// # arena.spawn(sphere_body_r3(Vec3::ZERO, Vec3::ZERO, 0.5, 1.0));
+/// # arena.spawn(sphere_body_r3(Vec3::X, Vec3::ZERO, 0.5, 1.0));
+/// arena.sort_unstable_by_key(|body| body.position.y.to_bits());
+/// ```
 pub struct BodyArena<S: PhysicsSpace> {
     dense: Vec<RigidBody<S>>,
     /// Dense position -> handle, parallel to `dense`.
@@ -242,10 +295,6 @@ impl<S: PhysicsSpace> BodyArena<S> {
         Some(removed)
     }
 
-    pub fn contains(&self, id: BodyId) -> bool {
-        self.dense_index(id).is_some()
-    }
-
     /// Position of `id` in the dense slice, or `None` if the handle is stale.
     /// Positions move under [`Self::despawn`] and are valid only until the
     /// next one.
@@ -272,6 +321,20 @@ impl<S: PhysicsSpace> BodyArena<S> {
             None => None,
         }
     }
+
+    /// Mutable iteration in dense order: per-body edits without a handle on the
+    /// slice the ordering invariant lives in.
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, RigidBody<S>> {
+        self.dense.iter_mut()
+    }
+
+    /// The dense slice, mutable. Split-borrowing the two bodies of a contact
+    /// needs it and cannot go through [`Self::get_mut`] twice; it does not
+    /// leave the crate, where the phase loops are the only callers and none of
+    /// them permutes.
+    pub(crate) fn dense_mut(&mut self) -> &mut [RigidBody<S>] {
+        &mut self.dense
+    }
 }
 
 impl<S: PhysicsSpace> Deref for BodyArena<S> {
@@ -279,12 +342,6 @@ impl<S: PhysicsSpace> Deref for BodyArena<S> {
 
     fn deref(&self) -> &Self::Target {
         &self.dense
-    }
-}
-
-impl<S: PhysicsSpace> DerefMut for BodyArena<S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.dense
     }
 }
 
@@ -550,7 +607,6 @@ mod tests {
         );
         assert_ne!(recycled.generation(), doomed.generation());
 
-        assert!(!arena.contains(doomed));
         assert!(arena.get(doomed).is_none());
         assert!(arena.dense_index(doomed).is_none());
         assert_eq!(arena[recycled].position, Vec3::Y);
@@ -559,7 +615,7 @@ mod tests {
             "stale despawn must be inert"
         );
         assert!(
-            arena.contains(recycled),
+            arena.get(recycled).is_some(),
             "a stale despawn removed the live body sharing its slot"
         );
     }
@@ -585,6 +641,48 @@ mod tests {
         assert_eq!(arena.id_at(arena.dense_index(last).unwrap()), last);
         let positions: Vec<Vec3> = arena.iter().map(|b| b.position).collect();
         assert_eq!(positions, vec![Vec3::X, Vec3::Z]);
+    }
+
+    /// The correspondence the whole indirection rests on, stated over the
+    /// public surface: every dense position resolves back through the handle
+    /// stored at it. A permutation of the dense slice that the slot table did
+    /// not follow breaks exactly this, and breaks it silently, which is why the
+    /// mutable slice does not leave the crate.
+    #[test]
+    fn every_dense_position_resolves_back_through_its_own_handle() {
+        let mut arena = BodyArena::new();
+        let assert_consistent = |arena: &BodyArena<EuclideanR3>| {
+            for dense in 0..arena.len() {
+                assert_eq!(
+                    arena.dense_index(arena.id_at(dense)),
+                    Some(dense),
+                    "slot table disagrees with dense position {dense}"
+                );
+            }
+        };
+
+        let mut live = Vec::new();
+        for i in 0..5 {
+            live.push(arena.spawn(body_r3(Vec3::splat(i as f32), 1.0, 1.0)));
+            assert_consistent(&arena);
+        }
+        // The three despawns land at dense 0, then mid-slice, then the tail,
+        // where swap_remove moves nothing and the slot write must be skipped.
+        for victim in [live[0], live[2], live[3]] {
+            assert!(arena.despawn(victim).is_some());
+            assert_consistent(&arena);
+        }
+        arena.spawn(body_r3(Vec3::ZERO, 1.0, 1.0));
+        assert_consistent(&arena);
+
+        // Per-body mutation is the supported write path and must leave the
+        // correspondence alone.
+        for (dense, body) in arena.iter_mut().enumerate() {
+            body.restitution = dense as f32;
+        }
+        assert_consistent(&arena);
+        let restitutions: Vec<f32> = arena.iter().map(|b| b.restitution).collect();
+        assert_eq!(restitutions, vec![0.0, 1.0, 2.0]);
     }
 
     /// Handle allocation is part of the determinism contract: two arenas

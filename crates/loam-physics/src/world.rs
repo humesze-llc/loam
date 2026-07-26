@@ -59,6 +59,11 @@ fn canonical_pair(a: BodyId, b: BodyId) -> PairKey {
 /// Membership is over dynamic bodies only. A static body absorbs no impulse and
 /// its state is invariant under the solve, so two groups resting on one floor
 /// are two islands rather than one.
+///
+/// Instrumentation, on [`Schedule`]'s terms: the partition is the claim that a
+/// parallel solver can take one island whole, and the three fields below are
+/// the readout that checks it, so both ship in the binary the claim is about
+/// rather than behind `cfg(test)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Island {
     /// Lowest handle among [`Self::bodies`]. A function of the partition alone,
@@ -289,6 +294,10 @@ impl<S: PhysicsSpace> World<S> {
     /// for the next step's eviction keeps `manifolds` free of keys that name
     /// no live body, so a caller inspecting it between steps sees the world it
     /// actually has.
+    ///
+    /// API, not instrumentation: it is the inverse of [`Self::push_body`] and
+    /// the only removal that leaves the world's own state consistent, so a
+    /// caller that can spawn has to be able to reach it.
     pub fn despawn_body(&mut self, id: BodyId) -> bool {
         if self.bodies.despawn(id).is_none() {
             return false;
@@ -399,7 +408,7 @@ impl<S: PhysicsSpace> World<S> {
             #[cfg(test)]
             self.visit_log.update_manifolds.push(key);
             let (i, j) = self.dense_pair(key);
-            let (a, b) = split_two_mut(&mut self.bodies, i, j);
+            let (a, b) = split_two_mut(self.bodies.dense_mut(), i, j);
             let Some(contact) = self.narrowphase.test(a, b, &self.space) else {
                 continue;
             };
@@ -463,7 +472,7 @@ impl<S: PhysicsSpace> World<S> {
             self.visit_log.prepare_solve.push(*key);
             let (i, j) = self.dense_pair(*key);
             let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
-            let (a, b) = split_two_mut(&mut self.bodies, i, j);
+            let (a, b) = split_two_mut(self.bodies.dense_mut(), i, j);
             for cp in &mut manifold.points {
                 let v_rel = self.space.velocity_at_point(b, cp.world_point)
                     - self.space.velocity_at_point(a, cp.world_point);
@@ -507,7 +516,7 @@ impl<S: PhysicsSpace> World<S> {
             self.visit_log.warm_start.push(*key);
             let (i, j) = self.dense_pair(*key);
             let manifold = self.manifolds.get(key).expect(STALE_CONSTRAINT_KEY);
-            let (a, b) = split_two_mut(&mut self.bodies, i, j);
+            let (a, b) = split_two_mut(self.bodies.dense_mut(), i, j);
             for cp in &manifold.points {
                 if cp.normal_impulse > 0.0 {
                     self.space.apply_contact_impulse(
@@ -539,7 +548,7 @@ impl<S: PhysicsSpace> World<S> {
                 self.visit_log.solve_sweeps.push(*key);
                 let (i, j) = self.dense_pair(*key);
                 let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
-                let (a, b) = split_two_mut(&mut self.bodies, i, j);
+                let (a, b) = split_two_mut(self.bodies.dense_mut(), i, j);
                 for cp in &mut manifold.points {
                     solve_normal_then_tangent(&self.space, a, b, cp);
                 }
@@ -648,7 +657,13 @@ impl<S: PhysicsSpace> World<S> {
 
     /// The islands of the current manifold set, ascending by island id.
     /// Allocating form, for callers outside the step loop; the step groups its
-    /// constraint buffer through the same partition without allocating.
+    /// constraint buffer through the same partition without allocating. Public
+    /// as the read side of [`Island`]'s instrumentation, not as a step API.
+    ///
+    /// Panics if `manifolds` names a body the arena no longer holds, which is
+    /// reachable only between a bare [`BodyArena::despawn`] and the next
+    /// [`Self::step`]; [`Self::despawn_body`] is the entry point that keeps the
+    /// two consistent.
     pub fn islands(&self) -> Vec<Island> {
         let mut parent = Vec::new();
         let mut labels = Vec::new();
@@ -731,9 +746,17 @@ impl<S: PhysicsSpace> World<S> {
     }
 
     /// Storage positions of a key's two bodies, in the key's own order. Both
-    /// resolve: a manifold outlives neither its bodies (`despawn_body` drops
-    /// it) nor the step that stopped touching it (`update_manifolds` evicts
-    /// it).
+    /// resolve, but as a property of the four callers rather than of the
+    /// manifold map: `update_manifolds` passes keys its own broadphase minted
+    /// from the live arena this step, and the three solve phases pass
+    /// `constraint_keys`, filled after that phase evicted every key it did not
+    /// touch.
+    ///
+    /// The map itself carries no such guarantee. `despawn_body` prunes it, but
+    /// [`BodyArena::despawn`] is reachable on `bodies` directly and does not,
+    /// so between one of those and the next `update_manifolds` the map can name
+    /// a dead body. Nothing in that window reaches here; [`Self::islands`],
+    /// which walks the map, is where it surfaces as a panic.
     fn dense_pair(&self, key: PairKey) -> (usize, usize) {
         (
             self.bodies.dense_index(key.0).expect(STALE_MANIFOLD_BODY),
@@ -1581,6 +1604,59 @@ mod tests {
             .iter()
             .map(|cp| cp.normal_impulse)
             .collect()
+    }
+
+    /// `dense_pair` states its precondition as a property of its callers, not
+    /// of `manifolds`, because [`BodyArena::despawn`] is reachable on `bodies`
+    /// and prunes nothing. This pins the consequence the doc names: the map
+    /// keeps naming the dead body, `islands` panics on it, and the next step's
+    /// eviction is what clears it. `despawn_body` is the control, and the pair
+    /// of them is what would fail if either half of the doc drifted.
+    #[test]
+    fn bare_arena_despawn_strands_a_manifold_key_until_the_next_step() {
+        let dt = 1.0 / 240.0;
+        let settle_steps = 400;
+        let (mut world, floor, spheres) = settled_islands(dt, settle_steps);
+        let doomed = spheres[1];
+        assert!(
+            world.manifolds.contains_key(&(floor, doomed)),
+            "fixture has no manifold on the doomed body, so nothing is stranded"
+        );
+
+        assert!(world.bodies.despawn(doomed).is_some());
+        assert!(
+            world.manifolds.contains_key(&(floor, doomed)),
+            "the arena despawn pruned manifolds, so despawn_body is no longer \
+             the only removal that keeps the world consistent"
+        );
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.islands()));
+        assert!(
+            resolved.is_err(),
+            "islands resolved a key naming a despawned body"
+        );
+
+        world.step(dt);
+        assert!(
+            !world
+                .manifolds
+                .keys()
+                .any(|&(a, b)| a == doomed || b == doomed),
+            "the step did not evict the stranded key"
+        );
+        assert_eq!(
+            world.islands().len(),
+            ISLAND_X.len() - 1,
+            "the eviction did not close the panic window"
+        );
+
+        // The control: the same removal through the world drops the manifold
+        // with the body, so no window exists in the first place.
+        let (mut control, control_floor, control_spheres) = settled_islands(dt, settle_steps);
+        assert!(control.despawn_body(control_spheres[1]));
+        assert!(!control
+            .manifolds
+            .contains_key(&(control_floor, control_spheres[1])));
+        assert_eq!(control.islands().len(), ISLAND_X.len() - 1);
     }
 
     /// The property positional indices cannot have: despawning a body
