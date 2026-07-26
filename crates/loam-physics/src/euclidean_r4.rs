@@ -69,6 +69,10 @@ impl PhysicsSpace for EuclideanR4 {
         }
     }
 
+    fn wedge(&self, a: Vec4, b: Vec4) -> Bivector4 {
+        Bivector4::wedge(a, b)
+    }
+
     fn velocity_at_point(&self, body: &RigidBody<EuclideanR4>, p: Vec4) -> Vec4 {
         let r = p - body.position;
         body.velocity + omega_cross_r(body.angular_velocity, r)
@@ -448,6 +452,9 @@ pub use loam_shape::polytope_geom::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::determinism_fixture::{
+        determinism_scenario_trajectory, fnv1a64, GOLDEN_TRAJECTORY_HASH,
+    };
     use crate::field::Gravity;
     use crate::world::World;
 
@@ -1086,46 +1093,28 @@ mod tests {
     /// runs must agree to the last bit.
     #[test]
     fn fixed_scenario_replay_is_bit_identical_determinism() {
-        fn run() -> Vec<[u32; 4]> {
-            let mut world = World::new(EuclideanR4);
-            world.push_field(Box::new(Gravity::new(Vec4::new(0.0, -9.8, 0.0, 0.0))));
-            world.push_body(halfspace4_body_r4(Vec4::Y, 0.0));
-            // Deterministic stack: fixed offsets, no RNG, so any run-to-run
-            // difference is genuine nondeterminism rather than seed noise.
-            for i in 0..6u32 {
-                let y = 1.0 + i as f32 * 0.45;
-                let x = ((i % 3) as f32 - 1.0) * 0.05;
-                world.push_body(sphere_body_r4(
-                    Vec4::new(x, y, 0.0, 0.0),
-                    Vec4::ZERO,
-                    0.2,
-                    1.0,
-                ));
-            }
-            let dt = 1.0 / 60.0;
-            for _ in 0..240 {
-                world.step(dt);
-            }
-            world
-                .bodies
-                .iter()
-                .map(|b| {
-                    let p = b.position;
-                    [p.x.to_bits(), p.y.to_bits(), p.z.to_bits(), p.w.to_bits()]
-                })
-                .collect()
-        }
-        let first = run();
-        let second = run();
+        let first = determinism_scenario_trajectory();
+        let second = determinism_scenario_trajectory();
         assert_eq!(first, second, "fixed-scenario replay must be bit-identical");
         // Guard against a vacuous pass: the simulation must stay finite.
-        for body in &first {
-            for &bits in body {
-                assert!(
-                    f32::from_bits(bits).is_finite(),
-                    "non-finite state in replay"
-                );
-            }
+        for &bits in &first {
+            assert!(
+                f32::from_bits(bits).is_finite(),
+                "non-finite state in replay"
+            );
         }
+    }
+
+    /// The replay pin above passes for any change that is merely
+    /// self-consistent. This one pins the trajectory itself against a value
+    /// committed to the repository, so a behavior change has to be declared.
+    #[test]
+    fn fixed_scenario_trajectory_matches_golden_determinism_hash() {
+        let hash = fnv1a64(&determinism_scenario_trajectory());
+        assert_eq!(
+            hash, GOLDEN_TRAJECTORY_HASH,
+            "trajectory hash {hash:#018x} does not match the committed golden \
+             {GOLDEN_TRAJECTORY_HASH:#018x}"
+        );
     }
 }
