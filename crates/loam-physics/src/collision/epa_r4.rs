@@ -352,6 +352,15 @@ fn contact_from_face(polytope: &Polytope4, face: Face4) -> Option<ContactInfo4> 
 /// this tile instead, as `simplex_r4::closest_to_origin` does, drops vertices
 /// from the combination and breaks the identity.
 ///
+/// A negative weight therefore makes `point_a` and `point_b` affine
+/// extrapolations: each leaves the convex hull of its own shape's support
+/// points, so neither witness is guaranteed to lie on its surface, and their
+/// midpoint can sit outside both bodies. That is deliberate. The contact point
+/// feeds a lever arm and a manifold merge radius, both of which want the
+/// combination that reproduces `closest`; a witness clamped back onto the hull
+/// would name a surface point whose difference is no longer the penetration
+/// vector.
+///
 /// The tetra centroid is the fallback for a singular Gram system. `build_face`
 /// floors the tetra's 3-volume, so reaching it takes a face anisotropic enough
 /// to lose a pivot in f32, where no decomposition of the plane point would be
@@ -447,28 +456,35 @@ mod tests {
         assert!(contact.point.w.abs() < 0.1);
     }
 
-    /// A face whose plane projection falls outside its own tetra, nearest one
-    /// edge. The contact must be the affine combination that realizes the
-    /// projection over all four vertices, so the witnesses keep
-    /// `point_a − point_b = normal·penetration`; clamping to the edge rebuilds
-    /// the contact from two vertices and breaks that identity.
+    /// A face whose plane projection falls outside its own tetra. The contact
+    /// must be the affine combination that realizes the projection over all
+    /// four vertices, so the witnesses keep
+    /// `point_a − point_b = normal·penetration`; clamping to the nearest
+    /// sub-simplex rebuilds the contact from three vertices and breaks that
+    /// identity.
+    ///
+    /// The four weights are pairwise distinct and non-zero, so each vertex is
+    /// separately observable: transposing any two of them permutes the solved
+    /// weights and moves the contact, which a fixture with a repeated or zero
+    /// weight would hide.
     #[test]
     fn contact_from_face_realizes_the_plane_projection_outside_the_tetra() {
         use super::super::simplex_r4::closest_to_origin;
 
-        // Tetra in the hyperplane x = 1, so the plane projection is x̂. Every
-        // vertex satisfies y + z ≥ 1, which puts x̂ outside the tetra.
+        // Tetra in the hyperplane x = 1, so the plane projection is x̂; the
+        // affine coordinates below are not all non-negative, which puts x̂
+        // outside the tetra.
         let points = [
             Vec4::new(1.0, 1.0, 0.0, 0.0),
             Vec4::new(1.0, 0.0, 1.0, 0.0),
-            Vec4::new(1.0, 2.0, 2.0, 0.0),
-            Vec4::new(1.0, 1.0, 1.0, 2.0),
+            Vec4::new(1.0, 0.0, 0.0, 1.0),
+            Vec4::new(1.0, 6.0, -3.0, 2.0),
         ];
         let pre_images_b = [
-            Vec4::ZERO,
-            Vec4::new(0.0, 0.0, 0.0, 3.0),
-            Vec4::new(0.0, 0.0, 3.0, 0.0),
-            Vec4::new(0.0, 3.0, 0.0, 0.0),
+            Vec4::new(0.0, 1.0, 0.0, 0.0),
+            Vec4::new(0.0, 0.0, 1.0, 0.0),
+            Vec4::new(0.0, 0.0, 0.0, 1.0),
+            Vec4::new(1.0, 0.0, 0.0, 0.0),
         ];
         let vertices: Vec<MinkowskiPoint4> = points
             .iter()
@@ -480,19 +496,30 @@ mod tests {
             })
             .collect();
 
-        // Fixture premise: the convex solve lands on the edge v₀v₁ and keeps
-        // two of the four vertices.
+        // Fixture premise: the convex solve clamps to the triangle v₀v₁v₂ and
+        // drops v₃ from the combination.
         let clamped = closest_to_origin(&points.map(|p| p - Vec4::X));
-        assert_eq!(clamped.kept, vec![0, 1]);
+        assert_eq!(clamped.kept, vec![0, 1, 2]);
 
-        // Affine coordinates of x̂ on the tetra: the w-row forces w₃ = 0, the
-        // y- and z-rows give w₀ = w₁ = −2·w₂, and Σ wᵢ = 1 closes it.
-        let weights = [2.0 / 3.0, 2.0 / 3.0, -1.0 / 3.0, 0.0];
+        // Affine coordinates of x̂ on the tetra. In the yzw slice the first
+        // three vertices are the standard basis and the fourth is
+        // q₃ = (6, −3, 2), so Σ wᵢ·qᵢ = 0 forces (w₀, w₁, w₂) = −w₃·q₃, and
+        // Σ wᵢ = 1 then gives −4·w₃ = 1.
+        let weights = [1.5, -0.75, 0.5, -0.25];
         let realized = points
             .iter()
             .zip(weights)
             .fold(Vec4::ZERO, |acc, (&p, w)| acc + p * w);
         assert!((realized - Vec4::X).length() < 1e-6, "{realized:?}");
+
+        let solved = face_barycentrics(&points, Vec4::X);
+        assert!(
+            solved
+                .iter()
+                .zip(weights)
+                .all(|(&got, want)| (got - want).abs() < 1e-5),
+            "weights {solved:?} should be {weights:?}"
+        );
 
         let centroid = (points[0] + points[1] + points[2] + points[3]) * 0.25;
         let face = build_face(&vertices, 0, 1, 2, 3, centroid).expect("tetra is non-degenerate");
@@ -505,9 +532,10 @@ mod tests {
         };
         let contact = contact_from_face(&polytope, face).expect("face resolves a contact");
 
-        // Σ wᵢ·saᵢ = (1, 0, −1, 2) and Σ wᵢ·sbᵢ = (0, 0, −1, 2): the witnesses
-        // differ by x̂ = normal·penetration, and the contact is their midpoint.
-        let expected = Vec4::new(0.5, 0.0, -1.0, 2.0);
+        // Σ wᵢ·saᵢ = (0.75, 1.5, −0.75, 0.5) and Σ wᵢ·sbᵢ = (−0.25, 1.5,
+        // −0.75, 0.5): the witnesses differ by x̂ = normal·penetration, and the
+        // contact is their midpoint.
+        let expected = Vec4::new(0.25, 1.5, -0.75, 0.5);
         assert!(
             (contact.point - expected).length() < 1e-5,
             "contact {:?} should be {expected:?}",
