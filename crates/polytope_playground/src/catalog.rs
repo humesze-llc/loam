@@ -194,8 +194,16 @@ pub(crate) fn parse_shape_name(name: &str) -> Result<ShapeEntry> {
 
 /// Parse the comma-separated `shapes` key (`--shapes=a,b` natively,
 /// `?shapes=a,b` in the browser). Returns [`DEFAULT_ROW`] when the key
-/// is absent.
+/// is absent, and an error for the space-separated `--shapes a,b` form,
+/// whose value never reaches `args`.
 pub(crate) fn parse_row(args: &Args) -> Result<Vec<ShapeEntry>> {
+    if args.has_bare_flag("shapes") {
+        return Err(anyhow!(
+            "`--shapes` needs its value attached with `=`, as in \
+             `--shapes=24-cell,8-cell` (comma-separated for several \
+             shapes); the space-separated form drops the value"
+        ));
+    }
     let Some(raw) = args.get("shapes") else {
         return Ok(DEFAULT_ROW.to_vec());
     };
@@ -224,6 +232,30 @@ mod tests {
         assert_eq!(
             row.iter().map(|e| e.label).collect::<Vec<_>>(),
             ["120-cell", "8-cell"]
+        );
+    }
+
+    #[test]
+    fn a_bare_shapes_flag_is_diagnosed_rather_than_silently_defaulting() {
+        let args = Args::from_argv(["--shapes", "120-cell,tesseract"]);
+        assert_eq!(args.get("shapes"), None);
+        let err = parse_row(&args).unwrap_err().to_string();
+        assert!(err.contains("--shapes="), "{err}");
+
+        // A trailing `--shapes` with nothing after it is the same mistake.
+        assert!(parse_row(&Args::from_argv(["--seed=42", "--shapes"])).is_err());
+    }
+
+    #[test]
+    fn the_attached_form_and_unrelated_arguments_are_not_diagnosed() {
+        let row = parse_row(&Args::from_argv(["--seed=42", "--shapes=5-cell,8-cell"])).unwrap();
+        assert_eq!(
+            row.iter().map(|e| e.label).collect::<Vec<_>>(),
+            ["5-cell", "8-cell"]
+        );
+        assert_eq!(
+            parse_row(&Args::from_argv(["shapes", "--x=--shapes"])).unwrap(),
+            DEFAULT_ROW
         );
     }
 
