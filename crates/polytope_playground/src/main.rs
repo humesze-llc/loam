@@ -78,6 +78,7 @@ mod composer;
 mod console;
 mod consts;
 mod filmstrip;
+mod physics;
 mod projections;
 mod render;
 mod sections;
@@ -97,9 +98,9 @@ use consts::{
 };
 #[cfg(test)]
 use loam_physics::polytope::Polytope4;
+use physics::PlaygroundPhysics;
 use state::{
-    body_position, CameraMode, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode,
-    WireframeProjection,
+    CameraMode, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode, WireframeProjection,
 };
 use wireframe_geom::*;
 
@@ -178,7 +179,7 @@ impl Demo {
         // entries emit `BodyUniform::default()` (kind = Invalid) so the
         // kernel skips them and the rasterizer draws them instead. Mirrors
         // `Demo::sdf_body_for_slot`, which handles later re-uploads.
-        let n = row.len();
+        let physics = PlaygroundPhysics::new(row.len(), BODY_SIZE);
         let bodies: Vec<BodyUniform> = row
             .iter()
             .enumerate()
@@ -186,11 +187,12 @@ impl Demo {
                 if entry.shape.polytope4().is_some() {
                     BodyUniform::default()
                 } else {
+                    let pose = physics.pose(slot, Rotor4::IDENTITY);
                     BodyUniform::polytope_with_rotor(
-                        body_position(slot, n),
+                        pose.position.to_array(),
                         entry.shape.shape_id(),
                         BODY_SIZE,
-                        Rotor4::IDENTITY,
+                        pose.rotor,
                         entry.body_color,
                     )
                 }
@@ -280,6 +282,7 @@ impl Demo {
 
         Ok(Self {
             space: EuclideanR3,
+            physics,
             camera,
             orbit,
             freecam,
@@ -437,6 +440,10 @@ impl Demo {
                 }
             }
         }
+        // Rigid bodies advance on the tick count, not on `dt_secs`, so a
+        // trajectory is frame-rate independent. `write_all` then reconciles
+        // the world with the rendered row and uploads the resulting poses.
+        self.physics.step(ctx.n_ticks);
         self.write_all(self.rot_state);
 
         // Gate the orbit on `!ui_has_focus` so dragging the egui slider
@@ -581,7 +588,6 @@ impl Demo {
 
         // Anchor: the leading polychoron's body center in world R³.
         let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
-        let n = render_row.len();
         let Some((slot, _entry)) = render_row
             .iter()
             .enumerate()
@@ -589,8 +595,7 @@ impl Demo {
         else {
             return;
         };
-        let body_pos = body_position(slot, n);
-        let world_pos = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+        let world_pos = self.physics.pose(slot, self.rot_state).position_r3();
 
         let view_dir = self.camera.view();
         let cfg = &frame.rd.surface_bundle.config;
@@ -630,7 +635,6 @@ impl Demo {
         }
         // First polychoron in the rendered row; its vertex 0 is the anchor.
         let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
-        let n = render_row.len();
         let Some((slot, entry)) = render_row
             .iter()
             .enumerate()
@@ -641,13 +645,13 @@ impl Demo {
         let polytope = entry.shape.polytope4().expect("filter guarantees Some");
         let topo = polytope.topology();
         let canonical_v0 = topo.vertices[0];
-        let v_local_4d = self.effective_body_size() * self.rot_state.apply(canonical_v0);
+        let pose = self.physics.pose(slot, self.rot_state);
+        let v_local_4d = pose.body_local(canonical_v0, self.effective_body_size());
         let v_local_r3 = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
             v_local_4d,
             &self.resolved_wireframe_projection(),
         );
-        let body_pos = body_position(slot, n);
-        let world_pos = v_local_r3 + Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+        let world_pos = v_local_r3 + pose.position_r3();
 
         // Reproject world R³ -> screen pixels via the rasterizer's camera;
         // `None` (anchor offscreen) draws nothing.

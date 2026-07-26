@@ -15,6 +15,7 @@ use loam_render::raymarch::{BodyUniform, Hyperslice4DNode};
 
 use crate::catalog::ShapeEntry;
 use crate::consts::{BASE_ROTATION_RATE, BODY_SIZE, BODY_X_SPACING, BODY_Y, T_SLIDER_INITIAL};
+use crate::physics::PlaygroundPhysics;
 
 // Projection modes live in `projections.rs`; re-export so `impl Demo`, the test
 // module, and the other playground modules keep importing them from `state`.
@@ -285,8 +286,9 @@ pub(crate) enum DragPayload {
 // Body layout helper
 // ---------------------------------------------------------------------------
 
-/// Position of the `slot`-th of `n` bodies, centred on the world origin and
-/// spaced by [`BODY_X_SPACING`].
+/// Spawn position of the `slot`-th of `n` bodies, centred on the world origin
+/// and spaced by [`BODY_X_SPACING`]. The static layout only: once a body is
+/// in a [`PlaygroundPhysics`] world its live position comes from there.
 pub(crate) fn body_position(slot: usize, n: usize) -> [f32; 4] {
     let x = (slot as f32 - (n as f32 - 1.0) * 0.5) * BODY_X_SPACING;
     [x, BODY_Y, 0.0, 0.0]
@@ -298,6 +300,9 @@ pub(crate) fn body_position(slot: usize, n: usize) -> [f32; 4] {
 
 pub(crate) struct Demo {
     pub(crate) space: EuclideanR3,
+    /// Rigid-body state for the rendered row, one body per slot. Drives every
+    /// render path's pose; see [`crate::physics`].
+    pub(crate) physics: PlaygroundPhysics,
     pub(crate) camera: Camera<EuclideanR3>,
     pub(crate) orbit: OrbitController<EuclideanR3>,
     /// Freecam preset (mouse-look + WASD + cursor grab); drives the camera in
@@ -622,13 +627,7 @@ impl Demo {
     /// Invalid), which the kernel skips, and the surface comes from
     /// [`Self::section_faces`] (Raster) or nowhere (Off). Smooth-surface shapes
     /// ignore the mode and always produce a live SDF body.
-    fn sdf_body_for_slot(
-        &self,
-        entry: &ShapeEntry,
-        slot: usize,
-        n: usize,
-        rotor: Rotor4,
-    ) -> BodyUniform {
+    fn sdf_body_for_slot(&self, entry: &ShapeEntry, slot: usize, rotor: Rotor4) -> BodyUniform {
         // The 120-cell and 600-cell have NO authoritative SDF: their
         // `cell{120,600}_face_planes` are the known-wrong dual-vertex
         // approximation (see `loam_shape::polytope_geom`), wrong on 96 normals.
@@ -644,11 +643,12 @@ impl Demo {
         if !self.surface_mode.uses_sdf_for_polychora() && entry.shape.polytope4().is_some() {
             return BodyUniform::default();
         }
+        let pose = self.physics.pose(slot, rotor);
         BodyUniform::polytope_with_rotor(
-            body_position(slot, n),
+            pose.position.to_array(),
             entry.shape.shape_id(),
             self.effective_body_size(),
-            rotor,
+            pose.rotor,
             entry.body_color,
         )
     }
@@ -766,13 +766,18 @@ impl Demo {
     /// `body_uniform_scratch` is taken out of `self` for the build (so it can
     /// borrow `&self`) and put back, keeping its capacity so the steady-state spin
     /// upload does not allocate.
+    ///
+    /// The single choke point where the rendered row's slot count is
+    /// materialized, so it is also where the physics world is reconciled with
+    /// it ([`PlaygroundPhysics::sync`]).
     fn upload_render_row_bodies(&mut self, rotor: Rotor4) {
+        let n = self.render_row().len();
+        self.physics.sync(n, self.effective_body_size());
         let mut scratch = std::mem::take(&mut self.body_uniform_scratch);
         scratch.clear();
-        let n = self.render_row().len();
         for slot in 0..n {
             let entry = &self.render_row()[slot];
-            scratch.push(self.sdf_body_for_slot(entry, slot, n, rotor));
+            scratch.push(self.sdf_body_for_slot(entry, slot, rotor));
         }
         self.node.set_bodies(&scratch);
         self.body_uniform_scratch = scratch;
@@ -801,7 +806,8 @@ impl Demo {
         }
     }
 
-    /// Full reset: pause spin, slice, rate, active set, orientation, time, draft.
+    /// Full reset: pause spin, slice, rate, active set, orientation, time,
+    /// draft, and thrown bodies.
     /// `rotate` flips off too so the next `update()` does not immediately respin.
     pub(crate) fn reset(&mut self) {
         self.rotate = false;
@@ -817,6 +823,8 @@ impl Demo {
         self.cross_section = SectionLayer::CROSS_SECTION_DEFAULT;
         self.projected_cap = SectionLayer::PROJECTED_CAP_DEFAULT;
         self.draft.clear();
+        let slots = self.render_row().len();
+        self.physics.respawn(slots, self.effective_body_size());
         self.write_all(Rotor4::IDENTITY);
     }
 }
