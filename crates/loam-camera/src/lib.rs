@@ -18,7 +18,7 @@
 mod camera;
 mod controller;
 
-pub use camera::Camera;
+pub use camera::{Camera, Ray};
 pub use controller::{CameraController, FirstPersonController, OrbitController};
 
 use std::f32::consts::FRAC_PI_2;
