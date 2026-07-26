@@ -74,10 +74,17 @@ impl PlaygroundPhysics {
     }
 
     /// Drop every body back onto the static layout at rest. Manifolds go with
-    /// them: warm-start impulses are keyed by slot, so a surviving entry would
-    /// be inherited by whichever body lands in that slot next.
+    /// them: their keys name the despawned handles, so every surviving entry
+    /// is unreachable warm-start state the next step would walk for nothing.
     pub(crate) fn respawn(&mut self, slots: usize, radius: f32) {
-        self.world.bodies.clear();
+        // Despawn rather than replace the arena: a fresh arena restarts
+        // generations at 0, so a handle held across a respawn would alias
+        // whichever body lands in its slot next, which is the exact aliasing
+        // the generation counter exists to prevent.
+        while let Some(last) = self.world.bodies.len().checked_sub(1) {
+            let id = self.world.bodies.id_at(last);
+            self.world.bodies.despawn(id);
+        }
         self.world.manifolds.clear();
         for slot in 0..slots {
             let position = Vec4::from_array(body_position(slot, slots));
@@ -95,7 +102,7 @@ impl PlaygroundPhysics {
             self.respawn(slots, radius);
             return;
         }
-        for body in &mut self.world.bodies {
+        for body in self.world.bodies.iter_mut() {
             body.collider = Collider::sphere_at_origin(radius);
             body.inertia = ball4_inertia(body.mass, radius);
         }

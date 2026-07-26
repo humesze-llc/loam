@@ -648,7 +648,7 @@ impl<S: PhysicsSpace> World<S> {
 
     /// The islands of the current manifold set, ascending by island id.
     /// Allocating form, for callers outside the step loop; the step groups its
-    /// constraint buffer through [`Self::fill_islands`], the same partition.
+    /// constraint buffer through the same partition without allocating.
     pub fn islands(&self) -> Vec<Island> {
         let mut parent = Vec::new();
         let mut labels = Vec::new();
