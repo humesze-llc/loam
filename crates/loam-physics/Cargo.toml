@@ -15,3 +15,7 @@ glam.workspace = true
 tracing.workspace = true
 loam-math  = { path = "../loam-math" }
 loam-shape = { path = "../loam-shape" }
+
+[[bench]]
+name = "broadphase"
+harness = false
