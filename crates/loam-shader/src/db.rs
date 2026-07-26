@@ -401,6 +401,25 @@ fn main() {
         validate_wgsl(&src).expect("SphericalS3 + geodesic kernel should validate");
     }
 
+    /// The boundary escape splits its numbers across two crates: `LOAM_MAX_ARC`
+    /// and `LOAM_S3_R2_MAX` are loam-math prelude data, `0.92` is kernel policy
+    /// buffering the S3 chart's saturating `loam_origin_distance`. The escape
+    /// can only fire if their product stays under the largest arc that chart
+    /// reports, `asin(√LOAM_S3_R2_MAX)`; above it a ray leaves the domain and
+    /// only the arc budget terminates the march. Every literal below is read
+    /// back out of one of the three pinned strings, so neither crate can move
+    /// its number without failing here.
+    #[test]
+    fn spherical_boundary_escape_fires_below_the_saturated_chart_radius() {
+        let prelude = SphericalS3.wgsl_impl();
+        assert!(prelude.contains("const LOAM_MAX_ARC: f32 = 1.5;"));
+        assert!(prelude.contains("const LOAM_S3_R2_MAX: f32 = 0.999999;"));
+        assert!(
+            crate::GEODESIC_MARCH_KERNEL.contains("loam_origin_distance(p) > LOAM_MAX_ARC * 0.92")
+        );
+        assert!(0.92_f32 * 1.5 < 0.999999_f32.sqrt().asin());
+    }
+
     #[test]
     fn blended_e3_h3_prelude_validates_against_abi_probe() {
         let bs = BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-2.0, 2.0));
