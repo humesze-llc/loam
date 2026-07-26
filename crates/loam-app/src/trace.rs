@@ -205,6 +205,24 @@ impl Default for PerfOverlay {
     }
 }
 
+/// Body width of the readout; also the right-inset basis for its boot seat.
+const OVERLAY_WIDTH: f32 = 260.0;
+
+/// Gap between the overlay and the edges of the space panels leave.
+const OVERLAY_MARGIN: f32 = 12.0;
+
+/// Boot position of the draggable overlay: inset from the top-right of the
+/// space the host's panels leave. `available_rect` and not `content_rect`,
+/// which is the viewport minus OS safe-area insets and is panel-unaware, so
+/// seating against it puts the readout behind the shell's menu bar.
+fn perf_overlay_seat(ctx: &loam_egui::egui::Context) -> loam_egui::egui::Pos2 {
+    let area = ctx.available_rect();
+    loam_egui::egui::pos2(
+        (area.right() - OVERLAY_MARGIN - OVERLAY_WIDTH).max(area.left()),
+        area.top() + OVERLAY_MARGIN,
+    )
+}
+
 impl PerfOverlay {
     pub fn new() -> Self {
         Self::default()
@@ -307,19 +325,17 @@ impl PerfOverlay {
             0.0
         };
 
-        // Top-right by default; `default_pos` (not `anchor`, which ignores
-        // drag) so `.movable` works and egui persists the dragged offset.
-        let screen = ctx.content_rect();
-        let default_x = (screen.right() - 12.0 - 260.0).max(0.0);
+        // `default_pos` (not `anchor`, which ignores drag) so `.movable`
+        // works and egui persists the dragged offset.
         egui::Area::new(egui::Id::new("loam-perf-overlay"))
-            .default_pos(egui::pos2(default_x, 12.0))
+            .default_pos(perf_overlay_seat(ctx))
             .movable(true)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 75)))
                     .show(ui, |ui| {
-                        ui.set_min_width(260.0);
+                        ui.set_min_width(OVERLAY_WIDTH);
                         let mono = egui::FontId::monospace(11.0);
                         let label_color = egui::Color32::from_rgb(180, 190, 200);
                         ui.label(
@@ -716,5 +732,75 @@ mod tests {
         let _ = buf.percentile(0.5);
         let after: Vec<Duration> = buf.as_slice().to_vec();
         assert_eq!(before, after, "percentile must not reorder self");
+    }
+}
+
+#[cfg(test)]
+mod seat_tests {
+    use super::*;
+    use loam_egui::egui;
+
+    /// Any bar taller than `OVERLAY_MARGIN` separates the two rects; an exact
+    /// height keeps the assertion independent of font metrics.
+    const BAR_HEIGHT: f32 = 64.0;
+
+    const PANEL_WIDTH: f32 = 120.0;
+
+    #[test]
+    fn perf_overlay_boots_clear_of_a_top_panel() {
+        // One frame of history, so `show` gets past its "no samples" early
+        // return. The store is thread-local and each test owns its thread.
+        frame_trace::begin_frame();
+        frame_trace::end_frame();
+
+        let ctx = egui::Context::default();
+        let mut overlay = PerfOverlay::new().always_visible();
+        let mut bar_bottom = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            bar_bottom = egui::TopBottomPanel::top("shell-menu-bar")
+                .exact_height(BAR_HEIGHT)
+                .show(ctx, |ui| {
+                    ui.label("bar");
+                })
+                .response
+                .rect
+                .bottom();
+            overlay.show(ctx);
+        });
+        let rect = ctx
+            .memory(|m| m.area_rect(egui::Id::new("loam-perf-overlay")))
+            .expect("overlay area is registered once shown");
+        assert!(
+            rect.top() >= bar_bottom,
+            "overlay top {} must clear the menu bar bottom {bar_bottom}",
+            rect.top(),
+        );
+    }
+
+    #[test]
+    fn perf_overlay_seat_stays_inside_the_horizontal_panel_band() {
+        let ctx = egui::Context::default();
+        let mut seat = None;
+        let mut area = egui::Rect::NOTHING;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::SidePanel::left("left")
+                .exact_width(PANEL_WIDTH)
+                .show(ctx, |ui| {
+                    ui.label("left");
+                });
+            egui::SidePanel::right("right")
+                .exact_width(PANEL_WIDTH)
+                .show(ctx, |ui| {
+                    ui.label("right");
+                });
+            area = ctx.available_rect();
+            seat = Some(perf_overlay_seat(ctx));
+        });
+        let seat = seat.expect("run closure sets the seat");
+        assert!(
+            seat.x >= area.left() && seat.x + OVERLAY_WIDTH <= area.right(),
+            "seat x {} plus width {OVERLAY_WIDTH} must lie inside {area:?}",
+            seat.x,
+        );
     }
 }
