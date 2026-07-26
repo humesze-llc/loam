@@ -439,11 +439,12 @@ where
     /// `last_redraw_at`. `None` when uncapped.
     last_redraw_anchor: Option<web_time::Instant>,
     tick_index: u64,
-    /// Fixed-timestep accumulator at 60Hz (matching `RunConfig::default()`)
-    /// so demos reading `FrameCtx::n_ticks` see the native cadence. A
-    /// different rate would need RunConfig plumbed through postMessage. The
-    /// catch-up cap comes from `DEFAULT_MAX_TICKS_PER_FRAME`, the same
-    /// definition `RunConfig::default` uses.
+    /// Fixed-timestep accumulator at 60Hz with the catch-up cap at
+    /// `DEFAULT_MAX_TICKS_PER_FRAME`, both matching `RunConfig::default()` so
+    /// demos reading `FrameCtx::n_ticks` see the native cadence. Overriding
+    /// either would need RunConfig plumbed through postMessage; a demo that
+    /// sets `RunConfig::max_ticks_per_frame` changes the native stall cadence
+    /// only.
     timestep: FixedTimestep,
     _marker: PhantomData<A::Space>,
 }

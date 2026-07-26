@@ -120,8 +120,11 @@ pub trait App: Sized + 'static {
     /// Borrow the user-owned `Self::Space` for `ShaderDb::apply_events`.
     fn space(&self) -> &Self::Space;
 
-    /// Per-tick simulation step at the fixed-timestep rate ([`RunConfig::fixed_hz`]).
-    /// Usually 0 or 1 per frame; can spike to [`RunConfig::max_ticks_per_frame`].
+    /// Per-tick simulation step at the fixed-timestep rate: usually 0 or 1 per
+    /// frame, spiking after a stall to the runner's catch-up cap. The native
+    /// runner takes rate and cap from [`RunConfig`]; the wasm worker hardcodes
+    /// 60Hz and [`DEFAULT_MAX_TICKS_PER_FRAME`], since `RunConfig` never
+    /// crosses its init message.
     fn tick(&mut self, _dt: f32, _ctx: &mut TickCtx) {}
 
     /// Per-frame update with drained input, after all the frame's ticks. Advance
@@ -206,8 +209,10 @@ pub trait App: Sized + 'static {
 
 /// Run one frame's fixed-timestep ticks: advance the accumulator and call
 /// `App::tick` for every tick it yields. Shared by the native runner and the
-/// wasm worker so the determinism-critical sim cadence has a single definition
-/// and cannot drift between platforms. Returns the tick count (for
+/// wasm worker so what a tick observes has a single definition and cannot
+/// drift between platforms. How many ticks a stalled frame yields belongs to
+/// the caller's accumulator and does differ; see
+/// [`DEFAULT_MAX_TICKS_PER_FRAME`]. Returns the tick count (for
 /// `FrameCtx::n_ticks`).
 ///
 /// The catch-up cap lives solely in the `FixedTimestep`
@@ -256,11 +261,12 @@ pub struct SetupCtx<'a> {
 /// Per-tick context. Visible to [`App::tick`]. Deliberately GPU-free so sim code stays
 /// bit-deterministic.
 pub struct TickCtx {
-    /// Sim time in seconds: `tick` scaled by the fixed timestep
-    /// (`1.0 / RunConfig::fixed_hz`). Derived from the tick index rather than
-    /// read from the clock, so replaying the same tick range yields the same
-    /// bits however the frames were paced. Wall-clock time lives on
-    /// [`FrameCtx::time`], outside the determinism boundary.
+    /// Sim time in seconds: `tick` scaled by the runner's fixed-timestep
+    /// interval (`1.0 / RunConfig::fixed_hz` natively, 1/60 in the wasm
+    /// worker). Derived from the tick index rather than read from the clock, so
+    /// replaying the same tick range yields the same bits however the frames
+    /// were paced. Wall-clock time lives on [`FrameCtx::time`], outside the
+    /// determinism boundary.
     pub time: f32,
     pub tick: u64,
 }
@@ -297,10 +303,11 @@ pub struct FrameCtx<'a> {
     /// state that must be lockstep-reproducible, use [`App::tick`] instead;
     /// `tick`'s `dt` is the fixed-timestep interval regardless of frame rate.
     ///
-    /// First call after setup gets `dt = 1.0 / RunConfig::fixed_hz` as a sensible
-    /// fallback (no prior frame to measure from). Subsequent calls reflect actual
-    /// elapsed time, so a 50fps frame gets dt ≈ 0.02 and a stutter-frame at
-    /// 15fps gets dt ≈ 0.066.
+    /// First call after setup gets the runner's fixed-timestep interval as a
+    /// sensible fallback (`1.0 / RunConfig::fixed_hz` natively, 1/60 in the
+    /// wasm worker; no prior frame to measure from). Subsequent calls reflect
+    /// actual elapsed time, so a 50fps frame gets dt ≈ 0.02 and a stutter-frame
+    /// at 15fps gets dt ≈ 0.066.
     pub dt: f32,
     /// `true` if egui is consuming pointer or keyboard input this frame (a widget is
     /// hovered, focused, or accepting text). Gameplay code should gate movement /
@@ -316,19 +323,25 @@ pub struct FrameCtx<'a> {
 // RunConfig
 // ---------------------------------------------------------------------------
 
-/// Catch-up ticks a single frame may run before the accumulator's excess is
-/// dropped. The one definition of the cap: the native runner reads it through
-/// [`RunConfig::max_ticks_per_frame`] and the wasm worker uses it directly, so
-/// both platforms simulate the same tick cadence under a stall.
+/// Default catch-up ticks a single frame may run before the accumulator's
+/// excess is dropped. The native runner reads
+/// [`RunConfig::max_ticks_per_frame`], which starts here; the wasm worker
+/// hardcodes this constant, since `RunConfig` never crosses the worker's init
+/// message, so overriding the cap changes the native stall cadence only.
+///
+/// Not the only cap constant: [`loam_time::DEFAULT_MAX_CATCH_UP`] is
+/// `FixedTimestep`'s own default at a different value, and both runners
+/// override it, so it is never the effective cap here.
 pub const DEFAULT_MAX_TICKS_PER_FRAME: u32 = 4;
 
 /// Runtime knobs. New fields land with defaults so adding configuration is non-breaking.
 pub struct RunConfig {
     pub window: WindowAttributes,
     pub fixed_hz: u32,
-    /// Spiral-of-death cap, applied by the runner's [`FixedTimestep`]. Ticks
-    /// beyond this in one frame are dropped, not deferred; `0` stops the sim
-    /// entirely.
+    /// Spiral-of-death cap, applied by the native runner's [`FixedTimestep`].
+    /// Ticks beyond this in one frame are dropped, not deferred; `0` stops the
+    /// sim entirely. Native only: the wasm worker hardcodes
+    /// [`DEFAULT_MAX_TICKS_PER_FRAME`] whatever this says.
     pub max_ticks_per_frame: u32,
     /// `EnvFilter`-style log filter. `None` means keep whatever `tracing-subscriber`
     /// was already configured with (or the `RUST_LOG` env var); `Some` installs a new
@@ -1295,7 +1308,7 @@ impl<A: App> Runner<A> {
         let _frame_scope = loam_time::frame_trace::scope("frame");
 
         // 1. Fixed-timestep ticks (shared with the wasm worker via
-        // `drive_fixed_ticks` so the sim cadence stays identical across platforms).
+        // `drive_fixed_ticks` so a tick sees the same dt and time on both).
         let n_ticks = if let Some(app) = self.app.as_mut() {
             drive_fixed_ticks(
                 app,
@@ -1429,7 +1442,7 @@ impl<A: App> Runner<A> {
         //     `resolve_target` is `None`.
         //   non-sRGB swap (browser-WebGPU): no reinterpretation and one view
         //     per attachment. Scene and UI both draw into `rd.scene_view()`,
-        //     the offscreen sRGB texture, and the end-of-frame composite pass
+        //     the offscreen scene texture, and the end-of-frame composite pass
         //     gamma-encodes that into the `begin_frame` swapchain view, the
         //     only pass writing through it here. `RenderDevice` forces MSAA off
         //     on this path, so nothing resolves.
@@ -1576,10 +1589,11 @@ impl<A: App> Runner<A> {
                 #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
                 capture::publish_status(self.capture.status());
 
-                // Composite pass: sRGB scene texture -> linear swapchain with manual
-                // gamma encoding. Writes into the same encoder as everything else
-                // (no separate submit). No-op on native (where scene_view() is None
-                // and rendering wrote directly into the swapchain).
+                // Composite pass: offscreen scene texture -> linear swapchain
+                // with manual gamma encoding. Writes into the same encoder as
+                // everything else (no separate submit). No-op on native (where
+                // scene_view() is None and rendering wrote directly into the
+                // swapchain).
                 if rd.scene_view().is_some() {
                     let _scope = loam_time::frame_trace::scope("composite");
                     rd.composite_to_swap(&mut encoder, &swap_view);
@@ -1783,20 +1797,19 @@ mod tests {
 
     #[test]
     fn executed_ticks_equal_ticks_charged_to_the_accumulator() {
-        // Prime, then a frame arriving ten ticks late. The cap is the
-        // accumulator's own default, so all ten are charged and all ten must
-        // run: a second cap inside the tick loop would book six of them
-        // without simulating them.
-        let offsets = [Duration::ZERO, TICK * 10];
-        let (times, timestep, tick_index) =
-            drive(Instant::now(), &offsets, loam_time::DEFAULT_MAX_CATCH_UP);
+        // Prime, then a frame arriving ten ticks late under a cap of exactly
+        // ten, so all ten are charged and all ten must run: any second cap
+        // inside the tick loop books ticks it never simulates.
+        const BACKLOG: u32 = 10;
+        let offsets = [Duration::ZERO, TICK * BACKLOG];
+        let (times, timestep, tick_index) = drive(Instant::now(), &offsets, BACKLOG);
 
         assert_eq!(
             times.len() as u64,
             timestep.tick(),
             "every tick charged to the accumulator must have run App::tick"
         );
-        assert_eq!(times.len(), loam_time::DEFAULT_MAX_CATCH_UP as usize);
+        assert_eq!(times.len(), BACKLOG as usize);
         assert_eq!(tick_index, timestep.tick());
     }
 
@@ -1820,8 +1833,8 @@ mod tests {
 
     #[test]
     fn timestep_tick_and_runner_index_stay_equal_across_a_stall() {
-        // Both caps in production use: the app default and the accumulator's
-        // own. The larger one is what exposes a cap re-applied downstream.
+        // Two cap sizes, since a cap re-applied downstream stays invisible
+        // whenever the accumulator's own cap is the smaller of the two.
         for cap in [DEFAULT_MAX_TICKS_PER_FRAME, loam_time::DEFAULT_MAX_CATCH_UP] {
             let base = Instant::now();
             let mut app = TickRecorder::default();
