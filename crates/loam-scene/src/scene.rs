@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::combinator::smooth_min_fn;
 use crate::primitive::Primitive;
-use loam_math::WgslSpace;
+use loam_math::{Space, WgslSpace};
 pub use loam_shape::Shape as PrimitiveKind;
 
 /// A node in the typed SDF scene tree. Leaves hold a primitive; interior nodes
@@ -60,7 +60,8 @@ impl SceneNode {
 
     /// Half-space leaf. Emission depends on the compile-time Space (see
     /// [`Primitive`]'s `HalfSpace` arm): chart-coord `dot(p, n) - d` in flat
-    /// charts, `+1e9` sentinel in curved charts until geodesic-plane SDFs land.
+    /// charts, [`crate::SENTINEL_DISTANCE`] in curved charts until geodesic-plane
+    /// SDFs land.
     pub fn plane(normal: Vec3, offset: f32) -> Self {
         SceneNode::Leaf(PrimitiveKind::HalfSpace { normal, offset })
     }
@@ -132,6 +133,17 @@ impl Scene {
         )
     }
 
+    /// Signed distance from `p` to the scene, the CPU twin of the emitted
+    /// `loam_scene_sdf`. Walks the same tree as [`emit_node`] with the scalar
+    /// algebra inlined, so the two cannot diverge structurally; see
+    /// [`Primitive::eval`] for the residual that remains.
+    ///
+    /// Allocation-free and recursion-only, so a grid bake pays no per-sample
+    /// heap traffic.
+    pub fn eval<S: Space<Point = Vec3, Vector = Vec3>>(&self, space: &S, p: Vec3) -> f32 {
+        eval_node(&self.root, space, p)
+    }
+
     /// Deserialize a Scene from a RON string.
     pub fn from_ron(src: &str) -> Result<Self, ron::error::SpannedError> {
         ron::from_str(src)
@@ -198,6 +210,42 @@ fn emit_node<S: WgslSpace>(
             let var = format!("d{idx}");
             body.push_str(&format!("\tlet {var} = {fn_name}({lv}, {rv});\n"));
             var
+        }
+    }
+}
+
+// ---- Recursive evaluator ----------------------------------------------------
+
+/// Scalar twin of [`emit_node`], one arm per `SceneNode` variant in the same
+/// order. The combinator expressions are transcribed from
+/// [`crate::combinator`]'s emitted text operand for operand: reassociating them
+/// is algebraically neutral but not bit-neutral, and this sits inside the
+/// determinism boundary once a baked collider feeds the sim.
+fn eval_node<S: Space<Point = Vec3, Vector = Vec3>>(node: &SceneNode, space: &S, p: Vec3) -> f32 {
+    match node {
+        SceneNode::Leaf(prim) => prim.eval(space, p),
+
+        SceneNode::Union(left, right) => eval_node(left, space, p).min(eval_node(right, space, p)),
+
+        SceneNode::Intersection(left, right) => {
+            eval_node(left, space, p).max(eval_node(right, space, p))
+        }
+
+        SceneNode::Difference(left, right) => {
+            eval_node(left, space, p).max(-eval_node(right, space, p))
+        }
+
+        SceneNode::SmoothUnion { k, left, right } => {
+            // Quilez 2013, "smooth minimum", polynomial variant, as emitted by
+            // `combinator::smooth_min_fn`. `mix(b, a, h)` is transcribed in the
+            // form WGSL defines it, `b·(1 − h) + a·h` (WGSL spec, "mix"), not
+            // the algebraically equal lerp form `b + (a − b)·h`: only the former
+            // is exact at the clamped ends `h ∈ {0, 1}`, which is where the vast
+            // majority of sample points sit.
+            let a = eval_node(left, space, p);
+            let b = eval_node(right, space, p);
+            let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
+            (b * (1.0 - h) + a * h) - k * h * (1.0 - h)
         }
     }
 }

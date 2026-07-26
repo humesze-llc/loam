@@ -34,11 +34,12 @@
 
 use std::boxed::Box;
 
-use glam::Vec4;
+use glam::{Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 
 use crate::literal::wgsl_f32;
 use crate::primitive4::Primitive4;
+use crate::SENTINEL_DISTANCE;
 pub use loam_shape::Shape;
 
 /// A node in the 4D scene tree. Mirrors [`crate::scene::SceneNode`] over 4D
@@ -61,7 +62,7 @@ impl SceneNode4 {
 
     /// Half-space (hyperplane) leaf. ℝ⁴ is flat and the only 4D Space loam ships, so
     /// [`crate::Primitive4`] emits a plain `dot(p, n) - offset` SDF; a curved 4D
-    /// Space would gate this on `WgslSpace::is_chart_flat` like the 3D path. Also
+    /// Space would gate this on `Space::is_chart_flat` like the 3D path. Also
     /// used by `loam-physics` for 4D collision walls.
     pub fn halfspace(normal: Vec4, offset: f32) -> Self {
         SceneNode4::Leaf(Shape::HalfSpace4D { normal, offset })
@@ -110,7 +111,7 @@ impl Scene4 {
         let mut counter = 0u32;
         let (d_root, _k_root) =
             emit_node_4d(&self.root, &mut counter, &mut helpers, &mut body, None);
-        let kind_consts = SCENE_KIND_CONSTANTS;
+        let kind_consts = scene_kind_constants();
         format!(
             "// ---- loam-scene scene4 (native 4D) ----\n\
              {kind_consts}\
@@ -135,9 +136,9 @@ impl Scene4 {
 
     /// Like [`Self::to_hyperslice_wgsl`] but with a runtime gate on every
     /// [`Shape::HalfSpace4D`] leaf: when `halfspace_gate_expr` is `< 0.5` the
-    /// halfspace SDF returns `1.0e9` and its `loam_scene_max_t` contribution is
-    /// skipped; `>= 0.5` matches the ungated emit. Lets a uniform flip floor /
-    /// ceiling / cutaway planes per frame without recompiling.
+    /// halfspace SDF returns [`SENTINEL_DISTANCE`] and its `loam_scene_max_t`
+    /// contribution is skipped; `>= 0.5` matches the ungated emit. Lets a uniform
+    /// flip floor / ceiling / cutaway planes per frame without recompiling.
     ///
     /// `halfspace_gate_expr` is a scalar `f32` WGSL expression in scope at
     /// `loam_scene_at` / `loam_scene_max_t` (e.g. `"u.params.x"`, `"1.0"`, `"0.0"`).
@@ -149,6 +150,24 @@ impl Scene4 {
         emit_hyperslice(self, w_slice_expr, Some(halfspace_gate_expr))
     }
 
+    /// CPU twin of the emitted `loam_scene_at`: the signed distance at
+    /// `vec4(p3, w_slice)` and the kind of the primitive that produced it.
+    ///
+    /// `halfspace_gate` is the value the gate uniform holds this frame; the CPU
+    /// cannot evaluate [`Self::to_hyperslice_wgsl_gated`]'s WGSL expression
+    /// string, so the caller supplies its truth value. Pass `true` to mirror the
+    /// ungated [`Self::to_hyperslice_wgsl`], whose emit is identical to a gate
+    /// that is always on.
+    pub fn eval_at(&self, p3: Vec3, w_slice: f32, halfspace_gate: bool) -> (f32, u32) {
+        eval_node_4d(&self.root, p3.extend(w_slice), halfspace_gate)
+    }
+
+    /// Signed distance alone, the `.dist` projection of [`Self::eval_at`],
+    /// exactly as the emitter derives `loam_scene_sdf` from `loam_scene_at`.
+    pub fn eval(&self, p3: Vec3, w_slice: f32, halfspace_gate: bool) -> f32 {
+        self.eval_at(p3, w_slice, halfspace_gate).0
+    }
+
     pub fn from_ron(src: &str) -> Result<Self, ron::error::SpannedError> {
         ron::from_str(src)
     }
@@ -158,16 +177,32 @@ impl Scene4 {
     }
 }
 
-/// WGSL kind constants emitted atop every Scene4 module. Pinned so kernel and
-/// tests reference the same values.
-const SCENE_KIND_CONSTANTS: &str = "\
-const LOAM_PRIM_HYPERSPHERE4D: u32 = 0u;\n\
-const LOAM_PRIM_HALFSPACE4D: u32 = 1u;\n\
-const LOAM_PRIM_OTHER: u32 = 255u;\n";
+// Kind of the primitive a `Scene4` hit belongs to, as returned by
+// `Scene4::eval_at` and as emitted into WGSL by `scene_kind_constants`. The
+// marcher routes floor classification on these.
+
+/// A [`Shape::HyperSphere4D`] leaf.
+pub const PRIM_KIND_HYPERSPHERE4D: u32 = 0;
+/// A [`Shape::HalfSpace4D`] leaf.
+pub const PRIM_KIND_HALFSPACE4D: u32 = 1;
+/// A `Difference` node, which has no single owning primitive, or a leaf with no
+/// 4D closed form.
+pub const PRIM_KIND_OTHER: u32 = 255;
+
+/// WGSL kind constants emitted atop every Scene4 module, formatted from the
+/// `PRIM_KIND_*` values so the shader and [`Scene4::eval_at`] cannot drift.
+fn scene_kind_constants() -> String {
+    format!(
+        "const LOAM_PRIM_HYPERSPHERE4D: u32 = {PRIM_KIND_HYPERSPHERE4D}u;\n\
+         const LOAM_PRIM_HALFSPACE4D: u32 = {PRIM_KIND_HALFSPACE4D}u;\n\
+         const LOAM_PRIM_OTHER: u32 = {PRIM_KIND_OTHER}u;\n"
+    )
+}
 
 /// Shared emit driver for the two `to_hyperslice_wgsl*` methods. `None` produces
 /// the ungated form; `Some` wraps every `HalfSpace4D` leaf's SDF in
-/// `select(1.0e9, raw, <expr> >= 0.5)` and skips its `loam_scene_max_t` term.
+/// `select(SENTINEL_DISTANCE, raw, <expr> >= 0.5)` and skips its
+/// `loam_scene_max_t` term.
 fn emit_hyperslice(
     scene: &Scene4,
     w_slice_expr: &str,
@@ -183,7 +218,7 @@ fn emit_hyperslice(
         &mut body,
         halfspace_gate_expr,
     );
-    let kind_consts = SCENE_KIND_CONSTANTS;
+    let kind_consts = scene_kind_constants();
     let max_t_body = emit_max_t_body(&scene.root, halfspace_gate_expr);
     // Parameter `p3` with an inner `let p` for the 4D point: WGSL forbids a `let`
     // shadowing the parameter name, and helpers expect to call `sdfN_pK(p)`.
@@ -206,7 +241,7 @@ fn emit_hyperslice(
          // contributes; the kernel uses this to terminate near-horizon\n\
          // rays that would otherwise exhaust the iteration budget.\n\
          fn loam_scene_max_t(ro: vec3<f32>, rd: vec3<f32>) -> f32 {{\n\
-         \tvar t_max: f32 = 1.0e9;\n\
+         \tvar t_max: f32 = {SENTINEL_DISTANCE:e};\n\
          {max_t_body}\
          \treturn t_max;\n\
          }}\n"
@@ -261,19 +296,21 @@ fn walk_max_t(node: &SceneNode4, body: &mut String, halfspace_gate_expr: Option<
     }
 }
 
-/// Map a Shape variant to its WGSL kind constant name.
-fn primitive_kind_constant(shape: &Shape) -> &'static str {
+/// Map a Shape variant to its WGSL kind-constant name and its numeric value.
+/// One match, two consumers, so the emitted identifier and the value
+/// [`Scene4::eval_at`] returns are the same decision.
+fn primitive_kind(shape: &Shape) -> (&'static str, u32) {
     match shape {
-        Shape::HyperSphere4D { .. } => "LOAM_PRIM_HYPERSPHERE4D",
-        Shape::HalfSpace4D { .. } => "LOAM_PRIM_HALFSPACE4D",
-        _ => "LOAM_PRIM_OTHER",
+        Shape::HyperSphere4D { .. } => ("LOAM_PRIM_HYPERSPHERE4D", PRIM_KIND_HYPERSPHERE4D),
+        Shape::HalfSpace4D { .. } => ("LOAM_PRIM_HALFSPACE4D", PRIM_KIND_HALFSPACE4D),
+        _ => ("LOAM_PRIM_OTHER", PRIM_KIND_OTHER),
     }
 }
 
 /// Walk the 4D scene tree, appending helpers to `helpers` and `let` bindings to
 /// `body`. Returns `(dist_var, kind_var)`, the WGSL identifiers for this node's
 /// distance and closest-primitive kind. `Some` gate wraps each `HalfSpace4D` SDF
-/// in `select(1.0e9, raw, <expr> >= 0.5)`.
+/// in `select(SENTINEL_DISTANCE, raw, <expr> >= 0.5)`.
 fn emit_node_4d(
     node: &SceneNode4,
     counter: &mut u32,
@@ -289,7 +326,7 @@ fn emit_node_4d(
             helpers.push_str(&prim.to_wgsl_4d(&fn_name));
             let d_var = format!("d{idx}");
             let k_var = format!("k{idx}");
-            let kind = primitive_kind_constant(prim);
+            let (kind, _kind_value) = primitive_kind(prim);
             // Only gated halfspaces route through `select`; everything else emits
             // the raw call (no toggle semantic on hypersphere / polytope SDFs).
             let gated = matches!(prim, Shape::HalfSpace4D { .. }) && halfspace_gate_expr.is_some();
@@ -297,7 +334,7 @@ fn emit_node_4d(
                 let gate = halfspace_gate_expr.expect("gated branch implies Some");
                 body.push_str(&format!("\tlet {d_var}_raw = {fn_name}(p);\n"));
                 body.push_str(&format!(
-                    "\tlet {d_var} = select(1.0e9, {d_var}_raw, {gate} >= 0.5);\n"
+                    "\tlet {d_var} = select({SENTINEL_DISTANCE:e}, {d_var}_raw, {gate} >= 0.5);\n"
                 ));
             } else {
                 body.push_str(&format!("\tlet {d_var} = {fn_name}(p);\n"));
@@ -339,6 +376,39 @@ fn emit_node_4d(
             // alternates between left's outside and right's inside); sentinel.
             body.push_str(&format!("\tlet {k_var}: u32 = LOAM_PRIM_OTHER;\n"));
             (d_var, k_var)
+        }
+    }
+}
+
+/// Scalar twin of [`emit_node_4d`], one arm per variant in the same order,
+/// returning `(dist, kind)` where the emitter returns the names of the two
+/// `let` bindings. Allocation-free.
+fn eval_node_4d(node: &SceneNode4, p: Vec4, halfspace_gate: bool) -> (f32, u32) {
+    match node {
+        SceneNode4::Leaf(prim) => {
+            let (_kind_name, kind) = primitive_kind(prim);
+            let gated = matches!(prim, Shape::HalfSpace4D { .. }) && !halfspace_gate;
+            let dist = if gated {
+                SENTINEL_DISTANCE
+            } else {
+                prim.eval_4d(p)
+            };
+            (dist, kind)
+        }
+        SceneNode4::Union(left, right) => {
+            let (ld, lk) = eval_node_4d(left, p, halfspace_gate);
+            let (rd, rk) = eval_node_4d(right, p, halfspace_gate);
+            (ld.min(rd), if ld <= rd { lk } else { rk })
+        }
+        SceneNode4::Intersection(left, right) => {
+            let (ld, lk) = eval_node_4d(left, p, halfspace_gate);
+            let (rd, rk) = eval_node_4d(right, p, halfspace_gate);
+            (ld.max(rd), if ld >= rd { lk } else { rk })
+        }
+        SceneNode4::Difference(left, right) => {
+            let (ld, _lk) = eval_node_4d(left, p, halfspace_gate);
+            let (rd, _rk) = eval_node_4d(right, p, halfspace_gate);
+            (ld.max(-rd), PRIM_KIND_OTHER)
         }
     }
 }
@@ -449,7 +519,7 @@ mod tests {
         assert!(wgsl.contains(": u32 = LOAM_PRIM_OTHER;"));
     }
 
-    /// Gated emit wraps every HalfSpace4D SDF in `select(1.0e9, raw, gate >= 0.5)`;
+    /// Gated emit wraps every HalfSpace4D SDF in `select(1e9, raw, gate >= 0.5)`;
     /// non-halfspace primitives are untouched.
     #[test]
     fn hyperslice_gated_wraps_halfspaces_only() {
@@ -458,8 +528,8 @@ mod tests {
         );
         let wgsl = scene.to_hyperslice_wgsl_gated("u.w_slice", "u.params.x");
         assert!(
-            wgsl.contains("select(1.0e9,"),
-            "gated halfspace must emit select(1.0e9, ...)"
+            wgsl.contains("select(1e9,"),
+            "gated halfspace must emit select(<sentinel>, ...)"
         );
         assert!(
             wgsl.contains("u.params.x >= 0.5"),

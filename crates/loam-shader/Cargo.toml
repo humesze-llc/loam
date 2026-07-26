@@ -21,6 +21,10 @@ tracing.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+# Tier 3 depending on tier 2 for tests only: the scene/GPU parity probe needs a
+# real `Scene` emit, and the inverse (wgpu in loam-scene) is the wrong direction.
+loam-scene = { path = "../loam-scene" }
+
 bytemuck.workspace = true
 glam.workspace = true
 pollster = "0.3"

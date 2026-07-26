@@ -5,6 +5,7 @@
 # IDE / editor / tooling
 CLAUDE.md
 .claude/
+.codex/
 .idea/
 .vscode/
 *.iml
