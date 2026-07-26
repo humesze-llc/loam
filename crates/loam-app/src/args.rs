@@ -140,7 +140,12 @@ pub fn set_query_override(search: String, hash: String) {
 
 /// Parse a query/hash fragment ("?a=1&b=2" or "#a=1") into `map`. Leading
 /// `?`/`#` stripped; segments without `=` skipped (bare `?flag` unsupported).
-#[cfg(target_arch = "wasm32")]
+/// Repeated keys resolve last-write-wins, which is what makes the caller's
+/// search-then-hash order mean "hash wins".
+///
+/// Pure `str` parsing with no `web_sys` dependency, so the `test` arm keeps
+/// it compiled and exercised on the host even though only wasm32 calls it.
+#[cfg(any(target_arch = "wasm32", test))]
 fn parse_query_into(raw: &str, map: &mut HashMap<String, String>) {
     let trimmed = raw.trim_start_matches(['?', '#']);
     if trimmed.is_empty() {
@@ -188,5 +193,84 @@ mod tests {
             vec!["tesseract", "5-cell", "8-cell"]
         );
         assert!(args.get_many("missing").is_empty());
+    }
+
+    /// Fold fragments into one map in caller order (search, then hash) and
+    /// sort, so the assertions below can be exact rather than key-by-key.
+    fn parse_all(fragments: &[&str]) -> Vec<(String, String)> {
+        let mut map = HashMap::new();
+        for fragment in fragments {
+            parse_query_into(fragment, &mut map);
+        }
+        let mut pairs: Vec<(String, String)> = map.into_iter().collect();
+        pairs.sort();
+        pairs
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn query_leading_markers_are_stripped_regardless_of_count_or_kind() {
+        assert_eq!(parse_all(&["?a=1&b=2"]), pairs(&[("a", "1"), ("b", "2")]));
+        assert_eq!(parse_all(&["#a=1"]), pairs(&[("a", "1")]));
+        assert_eq!(parse_all(&["??a=1"]), pairs(&[("a", "1")]));
+        assert_eq!(parse_all(&["#?a=1"]), pairs(&[("a", "1")]));
+    }
+
+    #[test]
+    fn query_segments_without_a_nonempty_key_and_separator_are_dropped() {
+        assert_eq!(parse_all(&["?flag"]), pairs(&[]));
+        assert_eq!(parse_all(&["?=1"]), pairs(&[]));
+        assert_eq!(parse_all(&["?"]), pairs(&[]));
+        assert_eq!(parse_all(&[""]), pairs(&[]));
+
+        // A malformed segment must not swallow its well-formed neighbours.
+        assert_eq!(parse_all(&["?flag&=1&a=2"]), pairs(&[("a", "2")]));
+    }
+
+    #[test]
+    fn query_values_decode_plus_as_space_and_keep_empty_values() {
+        assert_eq!(
+            parse_all(&["?title=hello+world&plus=a+b+c&empty="]),
+            pairs(&[("empty", ""), ("plus", "a b c"), ("title", "hello world")])
+        );
+    }
+
+    #[test]
+    fn query_repeated_keys_resolve_last_write_wins_within_and_across_fragments() {
+        assert_eq!(parse_all(&["?a=1&a=2&a=3"]), pairs(&[("a", "3")]));
+
+        // Caller order is search then hash, so the hash value must survive.
+        assert_eq!(
+            parse_all(&["?a=search&b=only-search", "#a=hash"]),
+            pairs(&[("a", "hash"), ("b", "only-search")])
+        );
+    }
+
+    #[test]
+    fn query_pairs_split_on_the_first_equals_so_values_keep_the_rest() {
+        assert_eq!(parse_all(&["?state=a=b"]), pairs(&[("state", "a=b")]));
+        assert_eq!(parse_all(&["?a=1=2=3"]), pairs(&[("a", "1=2=3")]));
+        assert_eq!(parse_all(&["?eq=="]), pairs(&[("eq", "=")]));
+
+        // Base64 padding is the value shape that reaches a share link with a
+        // trailing '=' without any percent-encoding to hide it.
+        assert_eq!(parse_all(&["?t=abc=="]), pairs(&[("t", "abc==")]));
+        assert_eq!(parse_all(&["?t=YQ="]), pairs(&[("t", "YQ=")]));
+
+        assert_eq!(
+            parse_all(&["?a=x=y&b=2"]),
+            pairs(&[("a", "x=y"), ("b", "2")])
+        );
+    }
+
+    #[test]
+    fn query_empty_fragment_leaves_prior_entries_intact() {
+        assert_eq!(parse_all(&["?a=1", "#", ""]), pairs(&[("a", "1")]));
     }
 }
