@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::body::{BodyArena, BodyId, RigidBody};
+use crate::collider::Collider;
 use crate::collision::VectorOps;
 use crate::field::ForceField;
 use crate::integrator::{integrate_body, PhysicsSpace};
@@ -126,6 +127,54 @@ fn shuffle<T>(units: &mut [T], seed: u64) {
 const STALE_CONSTRAINT_KEY: &str = "constraint buffer outlived its manifold";
 const STALE_MANIFOLD_BODY: &str = "manifold key names a body that is gone";
 
+/// Relative widening applied to each sweep interval. The cull rests on
+/// `|d(anchor, a) − d(anchor, b)| ≤ d(a, b)`, the triangle inequality for the
+/// Riemannian distance function (do Carmo 1992, *Riemannian Geometry*, ch. 7,
+/// prop. 3.6), which holds exactly in R but not in f32: each of the three
+/// distances carries a few ulps of error, so a pair within an ulp of tangency
+/// could be culled and the emitted set would stop being a function of the body
+/// set alone. Four eps per side covers all three error terms.
+const BROADPHASE_TRIANGLE_SLACK: f32 = 4.0 * f32::EPSILON;
+
+/// One body's interval on the sweep axis: geodesic distance to the anchor,
+/// widened by the body's bounding radius.
+#[derive(Clone, Copy)]
+struct RadialInterval {
+    lo: f32,
+    hi: f32,
+    radius: f32,
+    /// Storage position at fill time. The arena cannot change mid-sweep, so
+    /// this stays valid without carrying `S::Point` through a generic entry.
+    dense: u32,
+    id: BodyId,
+    dynamic: bool,
+}
+
+/// Radius of the smallest ball about a body's position that contains its
+/// collider; infinite for a collider of unbounded extent. Every narrowphase
+/// poses local geometry as `rotation · v + position` and a rotation preserves
+/// norms, so the largest local vertex norm bounds the body at any orientation.
+/// `Sphere`'s and `HyperSphere4D`'s `center` is ignored for the same reason the
+/// narrowphases ignore it: in physics the body position is the centre.
+fn bounding_radius(collider: &Collider) -> f32 {
+    match collider {
+        Collider::Sphere { radius, .. } | Collider::HyperSphere4D { radius, .. } => *radius,
+        Collider::Box3 { half_extents } => half_extents.length(),
+        Collider::Polygon2D { vertices } => max_norm(vertices.iter().map(|v| v.length_squared())),
+        Collider::ConvexPolytope3D { vertices } => {
+            max_norm(vertices.iter().map(|v| v.length_squared()))
+        }
+        Collider::ConvexPolytope4D { vertices } => {
+            max_norm(vertices.iter().map(|v| v.length_squared()))
+        }
+        Collider::HalfSpace { .. } | Collider::HalfSpace4D { .. } => f32::INFINITY,
+    }
+}
+
+fn max_norm(norms_squared: impl Iterator<Item = f32>) -> f32 {
+    norms_squared.fold(0.0_f32, f32::max).sqrt()
+}
+
 /// What each phase loop actually iterated, pushed from the loop's own control
 /// variable. Reading the retained buffer instead would agree with the schedule
 /// by construction and could not catch a loop head that walks a freshly built
@@ -167,6 +216,11 @@ pub struct World<S: PhysicsSpace> {
     body_order: Vec<usize>,
     pair_order: Vec<PairKey>,
     constraint_keys: Vec<PairKey>,
+    /// Broadphase scratch: the sweep's sorted intervals and its active list.
+    /// Retained on the same terms as the work-unit buffers above, so a step
+    /// with a steady body count never reaches the allocator.
+    broadphase_intervals: Vec<RadialInterval>,
+    broadphase_active: Vec<u32>,
     #[cfg(test)]
     visit_log: VisitLog,
 }
@@ -185,6 +239,8 @@ impl<S: PhysicsSpace> World<S> {
             body_order: Vec::new(),
             pair_order: Vec::new(),
             constraint_keys: Vec::new(),
+            broadphase_intervals: Vec::new(),
+            broadphase_active: Vec::new(),
             #[cfg(test)]
             visit_log: VisitLog::default(),
         }
@@ -288,7 +344,17 @@ impl<S: PhysicsSpace> World<S> {
         S::Point: Copy + std::ops::Sub<Output = S::Vector>,
     {
         let mut pairs = std::mem::take(&mut self.pair_order);
-        self.fill_broadphase(&mut pairs);
+        let mut intervals = std::mem::take(&mut self.broadphase_intervals);
+        let mut active = std::mem::take(&mut self.broadphase_active);
+        Self::fill_broadphase(
+            &self.bodies,
+            &self.space,
+            &mut intervals,
+            &mut active,
+            &mut pairs,
+        );
+        self.broadphase_intervals = intervals;
+        self.broadphase_active = active;
         self.schedule
             .order
             .apply(SchedulePhase::BroadphasePair, &mut pairs);
@@ -431,26 +497,102 @@ impl<S: PhysicsSpace> World<S> {
         self.constraint_keys = keys;
     }
 
-    /// All-pairs broadphase: one canonical [`PairKey`] per candidate pair,
-    /// ordered by [`BodyId`] and not by storage position. Pairs of two static
-    /// bodies are skipped.
+    /// Candidate pairs for the current body configuration: one canonical
+    /// [`PairKey`] per pair whose bounding balls overlap, in ascending key
+    /// order, skipping pairs of two static bodies. Allocating form, for callers
+    /// outside the step loop; the step sweeps into buffers the world retains.
     pub fn broadphase(&self) -> Vec<PairKey> {
         let mut pairs = Vec::new();
-        self.fill_broadphase(&mut pairs);
+        Self::fill_broadphase(
+            &self.bodies,
+            &self.space,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut pairs,
+        );
         pairs
     }
 
-    fn fill_broadphase(&self, pairs: &mut Vec<PairKey>) {
+    /// Sort-and-sweep broadphase, emitting one canonical [`PairKey`] per
+    /// candidate pair in ascending key order.
+    ///
+    /// A candidate is a pair that is not two static bodies and whose bounding
+    /// balls overlap, `d(a, b) ≤ r_a + r_b`; the same test the polytope
+    /// narrowphases already apply before entering GJK. That predicate, not the
+    /// acceleration structure, defines the emitted set, so the set is a
+    /// function of the body set alone and the sweep is free to prune however it
+    /// likes. Emission order is likewise a function of the handles and not of
+    /// storage position or discovery order, which is what lets a partitioned
+    /// executor reproduce it.
+    ///
+    /// The sweep axis is geodesic distance to the lowest-handle body: one
+    /// `distance` call per body, and defined in a curved space where a
+    /// coordinate axis is not. Interval overlap along it is necessary for ball
+    /// overlap by the triangle inequality, so the one-axis sweep (Cohen, Lin,
+    /// Manocha, Ponamgi 1995, "I-COLLIDE", sec. 3) carries over unchanged. It
+    /// degenerates to all-pairs when every body is equidistant from the anchor,
+    /// which a coordinate grid would not; the grid is the upgrade once a space
+    /// can hand out chart coordinates.
+    fn fill_broadphase(
+        bodies: &BodyArena<S>,
+        space: &S,
+        intervals: &mut Vec<RadialInterval>,
+        active: &mut Vec<u32>,
+        pairs: &mut Vec<PairKey>,
+    ) {
         pairs.clear();
-        let n = self.bodies.len();
+        intervals.clear();
+        active.clear();
+        let n = bodies.len();
+        if n < 2 {
+            return;
+        }
+
+        let anchor = (0..n)
+            .min_by_key(|&dense| bodies.id_at(dense))
+            .expect("a non-empty arena has a lowest handle");
+        let origin = bodies[anchor].position;
+
+        for dense in 0..n {
+            let body = &bodies[dense];
+            let radius = bounding_radius(&body.collider);
+            let d = space.distance(origin, body.position);
+            let slack = d * BROADPHASE_TRIANGLE_SLACK;
+            intervals.push(RadialInterval {
+                lo: d - radius - slack,
+                hi: d + radius + slack,
+                radius,
+                dense: dense as u32,
+                id: bodies.id_at(dense),
+                dynamic: body.inv_mass != 0.0,
+            });
+        }
+        // Unstable sort: the stable one allocates a scratch buffer, and the
+        // handle tie-break already makes the order total.
+        intervals.sort_unstable_by(|a, b| a.lo.total_cmp(&b.lo).then(a.id.cmp(&b.id)));
+
         for i in 0..n {
-            for j in (i + 1)..n {
-                if self.bodies[i].inv_mass == 0.0 && self.bodies[j].inv_mass == 0.0 {
+            let entry = intervals[i];
+            // `lo` is non-decreasing, so an interval that ends before this one
+            // starts also ends before every later one starts.
+            active.retain(|&open| intervals[open as usize].hi >= entry.lo);
+            for &open in active.iter() {
+                let other = intervals[open as usize];
+                if !entry.dynamic && !other.dynamic {
                     continue;
                 }
-                pairs.push(canonical_pair(self.bodies.id_at(i), self.bodies.id_at(j)));
+                let gap = space.distance(
+                    bodies[other.dense as usize].position,
+                    bodies[entry.dense as usize].position,
+                );
+                if gap <= other.radius + entry.radius {
+                    pairs.push(canonical_pair(other.id, entry.id));
+                }
             }
+            active.push(i as u32);
         }
+
+        pairs.sort_unstable();
     }
 
     /// Storage positions of a key's two bodies, in the key's own order. Both
@@ -560,10 +702,51 @@ mod tests {
     };
     use crate::field::Gravity;
     use glam::Vec3;
-    use loam_math::{Bivector3, EuclideanR3};
+    use loam_math::{Bivector3, EuclideanR3, Space};
 
     /// Arbitrary but fixed, so a failure is reproducible from its message.
     const PERMUTATION_SEEDS: [u64; 4] = [1, 0x9e37_79b9_7f4a_7c15, 0xdead_beef_cafe_f00d, 424_242];
+
+    /// Counts what the thread running a probe asks of the allocator. The test
+    /// runner gives each test its own thread, so a probe never sees a
+    /// concurrent test's allocations; the counter is thread-local rather than
+    /// global for exactly that reason. Const-initialised so reading it inside
+    /// `alloc` cannot itself allocate.
+    mod alloc_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static BYTES: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let _ = BYTES.try_with(|bytes| bytes.set(bytes.get() + layout.size()));
+                System.alloc(layout)
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let _ = BYTES.try_with(|bytes| bytes.set(bytes.get() + new_size));
+                System.realloc(ptr, layout, new_size)
+            }
+        }
+
+        pub fn bytes_allocated_by(body: impl FnOnce()) -> usize {
+            let before = BYTES.with(Cell::get);
+            body();
+            BYTES.with(Cell::get) - before
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING_ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
 
     /// Reversal first: for a Gauss-Seidel sweep it is the adversarial order,
     /// not just another sample.
@@ -1523,6 +1706,307 @@ mod tests {
             step.is_none(),
             "storage order reached the solve: the pair diverged from the control \
              at step {step:?}"
+        );
+    }
+
+    /// xorshift64 (Marsaglia 2003, "Xorshift RNGs", J. Stat. Soft. 8(14), the
+    /// 13/7/17 triple) so a randomized scene replays from the seed in the
+    /// failure message.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn new(seed: u64) -> Self {
+            // Absorbing at zero.
+            Self(seed | 1)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// Uniform in `[lo, hi)` off the top 24 bits, which is the whole f32
+        /// significand.
+        fn range(&mut self, lo: f32, hi: f32) -> f32 {
+            let unit = (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32;
+            lo + (hi - lo) * unit
+        }
+    }
+
+    /// Spheres and boxes at seeded positions over a static floor, a few of them
+    /// pinned static so the two-static skip is exercised, then thinned by
+    /// despawns so storage order and handle order disagree. The despawns are
+    /// what make the fixture adversarial: a broadphase keyed on storage
+    /// position agrees with one keyed on handles until the arena compacts.
+    fn random_scene(seed: u64, count: usize, spread: f32) -> World<EuclideanR3> {
+        let mut rng = Xorshift::new(seed);
+        let mut world = World::new(EuclideanR3);
+        register_default_narrowphase(&mut world.narrowphase);
+        world.push_field(Box::new(Gravity::new(Vec3::new(0.0, GRAVITY_Y, 0.0))));
+        world.push_body(halfspace_body_r3(Vec3::Y, 0.0));
+
+        let mut spawned = Vec::with_capacity(count);
+        for _ in 0..count {
+            let position = Vec3::new(
+                rng.range(-spread, spread),
+                rng.range(0.5, spread + 0.5),
+                rng.range(-spread, spread),
+            );
+            let id = if rng.next_u64() & 1 == 0 {
+                world.push_body(sphere_body_r3(
+                    position,
+                    Vec3::ZERO,
+                    rng.range(0.2, 0.8),
+                    1.0,
+                ))
+            } else {
+                world.push_body(box_body(
+                    position,
+                    Vec3::ZERO,
+                    Vec3::splat(rng.range(0.2, 0.6)),
+                    1.0,
+                ))
+            };
+            if rng.next_u64().is_multiple_of(8) {
+                world.bodies[id].mass = 0.0;
+                world.bodies[id].inv_mass = 0.0;
+            }
+            world.bodies[id].restitution = 0.0;
+            spawned.push(id);
+        }
+        for doomed in spawned.iter().step_by(5) {
+            assert!(world.despawn_body(*doomed));
+        }
+        world
+    }
+
+    /// The O(n²) definition of the candidate set: every pair that is not two
+    /// static bodies and whose bounding balls overlap. The sweep is only an
+    /// acceleration structure over this, so it owes exact agreement rather
+    /// than a superset.
+    fn all_pairs_reference(world: &World<EuclideanR3>) -> Vec<PairKey> {
+        let mut pairs = Vec::new();
+        let n = world.bodies.len();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (a, b) = (&world.bodies[i], &world.bodies[j]);
+                if a.inv_mass == 0.0 && b.inv_mass == 0.0 {
+                    continue;
+                }
+                let reach = bounding_radius(&a.collider) + bounding_radius(&b.collider);
+                if world.space.distance(a.position, b.position) <= reach {
+                    pairs.push(canonical_pair(world.bodies.id_at(i), world.bodies.id_at(j)));
+                }
+            }
+        }
+        pairs.sort_unstable();
+        pairs
+    }
+
+    fn dynamic_body_count(world: &World<EuclideanR3>) -> usize {
+        world.bodies.iter().filter(|b| b.inv_mass != 0.0).count()
+    }
+
+    /// Sweep sizes chosen so the sweep is exercised on a crowded scene, a
+    /// sparse one, and one large enough for the active list to turn over many
+    /// times.
+    const RANDOM_SCENE_SHAPES: [(usize, f32); 3] = [(12, 2.0), (40, 6.0), (80, 3.0)];
+
+    /// The sweep's contract: it emits the candidate set the O(n²) reference
+    /// defines, exactly, on every step of every seeded scene. Set equality and
+    /// not containment in either direction, because a sweep that emits a
+    /// superset has stopped pruning and one that emits a subset has dropped a
+    /// contact.
+    #[test]
+    fn sweep_broadphase_emits_exactly_the_all_pairs_candidate_set_determinism() {
+        let mut ever_beyond_the_floor = false;
+        for seed in PERMUTATION_SEEDS {
+            for (count, spread) in RANDOM_SCENE_SHAPES {
+                let mut world = random_scene(seed, count, spread);
+                // Stepped so the comparison covers configurations gravity and
+                // the solver produce, not only the one the seed laid out.
+                for step in 0..8 {
+                    let expected = all_pairs_reference(&world);
+                    assert_eq!(
+                        world.broadphase(),
+                        expected,
+                        "seed {seed}, {count} bodies, spread {spread}, step {step}"
+                    );
+                    ever_beyond_the_floor |= expected.len() > dynamic_body_count(&world);
+                    world.step(1.0 / 240.0);
+                }
+            }
+        }
+        // The floor is unbounded and pairs with every dynamic body, so a run
+        // that only ever emitted those pairs would have compared two trivial
+        // sets.
+        assert!(
+            ever_beyond_the_floor,
+            "no scene ever produced a candidate pair between two finite colliders"
+        );
+    }
+
+    /// The physics-safety half, stated against the narrowphase rather than
+    /// against the reference: a culled pair must be one the narrowphase would
+    /// have rejected anyway. This is what lets the golden hashes survive a
+    /// broadphase that emits fewer pairs than the old all-pairs loop.
+    #[test]
+    fn broadphase_culls_only_pairs_the_narrowphase_would_reject() {
+        for seed in PERMUTATION_SEEDS {
+            let mut world = random_scene(seed, 40, 3.0);
+            for step in 0..8 {
+                let emitted = world.broadphase();
+                let n = world.bodies.len();
+                let mut culled = 0usize;
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        // Two static bodies are excluded by the candidate
+                        // definition, not by the cull: neither can move, so a
+                        // contact between them has nothing to solve.
+                        if world.bodies[i].inv_mass == 0.0 && world.bodies[j].inv_mass == 0.0 {
+                            continue;
+                        }
+                        let key = canonical_pair(world.bodies.id_at(i), world.bodies.id_at(j));
+                        if emitted.binary_search(&key).is_ok() {
+                            continue;
+                        }
+                        culled += 1;
+                        let contact = world.narrowphase.test(
+                            &world.bodies[i],
+                            &world.bodies[j],
+                            &world.space,
+                        );
+                        assert!(
+                            contact.is_none(),
+                            "seed {seed} step {step}: the sweep culled {key:?}, which the \
+                             narrowphase reports in contact"
+                        );
+                    }
+                }
+                assert!(
+                    culled > 0,
+                    "seed {seed} step {step}: nothing was culled, so this pass proved nothing"
+                );
+                world.step(1.0 / 240.0);
+            }
+        }
+    }
+
+    /// Emission order is a function of the handles alone. Ascending and
+    /// strictly so, which also pins that no pair is emitted twice; a sweep
+    /// whose active list double-counted an interval would fail here rather
+    /// than by quietly solving a contact twice.
+    #[test]
+    fn broadphase_emits_strictly_ascending_keys_under_disagreeing_storage_order_determinism() {
+        for seed in PERMUTATION_SEEDS {
+            let world = random_scene(seed, 40, 3.0);
+            let disagrees = (1..world.bodies.len())
+                .any(|dense| world.bodies.id_at(dense) < world.bodies.id_at(dense - 1));
+            assert!(
+                disagrees,
+                "seed {seed}: storage order still agrees with handle order, so this \
+                 scene cannot tell the two apart"
+            );
+
+            let pairs = world.broadphase();
+            assert!(pairs.len() > 1, "seed {seed}: too few pairs to be ordered");
+            assert!(
+                pairs.windows(2).all(|w| w[0] < w[1]),
+                "seed {seed}: emission order is not strictly ascending in BodyId"
+            );
+        }
+    }
+
+    /// The scale claim. At 200 bodies the all-pairs loop is ~20k pairs; the
+    /// unbounded floor alone contributes one per dynamic body, so the floor is
+    /// the sweep's own lower bound and the assertion is that it lands near it.
+    #[test]
+    fn broadphase_prunes_the_quadratic_pair_set_at_scale() {
+        let world = random_scene(PERMUTATION_SEEDS[1], 200, 20.0);
+        let n = world.bodies.len();
+        assert!(
+            n >= 100,
+            "the scale case needs at least 100 bodies, got {n}"
+        );
+        let all_pairs = n * (n - 1) / 2;
+        let emitted = world.broadphase().len();
+        assert!(
+            emitted * 10 < all_pairs,
+            "the sweep emitted {emitted} of {all_pairs} pairs, which is no better than \
+             a constant-factor cull"
+        );
+    }
+
+    /// The buffers the step hands the sweep are reused, so a steady body count
+    /// must not reach the allocator at all. Measured on the sweep rather than
+    /// on the whole step because the phases downstream of it still allocate.
+    #[test]
+    fn broadphase_fill_allocates_nothing_after_the_first_pass() {
+        let world = random_scene(PERMUTATION_SEEDS[0], 120, 8.0);
+        let mut intervals = Vec::new();
+        let mut active = Vec::new();
+        let mut pairs = Vec::new();
+
+        // The first passes grow the three buffers to their steady size.
+        for _ in 0..2 {
+            World::fill_broadphase(
+                &world.bodies,
+                &world.space,
+                &mut intervals,
+                &mut active,
+                &mut pairs,
+            );
+        }
+        assert!(!pairs.is_empty(), "the fixture produced no pairs to emit");
+
+        let bytes = alloc_probe::bytes_allocated_by(|| {
+            for _ in 0..16 {
+                World::fill_broadphase(
+                    &world.bodies,
+                    &world.space,
+                    &mut intervals,
+                    &mut active,
+                    &mut pairs,
+                );
+            }
+        });
+        assert_eq!(
+            bytes, 0,
+            "16 sweeps over a steady body set asked the allocator for {bytes} bytes"
+        );
+    }
+
+    /// The bound the cull rests on: no posed vertex of a collider can lie
+    /// further from the body position than its bounding radius, at any
+    /// orientation. A bound that under-reported would cull contacting pairs.
+    #[test]
+    fn bounding_radius_contains_every_posed_vertex_of_its_collider() {
+        let half_extents = Vec3::new(0.5, 1.25, 0.25);
+        let vertices = crate::euclidean_r3::box_vertices(half_extents);
+        let radius = bounding_radius(&Collider::ConvexPolytope3D {
+            vertices: vertices.clone(),
+        });
+        assert_eq!(radius, half_extents.length());
+
+        let rotation = glam::Quat::from_axis_angle(Vec3::new(1.0, 2.0, 3.0).normalize(), 0.7);
+        for v in &vertices {
+            let posed = rotation * *v;
+            assert!(
+                posed.length() <= radius + 1e-6,
+                "posed vertex {posed} escaped the bounding radius {radius}"
+            );
+        }
+
+        assert_eq!(bounding_radius(&Collider::sphere_at_origin(0.75)), 0.75);
+        assert_eq!(
+            bounding_radius(&Collider::HalfSpace {
+                normal: Vec3::Y,
+                offset: 0.0
+            }),
+            f32::INFINITY,
+            "a half-space is unbounded and must never be culled"
         );
     }
 
