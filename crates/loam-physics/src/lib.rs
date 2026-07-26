@@ -44,4 +44,4 @@ pub use integrator::{integrate_body, PhysicsSpace};
 pub use manifold::{ContactPoint, Manifold};
 pub use narrowphase::{Narrowphase, NarrowphaseFn};
 pub use response::{Contact, FRICTION_COEFF};
-pub use world::{OrderPolicy, Schedule, SchedulePhase, World};
+pub use world::{Island, OrderPolicy, Schedule, SchedulePhase, World};

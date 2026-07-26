@@ -15,6 +15,14 @@
 //! work units that are independent, the orders a thread pool can produce are a
 //! subset of the permutations of that buffer, which is what makes
 //! permutation invariance testable before an executor exists.
+//!
+//! ## Islands
+//!
+//! The constraint buffer is grouped into [`Island`]s, the connected components
+//! of the contact graph over dynamic bodies, so a solve pass over one island
+//! reads and writes no body another island touches. Grouping is a reordering
+//! of independent work and leaves the solve bit-identical; it is what makes an
+//! island the unit a parallel solver can take whole.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -43,6 +51,25 @@ fn canonical_pair(a: BodyId, b: BodyId) -> PairKey {
     } else {
         (b, a)
     }
+}
+
+/// One connected component of the contact graph: a set of bodies no other
+/// island's solve can reach, and the constraints coupling them.
+///
+/// Membership is over dynamic bodies only. A static body absorbs no impulse and
+/// its state is invariant under the solve, so two groups resting on one floor
+/// are two islands rather than one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Island {
+    /// Lowest handle among [`Self::bodies`]. A function of the partition alone,
+    /// so one contact set names its islands the same way however the pairs
+    /// producing it were discovered or stored.
+    pub id: BodyId,
+    /// The island's dynamic bodies, ascending.
+    pub bodies: Vec<BodyId>,
+    /// The manifolds coupling them, ascending. A contact against a static body
+    /// belongs to the island of its dynamic side.
+    pub constraints: Vec<PairKey>,
 }
 
 /// How a step's work units are executed. Ships in release rather than behind
@@ -221,6 +248,10 @@ pub struct World<S: PhysicsSpace> {
     /// with a steady body count never reaches the allocator.
     broadphase_intervals: Vec<RadialInterval>,
     broadphase_active: Vec<u32>,
+    /// Island scratch: the union-find forest and the per-body island label,
+    /// both indexed by dense position and both retained for the same reason.
+    island_parent: Vec<u32>,
+    island_labels: Vec<BodyId>,
     #[cfg(test)]
     visit_log: VisitLog,
 }
@@ -241,6 +272,8 @@ impl<S: PhysicsSpace> World<S> {
             constraint_keys: Vec::new(),
             broadphase_intervals: Vec::new(),
             broadphase_active: Vec::new(),
+            island_parent: Vec::new(),
+            island_labels: Vec::new(),
             #[cfg(test)]
             visit_log: VisitLog::default(),
         }
@@ -383,14 +416,32 @@ impl<S: PhysicsSpace> World<S> {
         self.pair_order = pairs;
     }
 
-    /// Refill the constraint buffer in `manifolds` key order, then hand it to
-    /// the schedule. One buffer serves `prepare_solve`, `warm_start`, and
-    /// `solve`, so those three always agree on the constraint order. Nothing
-    /// between here and the end of the solve inserts or removes a manifold,
-    /// which is why those three phases can index by key without a fallback.
+    /// Refill the constraint buffer grouped by island, islands ascending by id
+    /// and constraints ascending by key inside each, then hand it to the
+    /// schedule. One buffer serves `prepare_solve`, `warm_start`, and `solve`,
+    /// so those three always agree on the constraint order. Nothing between
+    /// here and the end of the solve inserts or removes a manifold, which is
+    /// why those three phases can index by key without a fallback.
+    ///
+    /// Grouping only moves constraints across island boundaries, and the
+    /// bodies two islands write are disjoint, so the solve it produces is the
+    /// one the ungrouped buffer produced, bit for bit.
     fn collect_constraints(&mut self) {
+        let mut parent = std::mem::take(&mut self.island_parent);
+        let mut labels = std::mem::take(&mut self.island_labels);
+        Self::fill_islands(
+            &self.bodies,
+            self.manifolds.keys().copied(),
+            &mut parent,
+            &mut labels,
+        );
         self.constraint_keys.clear();
         self.constraint_keys.extend(self.manifolds.keys().copied());
+        let bodies = &self.bodies;
+        self.constraint_keys
+            .sort_unstable_by_key(|&key| (constraint_island(bodies, &labels, key), key));
+        self.island_parent = parent;
+        self.island_labels = labels;
         self.schedule
             .order
             .apply(SchedulePhase::Constraint, &mut self.constraint_keys);
@@ -595,6 +646,90 @@ impl<S: PhysicsSpace> World<S> {
         pairs.sort_unstable();
     }
 
+    /// The islands of the current manifold set, ascending by island id.
+    /// Allocating form, for callers outside the step loop; the step groups its
+    /// constraint buffer through [`Self::fill_islands`], the same partition.
+    pub fn islands(&self) -> Vec<Island> {
+        let mut parent = Vec::new();
+        let mut labels = Vec::new();
+        Self::fill_islands(
+            &self.bodies,
+            self.manifolds.keys().copied(),
+            &mut parent,
+            &mut labels,
+        );
+
+        let mut by_id: BTreeMap<BodyId, Island> = BTreeMap::new();
+        for &key in self.manifolds.keys() {
+            let id = constraint_island(&self.bodies, &labels, key);
+            let island = by_id.entry(id).or_insert_with(|| Island {
+                id,
+                bodies: Vec::new(),
+                constraints: Vec::new(),
+            });
+            island.constraints.push(key);
+            for member in [key.0, key.1] {
+                if self.bodies[member].inv_mass != 0.0 {
+                    island.bodies.push(member);
+                }
+            }
+        }
+
+        let mut islands: Vec<Island> = by_id.into_values().collect();
+        for island in &mut islands {
+            island.bodies.sort_unstable();
+            island.bodies.dedup();
+        }
+        islands
+    }
+
+    /// Union-find over the touched pairs, writing each body's island id to
+    /// `labels[dense]`. A body in no touched pair is its own singleton.
+    ///
+    /// A pair with a static body merges nothing: that body absorbs no impulse,
+    /// so the two sides of it are independent and joining them would hand a
+    /// parallel solver one island where it has two. The label is a post-pass
+    /// minimum over each component rather than whichever root the unions
+    /// happened to leave, which is what makes an island's identity a function
+    /// of the handles in it and not of the order the pairs arrived in.
+    fn fill_islands(
+        bodies: &BodyArena<S>,
+        touched: impl Iterator<Item = PairKey>,
+        parent: &mut Vec<u32>,
+        labels: &mut Vec<BodyId>,
+    ) {
+        let n = bodies.len();
+        parent.clear();
+        parent.extend(0..n as u32);
+        labels.clear();
+        labels.extend((0..n).map(|dense| bodies.id_at(dense)));
+
+        for key in touched {
+            let (i, j) = (
+                bodies.dense_index(key.0).expect(STALE_MANIFOLD_BODY),
+                bodies.dense_index(key.1).expect(STALE_MANIFOLD_BODY),
+            );
+            if bodies[i].inv_mass == 0.0 || bodies[j].inv_mass == 0.0 {
+                continue;
+            }
+            let (a, b) = (find_root(parent, i), find_root(parent, j));
+            if a != b {
+                // Which root survives only shapes the forest; the component and
+                // the label below are the same either way.
+                parent[a.max(b)] = a.min(b) as u32;
+            }
+        }
+
+        for dense in 0..n {
+            let root = find_root(parent, dense);
+            labels[root] = labels[root].min(bodies.id_at(dense));
+        }
+        for dense in 0..n {
+            let label = labels[find_root(parent, dense)];
+            labels[dense] = label;
+        }
+    }
+
     /// Storage positions of a key's two bodies, in the key's own order. Both
     /// resolve: a manifold outlives neither its bodies (`despawn_body` drops
     /// it) nor the step that stopped touching it (`update_manifolds` evicts
@@ -604,6 +739,39 @@ impl<S: PhysicsSpace> World<S> {
             self.bodies.dense_index(key.0).expect(STALE_MANIFOLD_BODY),
             self.bodies.dense_index(key.1).expect(STALE_MANIFOLD_BODY),
         )
+    }
+}
+
+/// Representative of `dense`'s component, halving the path it walks on the way
+/// (Tarjan and van Leeuwen 1984, JACM 31(2), sec. 2: path halving carries the
+/// same amortized bound as full compression in one pass).
+fn find_root(parent: &mut [u32], mut dense: usize) -> usize {
+    while parent[dense] as usize != dense {
+        parent[dense] = parent[parent[dense] as usize];
+        dense = parent[dense] as usize;
+    }
+    dense
+}
+
+/// The island a constraint is solved in: the island of its dynamic body. Every
+/// constraint has one, since the broadphase never emits a pair of two statics.
+fn constraint_island<S: PhysicsSpace>(
+    bodies: &BodyArena<S>,
+    labels: &[BodyId],
+    key: PairKey,
+) -> BodyId {
+    let (i, j) = (
+        bodies.dense_index(key.0).expect(STALE_MANIFOLD_BODY),
+        bodies.dense_index(key.1).expect(STALE_MANIFOLD_BODY),
+    );
+    debug_assert!(
+        bodies[i].inv_mass != 0.0 || bodies[j].inv_mass != 0.0,
+        "a contact between two static bodies has no island to solve in",
+    );
+    if bodies[i].inv_mass != 0.0 {
+        labels[i]
+    } else {
+        labels[j]
     }
 }
 
@@ -691,6 +859,8 @@ fn solve_normal_then_tangent<S>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::determinism_fixture::{
         determinism_scenario_run, first_divergent_step, fnv1a64, multi_island_groups,
@@ -2007,6 +2177,465 @@ mod tests {
             }),
             f32::INFINITY,
             "a half-space is unbounded and must never be culled"
+        );
+    }
+
+    /// Long enough for every column to fall, land, and rest in contact.
+    const ISLAND_SETTLE_STEPS: usize = 400;
+    /// Columns far enough apart in x that no column can reach its neighbour.
+    const ISLAND_COLUMN_PITCH: f32 = 4.0;
+    const ISLAND_COLUMNS: usize = 6;
+    const ISLAND_COLUMN_HEIGHT: usize = 3;
+    /// The column whose middle sphere is static. Not one of the two the
+    /// despawns below take from, so the wedge survives the thinning.
+    const ISLAND_PINNED_COLUMN: usize = 2;
+
+    /// Seeded columns of spheres over one shared static floor, settled, then
+    /// thinned so storage order and handle order disagree inside the surviving
+    /// islands.
+    ///
+    /// Columns rather than the scattered `random_scene` layout because a stack
+    /// is what holds contact: bodies dropped side by side settle into gaps and
+    /// leave every island a singleton, which would make every assertion about a
+    /// union vacuous. The despawns take low-slot bodies, so `swap_remove` moves
+    /// the last-spawned bodies, which carry the highest handles, into low
+    /// storage positions.
+    fn settled_columns(seed: u64) -> World<EuclideanR3> {
+        const GAP: f32 = 0.05;
+        /// Overlap that puts the pinned sphere inside both neighbours' reach
+        /// once the column has settled around it.
+        const PINNED_TOUCH: f32 = 0.01;
+
+        let mut rng = Xorshift::new(seed);
+        let mut world = World::new(EuclideanR3);
+        register_default_narrowphase(&mut world.narrowphase);
+        world.push_field(Box::new(Gravity::new(Vec3::new(0.0, GRAVITY_Y, 0.0))));
+        world.push_body(halfspace_body_r3(Vec3::Y, 0.0));
+
+        let mut columns: Vec<Vec<BodyId>> = Vec::with_capacity(ISLAND_COLUMNS);
+        for column in 0..ISLAND_COLUMNS {
+            let x = column as f32 * ISLAND_COLUMN_PITCH + rng.range(-0.5, 0.5);
+            // One radius per column: a stack of unequal spheres rolls off
+            // itself and the island stops being a column.
+            let radius = rng.range(0.3, 0.6);
+            let mut ids = Vec::with_capacity(ISLAND_COLUMN_HEIGHT);
+            for level in 0..ISLAND_COLUMN_HEIGHT {
+                // One column carries a static sphere placed to touch both its
+                // neighbours: the shared floor already covers the rule that a
+                // static body merges no islands, but it covers it where every
+                // candidate rule agrees. Wedged mid-column, a rule that merged
+                // through statics would visibly join the two dynamic spheres.
+                let pinned = column == ISLAND_PINNED_COLUMN && level == 1;
+                let y = if pinned {
+                    3.0 * radius - PINNED_TOUCH
+                } else {
+                    radius + GAP + level as f32 * (2.0 * radius + GAP)
+                };
+                let id = world.push_body(sphere_body_r3(
+                    Vec3::new(x, y, 0.0),
+                    Vec3::ZERO,
+                    radius,
+                    1.0,
+                ));
+                world.bodies[id].restitution = 0.0;
+                if pinned {
+                    world.bodies[id].mass = 0.0;
+                    world.bodies[id].inv_mass = 0.0;
+                }
+                ids.push(id);
+            }
+            columns.push(ids);
+        }
+
+        for column in columns.iter().take(2) {
+            assert!(world.despawn_body(column[0]));
+        }
+        for _ in 0..ISLAND_SETTLE_STEPS {
+            world.step(1.0 / 240.0);
+        }
+        world
+    }
+
+    fn labels_for(world: &World<EuclideanR3>, keys: &[PairKey]) -> Vec<BodyId> {
+        let mut parent = Vec::new();
+        let mut labels = Vec::new();
+        World::fill_islands(
+            &world.bodies,
+            keys.iter().copied(),
+            &mut parent,
+            &mut labels,
+        );
+        labels
+    }
+
+    /// Bodies for [`SYNTHETIC_EDGES`], with two of them static and two
+    /// despawned so handle order and storage order disagree. Never stepped:
+    /// the partition reads handles and `inv_mass` only, so positions are free
+    /// and the graph can be shaped rather than waited for.
+    fn synthetic_island_bodies() -> (World<EuclideanR3>, Vec<BodyId>) {
+        const SPAWNS: usize = 14;
+        const DESPAWNS: usize = 2;
+
+        let mut world = World::new(EuclideanR3);
+        let spawned: Vec<BodyId> = (0..SPAWNS)
+            .map(|i| world.push_body(island_sphere(i as f32 * ISLAND_COLUMN_PITCH)))
+            .collect();
+        let survivors = spawned[DESPAWNS..].to_vec();
+        for &position in &SYNTHETIC_STATICS {
+            let id = survivors[position];
+            world.bodies[id].mass = 0.0;
+            world.bodies[id].inv_mass = 0.0;
+        }
+        // Taken from the low handles, so `swap_remove` moves the two highest
+        // handles into the two lowest storage positions.
+        for &doomed in &spawned[..DESPAWNS] {
+            assert!(world.despawn_body(doomed));
+        }
+        (world, survivors)
+    }
+
+    /// Survivor positions that are static, by position in the survivor list.
+    const SYNTHETIC_STATICS: [usize; 2] = [1, 7];
+
+    /// Edges over `synthetic_island_bodies`' survivors, by position in that
+    /// list. A hub with a cycle hanging off it, a four-body chain, and four
+    /// edges that meet only at a static body.
+    const SYNTHETIC_EDGES: [(usize, usize); 11] = [
+        (0, 2),
+        (0, 4),
+        (0, 5),
+        (2, 5),
+        (6, 8),
+        (8, 10),
+        (10, 11),
+        (1, 3),
+        (1, 6),
+        (7, 9),
+        (7, 11),
+    ];
+
+    /// The components [`SYNTHETIC_EDGES`] defines. Everything unlisted is a
+    /// singleton, including both statics and the two bodies that meet only
+    /// through one.
+    const SYNTHETIC_COMPONENTS: [&[usize]; 2] = [&[0, 2, 4, 5], &[6, 8, 10, 11]];
+
+    /// The union-find's input is a set, so its output owes nothing to the order
+    /// that set is presented in, and its labels owe nothing to storage. Both on
+    /// a shaped graph: the physics fixtures build paths of at most three
+    /// bodies, and on those a label taken from whichever root the unions left
+    /// agrees with the component minimum by coincidence.
+    #[test]
+    fn island_labels_are_the_component_minimum_whatever_order_pairs_arrive_in_determinism() {
+        let (world, ids) = synthetic_island_bodies();
+        let canonical_keys: Vec<PairKey> = SYNTHETIC_EDGES
+            .iter()
+            .map(|&(a, b)| canonical_pair(ids[a], ids[b]))
+            .collect();
+        let canonical = labels_for(&world, &canonical_keys);
+
+        for members in SYNTHETIC_COMPONENTS {
+            let expected = members
+                .iter()
+                .map(|&i| ids[i])
+                .min()
+                .expect("a component with no members");
+            for &member in members {
+                let dense = world.bodies.dense_index(ids[member]).unwrap();
+                assert_eq!(
+                    canonical[dense], expected,
+                    "body {member} is labelled {:?}, not its component's lowest handle",
+                    canonical[dense]
+                );
+            }
+        }
+        let grouped: BTreeSet<usize> = SYNTHETIC_COMPONENTS
+            .iter()
+            .flat_map(|m| *m)
+            .copied()
+            .collect();
+        for (position, &id) in ids.iter().enumerate() {
+            if grouped.contains(&position) {
+                continue;
+            }
+            let dense = world.bodies.dense_index(id).unwrap();
+            assert_eq!(
+                canonical[dense], id,
+                "body {position} joined an island it has no edge into"
+            );
+        }
+
+        for order in order_variants(SchedulePhase::Constraint) {
+            let mut keys = canonical_keys.clone();
+            order.apply(SchedulePhase::Constraint, &mut keys);
+            assert_ne!(keys, canonical_keys, "{order:?} is the identity");
+            assert_eq!(
+                labels_for(&world, &keys),
+                canonical,
+                "{order:?} produced a different island assignment"
+            );
+        }
+    }
+
+    /// The label is the lowest handle in the component, which is what the
+    /// invariance harness needs to name an island. Storage position is the
+    /// tempting alternative and is wrong: a despawn compacts the arena and
+    /// would rename an island that did not change.
+    #[test]
+    fn island_ids_are_the_lowest_body_id_not_the_lowest_storage_position_determinism() {
+        let mut orders_disagreed = 0usize;
+        for seed in PERMUTATION_SEEDS {
+            let mut world = settled_columns(seed);
+            for step in 0..8 {
+                world.step(1.0 / 240.0);
+                let islands = world.islands();
+                for island in &islands {
+                    let lowest_handle = island.bodies.iter().copied().min();
+                    assert_eq!(
+                        Some(island.id),
+                        lowest_handle,
+                        "seed {seed} step {step}: island {:?} is not named by its \
+                         lowest handle",
+                        island.id
+                    );
+                    let lowest_stored =
+                        island.bodies.iter().copied().min_by_key(|&id| {
+                            world.bodies.dense_index(id).expect(STALE_MANIFOLD_BODY)
+                        });
+                    if lowest_stored != lowest_handle {
+                        orders_disagreed += 1;
+                    }
+                }
+                assert!(
+                    islands.windows(2).all(|w| w[0].id < w[1].id),
+                    "seed {seed} step {step}: islands are not strictly ascending in id"
+                );
+            }
+        }
+        assert!(
+            orders_disagreed > 0,
+            "no island ever held a body whose handle order disagreed with its \
+             storage order, so the two labelling rules were never told apart"
+        );
+    }
+
+    /// A static body absorbs no impulse, so the two bodies resting on either
+    /// side of one never reach each other and must not share an island. The
+    /// shared floor is the case that matters in practice; the fixture's wedged
+    /// static sphere is the same rule where a merge would be least visible.
+    #[test]
+    fn a_static_body_joins_no_island_and_merges_none_determinism() {
+        for seed in PERMUTATION_SEEDS {
+            let world = settled_columns(seed);
+            let pinned = world
+                .bodies
+                .iter()
+                .position(|body| {
+                    body.inv_mass == 0.0 && matches!(body.collider, Collider::Sphere { .. })
+                })
+                .map(|dense| world.bodies.id_at(dense))
+                .expect("the fixture lost its static sphere");
+
+            let neighbours: Vec<BodyId> = world
+                .manifolds
+                .keys()
+                .filter_map(|&(a, b)| match (a == pinned, b == pinned) {
+                    (true, false) => Some(b),
+                    (false, true) => Some(a),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                neighbours.len(),
+                2,
+                "seed {seed}: the static sphere touches {} bodies, so it is \
+                 not wedged between two",
+                neighbours.len()
+            );
+
+            let islands = world.islands();
+            let island_of = |id: BodyId| {
+                islands
+                    .iter()
+                    .find(|island| island.bodies.contains(&id))
+                    .map(|island| island.id)
+            };
+            assert!(
+                island_of(pinned).is_none(),
+                "seed {seed}: a static body joined an island"
+            );
+            assert_ne!(
+                island_of(neighbours[0]),
+                island_of(neighbours[1]),
+                "seed {seed}: two bodies that meet only through a static one \
+                 were merged into one island"
+            );
+        }
+    }
+
+    /// Connected components by flood fill over an adjacency list built from the
+    /// manifold keys: the definition the union-find is an acceleration of, so
+    /// it owes exact agreement rather than self-consistency.
+    ///
+    /// Static bodies are absent from the adjacency: they carry no island and
+    /// join none, which is the rule that keeps three groups on one floor apart.
+    fn flood_fill_islands(world: &World<EuclideanR3>) -> Vec<Island> {
+        let dynamic = |id: BodyId| world.bodies[id].inv_mass != 0.0;
+        let mut adjacency: BTreeMap<BodyId, Vec<BodyId>> = BTreeMap::new();
+        for &(a, b) in world.manifolds.keys() {
+            for id in [a, b].into_iter().filter(|&id| dynamic(id)) {
+                adjacency.entry(id).or_default();
+            }
+            if dynamic(a) && dynamic(b) {
+                adjacency.entry(a).or_default().push(b);
+                adjacency.entry(b).or_default().push(a);
+            }
+        }
+
+        let mut seen: BTreeSet<BodyId> = BTreeSet::new();
+        let mut islands = Vec::new();
+        for &seed in adjacency.keys() {
+            if !seen.insert(seed) {
+                continue;
+            }
+            let mut bodies = vec![seed];
+            let mut frontier = vec![seed];
+            while let Some(body) = frontier.pop() {
+                for &next in &adjacency[&body] {
+                    if seen.insert(next) {
+                        bodies.push(next);
+                        frontier.push(next);
+                    }
+                }
+            }
+            bodies.sort_unstable();
+            let constraints = world
+                .manifolds
+                .keys()
+                .copied()
+                .filter(|&(a, b)| {
+                    bodies.binary_search(&a).is_ok() || bodies.binary_search(&b).is_ok()
+                })
+                .collect();
+            islands.push(Island {
+                id: bodies[0],
+                bodies,
+                constraints,
+            });
+        }
+        islands.sort_unstable_by_key(|island| island.id);
+        islands
+    }
+
+    /// The partition itself, against the independent oracle. Equality of the
+    /// whole island list also pins that no body lands in two islands and that
+    /// every touched pair lands in exactly one.
+    #[test]
+    fn islands_match_a_flood_fill_of_the_contact_graph_determinism() {
+        let mut ever_multi_body = false;
+        for seed in PERMUTATION_SEEDS {
+            let mut world = settled_columns(seed);
+            for step in 0..8 {
+                world.step(1.0 / 240.0);
+                let islands = world.islands();
+                ever_multi_body |= islands.iter().any(|island| island.bodies.len() > 1);
+                assert_eq!(
+                    islands,
+                    flood_fill_islands(&world),
+                    "seed {seed} step {step}: union-find disagreed with the flood fill"
+                );
+            }
+        }
+        assert!(
+            ever_multi_body,
+            "no island ever held two bodies, so the comparison never covered a union"
+        );
+    }
+
+    /// Criterion for a world whose contact graph is connected: grouping has
+    /// nothing to move, so the constraint order the solver sees is the one it
+    /// saw before islands existed, and the solve is unchanged bit for bit
+    /// rather than merely close.
+    #[test]
+    fn a_single_island_solves_in_the_global_ascending_key_order_determinism() {
+        let world = settled_sphere_stack(1.0 / 240.0, 200);
+        let islands = world.islands();
+        assert_eq!(
+            islands.len(),
+            1,
+            "the stack is not one island, so this fixture cannot state the \
+             single-island case"
+        );
+
+        let ascending: Vec<PairKey> = world.manifolds.keys().copied().collect();
+        assert!(ascending.len() > 1, "too few constraints to be ordered");
+        assert_eq!(
+            world.constraint_keys, ascending,
+            "grouping moved a constraint in a world with a single island"
+        );
+        assert_eq!(islands[0].constraints, ascending);
+        assert_eq!(
+            islands[0].bodies.len(),
+            3,
+            "the island should hold the three spheres and not the static floor"
+        );
+    }
+
+    /// The grouped buffer is the islands laid end to end, and on this fixture
+    /// that is genuinely a different sequence from ascending key order: the
+    /// chain's contacts and the pair's interleave when sorted by key alone.
+    /// `multi_island_scenario_matches_golden_determinism_hash` still holds
+    /// against a constant recorded before the grouping existed, which is what
+    /// makes the reordering bit-neutral rather than merely untested.
+    #[test]
+    fn constraint_buffer_runs_island_by_island_determinism() {
+        let mut world = multi_island_world(Schedule::default());
+        for _ in 0..MULTI_ISLAND_STEPS {
+            world.step(MULTI_ISLAND_DT);
+        }
+
+        let islands = world.islands();
+        assert_eq!(
+            islands.len(),
+            3,
+            "the groups share only the static floor, so they are three islands"
+        );
+        let grouped: Vec<PairKey> = islands
+            .iter()
+            .flat_map(|island| island.constraints.iter().copied())
+            .collect();
+        assert_eq!(
+            world.constraint_keys, grouped,
+            "the solved buffer is not the islands in order"
+        );
+
+        let ascending: Vec<PairKey> = world.manifolds.keys().copied().collect();
+        assert_ne!(
+            grouped, ascending,
+            "the fixture's islands happen to be contiguous in ascending key \
+             order, so it cannot show that grouping reorders anything"
+        );
+    }
+
+    /// The step's island work runs out of the buffers the world retains, on
+    /// the same terms as the sweep above. Measured on `collect_constraints` so
+    /// the in-place sort is inside the probe, not only the union-find.
+    #[test]
+    fn island_grouping_allocates_nothing_after_the_first_pass() {
+        let mut world = settled_columns(PERMUTATION_SEEDS[0]);
+        for _ in 0..2 {
+            world.collect_constraints();
+        }
+        assert!(world.constraint_keys.len() > 1);
+
+        let bytes = alloc_probe::bytes_allocated_by(|| {
+            for _ in 0..16 {
+                world.collect_constraints();
+            }
+        });
+        assert_eq!(
+            bytes, 0,
+            "16 island passes over a steady contact set asked the allocator for \
+             {bytes} bytes"
         );
     }
 
