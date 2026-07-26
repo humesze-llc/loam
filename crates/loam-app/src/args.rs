@@ -253,6 +253,23 @@ mod tests {
     }
 
     #[test]
+    fn query_pairs_split_on_the_first_equals_so_values_keep_the_rest() {
+        assert_eq!(parse_all(&["?state=a=b"]), pairs(&[("state", "a=b")]));
+        assert_eq!(parse_all(&["?a=1=2=3"]), pairs(&[("a", "1=2=3")]));
+        assert_eq!(parse_all(&["?eq=="]), pairs(&[("eq", "=")]));
+
+        // Base64 padding is the value shape that reaches a share link with a
+        // trailing '=' without any percent-encoding to hide it.
+        assert_eq!(parse_all(&["?t=abc=="]), pairs(&[("t", "abc==")]));
+        assert_eq!(parse_all(&["?t=YQ="]), pairs(&[("t", "YQ=")]));
+
+        assert_eq!(
+            parse_all(&["?a=x=y&b=2"]),
+            pairs(&[("a", "x=y"), ("b", "2")])
+        );
+    }
+
+    #[test]
     fn query_empty_fragment_leaves_prior_entries_intact() {
         assert_eq!(parse_all(&["?a=1", "#", ""]), pairs(&[("a", "1")]));
     }
