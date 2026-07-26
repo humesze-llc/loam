@@ -695,8 +695,10 @@ where
         };
         self.last_update_at = Some(now);
 
-        // Fixed-timestep ticks via the shared `drive_fixed_ticks`, so the sim
-        // cadence is identical to the windowed runner (60Hz here).
+        // Fixed-timestep ticks via the shared `drive_fixed_ticks`. The
+        // accumulator logic matches the windowed runner; the rate is hardcoded
+        // at 60Hz here and diverges from any `RunConfig::fixed_hz` a demo set,
+        // because `RunConfig` does not cross the postMessage boundary.
         let n_ticks = crate::drive_fixed_ticks(
             &mut self.app,
             &mut self.timestep,

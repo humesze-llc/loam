@@ -4,10 +4,10 @@
 //! Three timings per size, because "the sweep is Nx faster" means two different
 //! things depending on the denominator.
 //!
-//! `allpairs_ns` is the broadphase the sweep replaced: every pair that is not
+//! `ap_ns` is the broadphase the sweep replaced: every pair that is not
 //! two static bodies, with no distance test and no sort. A speedup claim for
 //! the sweep is a claim over this, and it is also what the narrowphase used to
-//! be handed, so `allpairs/emitted` is the factor by which the narrowphase's
+//! be handed, so `ap/emitted` is the factor by which the narrowphase's
 //! input shrank. That is where the larger win lives, since the narrowphase runs
 //! GJK per emitted pair.
 //!
@@ -26,16 +26,18 @@
 //!
 //! Measured on a 13th Gen Intel Core i9-13980HX, Windows 11 Pro 10.0.26200,
 //! rustc 1.95.0, `cargo bench` (opt-level 3, no debug assertions). Each cell is
-//! the median over seven process runs: the within-run median still leaves
-//! `allpairs_ns` at 101 bodies bimodal, observed anywhere from 12 to 55
-//! microseconds, where the 201 and 401 rows hold to within 1.7x and 1.2x. Read
-//! the 101 ratios as an order of magnitude, not a figure.
+//! the median over seven process runs. Run-to-run spread is large and bimodal
+//! at 101 and 201 bodies: `ap_ns` at 101 was observed from 12 to 55
+//! microseconds, and at 201 from 34 to 103, splitting around 50k and 89k. Only
+//! the 401 row is stable, within 1.2x. Read the 101 and 201 ratios as an order
+//! of magnitude, not a figure; the shape, ap/sweep growing with body
+//! count, is what survives the noise.
 //!
 //! ```text
-//! bodies emitted allpairs sweep_ns scan_ns allpairs_ns scan/sweep allpairs/sweep allpairs/emitted
-//!    101     160     5050     9946    6907       31698       0.7x           3.2x              32x
-//!    201     312    20100    26848   24770       95717       0.9x           3.6x              64x
-//!    401     611    80200    74506   89880      563359       1.2x           7.6x             131x
+//! bodies  emitted  ap_pairs  sweep_ns  scan_ns   ap_ns  scan/sweep  ap/sweep  ap/emitted
+//!    101      160      5050      9946     6907   31698        0.7x      3.2x         32x
+//!    201      312     20100     26848    24770   95717        0.9x      3.6x         64x
+//!    401      611     80200     74506    89880  563359        1.2x      7.6x        131x
 //! ```
 //!
 //! The sweep's win over the broadphase it replaced grows with the body count,

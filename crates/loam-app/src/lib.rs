@@ -1307,8 +1307,9 @@ impl<A: App> Runner<A> {
         // CPU work this frame" vs. "what's the dominant section."
         let _frame_scope = loam_time::frame_trace::scope("frame");
 
-        // 1. Fixed-timestep ticks (shared with the wasm worker via
-        // `drive_fixed_ticks` so a tick sees the same dt and time on both).
+        // 1. Fixed-timestep ticks, through the same `drive_fixed_ticks` the
+        // wasm worker uses. The accumulator logic is shared; the rate is not,
+        // since the worker hardcodes 60Hz and cannot read `RunConfig`.
         let n_ticks = if let Some(app) = self.app.as_mut() {
             drive_fixed_ticks(
                 app,

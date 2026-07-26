@@ -1,7 +1,10 @@
 // Final composite pass for browser-WebGPU. Samples the offscreen scene texture,
-// which reads back linear whether its format is an sRGB one the sampler decodes
-// or a linear-storage one, applies manual sRGB ENCODING, and writes the result
-// to a linear-format swapchain texture.
+// applies manual sRGB ENCODING, and writes the result to a linear-format
+// swapchain texture. The scene half of that texture reads back linear either
+// way, by sampler decode where the format is an sRGB one or by storage where
+// it is not. The egui-painted half does not, on a canvas whose format has no
+// sRGB sibling: egui-wgpu writes already-encoded values there and this pass
+// encodes them again. See `RenderDevice`'s module doc for that arm.
 //
 // Why: Chrome's WebGPU canvas advertises only linear surface formats
 // (Bgra8Unorm / Rgba8Unorm / Rgba16Float). Without this manual gamma encode the
@@ -51,9 +54,10 @@ fn linear_to_srgb(c: f32) -> f32 {
 
 @fragment
 fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
-    // Sample arrives linear: `RenderDevice` gives scene_tex the canvas format's
-    // sRGB sibling where it has one (`Bgra8UnormSrgb`, auto-decoded here) and a
-    // linear-storage format otherwise (`Rgba16Float`, no decode needed). We
+    // Scene samples arrive linear: `RenderDevice` gives scene_tex the canvas
+    // format's sRGB sibling where it has one (`Bgra8UnormSrgb`, auto-decoded
+    // here) and a linear-storage format otherwise (`Rgba16Float`, no decode
+    // needed). Egui-painted texels on the no-sibling arm arrive encoded. We
     // re-encode to sRGB manually and write to a linear swapchain so the WebGPU
     // canvas compositor sees sRGB-encoded bits.
     let linear = textureSample(scene_tex, scene_sampler, in.uv);

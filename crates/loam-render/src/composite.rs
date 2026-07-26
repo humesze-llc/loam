@@ -7,9 +7,11 @@
 //! advertises linear canvas formats, so direct writes display ~2.2x dark.
 //! Instead the scene renders into an offscreen target carrying the canvas
 //! format's sRGB sibling (`Bgra8Unorm` -> `Bgra8UnormSrgb`), or the canvas
-//! format itself where it has none (`Rgba16Float`), and this pass samples it
-//! (linear either way, by sampler decode or by storage), applies
-//! `linear_to_srgb`, and writes the sRGB-encoded bits the compositor expects.
+//! format itself where it has none (`Rgba16Float`), and this pass samples it,
+//! applies `linear_to_srgb`, and writes the sRGB-encoded bits the compositor
+//! expects. Scene texels read back linear either way, by sampler decode or by
+//! storage; egui-painted texels do not on the no-sibling arm, where egui-wgpu
+//! writes encoded values that this pass then encodes twice.
 //!
 //! Cost: one fullscreen-triangle pass per frame, single-digit microseconds
 //! at 1080p; negligible vs. the polytope SDF raymarch.
