@@ -76,7 +76,14 @@ pub fn closest_to_origin(simplex: &[Vec4]) -> Closest {
 ///
 /// `min_α |v₀ + Σ αᵢ (vᵢ − v₀)|²` reduces to the normal equations `G α = −Dᵀv₀`
 /// with Gram matrix `Dᵢⱼ = (vᵢ − v₀) · (vⱼ − v₀)`.
-fn project_origin_onto_affine_hull(subset: &[usize], simplex: &[Vec4]) -> Option<(Vec4, Vec<f32>)> {
+///
+/// Weights sum to 1 but are unclamped: they go negative when the projection
+/// falls outside the sub-simplex, which is what makes this an affine
+/// decomposition rather than a convex one.
+pub(super) fn project_origin_onto_affine_hull(
+    subset: &[usize],
+    simplex: &[Vec4],
+) -> Option<(Vec4, Vec<f32>)> {
     let n = subset.len();
     if n == 0 {
         return None;
