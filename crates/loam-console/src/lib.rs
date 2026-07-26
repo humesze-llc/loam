@@ -1062,10 +1062,12 @@ impl<Ctx: 'static> Console<Ctx> {
         let trailing_ws = self.input.ends_with(char::is_whitespace);
 
         // No whitespace yet: still typing the command name.
-        if parsed.len() == 1 && !trailing_ws {
-            return Some(CompletionContext::Command {
-                prefix: parsed.into_iter().next().unwrap(),
-            });
+        if !trailing_ws {
+            if let [only] = parsed.as_slice() {
+                return Some(CompletionContext::Command {
+                    prefix: only.clone(),
+                });
+            }
         }
 
         // On an argument now (0-based `arg_index`). `prior` captures the arg tokens
@@ -1205,18 +1207,16 @@ impl<Ctx: 'static> Console<Ctx> {
             return;
         }
 
-        if !self.commands.contains_key(&name) {
-            self.push_history(HistoryLine::error(format!(
-                "no command '{name}'. try: help"
-            )));
-            return;
-        }
-
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut writer = ConsoleWriter::new();
-        let result = {
-            let cmd = self.commands.get_mut(&name).expect("checked above");
-            cmd.run(&arg_refs, ctx, &mut writer)
+        let result = match self.commands.get_mut(&name) {
+            Some(cmd) => cmd.run(&arg_refs, ctx, &mut writer),
+            None => {
+                self.push_history(HistoryLine::error(format!(
+                    "no command '{name}'. try: help"
+                )));
+                return;
+            }
         };
         for hl in writer.lines {
             self.push_history(hl);

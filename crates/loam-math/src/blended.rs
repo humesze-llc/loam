@@ -319,7 +319,8 @@ pub const PARALLEL_TRANSPORT_DEFAULT_STEPS: u32 = 8;
 
 /// Parallel-transport `v` along the segment `p_from` -> `p_to`, parameterised
 /// linearly over t ∈ [0, 1]. For a conformally flat metric g = e^(2φ)·δ the ODE
-/// is V̇ = -Γ^k_ij·γ̇^i·V^j = -[(∇φ·γ̇)·V + (∇φ·V)·γ̇ - (γ̇·V)·∇φ] with
+/// is V̇ = -Γ^k_ij·γ̇^i·V^j
+///        = -[(∇φ·γ̇)·V + (∇φ·V)·γ̇ - (γ̇·V)·∇φ] with
 /// γ̇ = p_to − p_from (Wald, *General Relativity*, 1984, App. D).
 pub fn parallel_transport_segment_rk4<S: ConformallyFlat>(
     space: &S,

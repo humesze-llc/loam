@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | [`Shape::HyperSphere4D`] | closed-form | `length(p − center) − radius` |
 //! | [`Shape::HalfSpace4D`] | closed-form | `dot(p, normal) − offset`; honest in flat ℝ⁴ (the only 4D Space today) |
-//! | [`Shape::ConvexPolytope4D`] | [`SENTINEL_DISTANCE`] | real path is `Hyperslice4DNode`'s per-frame uniforms |
+//! | [`Shape::ConvexPolytope4D`] | [`SENTINEL_DISTANCE`] | real path is per-frame uniforms |
 //! | 3D-only variants | [`SENTINEL_DISTANCE`] | shouldn't appear in `Scene4` |
 
 use glam::Vec4;

@@ -922,7 +922,8 @@ impl Rotor for Rotor4 {
         let sin_sum = sum_part.length();
         let sin_diff = diff_part.length();
 
-        // h/sin(h) → 1 as h → 0, so the guard covers only the exact 0/0. The
+        // h/sin(h) -> 1 as h -> 0, so the guard covers only the exact 0/0.
+        // The
         // other zero of the sine, h = π, is the branch cut: the eigenpart's
         // plane is then unrecoverable from the rotor, and scaling the zero
         // vector by 1 drops that half-turn rather than returning infinities.

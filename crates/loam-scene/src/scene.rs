@@ -134,7 +134,7 @@ impl Scene {
     }
 
     /// Signed distance from `p` to the scene, the CPU twin of the emitted
-    /// `loam_scene_sdf`. Walks the same tree as [`emit_node`] with the scalar
+    /// `loam_scene_sdf`. Walks the same tree as the emitter with the scalar
     /// algebra inlined, so the two cannot diverge structurally; see
     /// [`Primitive::eval`] for the residual that remains.
     ///
