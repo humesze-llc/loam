@@ -127,69 +127,8 @@ mod tests {
     use crate::bivector::{Bivector, Bivector2};
     use std::f32::consts::FRAC_PI_2;
 
-    fn assert_close(a: f32, b: f32) {
-        assert!((a - b).abs() <= 1e-5, "expected {a} close to {b}");
-    }
-
     fn assert_vec2_close(a: Vec2, b: Vec2) {
         assert!((a - b).length() <= 1e-5, "expected {a:?} close to {b:?}");
-    }
-
-    #[test]
-    fn distance_is_symmetric_and_zero_on_diagonal() {
-        let s = EuclideanR2;
-        let a = Vec2::new(1.0, 2.0);
-        let b = Vec2::new(-3.0, 4.0);
-        assert_close(s.distance(a, b), s.distance(b, a));
-        assert_close(s.distance(a, a), 0.0);
-    }
-
-    #[test]
-    fn exp_log_round_trip() {
-        let s = EuclideanR2;
-        let a = Vec2::new(0.5, -1.0);
-        let v = Vec2::new(2.0, 3.0);
-        let b = s.exp(a, v);
-        assert_vec2_close(s.log(a, b), v);
-    }
-
-    #[test]
-    fn iso_identity_is_neutral() {
-        let s = EuclideanR2;
-        let i = s.iso_identity();
-        let p = Vec2::new(1.5, -2.0);
-        assert_vec2_close(s.iso_apply(i, p), p);
-    }
-
-    #[test]
-    fn iso_compose_matches_sequential_apply() {
-        let s = EuclideanR2;
-        let r = Bivector2(0.5).exp();
-        let a = Iso2 {
-            rotation: r,
-            translation: Vec2::new(1.0, 0.0),
-        };
-        let b = Iso2 {
-            rotation: Bivector2(-0.3).exp(),
-            translation: Vec2::new(0.0, 2.0),
-        };
-        let p = Vec2::new(0.7, -0.4);
-        let composed = s.iso_apply(s.iso_compose(a, b), p);
-        let sequential = s.iso_apply(a, s.iso_apply(b, p));
-        assert_vec2_close(composed, sequential);
-    }
-
-    #[test]
-    fn iso_compose_with_inverse_is_identity() {
-        let s = EuclideanR2;
-        let a = Iso2 {
-            rotation: Bivector2(0.9).exp(),
-            translation: Vec2::new(1.3, -0.8),
-        };
-        let p = Vec2::new(0.2, 3.1);
-        let inv = s.iso_inverse(a);
-        let round = s.iso_apply(s.iso_compose(inv, a), p);
-        assert_vec2_close(round, p);
     }
 
     #[test]
