@@ -2,10 +2,13 @@
 name = "loam-shape"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam canonical geometric primitives: single Shape enum used by both loam-scene (rendering) and loam-physics (collision)."
+keywords = ["geometry", "polytope", "primitives", "sdf", "collision"]
+categories = ["mathematics", "game-development"]
 
 [dependencies]
 loam-math = { path = "../loam-math" }

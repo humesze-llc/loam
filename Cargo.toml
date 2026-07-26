@@ -21,9 +21,11 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
+# Tracks the `channel` pin in rust-toolchain.toml; bump both together.
+rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
-authors = ["Zach Humes <humesze@gmail.com>"]
+authors = ["Zach Humes <humesze@proton.me>"]
 repository = "https://github.com/humesze-llc/loam"
 
 [workspace.dependencies]
@@ -52,10 +54,13 @@ web-time = "1"
 name = "loam"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam: a Rust game engine with non-Euclidean geometry as a primitive"
+keywords = ["gamedev", "geometry", "non-euclidean", "4d", "wgpu"]
+categories = ["game-engines", "graphics", "mathematics"]
 
 [dependencies]
 loam-math      = { path = "crates/loam-math" }

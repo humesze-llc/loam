@@ -2,10 +2,13 @@
 name = "loam-math"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam math primitives: the Space trait and concrete geometries (Euclidean, hyperbolic, spherical, 4D)."
+keywords = ["geometry", "non-euclidean", "hyperbolic", "4d", "manifold"]
+categories = ["mathematics", "game-development"]
 
 [dependencies]
 glam.workspace = true

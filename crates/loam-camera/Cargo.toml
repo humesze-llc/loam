@@ -2,10 +2,13 @@
 name = "loam-camera"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam camera controllers: orbit and first-person."
+keywords = ["camera", "orbit", "first-person", "graphics", "gamedev"]
+categories = ["game-development", "graphics"]
 
 [dependencies]
 glam.workspace = true

@@ -2,10 +2,13 @@
 name = "loam-egui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Loam + egui integration: ApplicationHandler glue, wgpu paint pass, world-anchored label helper. Wraps egui rather than abstracting over UI frameworks; the name reflects that."
+keywords = ["egui", "gui", "wgpu", "winit", "gamedev"]
+categories = ["game-development", "gui"]
 
 [dependencies]
 anyhow.workspace = true
