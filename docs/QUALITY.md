@@ -1,41 +1,44 @@
 # Quality bar
 
-The gate a change clears before it ships. Items 1-6 are mechanical and should
-be enforced in CI; 7-9 are review judgment; 10-11 are release-only. A red
-required item blocks the merge.
+The gate a change clears before it ships. Items 1-7 are mechanical and run in
+CI (`.github/workflows/ci.yml`); 8-10 are review judgment; 11 is release-only.
+A red required item blocks the merge.
 
 ## Mechanical (CI-enforced)
 
 1. **Format**: `cargo fmt --all --check` clean.
 2. **Lints**: `cargo clippy --workspace --all-targets -- -D warnings` clean.
-3. **Tests**: `cargo test --workspace` green. Math primitives ship with
-   invariant tests (not output-pinning); new `WgslSpace` methods ship with
-   CPU/GPU parity (probe) tests; boundary cases are explicit.
-4. **Docs**: `cargo doc --workspace --no-deps` with no warnings (broken
-   intra-doc links and private-item links fail).
-5. **WebAssembly**: `cargo build -p loam-app --target wasm32-unknown-unknown`
-   builds; the browser path is a shipping target, not an afterthought.
-6. **GPU probes**: the shader-probe tests (`loam-shader`) pass: every WGSL
-   `Space`/SDF kernel that has a CPU counterpart is checked for parity.
+3. **Tests**: `cargo test --workspace --all-targets` green. Math primitives
+   ship with invariant tests (not output-pinning); new `WgslSpace` methods ship
+   with CPU/GPU parity (probe) tests; boundary cases are explicit.
+4. **Docs**: `cargo doc --no-deps --workspace` under `RUSTDOCFLAGS=-D warnings`
+   (broken intra-doc links and missing code-block languages fail).
+5. **WebAssembly**: the browser demo builds on wasm32:
+   `cargo build --target wasm32-unknown-unknown -p polytope_playground --no-default-features`.
+   `--no-default-features` drops the native-only `capture` feature, matching
+   what `index.html` tells Trunk to run.
+6. **GPU probes**: `cargo test --workspace gpu_probe -- --include-ignored`
+   green on a software Vulkan adapter: every WGSL `Space`/SDF kernel that has
+   a CPU counterpart is checked for parity.
+7. **Determinism**: `cargo test -p loam-physics determinism` green: a
+   fixed-seed simulation replays bit-identically on the same architecture (the
+   reproducibility contract).
 
 ## Style (review)
 
-7. **Comment discipline**: comments only when load-bearing (a non-obvious
+8. **Comment discipline**: comments only when load-bearing (a non-obvious
    WHY, a named invariant, a citation). No narration, no over-explained math,
    no `TODO`/`FIXME`/stub in committed code. No em-dashes; no decorative ASCII
    arrows.
-8. **Error policy**: `thiserror` at library boundaries where matching has a
+9. **Error policy**: `thiserror` at library boundaries where matching has a
    real callsite, `anyhow` at app boundaries; no `unwrap`/`expect`/`todo!` in
    library code.
-9. **No magic numbers**: every constant has a named binding or an inline note
-   tying it to a formula or a measured bound. No defensive abstraction (a trait
-   with one impl, a flag with one consumer).
+10. **No magic numbers**: every constant has a named binding or an inline note
+    tying it to a formula or a measured bound. No defensive abstraction (a
+    trait with one impl, a flag with one consumer).
 
 ## Release (manual)
 
-10. **Determinism**: a fixed-seed simulation replays bit-identically on the
-    same architecture (the reproducibility contract); the determinism check is
-    green.
 11. **Public surface current**: `README.md` describes what actually ships (no
     stale run commands, no aspirational claims stated as present tense); the
     rustdoc and any hosted demo reflect the current branch; a representative

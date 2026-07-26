@@ -58,9 +58,8 @@ jobs:
       # locally because they need a wgpu adapter. lavapipe (from
       # mesa-vulkan-drivers above) provides one in CI. Filter by
       # name so the loam-camera perf bench (the other #[ignore]d
-      # test) does not run here. CONVENTIONS section 4 / 5 calls
-      # CPU/GPU parity load-bearing for the engineering thesis;
-      # this is the gate.
+      # test) does not run here. This is the gate behind docs/QUALITY.md
+      # item 6.
       - name: cargo test gpu_probe -- --include-ignored
         env:
           WGPU_BACKEND: vulkan
