@@ -38,7 +38,7 @@ pub struct Ray {
 ///   metric, so storing Riemannian-unit vectors would leak embedding
 ///   scale factors into the renderer.
 /// - Right-handed: `forward` is the look direction, so `right × up =
-///   -forward`. Matches [`crate::OrbitCamera`] and the WGSL prelude.
+///   -forward`. Matches the WGSL prelude.
 /// - Construct via [`Camera::looking_at`] or a
 ///   [`crate::CameraController`]; mutating the basis by hand drifts off
 ///   orthonormal under `translate`.
