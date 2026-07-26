@@ -78,6 +78,7 @@ mod composer;
 mod console;
 mod consts;
 mod filmstrip;
+mod physics;
 mod projections;
 mod render;
 mod sections;
@@ -97,8 +98,9 @@ use consts::{
 };
 #[cfg(test)]
 use loam_physics::polytope::Polytope4;
+use physics::PlaygroundPhysics;
 use state::{
-    body_position, CameraMode, Demo, RotationMode, SurfaceMode, ViewMode, WireframeColorMode,
+    CameraMode, Demo, RotationMode, RowFrame, SurfaceMode, ViewMode, WireframeColorMode,
     WireframeProjection,
 };
 use wireframe_geom::*;
@@ -174,26 +176,25 @@ impl Demo {
             ctx.rd.sample_count(),
         );
 
-        // Initial SDF body uniforms. With the raster default, polychoral
-        // entries emit `BodyUniform::default()` (kind = Invalid) so the
-        // kernel skips them and the rasterizer draws them instead. Mirrors
-        // `Demo::sdf_body_for_slot`, which handles later re-uploads.
-        let n = row.len();
+        // Initial SDF body uniforms, through the same builder every later
+        // re-upload uses: with the raster default, polychoral entries emit
+        // `BodyUniform::default()` (kind = Invalid) so the kernel skips them
+        // and the rasterizer draws them instead.
+        let surface_mode = SurfaceMode::default();
+        let physics = PlaygroundPhysics::new(row.len(), BODY_SIZE);
         let bodies: Vec<BodyUniform> = row
             .iter()
             .enumerate()
             .map(|(slot, entry)| {
-                if entry.shape.polytope4().is_some() {
-                    BodyUniform::default()
-                } else {
-                    BodyUniform::polytope_with_rotor(
-                        body_position(slot, n),
-                        entry.shape.shape_id(),
-                        BODY_SIZE,
-                        Rotor4::IDENTITY,
-                        entry.body_color,
-                    )
-                }
+                state::sdf_body_uniform(
+                    &physics,
+                    entry,
+                    slot,
+                    row.len(),
+                    Rotor4::IDENTITY,
+                    BODY_SIZE,
+                    surface_mode,
+                )
             })
             .collect();
         node.set_bodies(&bodies);
@@ -280,6 +281,7 @@ impl Demo {
 
         Ok(Self {
             space: EuclideanR3,
+            physics,
             camera,
             orbit,
             freecam,
@@ -318,7 +320,7 @@ impl Demo {
             section_faces_mesh_scratch: loam_shape::TriangleMesh::<3>::default(),
             body_uniform_scratch: Vec::new(),
             slerp_scratch: Vec::new(),
-            surface_mode: SurfaceMode::default(),
+            surface_mode,
             row,
             w_slice: initial_w,
             slider_up_held: false,
@@ -437,6 +439,10 @@ impl Demo {
                 }
             }
         }
+        // Rigid bodies advance on the tick count, not on `dt_secs`, so a
+        // trajectory is frame-rate independent. `write_all` then reconciles
+        // the world with the rendered row and uploads the resulting poses.
+        self.physics.step(ctx.n_ticks);
         self.write_all(self.rot_state);
 
         // Gate the orbit on `!ui_has_focus` so dragging the egui slider
@@ -580,17 +586,16 @@ impl Demo {
         };
 
         // Anchor: the leading polychoron's body center in world R³.
-        let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
-        let n = render_row.len();
-        let Some((slot, _entry)) = render_row
+        let row_frame = self.row_frame();
+        let Some((slot, _entry)) = row_frame
+            .row
             .iter()
             .enumerate()
             .find(|(_, e)| e.shape.polytope4().is_some())
         else {
             return;
         };
-        let body_pos = body_position(slot, n);
-        let world_pos = Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+        let world_pos = row_frame.pose(slot).position_r3();
 
         let view_dir = self.camera.view();
         let cfg = &frame.rd.surface_bundle.config;
@@ -629,9 +634,9 @@ impl Demo {
             return;
         }
         // First polychoron in the rendered row; its vertex 0 is the anchor.
-        let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
-        let n = render_row.len();
-        let Some((slot, entry)) = render_row
+        let row_frame = self.row_frame();
+        let Some((slot, entry)) = row_frame
+            .row
             .iter()
             .enumerate()
             .find(|(_, e)| e.shape.polytope4().is_some())
@@ -639,15 +644,10 @@ impl Demo {
             return;
         };
         let polytope = entry.shape.polytope4().expect("filter guarantees Some");
-        let topo = polytope.topology();
-        let canonical_v0 = topo.vertices[0];
-        let v_local_4d = self.effective_body_size() * self.rot_state.apply(canonical_v0);
-        let v_local_r3 = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
-            v_local_4d,
-            &self.resolved_wireframe_projection(),
-        );
-        let body_pos = body_position(slot, n);
-        let world_pos = v_local_r3 + Vec3::new(body_pos[0], body_pos[1], body_pos[2]);
+        let label = entry.label;
+        // Through the same seam the raster passes use, so the leader line lands
+        // on the vertex the wireframe drew rather than on the layout.
+        let world_pos = row_frame.anchor_r3(slot, polytope.topology().vertices[0]);
 
         // Reproject world R³ -> screen pixels via the rasterizer's camera;
         // `None` (anchor offscreen) draws nothing.
@@ -667,7 +667,7 @@ impl Demo {
             return;
         };
 
-        let title = format!("{} vertex 0", entry.label);
+        let title = format!("{label} vertex 0");
         loam_egui::callout(
             ctx,
             "polytope-playground-example-callout",
