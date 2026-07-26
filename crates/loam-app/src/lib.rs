@@ -204,11 +204,16 @@ pub trait App: Sized + 'static {
 // Context structs
 // ---------------------------------------------------------------------------
 
-/// Run one frame's fixed-timestep ticks: advance the accumulator, cap the
-/// catch-up at `max_ticks`, and call `App::tick` for each, bumping `tick_index`.
-/// Shared by the native runner and the wasm worker so the determinism-critical
-/// sim cadence has a single definition and cannot drift between platforms.
-/// Returns the capped tick count (for `FrameCtx::n_ticks`).
+/// Run one frame's fixed-timestep ticks: advance the accumulator and call
+/// `App::tick` for every tick it yields. Shared by the native runner and the
+/// wasm worker so the determinism-critical sim cadence has a single definition
+/// and cannot drift between platforms. Returns the tick count (for
+/// `FrameCtx::n_ticks`).
+///
+/// The catch-up cap lives solely in the `FixedTimestep`
+/// (`with_max_catch_up`); capping again here would book ticks the accumulator
+/// charged but the sim never ran, silently losing sim time and desyncing
+/// `tick_index` from `FixedTimestep::tick`.
 ///
 /// `now` reaches the wall clock only through the accumulator, which decides
 /// *how many* ticks run. What each tick sees is a pure function of its index.
@@ -218,20 +223,23 @@ pub(crate) fn drive_fixed_ticks<A: App>(
     tick_index: &mut u64,
     now: Instant,
     fixed_hz: u32,
-    max_ticks: usize,
 ) -> usize {
     let _scope = loam_time::frame_trace::scope("sim-ticks");
-    let n_capped = timestep.advance(now).count().min(max_ticks);
+    let ticks = timestep.advance(now);
     let dt = 1.0 / fixed_hz as f32;
-    for _ in 0..n_capped {
+    // Bounded by the accumulator's catch-up cap, so the narrowing is exact.
+    let n_ticks = (ticks.end - ticks.start) as usize;
+    for tick in ticks {
         let mut tctx = TickCtx {
-            time: *tick_index as f32 * dt,
-            tick: *tick_index,
+            time: tick as f32 * dt,
+            tick,
         };
         app.tick(dt, &mut tctx);
-        *tick_index = tick_index.wrapping_add(1);
+        // Derived from the range rather than incremented independently, so
+        // the runner's counter cannot drift from `FixedTimestep::tick`.
+        *tick_index = tick + 1;
     }
-    n_capped
+    n_ticks
 }
 
 /// Setup-phase context. Available during [`App::setup`] and [`App::on_shader_reload`].
@@ -260,9 +268,12 @@ pub struct TickCtx {
 /// Render-time context for `App::record`. Owns the shared frame encoder; the
 /// runner reuses it for ui-paint and the wasm composite, then submits once.
 ///
-/// `view` is the runner's best color target for the platform (MSAA view, wasm
-/// sRGB scene texture, or swapchain). Pipelines built with
-/// [`RenderDevice::target_format`] + [`RenderDevice::sample_count`] match it.
+/// `view` is the runner's scene-pass color target for the platform (MSAA
+/// attachment, offscreen scene texture on the composite path, or the swapchain
+/// view). Pipelines built with [`RenderDevice::target_format`] +
+/// [`RenderDevice::sample_count`] match it. The UI pass overlays the same
+/// attachment afterwards: through a non-sRGB view of it on the
+/// direct-to-swapchain paths, through this very view on the composite path.
 pub struct RenderCtx<'a> {
     pub rd: &'a RenderDevice,
     pub view: &'a wgpu::TextureView,
@@ -305,11 +316,20 @@ pub struct FrameCtx<'a> {
 // RunConfig
 // ---------------------------------------------------------------------------
 
+/// Catch-up ticks a single frame may run before the accumulator's excess is
+/// dropped. The one definition of the cap: the native runner reads it through
+/// [`RunConfig::max_ticks_per_frame`] and the wasm worker uses it directly, so
+/// both platforms simulate the same tick cadence under a stall.
+pub const DEFAULT_MAX_TICKS_PER_FRAME: u32 = 4;
+
 /// Runtime knobs. New fields land with defaults so adding configuration is non-breaking.
 pub struct RunConfig {
     pub window: WindowAttributes,
     pub fixed_hz: u32,
-    pub max_ticks_per_frame: usize,
+    /// Spiral-of-death cap, applied by the runner's [`FixedTimestep`]. Ticks
+    /// beyond this in one frame are dropped, not deferred; `0` stops the sim
+    /// entirely.
+    pub max_ticks_per_frame: u32,
     /// `EnvFilter`-style log filter. `None` means keep whatever `tracing-subscriber`
     /// was already configured with (or the `RUST_LOG` env var); `Some` installs a new
     /// global default subscriber.
@@ -377,7 +397,7 @@ impl Default for RunConfig {
                 .with_title("loam app")
                 .with_visible(false),
             fixed_hz: 60,
-            max_ticks_per_frame: 4,
+            max_ticks_per_frame: DEFAULT_MAX_TICKS_PER_FRAME,
             log_filter: None,
             esc_exits: true,
             render_error_budget: 8,
@@ -522,10 +542,10 @@ struct InitArtifacts<A: App> {
     app: A,
 }
 
-/// Sample count is part of the contract between `RenderDevice` (the multisampled scene
-/// attachment) and `UiIntegration` (which builds egui pipelines against the same sample
-/// count). Building `UiIntegration` here, in the same place A::setup runs, keeps that
-/// pairing colocated so the two can't drift.
+/// Format and sample count are the contract between `RenderDevice` (which owns the color
+/// attachments and the views onto them) and `UiIntegration` (which builds egui pipelines
+/// against exactly one of each). Building `UiIntegration` here, in the same place
+/// A::setup runs, keeps that pairing colocated so the two can't drift.
 ///
 /// Free function (not a method on Runner) so it can be called from the wasm `spawn_local`
 /// closure where `&mut Runner` isn't available across the await point.
@@ -554,10 +574,12 @@ fn setup_after_device<A: App>(
     };
     let app = A::setup(&mut ctx).map_err(|e| e.context("App::setup"))?;
 
-    // egui pipelines must be built with the same sample count as the multisampled
-    // scene attachment, since both passes write into the same color attachment and the
-    // deferred MSAA resolve happens at the end of the egui paint pass. See
-    // [`UiIntegration::paint`]'s `resolve_target` parameter.
+    // Sample count must match the multisampled scene attachment, since the UI pass
+    // writes into that same attachment and carries its deferred MSAA resolve (see
+    // [`UiIntegration::paint`]'s `resolve_target`). Format is `ui_format`, not
+    // `target_format`, because on the direct-to-swapchain paths the UI pass draws
+    // through the attachment's non-sRGB reinterpretation rather than the view the
+    // scene pass uses; on the composite path the two formats coincide.
     let mut ui = UiIntegration::new(&rd.device, win, rd.ui_format(), rd.sample_count());
 
     // Runner-side pipeline warming (N3). Forces lazy pipeline compilation for
@@ -710,7 +732,8 @@ struct Runner<A: App> {
 
 impl<A: App> Runner<A> {
     fn new(config: RunConfig) -> Self {
-        let timestep = FixedTimestep::new(config.fixed_hz);
+        let timestep =
+            FixedTimestep::new(config.fixed_hz).with_max_catch_up(config.max_ticks_per_frame);
         Self {
             config,
             timestep,
@@ -1273,14 +1296,13 @@ impl<A: App> Runner<A> {
 
         // 1. Fixed-timestep ticks (shared with the wasm worker via
         // `drive_fixed_ticks` so the sim cadence stays identical across platforms).
-        let n_capped = if let Some(app) = self.app.as_mut() {
+        let n_ticks = if let Some(app) = self.app.as_mut() {
             drive_fixed_ticks(
                 app,
                 &mut self.timestep,
                 &mut self.tick_index,
                 Instant::now(),
                 self.config.fixed_hz,
-                self.config.max_ticks_per_frame,
             )
         } else {
             0
@@ -1312,7 +1334,7 @@ impl<A: App> Runner<A> {
                 input,
                 time: self.start.elapsed().as_secs_f32(),
                 fps: self.fps,
-                n_ticks: n_capped,
+                n_ticks,
                 tick: self.tick_index,
                 dt,
                 ui_has_focus,
@@ -1387,23 +1409,39 @@ impl<A: App> Runner<A> {
             }
         }
 
-        // 6. Render: scene (App::render) then UI overlay.
+        // 6. Render: scene (App::record) then UI overlay.
         //
-        // When MSAA is enabled, both passes write into the
-        // multisampled color attachment (`rd.msaa_view()`) and the
-        // egui pass attaches the swapchain view as `resolve_target`
-        // so the deferred MSAA resolve happens at the end of the
-        // egui pass. When MSAA is disabled, both passes write
-        // directly into the swapchain view and `resolve_target` is
-        // `None`.
+        // Three attachment topologies, one per surface path. On the two
+        // direct-to-swapchain paths the color attachment is addressed through
+        // two views, an sRGB one for the scene pass and its non-sRGB
+        // reinterpretation for the UI pass, so egui blends in the gamma space
+        // its feathering assumes; where the adapter forbids the
+        // reinterpretation both views of a pair carry the attachment's own
+        // format and those two topologies are otherwise unchanged.
         //
-        // Capture taps:
-        //   - `pre`-egui:  after App::render, before ui.paint. MSAA must be off (the
-        //     multisampled attachment isn't directly copyable). The pre tap reads the
-        //     swapchain view, which at this point contains just the 3D pass output.
-        //   - `post`-egui: after ui.paint, before frame.present. Reads the swapchain
-        //     view, which contains the final composite (and the MSAA resolve target
-        //     when MSAA is on). This is what DWM receives.
+        //   sRGB swap, MSAA on:  scene into `rd.msaa_view()`, UI into
+        //     `rd.msaa_ui_view()` (same attachment) with the reinterpreted
+        //     swapchain view as `resolve_target`, so the deferred MSAA resolve
+        //     happens at the end of the egui pass. Nothing draws into the
+        //     `begin_frame` swapchain view.
+        //   sRGB swap, MSAA off: scene into the `begin_frame` swapchain view,
+        //     UI into the reinterpreted view of that same texture,
+        //     `resolve_target` is `None`.
+        //   non-sRGB swap (browser-WebGPU): no reinterpretation and one view
+        //     per attachment. Scene and UI both draw into `rd.scene_view()`,
+        //     the offscreen sRGB texture, and the end-of-frame composite pass
+        //     gamma-encodes that into the `begin_frame` swapchain view, the
+        //     only pass writing through it here. `RenderDevice` forces MSAA off
+        //     on this path, so nothing resolves.
+        //
+        // Capture taps read the swapchain texture, so they carry the frame's
+        // pixels only on the direct paths; under the composite the passes have
+        // not written it yet at either tap.
+        //   - `pre`-egui:  after App::record, before ui.paint. MSAA must be off (the
+        //     multisampled attachment isn't directly copyable). The pre tap reads
+        //     just the 3D pass output.
+        //   - `post`-egui: after ui.paint, before frame.present. Reads scene + UI
+        //     (via the MSAA resolve when MSAA is on). This is what DWM receives.
         // FPS-gate decides whether either tap fires this frame. Computed once before the
         // render pass so the same `now` is used to schedule the next capture interval.
         #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
@@ -1419,13 +1457,10 @@ impl<A: App> Runner<A> {
         match begin_result {
             Ok((frame, swap_view)) => {
                 let mut last_err: Option<anyhow::Error> = None;
-                // Render-target priority chain:
-                //   1. MSAA view (native, MSAA on): scene + UI render multisampled,
-                //      resolve at egui paint pass's resolve_target = swap_view.
-                //   2. Scene view (browser, non-sRGB swap): scene + UI render into
-                //      an offscreen sRGB texture; a composite pass at end-of-frame
-                //      samples it and gamma-encodes for write to swap_view.
-                //   3. Swap view directly (native, MSAA off).
+                // Scene-pass target, per the topology above: the multisampled
+                // attachment if there is one, else the offscreen scene texture
+                // on the composite path, else the swapchain view. The UI pass
+                // picks its own target below.
                 let render_view = rd.msaa_view().or(rd.scene_view()).unwrap_or(&swap_view);
 
                 // GPU timer start. Tiny dedicated encoder so the timestamp lands in
@@ -1503,7 +1538,10 @@ impl<A: App> Runner<A> {
                     let (ui_view, ui_resolve) = match (&ui_swap_view, rd.msaa_ui_view()) {
                         (Some(swap), Some(msaa)) => (msaa, Some(swap)),
                         (Some(swap), None) => (swap, None),
-                        (None, _) => (render_view, (rd.sample_count() > 1).then_some(&swap_view)),
+                        // Composite path. `RenderDevice` forces MSAA off when it
+                        // takes this path, so `render_view` is the offscreen
+                        // scene texture and there is never a resolve to attach.
+                        (None, _) => (render_view, None),
                     };
                     ui.paint(
                         &rd.device,
@@ -1687,24 +1725,26 @@ mod tests {
         }
     }
 
-    /// Drive frames whose wall-clock instants are `base + offsets[i]` and return
-    /// every `TickCtx::time` the app observed. The first offset only primes the
-    /// accumulator.
-    fn tick_times(base: Instant, offsets: &[Duration], max_ticks: usize) -> Vec<f32> {
+    /// Drive frames whose wall-clock instants are `base + offsets[i]`, mirroring
+    /// how the runners wire the cap into the accumulator. Returns the
+    /// `TickCtx::time` values the app observed, the accumulator, and the
+    /// runner-side tick counter. The first offset only primes the accumulator.
+    fn drive(
+        base: Instant,
+        offsets: &[Duration],
+        max_catch_up: u32,
+    ) -> (Vec<f32>, FixedTimestep, u64) {
         let mut app = TickRecorder::default();
-        let mut timestep = FixedTimestep::new(60);
+        let mut timestep = FixedTimestep::new(60).with_max_catch_up(max_catch_up);
         let mut tick_index = 0u64;
         for offset in offsets {
-            drive_fixed_ticks(
-                &mut app,
-                &mut timestep,
-                &mut tick_index,
-                base + *offset,
-                60,
-                max_ticks,
-            );
+            drive_fixed_ticks(&mut app, &mut timestep, &mut tick_index, base + *offset, 60);
         }
-        app.times
+        (app.times, timestep, tick_index)
+    }
+
+    fn tick_times(base: Instant, offsets: &[Duration], max_catch_up: u32) -> Vec<f32> {
+        drive(base, offsets, max_catch_up).0
     }
 
     #[test]
@@ -1739,5 +1779,90 @@ mod tests {
             stuttered, expected,
             "catching up ten ticks in one frame must yield the same time sequence"
         );
+    }
+
+    #[test]
+    fn executed_ticks_equal_ticks_charged_to_the_accumulator() {
+        // Prime, then a frame arriving ten ticks late. The cap is the
+        // accumulator's own default, so all ten are charged and all ten must
+        // run: a second cap inside the tick loop would book six of them
+        // without simulating them.
+        let offsets = [Duration::ZERO, TICK * 10];
+        let (times, timestep, tick_index) =
+            drive(Instant::now(), &offsets, loam_time::DEFAULT_MAX_CATCH_UP);
+
+        assert_eq!(
+            times.len() as u64,
+            timestep.tick(),
+            "every tick charged to the accumulator must have run App::tick"
+        );
+        assert_eq!(times.len(), loam_time::DEFAULT_MAX_CATCH_UP as usize);
+        assert_eq!(tick_index, timestep.tick());
+    }
+
+    #[test]
+    fn the_runner_caps_catch_up_in_the_accumulator_not_the_tick_loop() {
+        let config = RunConfig {
+            max_ticks_per_frame: 2,
+            ..RunConfig::default()
+        };
+        let mut runner = Runner::<TickRecorder>::new(config);
+        let base = Instant::now();
+        runner.timestep.advance(base);
+        let ticks = runner.timestep.advance(base + TICK * 10);
+        assert_eq!(
+            ticks.end - ticks.start,
+            2,
+            "RunConfig::max_ticks_per_frame must reach the accumulator, \
+             which is the only place the cap may be applied"
+        );
+    }
+
+    #[test]
+    fn timestep_tick_and_runner_index_stay_equal_across_a_stall() {
+        // Both caps in production use: the app default and the accumulator's
+        // own. The larger one is what exposes a cap re-applied downstream.
+        for cap in [DEFAULT_MAX_TICKS_PER_FRAME, loam_time::DEFAULT_MAX_CATCH_UP] {
+            let base = Instant::now();
+            let mut app = TickRecorder::default();
+            let mut timestep = FixedTimestep::new(60).with_max_catch_up(cap);
+            let mut tick_index = 0u64;
+
+            // Prime, three steady frames, a 30-tick stall, three steady frames.
+            let steps = [
+                Duration::ZERO,
+                TICK,
+                TICK,
+                TICK,
+                TICK * 30,
+                TICK,
+                TICK,
+                TICK,
+            ];
+            let mut elapsed = Duration::ZERO;
+            for step in steps {
+                elapsed += step;
+                drive_fixed_ticks(&mut app, &mut timestep, &mut tick_index, base + elapsed, 60);
+                assert_eq!(
+                    tick_index,
+                    timestep.tick(),
+                    "cap {cap}: runner tick_index diverged from the accumulator at {elapsed:?}"
+                );
+                assert_eq!(
+                    app.times.len() as u64,
+                    timestep.tick(),
+                    "cap {cap}: a booked tick was never simulated at {elapsed:?}"
+                );
+            }
+
+            let expected_ticks = 3 + u64::from(cap) + 3;
+            assert_eq!(timestep.tick(), expected_ticks);
+            // Dropped backlog must not punch a hole in the sim-time sequence:
+            // the stall costs wall-clock time, not tick indices.
+            let expected_times: Vec<f32> = (0..expected_ticks)
+                .map(|i| i as f32 * (1.0 / 60.0))
+                .collect();
+            assert_eq!(app.times, expected_times, "cap {cap}");
+        }
     }
 }

@@ -22,9 +22,11 @@
 //!   local-frame matching for fast-rotating bodies.
 //! - Up to 4 contact slots per manifold; replacement policy when full evicts the slot with
 //!   smallest accumulated total impulse.
-//! - Manifolds are keyed by `(body_a, body_b)` with `body_a < body_b`. This breaks if bodies
-//!   are removed mid-simulation; not an issue today since neither demo removes bodies.
+//! - Manifolds are keyed by `(body_a, body_b)` with `body_a < body_b`, on generational
+//!   [`BodyId`] handles rather than storage positions, so a despawn elsewhere in the world
+//!   cannot rebind a key to a different pair of bodies.
 
+use crate::body::BodyId;
 use crate::collision::VectorOps;
 use crate::integrator::PhysicsSpace;
 use crate::response::Contact;
@@ -71,10 +73,10 @@ pub struct ContactPoint<S: PhysicsSpace> {
 
 /// Persistent contact data for one pair of bodies.
 pub struct Manifold<S: PhysicsSpace> {
-    /// Index of body A in `World::bodies`. Always `< body_b`.
-    pub body_a: usize,
-    /// Index of body B. Always `> body_a`.
-    pub body_b: usize,
+    /// Handle of body A. Always `< body_b`.
+    pub body_a: BodyId,
+    /// Handle of body B. Always `> body_a`.
+    pub body_b: BodyId,
     /// Combined restitution for this pair. Set on first contact and kept; per-pair restitution
     /// doesn't change between frames.
     pub restitution: f32,
@@ -86,7 +88,7 @@ impl<S: PhysicsSpace> Manifold<S>
 where
     S::Vector: VectorOps,
 {
-    pub fn new(body_a: usize, body_b: usize, restitution: f32) -> Self {
+    pub fn new(body_a: BodyId, body_b: BodyId, restitution: f32) -> Self {
         debug_assert!(body_a < body_b);
         Self {
             body_a,
@@ -193,7 +195,8 @@ mod tests {
     /// normal and tangent impulses (the warm-start payload) while updating geometry.
     #[test]
     fn merge_preserves_warm_start_impulses() {
-        let mut m: Manifold<EuclideanR2> = Manifold::new(0, 1, 0.0);
+        let mut m: Manifold<EuclideanR2> =
+            Manifold::new(BodyId::forge(0, 0), BodyId::forge(1, 0), 0.0);
         m.add_or_update(contact(Vec2::ZERO, Vec2::Y, 0.01));
         m.points[0].normal_impulse = 4.2;
         m.points[0].tangent_impulse = -1.7;
@@ -227,7 +230,8 @@ mod tests {
     /// of every slot, the slot with smallest total accumulated impulse must be evicted.
     #[test]
     fn add_at_max_points_evicts_weakest_slot() {
-        let mut m: Manifold<EuclideanR2> = Manifold::new(0, 1, 0.0);
+        let mut m: Manifold<EuclideanR2> =
+            Manifold::new(BodyId::forge(0, 0), BodyId::forge(1, 0), 0.0);
         // Place four slots far enough apart that none merge with each other or with the new
         // contact below.
         let bases = [
@@ -273,7 +277,8 @@ mod tests {
     /// existing slots' impulses.
     #[test]
     fn new_slot_below_capacity_leaves_others_intact() {
-        let mut m: Manifold<EuclideanR2> = Manifold::new(0, 1, 0.0);
+        let mut m: Manifold<EuclideanR2> =
+            Manifold::new(BodyId::forge(0, 0), BodyId::forge(1, 0), 0.0);
         m.add_or_update(contact(Vec2::ZERO, Vec2::Y, 0.0));
         m.points[0].normal_impulse = 9.0;
         m.points[0].tangent_impulse = 0.5;
