@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::body::RigidBody;
+use crate::body::{BodyArena, BodyId, RigidBody};
 use crate::collision::VectorOps;
 use crate::field::ForceField;
 use crate::integrator::{integrate_body, PhysicsSpace};
@@ -30,8 +30,19 @@ use crate::narrowphase::Narrowphase;
 use crate::response::FRICTION_COEFF;
 
 /// Pair key for the manifold cache. Convention: `(small, large)` so a pair has
-/// one canonical key regardless of broadphase iteration order.
-pub type PairKey = (usize, usize);
+/// one canonical key regardless of broadphase iteration order. Keyed on
+/// [`BodyId`] rather than on storage position, so a manifold and its
+/// warm-start impulses survive a despawn that compacts the arena.
+pub type PairKey = (BodyId, BodyId);
+
+fn canonical_pair(a: BodyId, b: BodyId) -> PairKey {
+    debug_assert_ne!(a, b, "a body cannot pair with itself");
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
 
 /// How a step's work units are executed. Ships in release rather than behind
 /// `cfg(test)`: the determinism contract is a claim about the shipping binary,
@@ -113,6 +124,7 @@ fn shuffle<T>(units: &mut [T], seed: u64) {
 }
 
 const STALE_CONSTRAINT_KEY: &str = "constraint buffer outlived its manifold";
+const STALE_MANIFOLD_BODY: &str = "manifold key names a body that is gone";
 
 /// What each phase loop actually iterated, pushed from the loop's own control
 /// variable. Reading the retained buffer instead would agree with the schedule
@@ -136,7 +148,7 @@ struct VisitLog {
 
 pub struct World<S: PhysicsSpace> {
     pub space: S,
-    pub bodies: Vec<RigidBody<S>>,
+    pub bodies: BodyArena<S>,
     pub fields: Vec<Box<dyn ForceField<S>>>,
     pub narrowphase: Narrowphase<S>,
     /// Persistent contact manifolds, keyed `(body_a, body_b)` with `a < b`.
@@ -163,7 +175,7 @@ impl<S: PhysicsSpace> World<S> {
     pub fn new(space: S) -> Self {
         Self {
             space,
-            bodies: Vec::new(),
+            bodies: BodyArena::new(),
             fields: Vec::new(),
             narrowphase: Narrowphase::new(),
             manifolds: BTreeMap::new(),
@@ -178,11 +190,22 @@ impl<S: PhysicsSpace> World<S> {
         }
     }
 
-    /// Add a body to the world; returns its index.
-    pub fn push_body(&mut self, body: RigidBody<S>) -> usize {
-        let id = self.bodies.len();
-        self.bodies.push(body);
-        id
+    /// Add a body to the world; returns its handle.
+    pub fn push_body(&mut self, body: RigidBody<S>) -> BodyId {
+        self.bodies.spawn(body)
+    }
+
+    /// Remove a body and every manifold it takes part in. Returns false if the
+    /// handle is stale. Dropping the manifolds here rather than leaving them
+    /// for the next step's eviction keeps `manifolds` free of keys that name
+    /// no live body, so a caller inspecting it between steps sees the world it
+    /// actually has.
+    pub fn despawn_body(&mut self, id: BodyId) -> bool {
+        if self.bodies.despawn(id).is_none() {
+            return false;
+        }
+        self.manifolds.retain(|&(a, b), _| a != id && b != id);
+        true
     }
 
     /// Add a force field to the world.
@@ -273,20 +296,20 @@ impl<S: PhysicsSpace> World<S> {
         #[cfg(test)]
         self.visit_log.update_manifolds.clear();
 
-        for &(i, j) in &pairs {
+        for &key in &pairs {
             #[cfg(test)]
-            self.visit_log.update_manifolds.push((i, j));
+            self.visit_log.update_manifolds.push(key);
+            let (i, j) = self.dense_pair(key);
             let (a, b) = split_two_mut(&mut self.bodies, i, j);
             let Some(contact) = self.narrowphase.test(a, b, &self.space) else {
                 continue;
             };
-            let key = (i, j);
             touched.insert(key);
             let restitution = contact.restitution;
             let manifold = self
                 .manifolds
                 .entry(key)
-                .or_insert_with(|| Manifold::new(i, j, restitution));
+                .or_insert_with(|| Manifold::new(key.0, key.1, restitution));
             manifold.add_or_update(contact);
         }
 
@@ -321,8 +344,9 @@ impl<S: PhysicsSpace> World<S> {
         for key in &keys {
             #[cfg(test)]
             self.visit_log.prepare_solve.push(*key);
+            let (i, j) = self.dense_pair(*key);
             let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
-            let (a, b) = split_two_mut(&mut self.bodies, manifold.body_a, manifold.body_b);
+            let (a, b) = split_two_mut(&mut self.bodies, i, j);
             for cp in &mut manifold.points {
                 let v_rel = self.space.velocity_at_point(b, cp.world_point)
                     - self.space.velocity_at_point(a, cp.world_point);
@@ -364,8 +388,9 @@ impl<S: PhysicsSpace> World<S> {
         for key in &keys {
             #[cfg(test)]
             self.visit_log.warm_start.push(*key);
+            let (i, j) = self.dense_pair(*key);
             let manifold = self.manifolds.get(key).expect(STALE_CONSTRAINT_KEY);
-            let (a, b) = split_two_mut(&mut self.bodies, manifold.body_a, manifold.body_b);
+            let (a, b) = split_two_mut(&mut self.bodies, i, j);
             for cp in &manifold.points {
                 if cp.normal_impulse > 0.0 {
                     self.space.apply_contact_impulse(
@@ -395,8 +420,9 @@ impl<S: PhysicsSpace> World<S> {
             for key in &keys {
                 #[cfg(test)]
                 self.visit_log.solve_sweeps.push(*key);
+                let (i, j) = self.dense_pair(*key);
                 let manifold = self.manifolds.get_mut(key).expect(STALE_CONSTRAINT_KEY);
-                let (a, b) = split_two_mut(&mut self.bodies, manifold.body_a, manifold.body_b);
+                let (a, b) = split_two_mut(&mut self.bodies, i, j);
                 for cp in &mut manifold.points {
                     solve_normal_then_tangent(&self.space, a, b, cp);
                 }
@@ -420,18 +446,35 @@ impl<S: PhysicsSpace> World<S> {
                 if self.bodies[i].inv_mass == 0.0 && self.bodies[j].inv_mass == 0.0 {
                     continue;
                 }
-                pairs.push((i, j));
+                pairs.push(canonical_pair(self.bodies.id_at(i), self.bodies.id_at(j)));
             }
         }
     }
+
+    /// Storage positions of a key's two bodies, in the key's own order. Both
+    /// resolve: a manifold outlives neither its bodies (`despawn_body` drops
+    /// it) nor the step that stopped touching it (`update_manifolds` evicts
+    /// it).
+    fn dense_pair(&self, key: PairKey) -> (usize, usize) {
+        (
+            self.bodies.dense_index(key.0).expect(STALE_MANIFOLD_BODY),
+            self.bodies.dense_index(key.1).expect(STALE_MANIFOLD_BODY),
+        )
+    }
 }
 
-/// Split-borrow `&mut slice[i]` and `&mut slice[j]` simultaneously. Caller must
-/// ensure `i < j`.
+/// Split-borrow `&mut slice[i]` and `&mut slice[j]` simultaneously, returned in
+/// argument order. Caller must ensure `i != j`. The two are ordered by
+/// [`BodyId`], not by storage position, so either may be the lower index.
 fn split_two_mut<T>(slice: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
-    debug_assert!(i < j, "split_two_mut requires i < j (got {i}, {j})");
-    let (left, right) = slice.split_at_mut(j);
-    (&mut left[i], &mut right[0])
+    debug_assert_ne!(i, j, "split_two_mut requires distinct indices");
+    if i < j {
+        let (left, right) = slice.split_at_mut(j);
+        (&mut left[i], &mut right[0])
+    } else {
+        let (left, right) = slice.split_at_mut(i);
+        (&mut right[0], &mut left[j])
+    }
 }
 
 /// One PGS iteration over a contact: normal then tangent (friction) solve, both
@@ -513,7 +556,7 @@ mod tests {
     use crate::euclidean_r3::{halfspace_body_r3, register_default_narrowphase, sphere_body_r3};
     use crate::field::Gravity;
     use glam::Vec3;
-    use loam_math::EuclideanR3;
+    use loam_math::{Bivector3, EuclideanR3};
 
     /// Arbitrary but fixed, so a failure is reproducible from its message.
     const PERMUTATION_SEEDS: [u64; 4] = [1, 0x9e37_79b9_7f4a_7c15, 0xdead_beef_cafe_f00d, 424_242];
@@ -917,7 +960,8 @@ mod tests {
         for _ in 0..MULTI_ISLAND_STEPS {
             world.step(MULTI_ISLAND_DT);
             let mut this_step = [0usize; 3];
-            for &(i, j) in world.manifolds.keys() {
+            for &(id_a, id_b) in world.manifolds.keys() {
+                let (i, j) = (id_a.slot() as usize, id_b.slot() as usize);
                 let a = groups.iter().position(|g| g.contains(&i));
                 let b = groups.iter().position(|g| g.contains(&j));
                 let group = match (a, b) {
@@ -1129,6 +1173,199 @@ mod tests {
             world.step(dt);
         }
         world
+    }
+
+    /// Sphere centres on the x axis, several diameters apart, so no two
+    /// spheres can reach each other for the length of a test.
+    const ISLAND_X: [f32; 4] = [-4.0, 0.0, 4.0, 8.0];
+
+    /// One sphere per island over one shared static floor, settled until every
+    /// manifold carries a converged warm-start impulse. The floor is static,
+    /// so it transmits no impulse and merges no islands: any influence one
+    /// island shows from another is a defect, which is what makes bit equality
+    /// the right assertion below.
+    fn settled_islands(dt: f32, settle_steps: usize) -> (World<EuclideanR3>, BodyId, Vec<BodyId>) {
+        let mut world = World::new(EuclideanR3);
+        register_default_narrowphase(&mut world.narrowphase);
+        world.push_field(Box::new(Gravity::new(Vec3::new(0.0, GRAVITY_Y, 0.0))));
+
+        let floor = world.push_body(halfspace_body_r3(Vec3::Y, 0.0));
+        world.bodies[floor].restitution = 0.0;
+        let mut spheres = Vec::with_capacity(ISLAND_X.len());
+        for x in ISLAND_X {
+            let id = world.push_body(island_sphere(x));
+            world.bodies[id].restitution = 0.0;
+            spheres.push(id);
+        }
+
+        for _ in 0..settle_steps {
+            world.step(dt);
+        }
+        (world, floor, spheres)
+    }
+
+    fn island_sphere(x: f32) -> RigidBody<EuclideanR3> {
+        sphere_body_r3(
+            Vec3::new(x, SPHERE_RADIUS, 0.0),
+            Vec3::ZERO,
+            SPHERE_RADIUS,
+            1.0,
+        )
+    }
+
+    fn body_state(world: &World<EuclideanR3>, id: BodyId) -> (Vec3, Vec3, Bivector3) {
+        let body = &world.bodies[id];
+        (body.position, body.velocity, body.angular_velocity)
+    }
+
+    fn normal_impulses(world: &World<EuclideanR3>, key: PairKey) -> Vec<f32> {
+        world.manifolds[&key]
+            .points
+            .iter()
+            .map(|cp| cp.normal_impulse)
+            .collect()
+    }
+
+    /// The property positional indices cannot have: despawning a body
+    /// compacts storage, and every surviving manifold must keep both its key
+    /// and its accumulated impulses across that move. Bit equality against a
+    /// world that despawned nothing, not a tolerance: a disjoint island's
+    /// trajectory is identically unchanged, and a tolerance would let a
+    /// rebound from a rebound key hide inside it.
+    #[test]
+    fn despawn_preserves_surviving_manifold_keys_and_warm_start_impulses() {
+        let dt = 1.0 / 240.0;
+        let settle_steps = 400;
+        let (mut world, floor, spheres) = settled_islands(dt, settle_steps);
+        let (mut control, _, control_spheres) = settled_islands(dt, settle_steps);
+
+        let doomed = spheres[1];
+        let keeper = spheres[3];
+        let keeper_key = (floor, keeper);
+        let control_key = (floor, control_spheres[3]);
+
+        let impulses_before = normal_impulses(&world, keeper_key);
+        assert!(
+            impulses_before.iter().any(|&jn| jn > 0.0),
+            "fixture carries no warm-start payload, so nothing below is being preserved"
+        );
+        let keeper_position_before = world.bodies.dense_index(keeper).unwrap();
+
+        assert!(world.despawn_body(doomed));
+
+        assert_ne!(
+            world.bodies.dense_index(keeper).unwrap(),
+            keeper_position_before,
+            "despawn moved no surviving body, so this test never reached the compaction case"
+        );
+        assert!(
+            !world
+                .manifolds
+                .keys()
+                .any(|&(a, b)| a == doomed || b == doomed),
+            "the removed body's manifolds outlived it"
+        );
+        assert_eq!(
+            normal_impulses(&world, keeper_key),
+            impulses_before,
+            "compaction disturbed a surviving manifold's warm-start impulses"
+        );
+
+        for _ in 0..60 {
+            world.step(dt);
+            control.step(dt);
+        }
+
+        assert_eq!(
+            body_state(&world, keeper),
+            body_state(&control, control_spheres[3]),
+            "an unrelated despawn perturbed a surviving island"
+        );
+        let impulses_after = normal_impulses(&world, keeper_key);
+        assert_eq!(
+            impulses_after,
+            normal_impulses(&control, control_key),
+            "an unrelated despawn moved a surviving manifold's impulses"
+        );
+        assert!(
+            impulses_after.iter().any(|&jn| jn > 0.0),
+            "the surviving contact stopped carrying an impulse"
+        );
+    }
+
+    /// The spawn half of the same contract: a body arriving mid-simulation
+    /// gets its own manifold and leaves every existing one alone.
+    #[test]
+    fn spawn_mid_simulation_leaves_existing_islands_bit_identical() {
+        let dt = 1.0 / 240.0;
+        let settle_steps = 400;
+        let (mut world, floor, spheres) = settled_islands(dt, settle_steps);
+        let (mut control, _, control_spheres) = settled_islands(dt, settle_steps);
+
+        let keeper = spheres[0];
+        let keeper_key = (floor, keeper);
+        let newcomer = world.push_body(island_sphere(12.0));
+        world.bodies[newcomer].restitution = 0.0;
+
+        for _ in 0..60 {
+            world.step(dt);
+            control.step(dt);
+        }
+
+        assert!(
+            world.manifolds.contains_key(&(floor, newcomer)),
+            "the spawned body never made contact, so it exercised no solver state"
+        );
+        assert_eq!(
+            body_state(&world, keeper),
+            body_state(&control, control_spheres[0]),
+            "a spawn perturbed an existing island"
+        );
+        assert_eq!(
+            normal_impulses(&world, keeper_key),
+            normal_impulses(&control, (floor, control_spheres[0])),
+            "a spawn moved an existing manifold's warm-start impulses"
+        );
+    }
+
+    /// The aliasing failure the generation exists to prevent, at world scope:
+    /// a recycled slot must not inherit the previous occupant's contacts, and
+    /// the old handle must be rejected rather than resolve to the new body.
+    #[test]
+    fn a_recycled_slot_inherits_no_manifold_from_the_previous_body() {
+        let dt = 1.0 / 240.0;
+        let (mut world, floor, spheres) = settled_islands(dt, 400);
+        let doomed = spheres[1];
+        assert!(world.manifolds.contains_key(&(floor, doomed)));
+
+        assert!(world.despawn_body(doomed));
+        assert!(
+            !world.despawn_body(doomed),
+            "a stale handle despawned a second body"
+        );
+        assert!(world.bodies.get(doomed).is_none());
+
+        let reborn = world.push_body(island_sphere(ISLAND_X[1]));
+        assert_eq!(
+            reborn.slot(),
+            doomed.slot(),
+            "the slot was not recycled, so this test is not exercising aliasing"
+        );
+        assert_ne!(reborn, doomed);
+        assert!(
+            world.bodies.get(doomed).is_none(),
+            "the stale handle resolved to the body that took its slot"
+        );
+
+        world.step(dt);
+        assert!(
+            world.manifolds.contains_key(&(floor, reborn)),
+            "the respawned body made no contact"
+        );
+        assert!(
+            !world.manifolds.contains_key(&(floor, doomed)),
+            "a manifold keyed on the despawned body came back with the slot"
+        );
     }
 
     /// Discard the cached normal impulses so the next step solves from zero.

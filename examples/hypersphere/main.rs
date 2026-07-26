@@ -47,7 +47,7 @@ use loam_math::{EuclideanR3, EuclideanR4};
 use loam_physics::{
     euclidean_r4::{halfspace4_body_r4, register_default_narrowphase, sphere_body_r4},
     field::Gravity,
-    World,
+    BodyId, World,
 };
 use loam_render::{
     device::RenderDevice,
@@ -93,7 +93,7 @@ fn spawn_position(i: usize, count: usize) -> Vec4 {
     Vec4::new(x, y, z, w)
 }
 
-fn build_world(count: usize) -> (World<EuclideanR4>, Vec<usize>) {
+fn build_world(count: usize) -> (World<EuclideanR4>, Vec<BodyId>) {
     let mut world = World::new(EuclideanR4);
     register_default_narrowphase(&mut world.narrowphase);
     world.push_field(Box::new(Gravity::new(Vec4::new(0.0, -9.8, 0.0, 0.0))));
@@ -124,7 +124,7 @@ struct HypersphereApp {
     node: Hyperslice4DNode,
 
     world: World<EuclideanR4>,
-    ball_ids: Vec<usize>,
+    ball_ids: Vec<BodyId>,
     count: usize,
     paused: bool,
 

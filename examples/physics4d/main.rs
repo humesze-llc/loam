@@ -153,7 +153,7 @@ fn main() {
     println!("4D physics demo - {mode_label} mode");
     println!("  gravity:  {}", fmt_v4(Vec4::new(0.0, -9.8, 0.0, 0.0)));
     println!(
-        "  bodies:   {} (falling pentatope is id {falling_id})",
+        "  bodies:   {} (falling pentatope is id {falling_id:?})",
         world.bodies.len()
     );
     println!("  dt:       1/60 s");
