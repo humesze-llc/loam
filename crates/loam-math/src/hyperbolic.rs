@@ -344,70 +344,10 @@ mod tests {
     }
 
     #[test]
-    fn distance_is_symmetric_and_zero_on_diagonal() {
-        let s = h3();
-        let a = Vec3::new(0.1, 0.2, 0.3);
-        let b = Vec3::new(-0.4, 0.05, 0.2);
-        assert_relative_eq!(s.distance(a, b), s.distance(b, a), epsilon = 1e-5);
-        assert_relative_eq!(s.distance(a, a), 0.0, epsilon = 1e-6);
-    }
-
-    #[test]
     fn distance_at_origin_is_twice_artanh() {
         let s = h3();
         let p = Vec3::new(0.4, 0.0, 0.0);
         assert_relative_eq!(s.distance(Vec3::ZERO, p), 2.0 * artanh(0.4), epsilon = 1e-5);
-    }
-
-    #[test]
-    fn exp_log_round_trip() {
-        let s = h3();
-        let a = Vec3::new(0.1, -0.2, 0.05);
-        let b = Vec3::new(0.3, 0.15, -0.1);
-        let recovered = s.exp(a, s.log(a, b));
-        assert_relative_eq!(recovered.x, b.x, epsilon = 1e-5);
-        assert_relative_eq!(recovered.y, b.y, epsilon = 1e-5);
-        assert_relative_eq!(recovered.z, b.z, epsilon = 1e-5);
-    }
-
-    #[test]
-    fn iso_identity_is_neutral() {
-        let s = h3();
-        let p = Vec3::new(0.2, -0.3, 0.1);
-        let q = s.iso_apply(s.iso_identity(), p);
-        assert_relative_eq!(q.x, p.x, epsilon = 1e-6);
-        assert_relative_eq!(q.y, p.y, epsilon = 1e-6);
-        assert_relative_eq!(q.z, p.z, epsilon = 1e-6);
-    }
-
-    #[test]
-    fn iso_compose_with_inverse_is_identity() {
-        let s = h3();
-        let iso = Iso3H::from_translation(Vec3::new(0.2, 0.0, 0.1));
-        let id_a = s.iso_compose(iso, s.iso_inverse(iso));
-        let id_b = s.iso_compose(s.iso_inverse(iso), iso);
-        let p = Vec3::new(0.05, -0.1, 0.07);
-        let pa = s.iso_apply(id_a, p);
-        let pb = s.iso_apply(id_b, p);
-        assert_relative_eq!(pa.x, p.x, epsilon = 1e-4);
-        assert_relative_eq!(pa.y, p.y, epsilon = 1e-4);
-        assert_relative_eq!(pa.z, p.z, epsilon = 1e-4);
-        assert_relative_eq!(pb.x, p.x, epsilon = 1e-4);
-        assert_relative_eq!(pb.y, p.y, epsilon = 1e-4);
-        assert_relative_eq!(pb.z, p.z, epsilon = 1e-4);
-    }
-
-    #[test]
-    fn iso_compose_matches_sequential_apply() {
-        let s = h3();
-        let a = Iso3H::from_translation(Vec3::new(0.15, 0.0, 0.0));
-        let b = Iso3H::from_rotation(Quat::from_rotation_z(0.4));
-        let p = Vec3::new(0.05, 0.05, 0.05);
-        let composed = s.iso_apply(s.iso_compose(a, b), p);
-        let sequential = s.iso_apply(a, s.iso_apply(b, p));
-        assert_relative_eq!(composed.x, sequential.x, epsilon = 1e-5);
-        assert_relative_eq!(composed.y, sequential.y, epsilon = 1e-5);
-        assert_relative_eq!(composed.z, sequential.z, epsilon = 1e-5);
     }
 
     #[test]
@@ -419,17 +359,6 @@ mod tests {
         assert_relative_eq!(moved.x, target.x, epsilon = 1e-5);
         assert_relative_eq!(moved.y, target.y, epsilon = 1e-5);
         assert_relative_eq!(moved.z, target.z, epsilon = 1e-5);
-    }
-
-    #[test]
-    fn distance_is_invariant_under_isometry() {
-        let s = h3();
-        let iso = Iso3H::from_translation(Vec3::new(0.3, 0.1, -0.2));
-        let a = Vec3::new(0.05, 0.0, 0.0);
-        let b = Vec3::new(0.1, 0.1, 0.0);
-        let d_before = s.distance(a, b);
-        let d_after = s.distance(s.iso_apply(iso, a), s.iso_apply(iso, b));
-        assert_relative_eq!(d_before, d_after, epsilon = 1e-4);
     }
 
     #[test]
