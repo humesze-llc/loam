@@ -5,18 +5,20 @@
 //! attachment. [`RenderDevice::begin_frame`] returns the per-frame
 //! `(SurfaceTexture, TextureView)`.
 //!
-//! Each color attachment is addressed through two views: the scene pass draws
-//! through the sRGB one ([`RenderDevice::msaa_view`], else the `begin_frame`
-//! view), the UI pass through the non-sRGB reinterpretation
-//! ([`RenderDevice::msaa_ui_view`], [`RenderDevice::create_ui_swap_view`]) so
-//! egui blends in gamma space. Under MSAA the UI pass runs last and so carries
-//! the resolve into the swapchain. Where the adapter forbids the
-//! reinterpretation (see `ui_target_formats`) both views of a pair carry the
-//! target's own format, leaving the topology otherwise unchanged.
+//! An sRGB surface renders direct to the swapchain, and there each color
+//! attachment is addressed through two views: the scene pass draws through the
+//! sRGB one ([`RenderDevice::msaa_view`], else the `begin_frame` view), the UI
+//! pass through the non-sRGB reinterpretation ([`RenderDevice::msaa_ui_view`],
+//! [`RenderDevice::create_ui_swap_view`]) so egui blends in gamma space. Under
+//! MSAA the UI pass runs last and so carries the resolve into the swapchain.
+//! Where the adapter forbids the reinterpretation (see `ui_target_formats`)
+//! both views of a pair carry the target's own format, leaving the topology
+//! otherwise unchanged.
 //!
-//! A non-sRGB surface takes the composite path instead: MSAA off, both passes
-//! draw into [`OffscreenTarget`], and [`crate::composite::CompositeNode`]
-//! gamma-encodes that into the swapchain.
+//! A non-sRGB surface takes the composite path instead: MSAA off, one view per
+//! attachment, scene and UI both drawing into [`OffscreenTarget`], and
+//! [`crate::composite::CompositeNode`] gamma-encoding that into the swapchain
+//! view. Nothing is reinterpreted there, so the UI blends in linear space.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -359,10 +361,12 @@ impl RenderDevice {
 
     /// Acquire the next swapchain texture and its default view. Returns the
     /// wgpu surface error directly so callers can branch on `Lost` / `Outdated`
-    /// / `Timeout`. Only the scene pass renders into this view, and only when
-    /// MSAA and the composite path are both off; the UI pass never does, it
-    /// takes [`RenderDevice::create_ui_swap_view`] or, on the composite path,
-    /// [`RenderDevice::scene_view`].
+    /// / `Timeout`. The view carries the surface's own format, so which pass
+    /// targets it is per-path: the composite pass on a non-sRGB surface (see
+    /// [`RenderDevice::composite_to_swap`]), the scene pass on an sRGB surface
+    /// with MSAA off, and no pass at all under MSAA, where the swapchain is
+    /// written by the resolve the frame's last pass attaches. A gamma-space UI
+    /// pass takes [`RenderDevice::create_ui_swap_view`], not this view.
     pub fn begin_frame(
         &self,
     ) -> std::result::Result<(SurfaceTexture, TextureView), wgpu::SurfaceError> {
@@ -449,7 +453,9 @@ impl RenderDevice {
 
     /// View of the acquired swapchain texture for the UI pass: the non-sRGB
     /// reinterpretation where the adapter supports it, the texture's own format
-    /// otherwise.
+    /// otherwise. Serves as the UI pass's color attachment with MSAA off and as
+    /// its `resolve_target` with MSAA on. Not used on the composite path, where
+    /// the UI pass never touches the swapchain.
     pub fn create_ui_swap_view(&self, frame: &SurfaceTexture) -> TextureView {
         frame
             .texture

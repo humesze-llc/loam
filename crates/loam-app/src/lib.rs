@@ -268,10 +268,12 @@ pub struct TickCtx {
 /// Render-time context for `App::record`. Owns the shared frame encoder; the
 /// runner reuses it for ui-paint and the wasm composite, then submits once.
 ///
-/// `view` is the runner's scene-pass color target for the platform (MSAA view,
-/// wasm sRGB scene texture, or swapchain), which the UI pass then overlays
-/// through its own view. Pipelines built with
-/// [`RenderDevice::target_format`] + [`RenderDevice::sample_count`] match it.
+/// `view` is the runner's scene-pass color target for the platform (MSAA
+/// attachment, offscreen scene texture on the composite path, or the swapchain
+/// view). Pipelines built with [`RenderDevice::target_format`] +
+/// [`RenderDevice::sample_count`] match it. The UI pass overlays the same
+/// attachment afterwards: through a non-sRGB view of it on the
+/// direct-to-swapchain paths, through this very view on the composite path.
 pub struct RenderCtx<'a> {
     pub rd: &'a RenderDevice,
     pub view: &'a wgpu::TextureView,
@@ -575,8 +577,9 @@ fn setup_after_device<A: App>(
     // Sample count must match the multisampled scene attachment, since the UI pass
     // writes into that same attachment and carries its deferred MSAA resolve (see
     // [`UiIntegration::paint`]'s `resolve_target`). Format is `ui_format`, not
-    // `target_format`, because the UI pass draws through the attachment's non-sRGB
-    // reinterpretation rather than the view the scene pass uses.
+    // `target_format`, because on the direct-to-swapchain paths the UI pass draws
+    // through the attachment's non-sRGB reinterpretation rather than the view the
+    // scene pass uses; on the composite path the two formats coincide.
     let mut ui = UiIntegration::new(&rd.device, win, rd.ui_format(), rd.sample_count());
 
     // Runner-side pipeline warming (N3). Forces lazy pipeline compilation for
@@ -1408,11 +1411,13 @@ impl<A: App> Runner<A> {
 
         // 6. Render: scene (App::record) then UI overlay.
         //
-        // Each color attachment is addressed through two views: an sRGB one for
-        // the scene pass and its non-sRGB reinterpretation for the UI pass, so
-        // egui blends in the gamma space its feathering assumes. Where the
-        // adapter forbids the reinterpretation, both views of a pair carry the
-        // attachment's own format and the topology below is unchanged.
+        // Three attachment topologies, one per surface path. On the two
+        // direct-to-swapchain paths the color attachment is addressed through
+        // two views, an sRGB one for the scene pass and its non-sRGB
+        // reinterpretation for the UI pass, so egui blends in the gamma space
+        // its feathering assumes; where the adapter forbids the
+        // reinterpretation both views of a pair carry the attachment's own
+        // format and those two topologies are otherwise unchanged.
         //
         //   sRGB swap, MSAA on:  scene into `rd.msaa_view()`, UI into
         //     `rd.msaa_ui_view()` (same attachment) with the reinterpreted
@@ -1422,18 +1427,21 @@ impl<A: App> Runner<A> {
         //   sRGB swap, MSAA off: scene into the `begin_frame` swapchain view,
         //     UI into the reinterpreted view of that same texture,
         //     `resolve_target` is `None`.
-        //   non-sRGB swap (browser-WebGPU): scene and UI both into
-        //     `rd.scene_view()`, which the end-of-frame composite pass
-        //     gamma-encodes into the swapchain view. `RenderDevice` forces MSAA
-        //     off here, so nothing resolves.
+        //   non-sRGB swap (browser-WebGPU): no reinterpretation and one view
+        //     per attachment. Scene and UI both draw into `rd.scene_view()`,
+        //     the offscreen sRGB texture, and the end-of-frame composite pass
+        //     gamma-encodes that into the `begin_frame` swapchain view, the
+        //     only pass writing through it here. `RenderDevice` forces MSAA off
+        //     on this path, so nothing resolves.
         //
-        // Capture taps:
+        // Capture taps read the swapchain texture, so they carry the frame's
+        // pixels only on the direct paths; under the composite the passes have
+        // not written it yet at either tap.
         //   - `pre`-egui:  after App::record, before ui.paint. MSAA must be off (the
-        //     multisampled attachment isn't directly copyable). The pre tap reads the
-        //     swapchain texture, which at this point holds just the 3D pass output.
-        //   - `post`-egui: after ui.paint, before frame.present. Reads the swapchain
-        //     texture, which holds scene + UI (via the MSAA resolve when MSAA is on).
-        //     This is what DWM receives.
+        //     multisampled attachment isn't directly copyable). The pre tap reads
+        //     just the 3D pass output.
+        //   - `post`-egui: after ui.paint, before frame.present. Reads scene + UI
+        //     (via the MSAA resolve when MSAA is on). This is what DWM receives.
         // FPS-gate decides whether either tap fires this frame. Computed once before the
         // render pass so the same `now` is used to schedule the next capture interval.
         #[cfg(all(feature = "capture", not(target_arch = "wasm32")))]
@@ -1452,7 +1460,7 @@ impl<A: App> Runner<A> {
                 // Scene-pass target, per the topology above: the multisampled
                 // attachment if there is one, else the offscreen scene texture
                 // on the composite path, else the swapchain view. The UI pass
-                // picks its own view below.
+                // picks its own target below.
                 let render_view = rd.msaa_view().or(rd.scene_view()).unwrap_or(&swap_view);
 
                 // GPU timer start. Tiny dedicated encoder so the timestamp lands in

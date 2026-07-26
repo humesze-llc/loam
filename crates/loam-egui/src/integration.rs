@@ -3,7 +3,7 @@
 //! Per-frame lifecycle: window events feed
 //! `egui_winit::State::on_window_event`; [`UiIntegration::begin_frame`]
 //! drains input before `App::ui`; [`UiIntegration::paint`] overlays the
-//! egui output after `App::render`.
+//! egui output onto the scene pass's color attachment.
 
 use std::sync::Arc;
 
@@ -22,11 +22,16 @@ pub struct UiIntegration {
 }
 
 impl UiIntegration {
-    /// Construct from the device and window.
+    /// Construct from the device and window. `surface_format` is the format of
+    /// the view [`UiIntegration::paint`] will be handed, which is not
+    /// necessarily the swapchain's; callers pass `RenderDevice::ui_format`.
     ///
-    /// An sRGB surface format triggers an egui-wgpu warning (its blend math
-    /// assumes linear space); the resulting small color shift is invisible at
-    /// HUD/widget scale and accepted for v0.
+    /// An sRGB format selects egui-wgpu's linear-framebuffer fragment entry
+    /// point (and its warning), blending the feathered alpha ramp in linear
+    /// space so hairlines read thin. That is the composite path, whose
+    /// offscreen target is sRGB, and the fallback where the adapter cannot
+    /// reinterpret a view; the direct-to-swapchain path passes the non-sRGB
+    /// twin and gets gamma-space blending.
     pub fn new(
         device: &wgpu::Device,
         window: &Arc<Window>,
@@ -162,11 +167,21 @@ impl UiIntegration {
 
     /// Finish the egui frame and paint onto `view`; pairs with `begin_frame`.
     /// Overlays with `LoadOp::Load`, so the caller must have already rendered
-    /// the scene. `viewport` is `(width_px, height_px)`.
+    /// the scene into the same attachment. `viewport` is `(width_px,
+    /// height_px)`.
     ///
-    /// `resolve_target` is `Some(swapchain_view)` under MSAA (with `view` the
-    /// multisampled attachment) so the resolve happens in this pass, and
-    /// `None` otherwise (`view` is the swapchain view).
+    /// `view` is the caller's UI-pass view of that attachment and carries the
+    /// format `new` was constructed with: on the direct-to-swapchain paths a
+    /// non-sRGB reinterpretation, of the multisampled attachment with MSAA on
+    /// and of the swapchain texture with MSAA off; on the composite path the
+    /// offscreen scene texture's own view, the one the scene pass drew
+    /// through, with the swapchain reached later by the composite pass rather
+    /// than here.
+    ///
+    /// `resolve_target` is `Some` exactly when `view` is multisampled: this
+    /// pass runs last, so it carries the frame's deferred MSAA resolve. Under
+    /// the windowed runner that target is a single-sampled view of the
+    /// swapchain texture.
     #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &mut self,
