@@ -21,13 +21,6 @@ use crate::space::{Space, WgslSpace};
 /// keeps `λ ≲ 2 × 10⁷`, well inside f32 dynamic range.
 const POINCARE_R2_MAX: f32 = 1.0 - 1e-7;
 
-/// Degeneracy floor on the squared norm of the gyration quaternion `1 - ab`.
-/// [`clamp_to_ball`] bounds `a·b` by `POINCARE_R2_MAX`, so the scalar part
-/// `1 + a·b` is at least `1e-7` and the squared norm at least `1e-14` for any
-/// clamped pair; `1e-20` sits six decades below that and eighteen above f32's
-/// denormal floor, so it fires only for input the clamp could not repair.
-const GYRATION_NORM2_MIN: f32 = 1e-20;
-
 /// Clamp an out-of-domain point onto the saturation shell. Never NaN or panic.
 fn clamp_to_ball(p: Vec3) -> Vec3 {
     let r2 = p.length_squared();
@@ -243,6 +236,8 @@ fn loam_gyr_apply(a: vec3<f32>, b: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     let scalar = 1.0 + dot(a, b);
     let axis = -cross(a, b);
     let norm2 = scalar * scalar + dot(axis, axis);
+    // Floored where the Rust twin is not: this is a prelude entry point, so a
+    // shader author's operands need not have come from loam_clamp_to_ball.
     if (norm2 < LOAM_H3_GYR_N2_MIN) {
         return v;
     }
@@ -322,8 +317,20 @@ fn mobius_add(a: Vec3, b: Vec3) -> Vec3 {
 /// Möbius gyration `gyr[a, b] v`, the rotation from Möbius non-associativity
 /// (Ungar, *From Möbius to Gyrogroups*, Amer. Math. Monthly 115, 2008, §4,
 /// Def. 4), evaluated as the rotation it is: conjugation by the quaternion
-/// `1 - ab` for pure-imaginary `a`, `b`, whose scalar part is `1 + a·b` and
-/// whose vector part is `-(a × b)`, applied by Rodrigues.
+/// `A = 1 - ab` for pure-imaginary `a`, `b`, whose scalar part is `1 + a·b`
+/// and whose vector part is `-(a × b)`, applied by Rodrigues.
+///
+/// That closed form is a theorem and not the cited definition, so it carries
+/// its own derivation. Read `a`, `b`, `v` as pure-imaginary quaternions, where
+/// `xy = -x·y + x×y` and conjugation `x ↦ -x` negates the vector part. Def. 3's
+/// Möbius addition is then the right quotient `a ⊕ x = (a + x)(1 - ax)⁻¹`,
+/// which is the disk automorphism of the one-dimensional case with quaternion
+/// division: expanding the quotient against `|1 - ax|² = 1 + 2a·x + |a|²|x|²`
+/// reproduces [`mobius_add`] term for term. Composing two of them gives
+/// `a ⊕ (b ⊕ v) = (a ⊕ b) ⊕ (A v A⁻¹)`, and the left gyroassociative law
+/// `a ⊕ (b ⊕ v) = (a ⊕ b) ⊕ gyr[a, b] v` (same source, §4) identifies the
+/// second factor. Conjugation rather than a unimodular multiplier because the
+/// quaternions do not commute.
 ///
 /// Ungar's defining form `⊖(a ⊕ b) ⊕ (a ⊕ (b ⊕ v))` subtracts two points that
 /// agree to within the size of `v`, and its Möbius denominator
@@ -335,13 +342,22 @@ fn mobius_add(a: Vec3, b: Vec3) -> Vec3 {
 /// the transported norm survives at any radius, and it is linear in `v`.
 /// `gyration_matches_ungars_four_addition_definition` pins the two forms
 /// against each other where the defining form is still trustworthy.
+///
+/// Unfloored. Both callers keep the operands inside the ball:
+/// [`HyperbolicH3::parallel_transport`] clamps them, and
+/// `gyration_matches_ungars_four_addition_definition` passes constants of
+/// radius under 0.5. So `|a·b| ≤ POINCARE_R2_MAX` and
+/// `|A|² ≥ (1 - POINCARE_R2_MAX)² = 1.4e-14`, a bound
+/// `parallel_transport_is_exact_where_the_clamp_conditions_the_gyration_worst`
+/// pins as attained and survivable; a floor below it can only fire for an
+/// operand the clamp did not produce, and the one such input that reaches
+/// here, a NaN, compares false against any floor and propagates regardless.
+/// The WGSL twin keeps its floor because `loam_gyr_apply` is a prelude entry
+/// point that a shader author can call directly with anything.
 fn gyr_apply(a: Vec3, b: Vec3, v: Vec3) -> Vec3 {
     let scalar = 1.0 + a.dot(b);
     let axis = -a.cross(b);
     let norm2 = scalar * scalar + axis.length_squared();
-    if norm2 < GYRATION_NORM2_MIN {
-        return v;
-    }
     v + (2.0 / norm2) * (scalar * axis.cross(v) + axis.cross(axis.cross(v)))
 }
 
@@ -603,6 +619,35 @@ mod tests {
             assert!(
                 residual <= 1e-5 * v.length(),
                 "gyr[{a:?}, {b:?}] disagrees with its definition by {residual}"
+            );
+        }
+    }
+
+    /// The gyration carries no degeneracy floor, so the worst-conditioned
+    /// operands the clamp can hand it have to come out right unaided. Two
+    /// out-of-ball points clamp onto the same saturation shell, and there
+    /// `gyr[to, -from]` takes its minimum squared norm `(1 - POINCARE_R2_MAX)²`
+    /// with an axis `to × -from` that is identically zero, so the smallest
+    /// denominator the clamp can produce meets an exactly zero numerator and
+    /// the transport is the identity to the bit.
+    #[test]
+    fn parallel_transport_is_exact_where_the_clamp_conditions_the_gyration_worst() {
+        let s = h3();
+        let outside = Vec3::new(2.0, 0.0, 0.0);
+        let shell = clamp_to_ball(outside);
+        let scalar = 1.0 + shell.dot(-shell);
+        let bound = (1.0 - POINCARE_R2_MAX) * (1.0 - POINCARE_R2_MAX);
+        assert!(
+            (scalar * scalar - bound).abs() <= 1e-3 * bound,
+            "the clamped shell puts the gyration norm² at {}, not at the \
+             documented bound {bound}",
+            scalar * scalar
+        );
+        for v in SWEEP_TANGENTS {
+            assert_eq!(
+                s.parallel_transport(outside, outside, v),
+                v,
+                "transport at the gyration's conditioning floor moved {v:?}"
             );
         }
     }
