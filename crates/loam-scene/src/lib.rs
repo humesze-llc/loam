@@ -11,7 +11,9 @@
 //! through `literal::wgsl_f32`, which is shortest-round-trip and always
 //! carries a decimal point or an exponent. Parsing the emitted literal recovers
 //! the exact input bits, so the emitter contributes no floor to CPU/GPU parity
-//! and no divisor collapses to zero.
+//! and no divisor collapses to zero. Constants must be finite; the emit
+//! functions panic on infinity or NaN rather than bake a token WGSL cannot
+//! spell.
 
 pub mod combinator;
 mod literal;
@@ -472,5 +474,26 @@ mod tests {
             scene = scene.to_hyperslice_wgsl("0.0"),
         );
         assert_naga_accepts(&hyperslice);
+    }
+
+    /// The finite-constant guard has to sit on the emit path, not just in the
+    /// literal printer: a non-finite radius must stop at `Scene::to_wgsl`
+    /// instead of reaching a shader as `inf`.
+    #[test]
+    #[should_panic(expected = "non-finite")]
+    fn scene3_rejects_a_non_finite_constant() {
+        use loam_math::EuclideanR3;
+        let scene = Scene::new(SceneNode::sphere(Vec3::ZERO, f32::INFINITY));
+        let _ = scene.to_wgsl(&EuclideanR3);
+    }
+
+    /// The 4D path bakes its constants through separate emit functions, so the
+    /// guard is pinned there independently.
+    #[test]
+    #[should_panic(expected = "non-finite")]
+    fn scene4_rejects_a_non_finite_constant() {
+        use glam::Vec4;
+        let scene = Scene4::new(SceneNode4::halfspace(Vec4::Y, f32::NAN));
+        let _ = scene.to_wgsl_4d();
     }
 }
