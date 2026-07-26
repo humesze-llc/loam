@@ -126,13 +126,49 @@ impl PlaygroundPhysics {
         }
     }
 
-    /// Pose of `slot`'s body under the UI spin rotor `spin`.
-    pub(crate) fn pose(&self, slot: usize, spin: Rotor4) -> BodyPose {
+    /// Pose of `slot` in a rendered row of `slots` bodies, under the UI spin
+    /// rotor `spin`.
+    ///
+    /// `slots` is the caller's own row length and is checked, not trusted: the
+    /// layout is frozen into each body at [`Self::respawn`] time, so a world
+    /// that missed a row edit would draw every body at another slot's layout
+    /// position and index past the end on the tail. [`Self::sync`] is the
+    /// reconciliation point, and the body upload runs it once per frame before
+    /// any render path reads a pose.
+    pub(crate) fn pose(&self, slot: usize, slots: usize, spin: Rotor4) -> BodyPose {
+        assert_eq!(
+            self.world.bodies.len(),
+            slots,
+            "physics world not synced to the rendered row"
+        );
         let body = &self.world.bodies[slot];
         BodyPose {
             position: body.position,
             rotor: composed_rotor(spin, body.orientation.rotation),
         }
+    }
+
+    /// Carry `canonical` into `slot`'s live body frame (writing `out`) and
+    /// return the R³ translate the raster paths apply AFTER projection. `out`
+    /// is cleared and refilled so a caller's scratch keeps its capacity.
+    ///
+    /// The single seam between the world and the raster passes: points,
+    /// section caps, and the wireframe take all of their per-body geometry
+    /// from here, which is what stops a pass from quietly falling back to the
+    /// authored spin rotor over the static layout.
+    pub(crate) fn body_frame(
+        &self,
+        slot: usize,
+        slots: usize,
+        spin: Rotor4,
+        canonical: &[Vec4],
+        size: f32,
+        out: &mut Vec<Vec4>,
+    ) -> Vec3 {
+        let pose = self.pose(slot, slots, spin);
+        out.clear();
+        out.extend(canonical.iter().map(|v| pose.body_local(*v, size)));
+        pose.position_r3()
     }
 }
 
@@ -156,7 +192,7 @@ mod tests {
         assert!(physics.at_rest());
         physics.step(600);
         for slot in 0..slots {
-            let pose = physics.pose(slot, Rotor4::IDENTITY);
+            let pose = physics.pose(slot, slots, Rotor4::IDENTITY);
             assert_eq!(pose.position.to_array(), body_position(slot, slots));
             assert_eq!(pose.rotor, Rotor4::IDENTITY);
         }
@@ -173,7 +209,10 @@ mod tests {
         physics.step(120);
         for slot in 0..slots {
             assert_eq!(
-                physics.pose(slot, Rotor4::IDENTITY).position.to_array(),
+                physics
+                    .pose(slot, slots, Rotor4::IDENTITY)
+                    .position
+                    .to_array(),
                 body_position(slot, slots)
             );
         }
@@ -190,7 +229,7 @@ mod tests {
                 let spin = rotor_at(plane, angle);
                 for slot in 0..3 {
                     assert_eq!(
-                        physics.pose(slot, spin).rotor,
+                        physics.pose(slot, 3, spin).rotor,
                         spin,
                         "{plane:?} at {angle} rad perturbed the spin rotor"
                     );
@@ -239,14 +278,17 @@ mod tests {
 
         let expected =
             Vec4::from_array(body_position(1, slots)) + impulse * (ticks as f32 * PHYSICS_DT);
-        let moved = physics.pose(1, Rotor4::IDENTITY).position;
+        let moved = physics.pose(1, slots, Rotor4::IDENTITY).position;
         assert!(
             (moved - expected).length() < 1e-5,
             "thrown pose {moved} away from {expected}"
         );
         for slot in [0, 2] {
             assert_eq!(
-                physics.pose(slot, Rotor4::IDENTITY).position.to_array(),
+                physics
+                    .pose(slot, slots, Rotor4::IDENTITY)
+                    .position
+                    .to_array(),
                 body_position(slot, slots),
                 "untouched slot {slot} moved"
             );
@@ -278,7 +320,7 @@ mod tests {
         // must share an index with it: absolutely orthogonal rotors commute
         // and could not tell the two composition orders apart.
         let spin = rotor_at(Plane4::Xy, 0.9);
-        let composed = physics.pose(0, spin).rotor;
+        let composed = physics.pose(0, 1, spin).rotor;
         let v = Vec4::new(0.3, -0.2, 0.9, 0.1);
         let staged = orientation.apply(spin.apply(v));
         assert!(
@@ -295,11 +337,11 @@ mod tests {
         let mut physics = PlaygroundPhysics::new(3, RADIUS);
         physics.world.bodies[0].apply_impulse(Vec4::new(0.0, 0.0, 0.0, 1.0));
         physics.step(10);
-        let in_flight = physics.pose(0, Rotor4::IDENTITY).position;
+        let in_flight = physics.pose(0, 3, Rotor4::IDENTITY).position;
 
         physics.sync(3, RADIUS);
         assert_eq!(
-            physics.pose(0, Rotor4::IDENTITY).position,
+            physics.pose(0, 3, Rotor4::IDENTITY).position,
             in_flight,
             "same-count sync cancelled a throw"
         );
@@ -308,9 +350,114 @@ mod tests {
         assert!(physics.at_rest(), "respawn left motion behind");
         for slot in 0..4 {
             assert_eq!(
-                physics.pose(slot, Rotor4::IDENTITY).position.to_array(),
+                physics.pose(slot, 4, Rotor4::IDENTITY).position.to_array(),
                 body_position(slot, 4)
             );
         }
+    }
+
+    /// Throw slot 1 off-centre so it carries BOTH a linear and an angular
+    /// velocity, then run it far enough that its pose cannot be confused with
+    /// the layout.
+    fn tumbling(slots: usize) -> PlaygroundPhysics {
+        let mut physics = PlaygroundPhysics::new(slots, RADIUS);
+        let layout = Vec4::from_array(body_position(1, slots));
+        // The +w lever puts the torque in the xw plane. The push is mostly +w,
+        // the axis on which the body cannot reach a neighbour, with enough +x
+        // to move its R³ translate off the layout as well; 0.16 of travel over
+        // these ticks against a 0.4 surface gap keeps the row a clean control
+        // group.
+        physics.world.bodies[1].apply_impulse_at_point(
+            &EuclideanR4,
+            Vec4::new(0.4, 0.0, 0.0, 1.2),
+            layout + Vec4::W * 0.5,
+        );
+        physics.step(24);
+        physics
+    }
+
+    /// [`PlaygroundPhysics::body_frame`] is the seam every raster pass reads
+    /// its per-body geometry through, so it must report the LIVE pose: the
+    /// composed rotor and the body's own `w` in the frame vertices, the body's
+    /// live centre in the R³ translate. Reverting it to the authored
+    /// `size * spin.apply(v)` over the static layout, which is what unwiring a
+    /// raster pass from physics means, fails here.
+    #[test]
+    fn body_frame_reports_the_live_pose_not_the_authored_spin() {
+        let slots = 3;
+        let physics = tumbling(slots);
+        let spin = rotor_at(Plane4::Xy, 0.7);
+        let size = 0.4;
+        let canonical = [
+            Vec4::new(1.0, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, 0.6, -0.3, 0.2),
+        ];
+
+        let mut out = Vec::new();
+        let origin = physics.body_frame(1, slots, spin, &canonical, size, &mut out);
+
+        let body = &physics.world.bodies[1];
+        let composed = composed_rotor(spin, body.orientation.rotation);
+        assert_ne!(
+            body.orientation.rotation,
+            Rotor4::IDENTITY,
+            "throw produced no rotation, so the pin below is vacuous"
+        );
+        assert_eq!(origin, body.position.truncate());
+        assert_ne!(
+            origin,
+            Vec4::from_array(body_position(1, slots)).truncate(),
+            "R³ translate still reads the static layout"
+        );
+        for (i, v) in canonical.iter().enumerate() {
+            assert_eq!(
+                out[i],
+                size * composed.apply(*v) + Vec4::W * body.position.w
+            );
+            assert_ne!(
+                out[i],
+                size * spin.apply(*v),
+                "frame vertex {i} still reads the authored spin alone"
+            );
+        }
+    }
+
+    /// An untouched slot's frame is byte-identical to the pre-physics
+    /// `size * spin.apply(v)`: the seam adds no drift to a body nobody threw,
+    /// which is what lets the pin above use exact equality.
+    #[test]
+    fn body_frame_of_an_untouched_slot_is_the_authored_spin_exactly() {
+        let slots = 3;
+        let physics = tumbling(slots);
+        let spin = rotor_at(Plane4::Zw, -1.1);
+        let size = 0.4;
+        let canonical = [Vec4::new(0.2, -0.7, 0.5, 0.1)];
+
+        let mut out = Vec::new();
+        let origin = physics.body_frame(2, slots, spin, &canonical, size, &mut out);
+        assert_eq!(out[0], size * spin.apply(canonical[0]));
+        assert_eq!(origin, Vec4::from_array(body_position(2, slots)).truncate());
+    }
+
+    /// `out` is refilled, not appended to, so a caller passing a per-frame
+    /// scratch buffer gets exactly one body's vertices.
+    #[test]
+    fn body_frame_refills_the_scratch_buffer() {
+        let physics = PlaygroundPhysics::new(2, RADIUS);
+        let canonical = [Vec4::X, Vec4::Y, Vec4::Z];
+        let mut out = vec![Vec4::ONE; 7];
+        physics.body_frame(0, 2, Rotor4::IDENTITY, &canonical, 1.0, &mut out);
+        assert_eq!(out.len(), canonical.len());
+    }
+
+    /// A render path reading a world the row edit never reached is a bug, not
+    /// a rendering: the slot count is checked at the seam rather than left to
+    /// index out of bounds on the tail or, worse, silently draw a body at
+    /// another slot's layout position.
+    #[test]
+    #[should_panic(expected = "physics world not synced to the rendered row")]
+    fn pose_rejects_a_row_the_world_was_not_synced_to() {
+        let physics = PlaygroundPhysics::new(3, RADIUS);
+        physics.pose(0, 4, Rotor4::IDENTITY);
     }
 }

@@ -166,6 +166,7 @@ impl Demo {
         let cfg = &rd.surface_bundle.config;
         // Rendered row: full `row` in Shapes, the `strip_subject` in Single.
         let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
+        let slots = render_row.len();
         let wireframe_projection = self.resolved_wireframe_projection();
         // Near-pole drop radius shared with the edges and cap outline: a point in
         // the pole band would draw as a giant clamp disc while its edges drop, so
@@ -179,6 +180,10 @@ impl Demo {
 
         let body_size = self.effective_body_size();
         let w_slice = self.w_slice;
+        // Body-frame buffers hoisted out of the row loop; `body_frame` refills
+        // them per body, so the row costs one growth, not one per shape.
+        let mut local_vertices: Vec<Vec4> = Vec::new();
+        let mut center_locals: Vec<Vec4> = Vec::new();
         let mesh = &mut self.points_mesh_scratch;
         mesh.positions.clear();
         mesh.colors.clear();
@@ -194,16 +199,17 @@ impl Demo {
                 stereographic_view_radius(polytope, cam_dist),
             );
             let topo = polytope.topology();
-            let pose = self.physics.pose(slot, self.rot_state);
-            let body_pos_r3 = pose.position_r3();
 
             // Body-local 4D vertices (rotated + scaled), shared by the vertex and
             // cell-center loops (WDepth normalization, Active cell strengths).
-            let local_vertices: Vec<Vec4> = topo
-                .vertices
-                .iter()
-                .map(|v| pose.body_local(*v, body_size))
-                .collect();
+            let body_pos_r3 = self.physics.body_frame(
+                slot,
+                slots,
+                self.rot_state,
+                topo.vertices,
+                body_size,
+                &mut local_vertices,
+            );
             // Canonical-max-w normalization (see render_wireframe_overlay), so
             // the points' w-depth color stays in step with the edges.
             let w_extent_local: f32 = if matches!(color_mode, WireframeColorMode::WDepth) {
@@ -271,8 +277,16 @@ impl Demo {
                 // sprites look like the wrong polytope, so inset them inside the cap.
                 const CELL_CENTER_INSET: f32 = 0.5;
                 let centers = polytope.cell_centers();
+                self.physics.body_frame(
+                    slot,
+                    slots,
+                    self.rot_state,
+                    &centers,
+                    body_size * CELL_CENTER_INSET,
+                    &mut center_locals,
+                );
                 for (ci, c) in centers.iter().enumerate() {
-                    let c_local = pose.body_local(*c, body_size * CELL_CENTER_INSET);
+                    let c_local = center_locals[ci];
                     let c3_local =
                         <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
                             c_local,
@@ -392,6 +406,7 @@ impl Demo {
         cap: state::SectionLayer,
     ) {
         let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
+        let slots = render_row.len();
         let body_size = self.effective_body_size();
 
         // Honest layer is drop-w (Identity makes `perspective_scale_at_w` report
@@ -428,14 +443,17 @@ impl Demo {
             let cross_clip = stereographic_clip_radius(&cross_projection, view_radius);
             let cap_clip = stereographic_clip_radius(&cap_projection, view_radius);
             let topo = polytope.topology();
-            let pose = self.physics.pose(slot, self.rot_state);
-            let body_pos_r3 = pose.position_r3();
 
             // Body-local 4D section vertices (no world translate): keep the body's
             // R³ position out of the perspective divide. Shared by both layers.
-            self.section_world_vertices_scratch.clear();
-            self.section_world_vertices_scratch
-                .extend(topo.vertices.iter().map(|v| pose.body_local(*v, body_size)));
+            let body_pos_r3 = self.physics.body_frame(
+                slot,
+                slots,
+                self.rot_state,
+                topo.vertices,
+                body_size,
+                &mut self.section_world_vertices_scratch,
+            );
 
             // Match the SDF's per-body coloring: catalog color, Lambert depth.
             // Alpha is the layer's `surface_alpha`; below 1.0 it renders through
@@ -571,6 +589,7 @@ impl Demo {
         // Disjoint field borrows keep `&mut self.unique_edge_palette_cache`
         // accessible in the loop.
         let render_row = state::render_row_entries(self.view_mode, &self.row, &self.strip_subject);
+        let slots = render_row.len();
 
         let mut section_edges = LineMesh::<3>::default();
         let mut parent_lines = LineMesh::<3>::default();
@@ -614,6 +633,9 @@ impl Demo {
         // Reused great-circle buffer; `push_blended_edge` clears it per edge,
         // put back after the loop so capacity persists.
         let mut slerp_scratch = std::mem::take(&mut self.slerp_scratch);
+        // Body-frame buffer hoisted out of the row loop; `body_frame` refills
+        // it per body, so the row costs one growth, not one per shape.
+        let mut local_vertices: Vec<Vec4> = Vec::new();
 
         for (slot, entry) in render_row.iter().enumerate() {
             let Some(polytope) = entry.shape.polytope4() else {
@@ -622,19 +644,19 @@ impl Demo {
             // Per-shape clip radius: finite for the 16-cell, `f32::INFINITY` else.
             let view_radius = stereographic_view_radius(polytope, cam_dist);
             let topo = polytope.topology();
-            let pose = self.physics.pose(slot, self.rot_state);
+            let body_size = self.effective_body_size();
             // The body's `w` rides inside the body-local frame (see
             // `BodyPose::body_local`); projecting there and translating in R³
             // AFTER keeps its apparent x-position stable when Perspective4D
             // scales (x, y, z) by `focal / (focal - w)`.
-            let body_pos_r3 = pose.position_r3();
-            // Body-local 4D vertices (no world translate; that follows projection).
-            let body_size = self.effective_body_size();
-            let local_vertices: Vec<Vec4> = topo
-                .vertices
-                .iter()
-                .map(|v| pose.body_local(*v, body_size))
-                .collect();
+            let body_pos_r3 = self.physics.body_frame(
+                slot,
+                slots,
+                self.rot_state,
+                topo.vertices,
+                body_size,
+                &mut local_vertices,
+            );
 
             // Cross-section perimeter outlines, one per enabled layer.
             // `polytope_section_overlay_with_vertices` returns the body-local

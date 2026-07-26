@@ -175,27 +175,25 @@ impl Demo {
             ctx.rd.sample_count(),
         );
 
-        // Initial SDF body uniforms. With the raster default, polychoral
-        // entries emit `BodyUniform::default()` (kind = Invalid) so the
-        // kernel skips them and the rasterizer draws them instead. Mirrors
-        // `Demo::sdf_body_for_slot`, which handles later re-uploads.
+        // Initial SDF body uniforms, through the same builder every later
+        // re-upload uses: with the raster default, polychoral entries emit
+        // `BodyUniform::default()` (kind = Invalid) so the kernel skips them
+        // and the rasterizer draws them instead.
+        let surface_mode = SurfaceMode::default();
         let physics = PlaygroundPhysics::new(row.len(), BODY_SIZE);
         let bodies: Vec<BodyUniform> = row
             .iter()
             .enumerate()
             .map(|(slot, entry)| {
-                if entry.shape.polytope4().is_some() {
-                    BodyUniform::default()
-                } else {
-                    let pose = physics.pose(slot, Rotor4::IDENTITY);
-                    BodyUniform::polytope_with_rotor(
-                        pose.position.to_array(),
-                        entry.shape.shape_id(),
-                        BODY_SIZE,
-                        pose.rotor,
-                        entry.body_color,
-                    )
-                }
+                state::sdf_body_uniform(
+                    &physics,
+                    entry,
+                    slot,
+                    row.len(),
+                    Rotor4::IDENTITY,
+                    BODY_SIZE,
+                    surface_mode,
+                )
             })
             .collect();
         node.set_bodies(&bodies);
@@ -321,7 +319,7 @@ impl Demo {
             section_faces_mesh_scratch: loam_shape::TriangleMesh::<3>::default(),
             body_uniform_scratch: Vec::new(),
             slerp_scratch: Vec::new(),
-            surface_mode: SurfaceMode::default(),
+            surface_mode,
             row,
             w_slice: initial_w,
             slider_up_held: false,
@@ -595,7 +593,10 @@ impl Demo {
         else {
             return;
         };
-        let world_pos = self.physics.pose(slot, self.rot_state).position_r3();
+        let world_pos = self
+            .physics
+            .pose(slot, render_row.len(), self.rot_state)
+            .position_r3();
 
         let view_dir = self.camera.view();
         let cfg = &frame.rd.surface_bundle.config;
@@ -645,7 +646,7 @@ impl Demo {
         let polytope = entry.shape.polytope4().expect("filter guarantees Some");
         let topo = polytope.topology();
         let canonical_v0 = topo.vertices[0];
-        let pose = self.physics.pose(slot, self.rot_state);
+        let pose = self.physics.pose(slot, render_row.len(), self.rot_state);
         let v_local_4d = pose.body_local(canonical_v0, self.effective_body_size());
         let v_local_r3 = <loam_math::EuclideanR4 as loam_math::RasterizableSpace<4>>::project_point(
             v_local_4d,

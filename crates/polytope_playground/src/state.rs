@@ -294,6 +294,49 @@ pub(crate) fn body_position(slot: usize, n: usize) -> [f32; 4] {
     [x, BODY_Y, 0.0, 0.0]
 }
 
+/// SDF body uniform for one entry of a rendered row of `slots`, with polychora
+/// opt-out per [`SurfaceMode`]: in Raster / Off the returned uniform is
+/// `BodyUniform::default()` (kind = Invalid), which the kernel skips, and the
+/// surface comes from the section-face raster (Raster) or nowhere (Off).
+/// Smooth-surface shapes ignore the mode and always produce a live SDF body.
+///
+/// The raymarched body's centre and orientation come from `physics`, not from
+/// `spin` over the static layout: the kernel and the raster passes read the
+/// same pose, so the SDF surface and the wireframe around it cannot separate.
+pub(crate) fn sdf_body_uniform(
+    physics: &PlaygroundPhysics,
+    entry: &ShapeEntry,
+    slot: usize,
+    slots: usize,
+    spin: Rotor4,
+    size: f32,
+    surface_mode: SurfaceMode,
+) -> BodyUniform {
+    // The 120-cell and 600-cell have NO authoritative SDF: their
+    // `cell{120,600}_face_planes` are the known-wrong dual-vertex
+    // approximation (see `loam_shape::polytope_geom`), wrong on 96 normals.
+    // Never raymarch them, on any platform or mode; the raster section +
+    // wireframe paths are their correct surfaces. (`row_blocks_sdf` also
+    // refuses to enter Sdf mode with them; this is the belt-and-suspenders.)
+    if matches!(
+        entry.shape.polytope4(),
+        Some(Polytope4::Cell120 | Polytope4::Cell600)
+    ) {
+        return BodyUniform::default();
+    }
+    if !surface_mode.uses_sdf_for_polychora() && entry.shape.polytope4().is_some() {
+        return BodyUniform::default();
+    }
+    let pose = physics.pose(slot, slots, spin);
+    BodyUniform::polytope_with_rotor(
+        pose.position.to_array(),
+        entry.shape.shape_id(),
+        size,
+        pose.rotor,
+        entry.body_color,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The App struct
 // ---------------------------------------------------------------------------
@@ -622,37 +665,6 @@ impl Demo {
         }
     }
 
-    /// SDF body uniform for one row entry, with polychora opt-out per [`SurfaceMode`]:
-    /// in Raster / Off the returned uniform is `BodyUniform::default()` (kind =
-    /// Invalid), which the kernel skips, and the surface comes from
-    /// [`Self::section_faces`] (Raster) or nowhere (Off). Smooth-surface shapes
-    /// ignore the mode and always produce a live SDF body.
-    fn sdf_body_for_slot(&self, entry: &ShapeEntry, slot: usize, rotor: Rotor4) -> BodyUniform {
-        // The 120-cell and 600-cell have NO authoritative SDF: their
-        // `cell{120,600}_face_planes` are the known-wrong dual-vertex
-        // approximation (see `loam_shape::polytope_geom`), wrong on 96 normals.
-        // Never raymarch them, on any platform or mode; the raster section +
-        // wireframe paths are their correct surfaces. (`row_blocks_sdf` also
-        // refuses to enter Sdf mode with them; this is the belt-and-suspenders.)
-        if matches!(
-            entry.shape.polytope4(),
-            Some(Polytope4::Cell120 | Polytope4::Cell600)
-        ) {
-            return BodyUniform::default();
-        }
-        if !self.surface_mode.uses_sdf_for_polychora() && entry.shape.polytope4().is_some() {
-            return BodyUniform::default();
-        }
-        let pose = self.physics.pose(slot, rotor);
-        BodyUniform::polytope_with_rotor(
-            pose.position.to_array(),
-            entry.shape.shape_id(),
-            self.effective_body_size(),
-            pose.rotor,
-            entry.body_color,
-        )
-    }
-
     /// Effective body radius after the [`Self::surface_scale`] multiplier. All
     /// `BODY_SIZE` consumers route through here so `surface scale` applies
     /// uniformly.
@@ -772,12 +784,21 @@ impl Demo {
     /// it ([`PlaygroundPhysics::sync`]).
     fn upload_render_row_bodies(&mut self, rotor: Rotor4) {
         let n = self.render_row().len();
-        self.physics.sync(n, self.effective_body_size());
+        let size = self.effective_body_size();
+        self.physics.sync(n, size);
         let mut scratch = std::mem::take(&mut self.body_uniform_scratch);
         scratch.clear();
         for slot in 0..n {
             let entry = &self.render_row()[slot];
-            scratch.push(self.sdf_body_for_slot(entry, slot, rotor));
+            scratch.push(sdf_body_uniform(
+                &self.physics,
+                entry,
+                slot,
+                n,
+                rotor,
+                size,
+                self.surface_mode,
+            ));
         }
         self.node.set_bodies(&scratch);
         self.body_uniform_scratch = scratch;
@@ -832,17 +853,18 @@ impl Demo {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_plane_angle, apply_projection_selection_defaults, compose_active_rotor,
-        default_edge_blend, hyperslice_cull_active, mode_annotation, render_row_entries,
-        resolve_schlegel_params, row_blocks_sdf, section_layer_projection,
-        synced_schlegel_projection, SectionLayer, ViewMode, WireframeProjection,
-        BASE_ROTATION_RATE, STEREOGRAPHIC_DEFAULT_POLE,
+        active_plane_angle, apply_projection_selection_defaults, body_position,
+        compose_active_rotor, default_edge_blend, hyperslice_cull_active, mode_annotation,
+        render_row_entries, resolve_schlegel_params, row_blocks_sdf, sdf_body_uniform,
+        section_layer_projection, synced_schlegel_projection, SectionLayer, SurfaceMode, ViewMode,
+        WireframeProjection, BASE_ROTATION_RATE, BODY_SIZE, STEREOGRAPHIC_DEFAULT_POLE,
     };
     use crate::catalog::ShapeEntry;
+    use crate::physics::{composed_rotor, PlaygroundPhysics};
     use glam::Vec4;
-    use loam_math::{Bivector, Plane4, Projection, Rotor, Rotor4};
+    use loam_math::{Bivector, EuclideanR4, Plane4, Projection, Rotor, Rotor4};
     use loam_physics::polytope::Polytope4;
-    use loam_render::raymarch::RaymarchShape;
+    use loam_render::raymarch::{BodyUniform, RaymarchShape};
     use std::collections::HashSet;
 
     fn entry(shape: RaymarchShape) -> ShapeEntry {
@@ -1608,5 +1630,129 @@ mod tests {
         let cap = SectionLayer::PROJECTED_CAP_DEFAULT;
         assert!(!cap.perimeter, "projected-cap perimeter off by default");
         assert!(!cap.fill_visible(), "projected-cap fill off by default");
+    }
+
+    /// Throw slot 1 along +w, the one axis on which it cannot reach a
+    /// neighbour, from a +x lever point so it picks up an angular velocity
+    /// too. The rest of the row stays a clean control group.
+    fn tumbling(slots: usize) -> PlaygroundPhysics {
+        let mut physics = PlaygroundPhysics::new(slots, BODY_SIZE);
+        let layout = Vec4::from_array(body_position(1, slots));
+        physics.world.bodies[1].apply_impulse_at_point(
+            &EuclideanR4,
+            Vec4::new(0.0, 0.0, 0.0, 1.2),
+            layout + Vec4::X * 0.5,
+        );
+        physics.step(24);
+        physics
+    }
+
+    /// The raymarched body reads the PHYSICS pose, not the authored layout
+    /// under the UI spin: a thrown, tumbling slot's uniform carries its live
+    /// centre and `spin · orientation`. Reverting either to the authored value
+    /// would strand the SDF surface while every raster pass followed the body.
+    #[test]
+    fn sdf_body_uniform_reads_the_physics_pose_not_the_authored_spin() {
+        let slots = 3;
+        let physics = tumbling(slots);
+        let shape = entry(RaymarchShape::Polytope(Polytope4::Cell24));
+        let spin = (Plane4::Xy.unit_bivector() * 0.7).exp().normalize();
+
+        let uniform = sdf_body_uniform(
+            &physics,
+            &shape,
+            1,
+            slots,
+            spin,
+            BODY_SIZE,
+            SurfaceMode::Sdf,
+        );
+
+        let body = &physics.world.bodies[1];
+        assert_ne!(
+            body.orientation.rotation,
+            Rotor4::IDENTITY,
+            "throw produced no rotation, so the rotor pin below is vacuous"
+        );
+        assert_eq!(uniform.position, body.position.to_array());
+        assert_ne!(
+            uniform.position,
+            body_position(1, slots),
+            "uniform centre still reads the static layout"
+        );
+        assert_eq!(
+            uniform.rotor,
+            <[f32; 8]>::from(composed_rotor(spin, body.orientation.rotation))
+        );
+        assert_ne!(
+            uniform.rotor,
+            <[f32; 8]>::from(spin),
+            "uniform rotor still reads the authored spin alone"
+        );
+    }
+
+    /// An untouched slot's uniform is the authored layout and spin exactly:
+    /// routing through physics adds no drift to a body nobody threw, which is
+    /// what lets the pin above use exact equality.
+    #[test]
+    fn sdf_body_uniform_of_an_untouched_slot_is_the_authored_layout_and_spin() {
+        let slots = 3;
+        let physics = tumbling(slots);
+        let shape = entry(RaymarchShape::Polytope(Polytope4::Cell24));
+        let spin = (Plane4::Zw.unit_bivector() * -1.1).exp().normalize();
+
+        let uniform = sdf_body_uniform(
+            &physics,
+            &shape,
+            2,
+            slots,
+            spin,
+            BODY_SIZE,
+            SurfaceMode::Sdf,
+        );
+        assert_eq!(uniform.position, body_position(2, slots));
+        assert_eq!(uniform.rotor, <[f32; 8]>::from(spin));
+    }
+
+    /// The polychora opt-out survives the pose plumbing: the 120/600-cell go
+    /// inert in every mode (their face planes are the known-wrong dual-vertex
+    /// fit), the other polychora only outside Sdf mode, and a smooth-surface
+    /// shape never opts out.
+    #[test]
+    fn sdf_body_uniform_keeps_the_polychora_opt_out() {
+        let slots = 3;
+        let physics = tumbling(slots);
+        let inert = BodyUniform::default().kind;
+        let live = |shape, mode| {
+            sdf_body_uniform(
+                &physics,
+                &entry(shape),
+                1,
+                slots,
+                Rotor4::IDENTITY,
+                BODY_SIZE,
+                mode,
+            )
+            .kind
+                != inert
+        };
+
+        for mode in [SurfaceMode::Sdf, SurfaceMode::Raster, SurfaceMode::Off] {
+            for heavy in [Polytope4::Cell120, Polytope4::Cell600] {
+                assert!(
+                    !live(RaymarchShape::Polytope(heavy), mode),
+                    "{heavy:?} raymarched in {mode:?}"
+                );
+            }
+            assert_eq!(
+                live(RaymarchShape::Polytope(Polytope4::Cell24), mode),
+                mode.uses_sdf_for_polychora(),
+                "24-cell SDF dispatch disagrees with {mode:?}"
+            );
+            assert!(
+                live(RaymarchShape::CliffordTorus, mode),
+                "smooth surface opted out in {mode:?}"
+            );
+        }
     }
 }
