@@ -746,8 +746,24 @@ mod seat_tests {
 
     const PANEL_WIDTH: f32 = 120.0;
 
+    /// Wide enough that the seat's left clamp stays untaken.
+    const VIEWPORT: egui::Vec2 = egui::vec2(1280.0, 800.0);
+
+    /// Narrower than `PANEL_WIDTH + OVERLAY_MARGIN + OVERLAY_WIDTH`, so the
+    /// band a side panel leaves cannot hold the readout and the clamp fires.
+    const NARROW_VIEWPORT: egui::Vec2 = egui::vec2(200.0, 400.0);
+
+    /// egui's fallback viewport is ~10000px wide, so a default `RawInput`
+    /// leaves the clamp unreachable no matter what the panels do.
+    fn viewport(size: egui::Vec2) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn perf_overlay_boots_clear_of_a_top_panel() {
+    fn perf_overlay_boots_into_the_top_right_of_the_panel_band() {
         // One frame of history, so `show` gets past its "no samples" early
         // return. The store is thread-local and each test owns its thread.
         frame_trace::begin_frame();
@@ -756,7 +772,8 @@ mod seat_tests {
         let ctx = egui::Context::default();
         let mut overlay = PerfOverlay::new().always_visible();
         let mut bar_bottom = 0.0;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        let mut band = egui::Rect::NOTHING;
+        let _ = ctx.run(viewport(VIEWPORT), |ctx| {
             bar_bottom = egui::TopBottomPanel::top("shell-menu-bar")
                 .exact_height(BAR_HEIGHT)
                 .show(ctx, |ui| {
@@ -765,6 +782,7 @@ mod seat_tests {
                 .response
                 .rect
                 .bottom();
+            band = ctx.available_rect();
             overlay.show(ctx);
         });
         let rect = ctx
@@ -775,14 +793,26 @@ mod seat_tests {
             "overlay top {} must clear the menu bar bottom {bar_bottom}",
             rect.top(),
         );
+        // Halves rather than exact insets: egui constrains a placed area to
+        // the viewport, so frame padding can shift the right edge inward.
+        assert!(
+            rect.center().x > band.center().x,
+            "overlay center x {} must sit in the band's right half of {band:?}",
+            rect.center().x,
+        );
+        assert!(
+            rect.center().y < band.center().y,
+            "overlay center y {} must sit in the band's top half of {band:?}",
+            rect.center().y,
+        );
     }
 
     #[test]
-    fn perf_overlay_seat_stays_inside_the_horizontal_panel_band() {
+    fn perf_overlay_seat_insets_from_the_top_right_of_the_panel_band() {
         let ctx = egui::Context::default();
         let mut seat = None;
-        let mut area = egui::Rect::NOTHING;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        let mut band = egui::Rect::NOTHING;
+        let _ = ctx.run(viewport(VIEWPORT), |ctx| {
             egui::SidePanel::left("left")
                 .exact_width(PANEL_WIDTH)
                 .show(ctx, |ui| {
@@ -793,14 +823,47 @@ mod seat_tests {
                 .show(ctx, |ui| {
                     ui.label("right");
                 });
-            area = ctx.available_rect();
+            band = ctx.available_rect();
+            seat = Some(perf_overlay_seat(ctx));
+        });
+        let seat = seat.expect("run closure sets the seat");
+        assert_eq!(
+            seat.x,
+            band.right() - OVERLAY_MARGIN - OVERLAY_WIDTH,
+            "seat must inset from the band's right edge, not its left, in {band:?}",
+        );
+        assert_eq!(
+            seat.y,
+            band.top() + OVERLAY_MARGIN,
+            "seat must inset from the band's top edge, not its bottom, in {band:?}",
+        );
+    }
+
+    #[test]
+    fn perf_overlay_seat_clamps_to_the_band_left_when_the_band_is_narrower_than_the_readout() {
+        let ctx = egui::Context::default();
+        let mut seat = None;
+        let mut band = egui::Rect::NOTHING;
+        let _ = ctx.run(viewport(NARROW_VIEWPORT), |ctx| {
+            egui::SidePanel::left("left")
+                .exact_width(PANEL_WIDTH)
+                .show(ctx, |ui| {
+                    ui.label("left");
+                });
+            band = ctx.available_rect();
             seat = Some(perf_overlay_seat(ctx));
         });
         let seat = seat.expect("run closure sets the seat");
         assert!(
-            seat.x >= area.left() && seat.x + OVERLAY_WIDTH <= area.right(),
-            "seat x {} plus width {OVERLAY_WIDTH} must lie inside {area:?}",
+            band.width() < OVERLAY_MARGIN + OVERLAY_WIDTH && band.left() > 0.0,
+            "fixture must leave a band {band:?} too narrow for the readout and \
+             offset from the viewport origin, or the clamp goes untested",
+        );
+        assert_eq!(
             seat.x,
+            band.left(),
+            "a band too narrow for the readout must seat it at the band's left \
+             edge, not at the viewport origin or off-screen",
         );
     }
 }
