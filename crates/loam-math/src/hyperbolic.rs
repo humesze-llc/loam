@@ -343,13 +343,17 @@ fn mobius_add(a: Vec3, b: Vec3) -> Vec3 {
 /// `gyration_matches_ungars_four_addition_definition` pins the two forms
 /// against each other where the defining form is still trustworthy.
 ///
-/// Unfloored. The sole caller clamps both operands into the ball, so
-/// `|a·b| ≤ POINCARE_R2_MAX` and `|A|² ≥ (1 - POINCARE_R2_MAX)² = 1e-14`; a
-/// floor below that can only fire for an operand the clamp did not produce,
-/// and the one such input that reaches here, a NaN, compares false against any
-/// floor and propagates regardless. The WGSL twin keeps its floor because
-/// `loam_gyr_apply` is a prelude entry point that a shader author can call
-/// directly with anything.
+/// Unfloored. Both callers keep the operands inside the ball:
+/// [`HyperbolicH3::parallel_transport`] clamps them, and
+/// `gyration_matches_ungars_four_addition_definition` passes constants of
+/// radius under 0.5. So `|a·b| ≤ POINCARE_R2_MAX` and
+/// `|A|² ≥ (1 - POINCARE_R2_MAX)² = 1.4e-14`, a bound
+/// `parallel_transport_is_exact_where_the_clamp_conditions_the_gyration_worst`
+/// pins as attained and survivable; a floor below it can only fire for an
+/// operand the clamp did not produce, and the one such input that reaches
+/// here, a NaN, compares false against any floor and propagates regardless.
+/// The WGSL twin keeps its floor because `loam_gyr_apply` is a prelude entry
+/// point that a shader author can call directly with anything.
 fn gyr_apply(a: Vec3, b: Vec3, v: Vec3) -> Vec3 {
     let scalar = 1.0 + a.dot(b);
     let axis = -a.cross(b);
@@ -615,6 +619,35 @@ mod tests {
             assert!(
                 residual <= 1e-5 * v.length(),
                 "gyr[{a:?}, {b:?}] disagrees with its definition by {residual}"
+            );
+        }
+    }
+
+    /// The gyration carries no degeneracy floor, so the worst-conditioned
+    /// operands the clamp can hand it have to come out right unaided. Two
+    /// out-of-ball points clamp onto the same saturation shell, and there
+    /// `gyr[to, -from]` takes its minimum squared norm `(1 - POINCARE_R2_MAX)²`
+    /// with an axis `to × -from` that is identically zero, so the smallest
+    /// denominator the clamp can produce meets an exactly zero numerator and
+    /// the transport is the identity to the bit.
+    #[test]
+    fn parallel_transport_is_exact_where_the_clamp_conditions_the_gyration_worst() {
+        let s = h3();
+        let outside = Vec3::new(2.0, 0.0, 0.0);
+        let shell = clamp_to_ball(outside);
+        let scalar = 1.0 + shell.dot(-shell);
+        let bound = (1.0 - POINCARE_R2_MAX) * (1.0 - POINCARE_R2_MAX);
+        assert!(
+            (scalar * scalar - bound).abs() <= 1e-3 * bound,
+            "the clamped shell puts the gyration norm² at {}, not at the \
+             documented bound {bound}",
+            scalar * scalar
+        );
+        for v in SWEEP_TANGENTS {
+            assert_eq!(
+                s.parallel_transport(outside, outside, v),
+                v,
+                "transport at the gyration's conditioning floor moved {v:?}"
             );
         }
     }
