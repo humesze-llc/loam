@@ -324,7 +324,8 @@ pub struct RunConfig {
     pub window: WindowAttributes,
     pub fixed_hz: u32,
     /// Spiral-of-death cap, applied by the runner's [`FixedTimestep`]. Ticks
-    /// beyond this in one frame are dropped, not deferred.
+    /// beyond this in one frame are dropped, not deferred; `0` stops the sim
+    /// entirely.
     pub max_ticks_per_frame: u32,
     /// `EnvFilter`-style log filter. `None` means keep whatever `tracing-subscriber`
     /// was already configured with (or the `RUST_LOG` env var); `Some` installs a new
