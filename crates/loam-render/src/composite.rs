@@ -5,9 +5,11 @@
 //! encodes linear output on write and no pass is needed; `RenderDevice::new`
 //! skips the [`CompositeNode`] there. Browser WebGPU (Chrome 2026-05) only
 //! advertises linear canvas formats, so direct writes display ~2.2x dark.
-//! Instead the scene renders into an offscreen `Bgra8UnormSrgb` target, and
-//! this pass samples it (decoded to linear), applies `linear_to_srgb`, and
-//! writes the sRGB-encoded bits the canvas compositor expects.
+//! Instead the scene renders into an offscreen target carrying the canvas
+//! format's sRGB sibling (`Bgra8Unorm` -> `Bgra8UnormSrgb`), or the canvas
+//! format itself where it has none (`Rgba16Float`), and this pass samples it
+//! (linear either way, by sampler decode or by storage), applies
+//! `linear_to_srgb`, and writes the sRGB-encoded bits the compositor expects.
 //!
 //! Cost: one fullscreen-triangle pass per frame, single-digit microseconds
 //! at 1080p; negligible vs. the polytope SDF raymarch.
