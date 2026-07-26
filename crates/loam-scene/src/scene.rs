@@ -215,7 +215,7 @@ mod tests {
         let wgsl = scene.to_wgsl(&EuclideanR3);
         assert!(wgsl.contains("fn loam_scene_sdf(p: vec3<f32>) -> f32"));
         assert!(wgsl.contains("loam_distance"));
-        assert!(wgsl.contains("0.250000"));
+        assert!(wgsl.contains("- (0.25)"));
     }
 
     #[test]
