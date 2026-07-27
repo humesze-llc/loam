@@ -248,11 +248,13 @@ impl Demo {
             &self.row_frame(),
             cross,
             cap,
-            &mut local_vertices,
-            &mut proj_scratch,
-            &mut cross_mesh,
-            &mut cap_mesh,
-            &mut section_scratch,
+            SectionBuffers {
+                local_vertices: &mut local_vertices,
+                proj_scratch: &mut proj_scratch,
+                cross_mesh: &mut cross_mesh,
+                cap_mesh: &mut cap_mesh,
+                section_scratch: &mut section_scratch,
+            },
         );
         self.section_cap_scratch = section_scratch;
         self.section_world_vertices_scratch = local_vertices;
@@ -608,16 +610,31 @@ pub(crate) fn build_points_mesh(
 /// Free function over [`RowFrame`] so "the caps are cut from the body physics
 /// put there" is unit-testable without a GPU-backed [`Demo`];
 /// [`Demo::render_section_faces`] is the one production caller.
+/// The caller-owned working set [`build_section_layer_meshes`] fills. Bundled
+/// rather than passed one by one because they are always taken from `Demo` and
+/// restored together, and threading the section scratch through put the
+/// parameter list over clippy's limit; a struct beats another `allow`.
+pub(crate) struct SectionBuffers<'a> {
+    pub(crate) local_vertices: &'a mut Vec<Vec4>,
+    pub(crate) proj_scratch: &'a mut Vec<Vec3>,
+    pub(crate) cross_mesh: &'a mut loam_shape::TriangleMesh<3>,
+    pub(crate) cap_mesh: &'a mut loam_shape::TriangleMesh<3>,
+    pub(crate) section_scratch: &'a mut SectionScratch,
+}
+
 pub(crate) fn build_section_layer_meshes(
     frame: &RowFrame<'_>,
     cross: state::SectionLayer,
     cap: state::SectionLayer,
-    local_vertices: &mut Vec<Vec4>,
-    proj_scratch: &mut Vec<Vec3>,
-    cross_mesh: &mut loam_shape::TriangleMesh<3>,
-    cap_mesh: &mut loam_shape::TriangleMesh<3>,
-    section_scratch: &mut SectionScratch,
+    buffers: SectionBuffers<'_>,
 ) {
+    let SectionBuffers {
+        local_vertices,
+        proj_scratch,
+        cross_mesh,
+        cap_mesh,
+        section_scratch,
+    } = buffers;
     let w_slice = frame.w_slice;
     // Honest layer is drop-w (Identity makes `perspective_scale_at_w` report
     // `Some(1.0)`, a scale-by-one + translate); the cap follows the active
@@ -1211,21 +1228,18 @@ mod tests {
             );
         }
 
-        fn sections(
-            &mut self,
-            frame: &RowFrame<'_>,
-            cross: SectionLayer,
-            cap: SectionLayer,
-        ) {
+        fn sections(&mut self, frame: &RowFrame<'_>, cross: SectionLayer, cap: SectionLayer) {
             build_section_layer_meshes(
                 frame,
                 cross,
                 cap,
-                &mut self.local_vertices,
-                &mut self.proj,
-                &mut self.cross_faces,
-                &mut self.cap_faces,
-                &mut self.section_scratch,
+                SectionBuffers {
+                    local_vertices: &mut self.local_vertices,
+                    proj_scratch: &mut self.proj,
+                    cross_mesh: &mut self.cross_faces,
+                    cap_mesh: &mut self.cap_faces,
+                    section_scratch: &mut self.section_scratch,
+                },
             );
         }
 
@@ -1273,11 +1287,13 @@ mod tests {
             frame,
             cross,
             cap,
-            &mut local_vertices,
-            &mut proj_scratch,
-            &mut cross_mesh,
-            &mut cap_mesh,
-            &mut SectionScratch::default(),
+            SectionBuffers {
+                local_vertices: &mut local_vertices,
+                proj_scratch: &mut proj_scratch,
+                cross_mesh: &mut cross_mesh,
+                cap_mesh: &mut cap_mesh,
+                section_scratch: &mut SectionScratch::default(),
+            },
         );
 
         BuiltRow {
@@ -1444,21 +1460,25 @@ mod tests {
             &frame(&pair.thrown, pair.spin),
             cross,
             cap,
-            &mut local_vertices,
-            &mut proj_scratch,
-            &mut live_cross,
-            &mut live_cap,
-            &mut SectionScratch::default(),
+            SectionBuffers {
+                local_vertices: &mut local_vertices,
+                proj_scratch: &mut proj_scratch,
+                cross_mesh: &mut live_cross,
+                cap_mesh: &mut live_cap,
+                section_scratch: &mut SectionScratch::default(),
+            },
         );
         build_section_layer_meshes(
             &frame(&pair.at_rest, pair.composed),
             cross,
             cap,
-            &mut local_vertices,
-            &mut proj_scratch,
-            &mut rest_cross,
-            &mut rest_cap,
-            &mut SectionScratch::default(),
+            SectionBuffers {
+                local_vertices: &mut local_vertices,
+                proj_scratch: &mut proj_scratch,
+                cross_mesh: &mut rest_cross,
+                cap_mesh: &mut rest_cap,
+                section_scratch: &mut SectionScratch::default(),
+            },
         );
 
         assert_translated(
