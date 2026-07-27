@@ -1401,6 +1401,58 @@ mod tests {
         close((numerical - closed_form).length(), 0.0, 5e-3);
     }
 
+    /// Transport is the flow of an ODE along a fixed curve, so chopping that
+    /// curve into more pieces refines the discretization without changing what
+    /// is being integrated: `n_steps` is counted per segment, so `k`
+    /// sub-segments is `k` times the RK4 steps one call spends on the same
+    /// curve. The answer must not move.
+    ///
+    /// This is the pin an integrated transport admits and a geodesic oracle
+    /// does not. `BlendedSpace` walks the chart-coordinate straight line rather
+    /// than its geodesic, so the pole ladder of the conformance suite has
+    /// nothing to compare a single call against; refinement compares the kernel
+    /// against itself at a step size where the truncation is orders smaller.
+    /// It is a rotation this sees, which norm and linearity are blind to: an
+    /// error committed once per segment or once per step scales with `k` while
+    /// the truncation falls as h⁴. A 0.05 rad twist about the direction of
+    /// travel, gated on nonzero curvature so the flat-region items stay green,
+    /// lands at 4.5e2 of the budget below while leaving every other test in the
+    /// crate, including the whole conformance suite, passing.
+    #[test]
+    fn transport_is_invariant_to_how_its_own_path_is_subdivided() {
+        use crate::{EuclideanR3, HyperbolicH3, Space};
+        let bs = BlendedSpace::new(EuclideanR3, HyperbolicH3, LinearBlendX::new(-0.15, 0.15));
+        let v = Vec3::new(0.05, -0.03, 0.04);
+
+        // Curved chart everywhere it matters, all inside the Poincaré ball:
+        // one segment crossing the seam, one wholly inside it, one in the
+        // H³-dominated half where α is pinned at 1.
+        let mut worst = 0.0_f32;
+        for (a, b) in [
+            (Vec3::new(-0.3, 0.05, 0.0), Vec3::new(0.3, -0.05, 0.02)),
+            (Vec3::new(-0.1, 0.0, 0.0), Vec3::new(0.1, 0.05, 0.0)),
+            (Vec3::new(0.2, 0.0, 0.0), Vec3::new(0.3, 0.1, 0.05)),
+        ] {
+            let direct = bs.parallel_transport(a, b, v);
+            for k in [2_u32, 4, 8, 16] {
+                let path: Vec<Vec3> = (0..=k)
+                    .map(|i| a + (b - a) * (i as f32 / k as f32))
+                    .collect();
+                let refined = bs.parallel_transport_along(&path, v);
+                // Both vectors sit at `b`, so √f(b) is common to them and the
+                // chart residual orders them exactly as the metric norm does.
+                worst = worst.max((refined - direct).length());
+            }
+        }
+        // Worst measured is 3.7e-5, on the seam-crossing segment and already
+        // flat in `k` at k=2: the gap is the coarse call's own truncation, not
+        // the refined one's, which is the shape a convergent kernel has.
+        assert!(
+            worst <= 1.0e-4,
+            "subdividing the transport path moved the result by {worst}"
+        );
+    }
+
     /// Closed-loop holonomy in H³: transport around a small triangle returns a
     /// vector differing from the original, proving real curvature is integrated
     /// (flat space would return it exactly).

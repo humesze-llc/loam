@@ -168,11 +168,27 @@ impl Demo {
             show_cell_centers: self.points_show_cell_centers,
             size_px: self.points_size_px,
         };
-        // Mesh taken out of `self` for the build: the row frame borrows the
-        // physics world for as long as the mesh it fills is borrowed. Put back
-        // so its capacity persists across frames.
+        // Mesh + scratch taken out of `self` for the build: the row frame
+        // borrows the physics world for as long as the buffers it fills are
+        // borrowed. Put back so their capacity persists across frames.
         let mut mesh = std::mem::take(&mut self.points_mesh_scratch);
-        build_points_mesh(&self.row_frame(), &style, &mut mesh);
+        let mut centers_cache = std::mem::take(&mut self.cell_centers_cache);
+        let mut local_vertices = std::mem::take(&mut self.overlay_local_vertices_scratch);
+        let mut center_locals = std::mem::take(&mut self.overlay_center_locals_scratch);
+        let mut cell_strengths = std::mem::take(&mut self.overlay_cell_strengths_scratch);
+        build_points_mesh(
+            &self.row_frame(),
+            &style,
+            &mut centers_cache,
+            &mut local_vertices,
+            &mut center_locals,
+            &mut cell_strengths,
+            &mut mesh,
+        );
+        self.cell_centers_cache = centers_cache;
+        self.overlay_local_vertices_scratch = local_vertices;
+        self.overlay_center_locals_scratch = center_locals;
+        self.overlay_cell_strengths_scratch = cell_strengths;
 
         // Camera matches the wireframe overlay / section faces.
         let view_dir = self.camera.view();
@@ -330,21 +346,31 @@ impl Demo {
         };
         let cross = self.cross_section;
         let cap = self.projected_cap;
-        // Cache + great-circle buffer taken out of `self` for the build: the row
-        // frame borrows the physics world for as long as they are borrowed. Put
-        // back so their capacity persists across frames.
+        // Cache, buffers and both meshes taken out of `self` for the build: the
+        // row frame borrows the physics world for as long as they are borrowed.
+        // Put back so their capacity persists across frames.
         let mut palette_cache = std::mem::take(&mut self.unique_edge_palette_cache);
         let mut slerp_scratch = std::mem::take(&mut self.slerp_scratch);
-        let (section_edges, parent_lines) = build_wireframe_meshes(
+        let mut local_vertices = std::mem::take(&mut self.overlay_local_vertices_scratch);
+        let mut cell_strengths = std::mem::take(&mut self.overlay_cell_strengths_scratch);
+        let mut section_edges = std::mem::take(&mut self.wireframe_section_edges_scratch);
+        let mut parent_lines = std::mem::take(&mut self.wireframe_parent_lines_scratch);
+        build_wireframe_meshes(
             &self.row_frame(),
             &style,
             cross,
             cap,
             &mut palette_cache,
             &mut slerp_scratch,
+            &mut local_vertices,
+            &mut cell_strengths,
+            &mut section_edges,
+            &mut parent_lines,
         );
         self.unique_edge_palette_cache = palette_cache;
         self.slerp_scratch = slerp_scratch;
+        self.overlay_local_vertices_scratch = local_vertices;
+        self.overlay_cell_strengths_scratch = cell_strengths;
 
         // Upload (no-op when a mesh is empty).
         self.section_edges.upload::<EuclideanR3, 3>(
@@ -361,6 +387,8 @@ impl Demo {
             &loam_math::Projection::Identity,
             1,
         );
+        self.wireframe_section_edges_scratch = section_edges;
+        self.wireframe_parent_lines_scratch = parent_lines;
 
         // Same view+projection as the SDF raymarcher, so the overlay aligns
         // pixel-for-pixel.
@@ -408,12 +436,20 @@ pub(crate) struct PointsStyle {
 /// caller's allocation. Same body-local project-then-translate pattern as the
 /// wireframe and section-faces paths.
 ///
+/// Every buffer is the caller's: `centers_cache` memoizes the topology-only
+/// cell centroids, and the three scratch buffers are refilled per body. On the
+/// 240 fps path nothing here reaches the allocator once they are warm.
+///
 /// Free function over [`RowFrame`] so "the sprites sit on the body physics put
 /// there" is unit-testable without a GPU-backed [`Demo`];
 /// [`Demo::render_points`] is the one production caller.
 pub(crate) fn build_points_mesh(
     frame: &RowFrame<'_>,
     style: &PointsStyle,
+    centers_cache: &mut std::collections::HashMap<loam_physics::polytope::Polytope4, Vec<Vec4>>,
+    local_vertices: &mut Vec<Vec4>,
+    center_locals: &mut Vec<Vec4>,
+    cell_strengths: &mut Vec<f32>,
     mesh: &mut loam_shape::PointMesh<3>,
 ) {
     // Active-mode palette: green for vertices in an intersected cell, gray
@@ -424,10 +460,6 @@ pub(crate) fn build_points_mesh(
     mesh.positions.clear();
     mesh.colors.clear();
     mesh.sizes.clear();
-    // Body-frame buffers hoisted out of the row loop; `body_local` refills them
-    // per body, so the row costs one growth, not one per shape.
-    let mut local_vertices: Vec<Vec4> = Vec::new();
-    let mut center_locals: Vec<Vec4> = Vec::new();
 
     for (slot, entry) in frame.row.iter().enumerate() {
         let Some(polytope) = entry.shape.polytope4() else {
@@ -444,8 +476,7 @@ pub(crate) fn build_points_mesh(
 
         // Body-local 4D vertices (rotated + scaled), shared by the vertex and
         // cell-center loops (WDepth normalization, Active cell strengths).
-        let body_pos_r3 =
-            frame.body_local(slot, topo.vertices, frame.body_size, &mut local_vertices);
+        let body_pos_r3 = frame.body_local(slot, topo.vertices, frame.body_size, local_vertices);
         // Canonical-max-w normalization (see build_wireframe_meshes), so the
         // points' w-depth color stays in step with the edges.
         let w_extent_local: f32 = if matches!(style.color_mode, WireframeColorMode::WDepth) {
@@ -461,11 +492,11 @@ pub(crate) fn build_points_mesh(
         };
         // Cell strengths only for Active mode (`compute_cell_strengths`, same as
         // the wireframe overlay).
-        let cell_strengths: Vec<f32> = if matches!(style.color_mode, WireframeColorMode::Active) {
-            compute_cell_strengths(topo.cells, &local_vertices, frame.w_slice)
+        if matches!(style.color_mode, WireframeColorMode::Active) {
+            compute_cell_strengths(topo.cells, local_vertices, frame.w_slice, cell_strengths);
         } else {
-            Vec::new()
-        };
+            cell_strengths.clear();
+        }
         let vertex_is_active = |vi: usize| -> bool {
             topo.cells
                 .iter()
@@ -512,12 +543,14 @@ pub(crate) fn build_points_mesh(
             // inradius, which is the DUAL's vertex set; at full inradius the
             // sprites look like the wrong polytope, so inset them inside the cap.
             const CELL_CENTER_INSET: f32 = 0.5;
-            let centers = polytope.cell_centers();
+            let centers: &[Vec4] = centers_cache
+                .entry(polytope)
+                .or_insert_with(|| polytope.cell_centers());
             frame.body_local(
                 slot,
-                &centers,
+                centers,
                 frame.body_size * CELL_CENTER_INSET,
-                &mut center_locals,
+                center_locals,
             );
             for (ci, c) in centers.iter().enumerate() {
                 let c_local = center_locals[ci];
@@ -699,9 +732,15 @@ pub(crate) struct WireframeStyle {
 /// over the row, in world R³. Non-polychoral shapes are skipped (no
 /// [`loam_physics::polytope::Polytope4`] mapping).
 ///
+/// Both meshes and every scratch buffer are the caller's, cleared on entry and
+/// refilled. Under Stereographic the parent mesh reaches ~92k segments for a
+/// full row of 600-cells, so owning them here would be megabytes of
+/// grow-and-copy per frame.
+///
 /// Free function over [`RowFrame`] so "the edges wrap the body physics put
 /// there" is unit-testable without a GPU-backed [`Demo`];
 /// [`Demo::render_wireframe_overlay`] is the one production caller.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_wireframe_meshes(
     frame: &RowFrame<'_>,
     style: &WireframeStyle,
@@ -709,9 +748,17 @@ pub(crate) fn build_wireframe_meshes(
     cap: state::SectionLayer,
     palette_cache: &mut std::collections::HashMap<loam_physics::polytope::Polytope4, Vec<[f32; 4]>>,
     slerp_scratch: &mut Vec<Vec4>,
-) -> (LineMesh<3>, LineMesh<3>) {
-    let mut section_edges = LineMesh::<3>::default();
-    let mut parent_lines = LineMesh::<3>::default();
+    local_vertices: &mut Vec<Vec4>,
+    cell_strengths: &mut Vec<f32>,
+    section_edges: &mut LineMesh<3>,
+    parent_lines: &mut LineMesh<3>,
+) {
+    section_edges.segments.clear();
+    section_edges.colors.clear();
+    section_edges.widths.clear();
+    parent_lines.segments.clear();
+    parent_lines.colors.clear();
+    parent_lines.widths.clear();
     // `nearest-active` off: uniform `style.alpha`. On: per-edge interp between
     // DIM (slice misses the cell) and BRIGHT (slice at its midpoint). DIM/BRIGHT
     // are activity-gradient peaks, not a global opacity.
@@ -725,9 +772,6 @@ pub(crate) fn build_wireframe_meshes(
     // Honest layer's outline is forced to drop-w so it can never follow a
     // distorting projection.
     let cross_section_projection = state::section_layer_projection(true, frame.projection);
-    // Body-frame buffer hoisted out of the row loop; `body_local` refills it per
-    // body, so the row costs one growth, not one per shape.
-    let mut local_vertices: Vec<Vec4> = Vec::new();
 
     for (slot, entry) in frame.row.iter().enumerate() {
         let Some(polytope) = entry.shape.polytope4() else {
@@ -740,8 +784,7 @@ pub(crate) fn build_wireframe_meshes(
         // `BodyPose::body_local`); projecting there and translating in R³ AFTER
         // keeps its apparent x-position stable when Perspective4D scales
         // (x, y, z) by `focal / (focal - w)`.
-        let body_pos_r3 =
-            frame.body_local(slot, topo.vertices, frame.body_size, &mut local_vertices);
+        let body_pos_r3 = frame.body_local(slot, topo.vertices, frame.body_size, local_vertices);
 
         // Cross-section perimeter outlines, one per enabled layer.
         // `polytope_section_overlay_with_vertices` returns the body-local drop-w
@@ -753,7 +796,7 @@ pub(crate) fn build_wireframe_meshes(
             let (_tri, perim) = polytope_section_overlay_with_vertices(
                 topo.edges,
                 topo.cells,
-                &local_vertices,
+                local_vertices,
                 WPlane::new(w_slice),
             );
             let mut push_perimeter = |projection: &loam_math::Projection<4>| {
@@ -797,7 +840,7 @@ pub(crate) fn build_wireframe_meshes(
 
         // Per-cell crossing strength in [0, 1], shared with build_points_mesh via
         // `compute_cell_strengths` so both passes agree on "active".
-        let cell_strengths = compute_cell_strengths(topo.cells, &local_vertices, w_slice);
+        compute_cell_strengths(topo.cells, local_vertices, w_slice, cell_strengths);
 
         // Per-edge brightness: max strength over cells containing both endpoints,
         // so an edge lights up when any containing cell is crossed.
@@ -831,7 +874,7 @@ pub(crate) fn build_wireframe_meshes(
                 if !(cell.contains(&i) && cell.contains(&j)) {
                     return false;
                 }
-                let (w_min, w_max) = cell_w_range(cell, &local_vertices);
+                let (w_min, w_max) = cell_w_range(cell, local_vertices);
                 slab_overlaps(w_min, w_max, w_slice, thickness)
             })
         };
@@ -913,7 +956,7 @@ pub(crate) fn build_wireframe_meshes(
             // Emit the edge in body-local 4D, projected to world R³; `blend` is
             // projection-derived (Stereographic -> 1, affine -> 0).
             push_blended_edge(
-                &mut parent_lines,
+                parent_lines,
                 a,
                 b,
                 color_a,
@@ -927,8 +970,6 @@ pub(crate) fn build_wireframe_meshes(
             );
         }
     }
-
-    (section_edges, parent_lines)
 }
 
 #[cfg(test)]
@@ -1103,6 +1144,68 @@ mod tests {
         cross_cap_triangles: Vec<[u32; 3]>,
     }
 
+    /// Every caller-owned buffer the two overlay builders write through, in one
+    /// value. Reusing a live `OverlayBuffers` across builds is what a frame does,
+    /// so the alloc pins and the geometry pins exercise the same seam.
+    #[derive(Default)]
+    struct OverlayBuffers {
+        palette_cache: std::collections::HashMap<Polytope4, Vec<[f32; 4]>>,
+        centers_cache: std::collections::HashMap<Polytope4, Vec<Vec4>>,
+        slerp: Vec<Vec4>,
+        local_vertices: Vec<Vec4>,
+        center_locals: Vec<Vec4>,
+        cell_strengths: Vec<f32>,
+        section_edges: LineMesh<3>,
+        parent_lines: LineMesh<3>,
+        sprites: loam_shape::PointMesh<3>,
+    }
+
+    impl OverlayBuffers {
+        fn wireframe(
+            &mut self,
+            frame: &RowFrame<'_>,
+            style: &WireframeStyle,
+            cross: SectionLayer,
+            cap: SectionLayer,
+        ) {
+            build_wireframe_meshes(
+                frame,
+                style,
+                cross,
+                cap,
+                &mut self.palette_cache,
+                &mut self.slerp,
+                &mut self.local_vertices,
+                &mut self.cell_strengths,
+                &mut self.section_edges,
+                &mut self.parent_lines,
+            );
+        }
+
+        fn points(&mut self, frame: &RowFrame<'_>, style: &PointsStyle) {
+            build_points_mesh(
+                frame,
+                style,
+                &mut self.centers_cache,
+                &mut self.local_vertices,
+                &mut self.center_locals,
+                &mut self.cell_strengths,
+                &mut self.sprites,
+            );
+        }
+    }
+
+    /// Both sprite kinds on, coloring taken from the wireframe style so the two
+    /// builders are pinned under one mode.
+    fn points_style_for(style: &WireframeStyle) -> PointsStyle {
+        PointsStyle {
+            color_mode: style.color_mode,
+            show_vertices: true,
+            show_cell_centers: true,
+            size_px: 6.0,
+        }
+    }
+
     /// Both section layers visible and both sprite kinds on, so no branch of a
     /// builder sits outside the pins.
     fn build_row(frame: &RowFrame<'_>, style: &WireframeStyle) -> BuiltRow {
@@ -1111,25 +1214,9 @@ mod tests {
             perimeter: true,
             surface_alpha: 0.5,
         };
-        let mut palette_cache = std::collections::HashMap::new();
-        let mut slerp_scratch = Vec::new();
-        let (perimeter, edges) = build_wireframe_meshes(
-            frame,
-            style,
-            cross,
-            cap,
-            &mut palette_cache,
-            &mut slerp_scratch,
-        );
-
-        let points_style = PointsStyle {
-            color_mode: style.color_mode,
-            show_vertices: true,
-            show_cell_centers: true,
-            size_px: 6.0,
-        };
-        let mut sprites = loam_shape::PointMesh::<3>::default();
-        build_points_mesh(frame, &points_style, &mut sprites);
+        let mut buffers = OverlayBuffers::default();
+        buffers.wireframe(frame, style, cross, cap);
+        buffers.points(frame, &points_style_for(style));
 
         let mut local_vertices = Vec::new();
         let mut proj_scratch = Vec::new();
@@ -1146,10 +1233,10 @@ mod tests {
         );
 
         BuiltRow {
-            edges: segment_points(&edges),
-            perimeter: segment_points(&perimeter),
-            sprites: sprites.positions,
-            sprite_colors: sprites.colors,
+            edges: segment_points(&buffers.parent_lines),
+            perimeter: segment_points(&buffers.section_edges),
+            sprites: buffers.sprites.positions,
+            sprite_colors: buffers.sprites.colors,
             cross_caps: cross_mesh.vertices,
             projected_caps: cap_mesh.vertices,
             projected_cap_triangles: cap_mesh.indices,
@@ -1241,35 +1328,21 @@ mod tests {
         };
         let cross = SectionLayer::CROSS_SECTION_DEFAULT;
         let cap = SectionLayer::PROJECTED_CAP_DEFAULT;
-        let mut palette_cache = std::collections::HashMap::new();
-        let mut slerp_scratch = Vec::new();
+        let mut live = OverlayBuffers::default();
+        let mut rest = OverlayBuffers::default();
 
-        let (live_perimeter, live_edges) = build_wireframe_meshes(
-            &frame(&pair.thrown, pair.spin),
-            &style,
-            cross,
-            cap,
-            &mut palette_cache,
-            &mut slerp_scratch,
-        );
-        let (rest_perimeter, rest_edges) = build_wireframe_meshes(
-            &frame(&pair.at_rest, pair.composed),
-            &style,
-            cross,
-            cap,
-            &mut palette_cache,
-            &mut slerp_scratch,
-        );
+        live.wireframe(&frame(&pair.thrown, pair.spin), &style, cross, cap);
+        rest.wireframe(&frame(&pair.at_rest, pair.composed), &style, cross, cap);
 
         assert_translated(
-            &segment_points(&live_edges),
-            &segment_points(&rest_edges),
+            &segment_points(&live.parent_lines),
+            &segment_points(&rest.parent_lines),
             pair.delta,
             "parent wireframe",
         );
         assert_translated(
-            &segment_points(&live_perimeter),
-            &segment_points(&rest_perimeter),
+            &segment_points(&live.section_edges),
+            &segment_points(&rest.section_edges),
             pair.delta,
             "section perimeter",
         );
@@ -1287,15 +1360,15 @@ mod tests {
             show_cell_centers: true,
             size_px: 6.0,
         };
-        let mut live = loam_shape::PointMesh::<3>::default();
-        let mut rest = loam_shape::PointMesh::<3>::default();
+        let mut live = OverlayBuffers::default();
+        let mut rest = OverlayBuffers::default();
 
-        build_points_mesh(&frame(&pair.thrown, pair.spin), &style, &mut live);
-        build_points_mesh(&frame(&pair.at_rest, pair.composed), &style, &mut rest);
+        live.points(&frame(&pair.thrown, pair.spin), &style);
+        rest.points(&frame(&pair.at_rest, pair.composed), &style);
 
         assert_translated(
-            &live.positions,
-            &rest.positions,
+            &live.sprites.positions,
+            &rest.sprites.positions,
             pair.delta,
             "point sprites",
         );
@@ -1535,18 +1608,15 @@ mod tests {
              cannot see the predicate's polarity"
         );
 
-        let mut slerp_scratch = Vec::new();
-        let mut palette_cache = std::collections::HashMap::new();
-        let (_perimeter, edges) = build_wireframe_meshes(
+        let mut buffers = OverlayBuffers::default();
+        buffers.wireframe(
             &frame,
             &style,
             SectionLayer::CROSS_SECTION_DEFAULT,
             SectionLayer::PROJECTED_CAP_DEFAULT,
-            &mut palette_cache,
-            &mut slerp_scratch,
         );
         assert_eq!(
-            edges.segments, expected,
+            buffers.parent_lines.segments, expected,
             "the cull kept a different edge set than the slab crosses"
         );
     }
@@ -1703,6 +1773,156 @@ mod tests {
         );
         let lift = pose.position.w;
         (physics, lift)
+    }
+
+    /// Counts what the thread running a probe asks of the allocator. The test
+    /// runner gives each test its own thread, so a probe never sees a
+    /// concurrent test's allocations; the counter is thread-local rather than
+    /// global for exactly that reason. Const-initialised so reading it inside
+    /// `alloc` cannot itself allocate.
+    mod alloc_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static BYTES: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let _ = BYTES.try_with(|bytes| bytes.set(bytes.get() + layout.size()));
+                System.alloc(layout)
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let _ = BYTES.try_with(|bytes| bytes.set(bytes.get() + new_size));
+                System.realloc(ptr, layout, new_size)
+            }
+        }
+
+        pub fn bytes_allocated_by(body: impl FnOnce()) -> usize {
+            let before = BYTES.with(Cell::get);
+            body();
+            BYTES.with(Cell::get) - before
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING_ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
+
+    /// Steady state costs the allocator nothing: with both line meshes and
+    /// every scratch buffer owned by the caller, a second build over the same
+    /// row reaches the allocator zero times. Returning a fresh `LineMesh`, or
+    /// hoisting a `Vec::new` back inside either builder, is tens of thousands
+    /// of pushed elements under this fixture and shows up immediately.
+    ///
+    /// Perimeters are off here because the shared section core still returns
+    /// owned meshes;
+    /// [`the_perimeter_path_adds_no_allocation_over_the_section_core`] bounds
+    /// that path against its own measured cost instead.
+    #[test]
+    fn a_warm_overlay_frame_reaches_the_allocator_zero_times() {
+        // Stereographic at blend 1 is the expensive path: every edge
+        // tessellates into `SPACE_TESSELLATION_SAMPLES` sub-segments through
+        // the slerp buffer. `Active` coloring routes through the per-cell
+        // strength buffer, and both sprite kinds route through the inset
+        // cell-centre buffer and the centroid cache.
+        let physics = PlaygroundPhysics::new(2, BODY_SIZE);
+        let frame = frame_of(
+            &physics,
+            ROW_16_PAIR,
+            rotor_at(Plane4::Zw, 0.4),
+            Projection::Stereographic { pole: Vec4::W },
+            SLICE_W,
+            CAMERA_DISTANCE,
+        );
+        let mut style = slice_colored_style();
+        style.space_blend = 1.0;
+        let points_style = points_style_for(&style);
+        let no_perimeter = SectionLayer {
+            perimeter: false,
+            surface_alpha: 0.0,
+        };
+
+        let mut buffers = OverlayBuffers::default();
+        buffers.wireframe(&frame, &style, no_perimeter, no_perimeter);
+        buffers.points(&frame, &points_style);
+        assert!(
+            !buffers.parent_lines.segments.is_empty() && !buffers.sprites.positions.is_empty(),
+            "the fixture emitted no geometry, so the pin is vacuous"
+        );
+
+        let bytes = alloc_probe::bytes_allocated_by(|| {
+            buffers.wireframe(&frame, &style, no_perimeter, no_perimeter);
+            buffers.points(&frame, &points_style);
+        });
+        assert_eq!(
+            bytes, 0,
+            "a warm frame asked the allocator for {bytes} bytes through the overlay builders"
+        );
+    }
+
+    /// With perimeters on, the wireframe builder adds nothing to what the
+    /// shared section core allocates on its own: the two owned meshes
+    /// `polytope_section_overlay_with_vertices` returns are the entire cost, so
+    /// any per-frame allocation reintroduced in `build_wireframe_meshes` lands
+    /// as a surplus over that measured baseline.
+    #[test]
+    fn the_perimeter_path_adds_no_allocation_over_the_section_core() {
+        let physics = PlaygroundPhysics::new(1, BODY_SIZE);
+        let frame = frame_of(
+            &physics,
+            ROW_16,
+            rotor_at(Plane4::Xz, 0.5),
+            Projection::Identity,
+            SLICE_W,
+            CAMERA_DISTANCE,
+        );
+        let style = slice_colored_style();
+        let cross = SectionLayer::CROSS_SECTION_DEFAULT;
+        let cap = SectionLayer {
+            perimeter: true,
+            surface_alpha: 0.5,
+        };
+
+        let mut buffers = OverlayBuffers::default();
+        buffers.wireframe(&frame, &style, cross, cap);
+        assert!(
+            !buffers.section_edges.segments.is_empty(),
+            "no perimeter was emitted, so the pin is vacuous"
+        );
+
+        // The same call the builder makes, on the same body-local vertices, so
+        // the baseline is the core's real cost and not a hardcoded number.
+        let topo = Polytope4::Cell16.topology();
+        let mut local = Vec::new();
+        frame.body_local(0, topo.vertices, BODY_SIZE, &mut local);
+        let core = alloc_probe::bytes_allocated_by(|| {
+            let _ = polytope_section_overlay_with_vertices(
+                topo.edges,
+                topo.cells,
+                &local,
+                WPlane::new(SLICE_W),
+            );
+        });
+        assert!(
+            core > 0,
+            "the section core allocated nothing here, so the comparison is vacuous"
+        );
+
+        let warm =
+            alloc_probe::bytes_allocated_by(|| buffers.wireframe(&frame, &style, cross, cap));
+        assert_eq!(
+            warm, core,
+            "the wireframe builder asked for {warm} bytes where the section core \
+             it calls asks for {core}"
+        );
     }
 
     /// `scaled` is `base` scaled about `centre` by `scale`, point for point.

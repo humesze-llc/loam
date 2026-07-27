@@ -483,6 +483,10 @@ pub(crate) struct Demo {
     /// [`Polytope4`]. A function of topology alone (greedy line-graph coloring), so
     /// valid for the process lifetime once computed.
     pub(crate) unique_edge_palette_cache: HashMap<Polytope4, Vec<[f32; 4]>>,
+    /// Memoized canonical cell centroids, keyed by [`Polytope4`]. Topology-only
+    /// like [`Self::unique_edge_palette_cache`], so the 600-cell's 600 centroid
+    /// folds run once per launch rather than once per body per frame.
+    pub(crate) cell_centers_cache: HashMap<Polytope4, Vec<Vec4>>,
     /// Runtime multiplier on [`BODY_SIZE`] for all polychora (default 1.0, range
     /// `(0, 10]`; the bound preserves the SDF marcher's bounded-w assumption). Set
     /// via `surface scale <N>`; applies uniformly to wireframe, SDF, perimeter, and
@@ -543,6 +547,25 @@ pub(crate) struct Demo {
     /// Reused great-circle sampling buffer for `push_blended_edge`, taken via
     /// `mem::take` so the Stereographic arc path does not allocate per frame.
     pub(crate) slerp_scratch: Vec<glam::Vec4>,
+    /// Combined section-perimeter mesh for the wireframe overlay, reused across
+    /// frames. A full row of 600-cells under Stereographic pushes tens of
+    /// thousands of segments, so a fresh mesh per frame costs megabytes and
+    /// tens of grow-and-copy rounds.
+    pub(crate) wireframe_section_edges_scratch: loam_shape::LineMesh<3>,
+    /// Combined parent-wireframe edge mesh, reused across frames. Separate from
+    /// [`Self::wireframe_section_edges_scratch`] because both are built in one
+    /// pass over the row and uploaded to different raster nodes.
+    pub(crate) wireframe_parent_lines_scratch: loam_shape::LineMesh<3>,
+    /// Body-local 4D vertex buffer shared by the wireframe and points builders
+    /// (they run sequentially within a frame); refilled per body by
+    /// `RowFrame::body_local`.
+    pub(crate) overlay_local_vertices_scratch: Vec<glam::Vec4>,
+    /// Second body-local buffer for the point builder's inset cell centres,
+    /// which are live at the same time as [`Self::overlay_local_vertices_scratch`].
+    pub(crate) overlay_center_locals_scratch: Vec<glam::Vec4>,
+    /// Per-cell crossing strengths for the frame's current body, shared by the
+    /// wireframe and points builders.
+    pub(crate) overlay_cell_strengths_scratch: Vec<f32>,
     /// How the six regular convex 4-polytopes are rendered. Smooth-surface shapes
     /// (Clifford torus, duocylinder) ignore this and always use the SDF.
     pub(crate) surface_mode: SurfaceMode,
