@@ -1729,6 +1729,24 @@ impl SpaceFixture for BlendedSpaceFixture {
     /// Declared rather than omitted: the exemption is one fixture's and not the
     /// suite's, and both gated items assert the miss is real, 4.9 and 2.0e1
     /// budgets at their worst sampled pairs.
+    ///
+    /// What covers this transport instead. Only one item in the suite sees a
+    /// rotation about the direction of travel,
+    /// `parallel_transport_matches_the_one_its_own_geodesics_imply`, and it
+    /// reads that rotation off a geodesic oracle, so the exemption would
+    /// otherwise leave one unpinned. Two tests in `blended.rs` cover the RK4
+    /// kernel this fixture's `Space` methods call, from the other side:
+    ///
+    /// - `transport_is_invariant_to_how_its_own_path_is_subdivided` replaces
+    ///   the oracle with refinement, which is the pin an integrated transport
+    ///   admits. RK4 steps are counted per segment, so subdividing the same
+    ///   chart line is a finer discretization of the same integral; a rotation
+    ///   committed once per segment or per step scales with the subdivision
+    ///   while the truncation falls as h⁴. That is the item a twist fails.
+    /// - `parallel_transport_in_h3_matches_closed_form_for_short_paths` pins
+    ///   the connection itself against the one source metric that has a closed
+    ///   form. Refinement cannot: every discretization of a wrong RHS
+    ///   converges to the same wrong flow.
     const TRANSPORT_FOLLOWS_THE_GEODESIC: bool = false;
 
     fn space(&self) -> Self::S {
