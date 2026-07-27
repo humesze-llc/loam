@@ -368,7 +368,16 @@ pub fn polytope_section_faces_with_vertices(
     color: [f32; 4],
 ) -> crate::TriangleMesh<3> {
     let mut tri_mesh = crate::TriangleMesh::<3>::default();
-    polytope_section_faces_append(edges, cells, vertices, slice, color, &mut tri_mesh);
+    let mut scratch = SectionScratch::default();
+    polytope_section_faces_append(
+        edges,
+        cells,
+        vertices,
+        slice,
+        color,
+        &mut scratch,
+        &mut tri_mesh,
+    );
     tri_mesh
 }
 
@@ -376,23 +385,24 @@ pub fn polytope_section_faces_with_vertices(
 /// caller-owned mesh, offsetting indices by the existing vertex count, so
 /// per-frame hot paths can merge many bodies into one reused scratch mesh
 /// instead of growing a fresh one per body. On an empty mesh it equals the
-/// non-append variant. Unlike [`polytope_section_perimeter_append`] it owns its
-/// [`SectionScratch`], costing one working set per call.
+/// non-append variant. Takes its [`SectionScratch`] from the caller, matching
+/// [`polytope_section_perimeter_append`], so a frame that draws both layers
+/// reaches the allocator through neither.
 pub fn polytope_section_faces_append(
     edges: &[[u32; 2]],
     cells: &[&[u32]],
     vertices: &[Vec4],
     slice: loam_math::WPlane,
     color: [f32; 4],
+    scratch: &mut SectionScratch,
     out: &mut crate::TriangleMesh<3>,
 ) {
-    let mut scratch = SectionScratch::default();
     for_each_section_cap(
         edges,
         cells,
         vertices,
         slice,
-        &mut scratch,
+        scratch,
         |ordered, centroid| push_cap_fan(ordered, centroid, color, out),
     );
 }

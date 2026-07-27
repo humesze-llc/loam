@@ -243,6 +243,7 @@ impl Demo {
         let mut proj_scratch = std::mem::take(&mut self.section_clip_projected_scratch);
         let mut cross_mesh = std::mem::take(&mut self.section_faces_mesh_scratch);
         let mut cap_mesh = std::mem::take(&mut self.section_faces_projected_scratch);
+        let mut section_scratch = std::mem::take(&mut self.section_cap_scratch);
         build_section_layer_meshes(
             &self.row_frame(),
             cross,
@@ -251,7 +252,9 @@ impl Demo {
             &mut proj_scratch,
             &mut cross_mesh,
             &mut cap_mesh,
+            &mut section_scratch,
         );
+        self.section_cap_scratch = section_scratch;
         self.section_world_vertices_scratch = local_vertices;
         self.section_clip_projected_scratch = proj_scratch;
         self.section_faces_mesh_scratch = cross_mesh;
@@ -613,6 +616,7 @@ pub(crate) fn build_section_layer_meshes(
     proj_scratch: &mut Vec<Vec3>,
     cross_mesh: &mut loam_shape::TriangleMesh<3>,
     cap_mesh: &mut loam_shape::TriangleMesh<3>,
+    section_scratch: &mut SectionScratch,
 ) {
     let w_slice = frame.w_slice;
     // Honest layer is drop-w (Identity makes `perspective_scale_at_w` report
@@ -659,6 +663,7 @@ pub(crate) fn build_section_layer_meshes(
         // outline cull in lockstep.
         let append_layer = |mesh: &mut loam_shape::TriangleMesh<3>,
                             proj_scratch: &mut Vec<Vec3>,
+                            scratch: &mut SectionScratch,
                             alpha: f32,
                             projection: &loam_math::Projection<4>,
                             scale: Option<f32>,
@@ -671,6 +676,7 @@ pub(crate) fn build_section_layer_meshes(
                 cap_vertices,
                 WPlane::new(w_slice),
                 [r, g, b, alpha],
+                scratch,
                 mesh,
             );
             proj_scratch.clear();
@@ -695,6 +701,7 @@ pub(crate) fn build_section_layer_meshes(
             append_layer(
                 cross_mesh,
                 proj_scratch,
+                section_scratch,
                 cross.surface_alpha,
                 &cross_projection,
                 cross_scale,
@@ -705,6 +712,7 @@ pub(crate) fn build_section_layer_meshes(
             append_layer(
                 cap_mesh,
                 proj_scratch,
+                section_scratch,
                 cap.surface_alpha,
                 &cap_projection,
                 cap_scale,
@@ -1170,6 +1178,9 @@ mod tests {
         center_locals: Vec<Vec4>,
         cell_strengths: Vec<f32>,
         section_scratch: SectionScratch,
+        cross_faces: loam_shape::TriangleMesh<3>,
+        cap_faces: loam_shape::TriangleMesh<3>,
+        proj: Vec<Vec3>,
         body_perimeter: LineMesh<3>,
         section_edges: LineMesh<3>,
         parent_lines: LineMesh<3>,
@@ -1197,6 +1208,24 @@ mod tests {
                 &mut self.body_perimeter,
                 &mut self.section_edges,
                 &mut self.parent_lines,
+            );
+        }
+
+        fn sections(
+            &mut self,
+            frame: &RowFrame<'_>,
+            cross: SectionLayer,
+            cap: SectionLayer,
+        ) {
+            build_section_layer_meshes(
+                frame,
+                cross,
+                cap,
+                &mut self.local_vertices,
+                &mut self.proj,
+                &mut self.cross_faces,
+                &mut self.cap_faces,
+                &mut self.section_scratch,
             );
         }
 
@@ -1248,6 +1277,7 @@ mod tests {
             &mut proj_scratch,
             &mut cross_mesh,
             &mut cap_mesh,
+            &mut SectionScratch::default(),
         );
 
         BuiltRow {
@@ -1418,6 +1448,7 @@ mod tests {
             &mut proj_scratch,
             &mut live_cross,
             &mut live_cap,
+            &mut SectionScratch::default(),
         );
         build_section_layer_meshes(
             &frame(&pair.at_rest, pair.composed),
@@ -1427,6 +1458,7 @@ mod tests {
             &mut proj_scratch,
             &mut rest_cross,
             &mut rest_cap,
+            &mut SectionScratch::default(),
         );
 
         assert_translated(
@@ -1919,6 +1951,41 @@ mod tests {
         assert_eq!(
             warm, 0,
             "a warm frame with both perimeters on asked the allocator for {warm} bytes"
+        );
+    }
+
+    /// The fill half of the section layers, which `CROSS_SECTION_DEFAULT` ships
+    /// on. Separate from the perimeter pin because the two run through
+    /// different `loam_shape` entry points and each owned its own working set
+    /// until the scratch was threaded through both.
+    #[test]
+    fn the_fill_path_reaches_the_allocator_zero_times() {
+        let physics = PlaygroundPhysics::new(1, BODY_SIZE);
+        let frame = frame_of(
+            &physics,
+            ROW_16,
+            rotor_at(Plane4::Xz, 0.5),
+            Projection::Identity,
+            SLICE_W,
+            CAMERA_DISTANCE,
+        );
+        let cross = SectionLayer::CROSS_SECTION_DEFAULT;
+        let cap = SectionLayer {
+            perimeter: true,
+            surface_alpha: 0.5,
+        };
+
+        let mut buffers = OverlayBuffers::default();
+        buffers.sections(&frame, cross, cap);
+        assert!(
+            !buffers.cross_faces.vertices.is_empty() && !buffers.cap_faces.vertices.is_empty(),
+            "no fill was emitted, so the pin is vacuous"
+        );
+
+        let warm = alloc_probe::bytes_allocated_by(|| buffers.sections(&frame, cross, cap));
+        assert_eq!(
+            warm, 0,
+            "a warm frame with both fills on asked the allocator for {warm} bytes"
         );
     }
 
