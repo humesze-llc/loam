@@ -53,7 +53,8 @@ use loam_egui::{Console, ConsoleUi};
 use loam_math::WPlane;
 use loam_math::{Bivector, EuclideanR3, Rotor, Rotor4};
 use loam_physics::polytope::{
-    polytope_section_faces_append, polytope_section_overlay_with_vertices, vertex_color_by_position,
+    polytope_section_faces_append, polytope_section_perimeter_append, vertex_color_by_position,
+    SectionScratch,
 };
 use loam_render::{
     device::RenderDevice,
@@ -326,6 +327,8 @@ impl Demo {
             body_uniform_scratch: Vec::new(),
             slerp_scratch: Vec::new(),
             wireframe_section_edges_scratch: LineMesh::<3>::default(),
+            body_perimeter_scratch: LineMesh::<3>::default(),
+            section_cap_scratch: SectionScratch::default(),
             wireframe_parent_lines_scratch: LineMesh::<3>::default(),
             overlay_local_vertices_scratch: Vec::new(),
             overlay_center_locals_scratch: Vec::new(),
