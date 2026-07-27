@@ -353,6 +353,8 @@ impl Demo {
         let mut slerp_scratch = std::mem::take(&mut self.slerp_scratch);
         let mut local_vertices = std::mem::take(&mut self.overlay_local_vertices_scratch);
         let mut cell_strengths = std::mem::take(&mut self.overlay_cell_strengths_scratch);
+        let mut section_scratch = std::mem::take(&mut self.section_cap_scratch);
+        let mut body_perimeter = std::mem::take(&mut self.body_perimeter_scratch);
         let mut section_edges = std::mem::take(&mut self.wireframe_section_edges_scratch);
         let mut parent_lines = std::mem::take(&mut self.wireframe_parent_lines_scratch);
         build_wireframe_meshes(
@@ -364,6 +366,8 @@ impl Demo {
             &mut slerp_scratch,
             &mut local_vertices,
             &mut cell_strengths,
+            &mut section_scratch,
+            &mut body_perimeter,
             &mut section_edges,
             &mut parent_lines,
         );
@@ -371,6 +375,8 @@ impl Demo {
         self.slerp_scratch = slerp_scratch;
         self.overlay_local_vertices_scratch = local_vertices;
         self.overlay_cell_strengths_scratch = cell_strengths;
+        self.section_cap_scratch = section_scratch;
+        self.body_perimeter_scratch = body_perimeter;
 
         // Upload (no-op when a mesh is empty).
         self.section_edges.upload::<EuclideanR3, 3>(
@@ -750,6 +756,8 @@ pub(crate) fn build_wireframe_meshes(
     slerp_scratch: &mut Vec<Vec4>,
     local_vertices: &mut Vec<Vec4>,
     cell_strengths: &mut Vec<f32>,
+    section_scratch: &mut SectionScratch,
+    body_perimeter: &mut LineMesh<3>,
     section_edges: &mut LineMesh<3>,
     parent_lines: &mut LineMesh<3>,
 ) {
@@ -787,26 +795,32 @@ pub(crate) fn build_wireframe_meshes(
         let body_pos_r3 = frame.body_local(slot, topo.vertices, frame.body_size, local_vertices);
 
         // Cross-section perimeter outlines, one per enabled layer.
-        // `polytope_section_overlay_with_vertices` returns the body-local drop-w
+        // `polytope_section_perimeter_append` fills the body-local drop-w
         // perimeter once; the honest layer maps it through drop-w (so its
         // outline matches the SDF slice), the cap through the active projection.
         // Under Stereographic a segment is dropped when either endpoint exceeds
         // the clip radius (per-segment: a perimeter segment is a single cap edge).
         if cross.perimeter || cap.perimeter {
-            let (_tri, perim) = polytope_section_overlay_with_vertices(
+            body_perimeter.segments.clear();
+            body_perimeter.colors.clear();
+            body_perimeter.widths.clear();
+            polytope_section_perimeter_append(
                 topo.edges,
                 topo.cells,
                 local_vertices,
                 WPlane::new(w_slice),
+                section_scratch,
+                body_perimeter,
             );
             let mut push_perimeter = |projection: &loam_math::Projection<4>| {
                 let section_scale = perspective_scale_at_w(w_slice, projection);
                 let clip_radius = stereographic_clip_radius(projection, view_radius);
-                for ((a, b), (color, width)) in perim
-                    .segments
-                    .iter()
-                    .zip(perim.colors.iter().zip(perim.widths.iter()))
-                {
+                for ((a, b), (color, width)) in body_perimeter.segments.iter().zip(
+                    body_perimeter
+                        .colors
+                        .iter()
+                        .zip(body_perimeter.widths.iter()),
+                ) {
                     let (pa, wa) = cap_vertex_projected_and_world(
                         *a,
                         w_slice,
@@ -1155,6 +1169,8 @@ mod tests {
         local_vertices: Vec<Vec4>,
         center_locals: Vec<Vec4>,
         cell_strengths: Vec<f32>,
+        section_scratch: SectionScratch,
+        body_perimeter: LineMesh<3>,
         section_edges: LineMesh<3>,
         parent_lines: LineMesh<3>,
         sprites: loam_shape::PointMesh<3>,
@@ -1177,6 +1193,8 @@ mod tests {
                 &mut self.slerp,
                 &mut self.local_vertices,
                 &mut self.cell_strengths,
+                &mut self.section_scratch,
+                &mut self.body_perimeter,
                 &mut self.section_edges,
                 &mut self.parent_lines,
             );
@@ -1822,10 +1840,9 @@ mod tests {
     /// hoisting a `Vec::new` back inside either builder, is tens of thousands
     /// of pushed elements under this fixture and shows up immediately.
     ///
-    /// Perimeters are off here because the shared section core still returns
-    /// owned meshes;
-    /// [`the_perimeter_path_adds_no_allocation_over_the_section_core`] bounds
-    /// that path against its own measured cost instead.
+    /// Perimeters are off here so a failure names which half regressed;
+    /// [`the_perimeter_path_reaches_the_allocator_zero_times`] pins the section
+    /// path with both layers on.
     #[test]
     fn a_warm_overlay_frame_reaches_the_allocator_zero_times() {
         // Stereographic at blend 1 is the expensive path: every edge
@@ -1868,13 +1885,12 @@ mod tests {
         );
     }
 
-    /// With perimeters on, the wireframe builder adds nothing to what the
-    /// shared section core allocates on its own: the two owned meshes
-    /// `polytope_section_overlay_with_vertices` returns are the entire cost, so
-    /// any per-frame allocation reintroduced in `build_wireframe_meshes` lands
-    /// as a surplus over that measured baseline.
+    /// With both section layers on, a warm frame still reaches the allocator
+    /// zero times: the perimeter comes back through
+    /// `polytope_section_perimeter_append` into caller-owned buffers, so
+    /// nothing on this path owns a mesh or a per-cell `Vec` of its own.
     #[test]
-    fn the_perimeter_path_adds_no_allocation_over_the_section_core() {
+    fn the_perimeter_path_reaches_the_allocator_zero_times() {
         let physics = PlaygroundPhysics::new(1, BODY_SIZE);
         let frame = frame_of(
             &physics,
@@ -1898,30 +1914,11 @@ mod tests {
             "no perimeter was emitted, so the pin is vacuous"
         );
 
-        // The same call the builder makes, on the same body-local vertices, so
-        // the baseline is the core's real cost and not a hardcoded number.
-        let topo = Polytope4::Cell16.topology();
-        let mut local = Vec::new();
-        frame.body_local(0, topo.vertices, BODY_SIZE, &mut local);
-        let core = alloc_probe::bytes_allocated_by(|| {
-            let _ = polytope_section_overlay_with_vertices(
-                topo.edges,
-                topo.cells,
-                &local,
-                WPlane::new(SLICE_W),
-            );
-        });
-        assert!(
-            core > 0,
-            "the section core allocated nothing here, so the comparison is vacuous"
-        );
-
         let warm =
             alloc_probe::bytes_allocated_by(|| buffers.wireframe(&frame, &style, cross, cap));
         assert_eq!(
-            warm, core,
-            "the wireframe builder asked for {warm} bytes where the section core \
-             it calls asks for {core}"
+            warm, 0,
+            "a warm frame with both perimeters on asked the allocator for {warm} bytes"
         );
     }
 

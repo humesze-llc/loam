@@ -552,6 +552,15 @@ pub(crate) struct Demo {
     /// thousands of segments, so a fresh mesh per frame costs megabytes and
     /// tens of grow-and-copy rounds.
     pub(crate) wireframe_section_edges_scratch: loam_shape::LineMesh<3>,
+    /// One body's body-local section perimeter, refilled per body and consumed
+    /// once per enabled section layer (the two layers project the same outline
+    /// differently), then folded into
+    /// [`Self::wireframe_section_edges_scratch`].
+    pub(crate) body_perimeter_scratch: loam_shape::LineMesh<3>,
+    /// Per-cell working set of the section core, handed to
+    /// `polytope_section_perimeter_append` so the cap fit runs out of retained
+    /// buffers instead of allocating per crossed cell.
+    pub(crate) section_cap_scratch: loam_shape::polytope::SectionScratch,
     /// Combined parent-wireframe edge mesh, reused across frames. Separate from
     /// [`Self::wireframe_section_edges_scratch`] because both are built in one
     /// pass over the row and uploaded to different raster nodes.

@@ -283,37 +283,75 @@ pub fn polytope_section_overlay_with_vertices(
 ) -> (crate::TriangleMesh<3>, crate::LineMesh<3>) {
     let mut tri_mesh = crate::TriangleMesh::<3>::default();
     let mut edge_mesh = crate::LineMesh::<3>::default();
+    let mut scratch = SectionScratch::default();
 
-    for_each_section_cap(edges, cells, vertices, slice, |ordered, centroid| {
-        let cv_base = tri_mesh.vertices.len() as u32;
-        tri_mesh.vertices.push(centroid.to_array());
-        tri_mesh.colors.push(SECTION_FILL_COLOR);
-        for cap_v in ordered {
-            tri_mesh.vertices.push(cap_v.to_array());
-            tri_mesh.colors.push(SECTION_FILL_COLOR);
-        }
-        let n = ordered.len() as u32;
-        for k in 0..n {
-            let k_next = (k + 1) % n;
-            tri_mesh
-                .indices
-                .push([cv_base, cv_base + 1 + k, cv_base + 1 + k_next]);
-        }
-
-        // Adjacent caps share face-on-slice edges, so the perimeter draws those
-        // twice; the duplication is invisible and avoids a global dedup pass.
-        for k in 0..ordered.len() {
-            let a = ordered[k];
-            let b = ordered[(k + 1) % ordered.len()];
-            edge_mesh.segments.push((a.to_array(), b.to_array()));
-            edge_mesh
-                .colors
-                .push((SECTION_EDGE_COLOR, SECTION_EDGE_COLOR));
-            edge_mesh.widths.push(SECTION_EDGE_WIDTH);
-        }
-    });
+    for_each_section_cap(
+        edges,
+        cells,
+        vertices,
+        slice,
+        &mut scratch,
+        |ordered, centroid| {
+            push_cap_fan(ordered, centroid, SECTION_FILL_COLOR, &mut tri_mesh);
+            push_cap_perimeter(ordered, &mut edge_mesh);
+        },
+    );
 
     (tri_mesh, edge_mesh)
+}
+
+/// Append variant of [`polytope_section_overlay_with_vertices`]'s perimeter
+/// half: writes cap-boundary segments into a caller-owned mesh and borrows the
+/// per-cell working set, so a per-frame overlay stops reaching the allocator
+/// once both have grown to their steady size. Callers wanting the translucent
+/// fill as well run [`polytope_section_faces_append`] over the same inputs.
+pub fn polytope_section_perimeter_append(
+    edges: &[[u32; 2]],
+    cells: &[&[u32]],
+    vertices: &[Vec4],
+    slice: loam_math::WPlane,
+    scratch: &mut SectionScratch,
+    out: &mut crate::LineMesh<3>,
+) {
+    for_each_section_cap(edges, cells, vertices, slice, scratch, |ordered, _| {
+        push_cap_perimeter(ordered, out);
+    });
+}
+
+/// Fan-triangulate one ordered cap about its centroid, uniformly colored.
+fn push_cap_fan(
+    ordered: &[Vec3],
+    centroid: Vec3,
+    color: [f32; 4],
+    out: &mut crate::TriangleMesh<3>,
+) {
+    let cv_base = out.vertices.len() as u32;
+    out.vertices.push(centroid.to_array());
+    out.colors.push(color);
+    for cap_v in ordered {
+        out.vertices.push(cap_v.to_array());
+        out.colors.push(color);
+    }
+    let n = ordered.len() as u32;
+    for k in 0..n {
+        let k_next = (k + 1) % n;
+        out.indices
+            .push([cv_base, cv_base + 1 + k, cv_base + 1 + k_next]);
+    }
+}
+
+/// Close one ordered cap into a segment loop.
+///
+/// Adjacent caps share face-on-slice edges, so the perimeter draws those twice;
+/// the duplication is invisible and avoids a global dedup pass.
+fn push_cap_perimeter(ordered: &[Vec3], out: &mut crate::LineMesh<3>) {
+    for k in 0..ordered.len() {
+        let a = ordered[k];
+        let b = ordered[(k + 1) % ordered.len()];
+        out.segments.push((a.to_array(), b.to_array()));
+        out.colors.push((SECTION_EDGE_COLOR, SECTION_EDGE_COLOR));
+        out.widths.push(SECTION_EDGE_WIDTH);
+    }
 }
 
 /// Cross-section faces only: opaque, fan-triangulated, every vertex the same
@@ -337,7 +375,9 @@ pub fn polytope_section_faces_with_vertices(
 /// Append variant of [`polytope_section_faces_with_vertices`]: writes into a
 /// caller-owned mesh, offsetting indices by the existing vertex count, so
 /// per-frame hot paths can merge many bodies into one reused scratch mesh
-/// without allocating. On an empty mesh it equals the non-append variant.
+/// instead of growing a fresh one per body. On an empty mesh it equals the
+/// non-append variant. Unlike [`polytope_section_perimeter_append`] it owns its
+/// [`SectionScratch`], costing one working set per call.
 pub fn polytope_section_faces_append(
     edges: &[[u32; 2]],
     cells: &[&[u32]],
@@ -346,21 +386,15 @@ pub fn polytope_section_faces_append(
     color: [f32; 4],
     out: &mut crate::TriangleMesh<3>,
 ) {
-    for_each_section_cap(edges, cells, vertices, slice, |ordered, centroid| {
-        let cv_base = out.vertices.len() as u32;
-        out.vertices.push(centroid.to_array());
-        out.colors.push(color);
-        for cap_v in ordered {
-            out.vertices.push(cap_v.to_array());
-            out.colors.push(color);
-        }
-        let n = ordered.len() as u32;
-        for k in 0..n {
-            let k_next = (k + 1) % n;
-            out.indices
-                .push([cv_base, cv_base + 1 + k, cv_base + 1 + k_next]);
-        }
-    });
+    let mut scratch = SectionScratch::default();
+    for_each_section_cap(
+        edges,
+        cells,
+        vertices,
+        slice,
+        &mut scratch,
+        |ordered, centroid| push_cap_fan(ordered, centroid, color, out),
+    );
 }
 
 /// Section faces using the polytope's own canonical (unrotated) topology
@@ -375,6 +409,16 @@ pub fn polytope4_section_faces(
     polytope_section_faces_with_vertices(topo.edges, topo.cells, topo.vertices, slice, color)
 }
 
+/// Per-cell working set of the section algorithm, held by the caller so a
+/// per-frame section reuses one set of buffers instead of allocating three per
+/// crossed cell.
+#[derive(Default)]
+pub struct SectionScratch {
+    cap: Vec<Vec3>,
+    keys: Vec<(usize, f32)>,
+    ordered: Vec<Vec3>,
+}
+
 /// Shared core of the section algorithm: for every cell whose w-range crosses
 /// the slice, intersect the cell's edges with the slice, fit and order the cap
 /// polygon, and invoke `emit(ordered_cap, centroid)` (both in R³). Degenerate
@@ -385,6 +429,7 @@ fn for_each_section_cap(
     cells: &[&[u32]],
     vertices: &[Vec4],
     slice: loam_math::WPlane,
+    scratch: &mut SectionScratch,
     mut emit: impl FnMut(&[Vec3], Vec3),
 ) {
     let slice = perturb_slice_if_needed(slice, vertices);
@@ -412,7 +457,8 @@ fn for_each_section_cap(
 
         // Cell edges are parent edges restricted to the cell's vertex set,
         // which avoids needing per-cell 2-face incidence data.
-        let mut cap: Vec<Vec3> = Vec::with_capacity(8);
+        let cap = &mut scratch.cap;
+        cap.clear();
         for &[i, j] in edges {
             if !cell.contains(&i) || !cell.contains(&j) {
                 continue;
@@ -433,7 +479,7 @@ fn for_each_section_cap(
 
         // The cap is a convex 2-polygon in R³; fit its plane basis.
         let centroid: Vec3 = cap.iter().copied().sum::<Vec3>() / cap.len() as f32;
-        let Some((basis_u, mut basis_v)) = fit_plane_basis(centroid, &cap) else {
+        let Some((basis_u, mut basis_v)) = fit_plane_basis(centroid, cap) else {
             continue;
         };
 
@@ -447,9 +493,16 @@ fn for_each_section_cap(
             basis_v = -basis_v;
         }
 
-        let ordered = order_around_centroid(&cap, centroid, basis_u, basis_v);
+        order_around_centroid(
+            &scratch.cap,
+            centroid,
+            basis_u,
+            basis_v,
+            &mut scratch.keys,
+            &mut scratch.ordered,
+        );
 
-        emit(&ordered, centroid);
+        emit(&scratch.ordered, centroid);
     }
 }
 
@@ -511,24 +564,29 @@ fn fit_plane_basis(centroid: Vec3, points: &[Vec3]) -> Option<(Vec3, Vec3)> {
 }
 
 /// Sort cap points by angle around the centroid in the `(basis_u, basis_v)`
-/// plane, walking the convex perimeter once (the centroid is interior).
+/// plane into `ordered`, walking the convex perimeter once (the centroid is
+/// interior). `keys` carries the angle per point so `atan2` runs once each
+/// rather than once per comparison.
 fn order_around_centroid(
     points: &[Vec3],
     centroid: Vec3,
     basis_u: Vec3,
     basis_v: Vec3,
-) -> Vec<Vec3> {
-    let mut indexed: Vec<(usize, f32)> = points
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let off = *p - centroid;
-            let angle = off.dot(basis_v).atan2(off.dot(basis_u));
-            (i, angle)
-        })
-        .collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    indexed.into_iter().map(|(i, _)| points[i]).collect()
+    keys: &mut Vec<(usize, f32)>,
+    ordered: &mut Vec<Vec3>,
+) {
+    keys.clear();
+    keys.extend(points.iter().enumerate().map(|(i, p)| {
+        let off = *p - centroid;
+        let angle = off.dot(basis_v).atan2(off.dot(basis_u));
+        (i, angle)
+    }));
+    // Unstable so the sort itself cannot allocate: a stable sort falls back to
+    // a scratch buffer above its insertion-sort threshold. Ties are coincident
+    // cap points, which the slice perturbation already rules out.
+    keys.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    ordered.clear();
+    ordered.extend(keys.iter().map(|&(i, _)| points[i]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,6 +1361,72 @@ mod tests {
                 "section face vertex {i} has color {c:?}, expected {color:?}"
             );
         }
+    }
+
+    // ----------------- Section perimeter, append form -----------------------
+
+    /// The append form emits the by-value overlay's perimeter exactly, segment
+    /// for segment: dropping the fill half changes no outline geometry. Run
+    /// against a reused scratch so a stale cap buffer would show up as a
+    /// divergence rather than as silent extra points.
+    #[test]
+    fn perimeter_append_matches_the_by_value_overlay_perimeter() {
+        let mut scratch = SectionScratch::default();
+        for polytope in Polytope4::ALL {
+            for w in [-0.3_f32, 0.0, 0.42] {
+                let slice = loam_math::WPlane::new(w);
+                let topo = polytope.topology();
+                let (_, expected) = polytope4_section_overlay(polytope, slice);
+
+                let mut appended = crate::LineMesh::<3>::default();
+                polytope_section_perimeter_append(
+                    topo.edges,
+                    topo.cells,
+                    topo.vertices,
+                    slice,
+                    &mut scratch,
+                    &mut appended,
+                );
+
+                assert_eq!(
+                    appended.segments, expected.segments,
+                    "{polytope:?} at w = {w}: appended perimeter geometry diverged"
+                );
+                assert_eq!(appended.colors, expected.colors);
+                assert_eq!(appended.widths, expected.widths);
+            }
+        }
+    }
+
+    /// The append form appends: a second call over the same body leaves the
+    /// first call's segments in place and repeats them, so a caller merging a
+    /// row of bodies into one mesh keeps every body's outline.
+    #[test]
+    fn perimeter_append_concatenates_instead_of_replacing() {
+        let slice = loam_math::WPlane::new(0.1);
+        let topo = Polytope4::Cell24.topology();
+        let mut scratch = SectionScratch::default();
+        let mut mesh = crate::LineMesh::<3>::default();
+        let append = |scratch: &mut SectionScratch, out: &mut crate::LineMesh<3>| {
+            polytope_section_perimeter_append(
+                topo.edges,
+                topo.cells,
+                topo.vertices,
+                slice,
+                scratch,
+                out,
+            );
+        };
+
+        append(&mut scratch, &mut mesh);
+        let single = mesh.segments.len();
+        assert!(single > 0, "the fixture emitted no perimeter");
+        append(&mut scratch, &mut mesh);
+
+        assert_eq!(mesh.segments.len(), 2 * single);
+        assert_eq!(mesh.segments[..single], mesh.segments[single..]);
+        assert_eq!(mesh.widths.len(), mesh.segments.len());
+        assert_eq!(mesh.colors.len(), mesh.segments.len());
     }
 
     // ----------------- Cross-validation: section perimeter vs SDF surface ---
