@@ -108,21 +108,25 @@ use wireframe_geom::*;
 /// Per-cell "crossing strength" in `[0, 1]`: 1 at the cell's w-midpoint
 /// (widest cap), 0 outside its w-range, linear in `|w_slice - midpoint|`
 /// over the half-extent. A cheap proxy for cap area, shared by
-/// `render_wireframe_overlay` and `render_points`.
-fn compute_cell_strengths(cells: &[&[u32]], local_vertices: &[Vec4], w_slice: f32) -> Vec<f32> {
-    cells
-        .iter()
-        .map(|cell| {
-            let (w_min, w_max) = cell_w_range(cell, local_vertices);
-            let half_extent = (w_max - w_min) * 0.5;
-            if half_extent <= 0.0 {
-                return 0.0;
-            }
-            let mid = (w_min + w_max) * 0.5;
-            let dist = (w_slice - mid).abs();
-            (1.0 - dist / half_extent).clamp(0.0, 1.0)
-        })
-        .collect()
+/// `render_wireframe_overlay` and `render_points`. `out` is cleared on entry
+/// and reuses the caller's allocation.
+fn compute_cell_strengths(
+    cells: &[&[u32]],
+    local_vertices: &[Vec4],
+    w_slice: f32,
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.extend(cells.iter().map(|cell| {
+        let (w_min, w_max) = cell_w_range(cell, local_vertices);
+        let half_extent = (w_max - w_min) * 0.5;
+        if half_extent <= 0.0 {
+            return 0.0;
+        }
+        let mid = (w_min + w_max) * 0.5;
+        let dist = (w_slice - mid).abs();
+        (1.0 - dist / half_extent).clamp(0.0, 1.0)
+    }));
 }
 
 #[cfg(test)]
@@ -303,6 +307,7 @@ impl Demo {
             wireframe_width_px: 1.8,
             wireframe_alpha: 1.0,
             unique_edge_palette_cache: std::collections::HashMap::new(),
+            cell_centers_cache: std::collections::HashMap::new(),
             surface_scale: 1.0,
             floor_enabled: true,
             section_faces,
@@ -320,6 +325,11 @@ impl Demo {
             section_faces_mesh_scratch: loam_shape::TriangleMesh::<3>::default(),
             body_uniform_scratch: Vec::new(),
             slerp_scratch: Vec::new(),
+            wireframe_section_edges_scratch: LineMesh::<3>::default(),
+            wireframe_parent_lines_scratch: LineMesh::<3>::default(),
+            overlay_local_vertices_scratch: Vec::new(),
+            overlay_center_locals_scratch: Vec::new(),
+            overlay_cell_strengths_scratch: Vec::new(),
             surface_mode,
             row,
             w_slice: initial_w,
@@ -899,6 +909,13 @@ mod color_tests {
 
     // ---- compute_cell_strengths -----------------------------------------
 
+    /// The into-form as an expression; the render path passes a retained buffer.
+    fn strengths_of(cells: &[&[u32]], local_vertices: &[Vec4], w_slice: f32) -> Vec<f32> {
+        let mut out = Vec::new();
+        compute_cell_strengths(cells, local_vertices, w_slice, &mut out);
+        out
+    }
+
     /// Slice at the cell's w-midpoint produces strength = 1 (cap is widest there).
     #[test]
     fn cell_strength_at_midpoint_is_one() {
@@ -908,7 +925,7 @@ mod color_tests {
             glam::Vec4::new(0.0, 0.0, 0.0, -0.5),
             glam::Vec4::new(0.0, 0.0, 0.0, 0.5),
         ];
-        let strengths = compute_cell_strengths(&cells, &local_vertices, 0.0);
+        let strengths = strengths_of(&cells, &local_vertices, 0.0);
         assert_eq!(strengths.len(), 1);
         assert!((strengths[0] - 1.0).abs() < 1e-5);
     }
@@ -921,7 +938,7 @@ mod color_tests {
             glam::Vec4::new(0.0, 0.0, 0.0, -0.5),
             glam::Vec4::new(0.0, 0.0, 0.0, 0.5),
         ];
-        let strengths = compute_cell_strengths(&cells, &local_vertices, 5.0);
+        let strengths = strengths_of(&cells, &local_vertices, 5.0);
         assert!(strengths[0].abs() < 1e-5);
     }
 
@@ -935,7 +952,7 @@ mod color_tests {
         ];
         // Slice exactly at the +w extreme: dist = 0.5, half_extent = 0.5,
         // strength = 1 - 1 = 0.
-        let strengths = compute_cell_strengths(&cells, &local_vertices, 0.5);
+        let strengths = strengths_of(&cells, &local_vertices, 0.5);
         assert!(strengths[0].abs() < 1e-5);
     }
 
@@ -949,7 +966,7 @@ mod color_tests {
             glam::Vec4::new(0.0, 0.0, 0.0, 0.5),
         ];
         // midpoint = 0, half_extent = 0.5; slice at 0.25 -> dist 0.25 -> 1 - 0.5 = 0.5.
-        let strengths = compute_cell_strengths(&cells, &local_vertices, 0.25);
+        let strengths = strengths_of(&cells, &local_vertices, 0.25);
         assert!((strengths[0] - 0.5).abs() < 1e-5);
     }
 
@@ -963,7 +980,7 @@ mod color_tests {
             glam::Vec4::new(0.0, 0.0, 0.0, 0.0),
             glam::Vec4::new(1.0, 0.0, 0.0, 0.0),
         ];
-        let strengths = compute_cell_strengths(&cells, &local_vertices, 0.0);
+        let strengths = strengths_of(&cells, &local_vertices, 0.0);
         assert!(strengths[0].abs() < 1e-5);
     }
 }
@@ -1406,7 +1423,8 @@ mod hyperslice_filter_tests {
         let cells: &[&[u32]] = &[cell];
         let edges: &[[u32; 2]] = &[[0, 1], [0, 2], [1, 3], [2, 3]];
 
-        let strengths = compute_cell_strengths(cells, &local_vertices, w_slice);
+        let mut strengths = Vec::new();
+        compute_cell_strengths(cells, &local_vertices, w_slice, &mut strengths);
         assert!(
             strengths[0] > 0.0,
             "the cell must be active for this contract to mean anything"
@@ -1468,7 +1486,8 @@ mod hyperslice_filter_tests {
         assert_eq!((w_min, w_max), (-0.3, 0.7), "fold picks the w extremes");
 
         let mid = (w_min + w_max) * 0.5;
-        let strengths = compute_cell_strengths(cells, &local_vertices, mid);
+        let mut strengths = Vec::new();
+        compute_cell_strengths(cells, &local_vertices, mid, &mut strengths);
         assert_eq!(
             strengths[0], 1.0,
             "strength at the cell's w-midpoint is the gradient peak"
