@@ -22,15 +22,27 @@ use crate::space::{Space, WgslSpace};
 const POINCARE_R2_MAX: f32 = 1.0 - 1e-7;
 
 /// Clamp an out-of-domain point onto the saturation shell. Never NaN or panic.
+///
+/// The scale factor is two square roots, a divide and three products, each
+/// rounding, so `p * (sqrt(R2MAX)/sqrt(r2))` lands outside the shell for about
+/// a third of out-of-ball directions, overshooting `|q|² = 1` by up to 2.4e-7.
+/// That is enough for a caller to see `1 + a·b` round to exactly zero, which
+/// is why the postcondition is enforced rather than assumed: downstream code
+/// derives its own bounds from `|q|² <= POINCARE_R2_MAX` and divides by them.
+/// The loop is a nudge of one ulp per pass and terminates in at most two on
+/// the out-of-domain path.
 fn clamp_to_ball(p: Vec3) -> Vec3 {
     let r2 = p.length_squared();
     if r2 <= POINCARE_R2_MAX {
-        p
-    } else {
-        #[cfg(debug_assertions)]
-        tracing::warn!("HyperbolicH3: point outside Poincaré ball clamped (|p|²={r2:.4})");
-        p * (POINCARE_R2_MAX.sqrt() / r2.sqrt())
+        return p;
     }
+    #[cfg(debug_assertions)]
+    tracing::warn!("HyperbolicH3: point outside Poincaré ball clamped (|p|²={r2:.4})");
+    let mut q = p * (POINCARE_R2_MAX.sqrt() / r2.sqrt());
+    while q.length_squared() > POINCARE_R2_MAX {
+        q *= 1.0 - f32::EPSILON;
+    }
+    q
 }
 
 /// An orientation- and time-orientation-preserving isometry of H³: a 4×4 Lorentz

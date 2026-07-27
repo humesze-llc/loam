@@ -750,7 +750,11 @@ mod invariants {
                     let ladder = pole_ladder(f, &s, a, b, v);
                     let residual = metric_residual(f, b, s.parallel_transport(a, b, v), ladder);
                     let ratio = residual / (tol.vector * metric_norm(f, b, ladder).max(1.0));
-                    if ratio > worst.0 {
+                    // `!(ratio <= worst.0)` rather than `ratio > worst.0`: a NaN
+                    // ratio compares false against everything, so the ordinary
+                    // form would leave `worst` at its seed and report the item
+                    // green on a transport that returned NaN.
+                    if !(ratio <= worst.0) {
                         worst = (ratio, a, b, v);
                     }
                 }
@@ -979,7 +983,8 @@ mod invariants {
                 let transported = s.parallel_transport(a, b, s.log(a, b));
                 let residual = metric_residual(f, b, transported, forward);
                 let ratio = residual / (tol.vector * metric_norm(f, b, forward).max(1.0));
-                if ratio > worst.0 {
+                // NaN-safe, for the reason given at the ladder item above.
+                if !(ratio <= worst.0) {
                     worst = (ratio, a, b);
                 }
             }
@@ -1454,12 +1459,21 @@ impl SpaceFixture for HyperbolicH3Fixture {
         // arguments and the conformal ratio is a value over itself, so the
         // transported vector is bit-identical to the input on any IEEE target.
         let near_boundary = Vec3::new(0.85, 0.0, 0.0);
+        // Off-axis and outside, chosen because it is one of the ~34% of
+        // out-of-ball directions whose naive clamp overshoots: the scale factor
+        // is two square roots, a divide and three products, and this direction
+        // rounds back to `|q|² == 1.0` exactly. `gyr_apply(q, -q, v)` then has
+        // `1 + a·b == 0` and a zero axis, so an unenforced clamp postcondition
+        // returns NaN here. Every other out-of-domain sample above is
+        // axis-aligned, which is the benign case.
+        let off_axis_outside = Vec3::new(1.2, 0.9, 1.4);
         vec![
             (interior, interior),
             (interior, Vec3::new(1.0, 0.0, 0.0)),
             (interior, Vec3::new(2.0, 0.0, 0.0)),
             (Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
             (near_boundary, -near_boundary),
+            (off_axis_outside, off_axis_outside),
         ]
     }
 
