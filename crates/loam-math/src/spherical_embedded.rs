@@ -24,9 +24,32 @@ use crate::EuclideanR4;
 
 /// Floor on the tangent-direction norm below which a geodesic has no defined
 /// direction: near-coincident (`p1 ≈ p0`) or near-antipodal (`p1 ≈ −p0`, the
-/// great circle is non-unique). Also gates `exp` / `log`. Matches the hemisphere
-/// model's floor so the two S³ impls agree on "too close to have a direction."
-const GEODESIC_EPSILON: f32 = 1e-7;
+/// great circle is non-unique). Conditioning class: direction recovery, the
+/// same class and value as the hemisphere model's `LOG_PERP_MIN`, so the two S³
+/// impls agree on "too close to have a direction"; at `1e-7` the residual is
+/// one f32 ulp of a coordinate of order 1 and its direction is rounding.
+///
+/// Reading the residual as `sin(ω)` assumes unit points. That is the contract
+/// on [`SphericalS3Embedded`], enforced at the two entrances that produce
+/// points ([`RasterizableSpace::array_to_point`] normalizes, [`Space::iso_apply`]
+/// re-normalizes to shed drift) and deliberately not re-checked per call; the
+/// guards themselves are norm comparisons and stay finite for any input.
+const GEODESIC_DIRECTION_MIN: f32 = 1e-7;
+
+/// Floor on the transport denominator `|from + to|² / 2`. Conditioning class:
+/// divisor floor on a squared quantity, which is why it is its own constant
+/// despite sharing [`GEODESIC_DIRECTION_MIN`]'s value: compared against a
+/// square, `1e-7` engages at `|from + to| = 4.5e-4`, an arc within 4.5e-4 rad
+/// of the antipodal cut locus where parallel transport is genuinely undefined
+/// and any finite answer is a choice rather than an approximation.
+///
+/// The arc reading, and the equality with `1 + ⟨from, to⟩`, assume unit points
+/// on the same contract as [`GEODESIC_DIRECTION_MIN`]; a non-unit pair scales
+/// the denominator by `|from|·|to|` and moves where the floor engages. Unlike
+/// the hemisphere model, whose chart floors `w` and so bounds this denominator
+/// below without a guard, `Point = Vec4` makes `from = −to` exactly
+/// representable, so the floor is load-bearing here.
+const TRANSPORT_DENOM_MIN: f32 = 1e-7;
 
 /// Spherical 3-space, full ambient embedding, curvature `K = +1`.
 ///
@@ -55,7 +78,7 @@ impl Space for SphericalS3Embedded {
         // the caller's vector drifted off-tangent.
         let v_tan = v - v.dot(at) * at;
         let theta = v_tan.length();
-        if theta < GEODESIC_EPSILON {
+        if theta < GEODESIC_DIRECTION_MIN {
             return at;
         }
         // Unit-sphere exponential cos(θ)·at + sin(θ)·v̂; `at` and `v_tan/θ` are
@@ -71,7 +94,7 @@ impl Space for SphericalS3Embedded {
         let dot = from.dot(to).clamp(-1.0, 1.0);
         let perp = to - dot * from;
         let n = perp.length();
-        if n < GEODESIC_EPSILON {
+        if n < GEODESIC_DIRECTION_MIN {
             // Coincident or antipodal: no defined tangent.
             return Vec4::ZERO;
         }
@@ -90,7 +113,7 @@ impl Space for SphericalS3Embedded {
         // `2·cos²(θ/2)` half-angle identity, same principle as the chord-form
         // distance).
         let sum = from + to;
-        let denom = (sum.length_squared() * 0.5).max(GEODESIC_EPSILON);
+        let denom = (sum.length_squared() * 0.5).max(TRANSPORT_DENOM_MIN);
         v - (v.dot(to) / denom) * sum
     }
 
@@ -176,7 +199,7 @@ impl RasterizableSpace<4> for SphericalS3Embedded {
         let perp = p1 - dot * p0;
         let n = perp.length();
         out.push(p0);
-        if n > GEODESIC_EPSILON {
+        if n > GEODESIC_DIRECTION_MIN {
             let dir = perp / n;
             for i in 1..samples {
                 let t = i as f32 / samples as f32;
@@ -407,7 +430,9 @@ mod tests {
     #[test]
     fn slerp_near_antipode_samples_stay_on_sphere() {
         let p0 = Vec4::X;
-        for delta in [1e-3_f32, 1e-5, 2e-7] {
+        // The tightest is `sin(ω)` at twice the gate, so it stays on the
+        // passing side of it whatever the gate is retuned to.
+        for delta in [1e-3_f32, 1e-5, GEODESIC_DIRECTION_MIN * 2.0] {
             let omega = PI - delta;
             let p1 = Vec4::new(omega.cos(), omega.sin(), 0.0, 0.0).normalize();
             let mut out = Vec::new();
@@ -486,8 +511,8 @@ mod tests {
     #[test]
     fn slerp_near_coincident_falls_back_on_sphere() {
         let p0 = Vec4::new(0.1, -0.2, 0.3, 0.9).normalize();
-        // omega well below GEODESIC_EPSILON.
-        let p1 = (p0 + Vec4::new(1e-9, 0.0, -1e-9, 0.0)).normalize();
+        let nudge = GEODESIC_DIRECTION_MIN * 0.01;
+        let p1 = (p0 + Vec4::new(nudge, 0.0, -nudge, 0.0)).normalize();
         let mut out = Vec::new();
         <SphericalS3Embedded as RasterizableSpace<4>>::tessellate_segment(p0, p1, 8, &mut out);
         for p in &out {
