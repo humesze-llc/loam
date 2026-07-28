@@ -310,11 +310,11 @@ fn polytope_section_overlay_with_vertices(
     (tri_mesh, edge_mesh)
 }
 
-/// Append variant of [`polytope_section_overlay_with_vertices`]'s perimeter
-/// half: writes cap-boundary segments into a caller-owned mesh and borrows the
-/// per-cell working set, so a per-frame overlay stops reaching the allocator
-/// once both have grown to their steady size. Callers wanting the translucent
-/// fill as well run [`polytope_section_faces_append`] over the same inputs.
+/// Append form of the section perimeter: writes cap-boundary segments into a
+/// caller-owned mesh and borrows the per-cell working set, so a per-frame
+/// overlay stops reaching the allocator once both have grown to their steady
+/// size. Callers wanting the translucent fill as well run
+/// [`polytope_section_faces_append`] over the same inputs.
 pub fn polytope_section_perimeter_append(
     edges: &[[u32; 2]],
     cells: &[&[u32]],
@@ -395,8 +395,8 @@ fn polytope_section_faces_with_vertices(
     tri_mesh
 }
 
-/// Append variant of [`polytope_section_faces_with_vertices`]: writes into a
-/// caller-owned mesh, offsetting indices by the existing vertex count, so
+/// Append form of the section faces: writes into a caller-owned mesh,
+/// offsetting indices by the existing vertex count, so
 /// per-frame hot paths can merge many bodies into one reused scratch mesh
 /// instead of growing a fresh one per body. On an empty mesh it equals the
 /// non-append variant. Takes its [`SectionScratch`] from the caller, matching
