@@ -180,14 +180,15 @@ struct Slot {
 /// reorder: `swap`, `reverse`, `sort_unstable_by_key` and the rest no longer
 /// resolve on an arena.
 ///
-/// It is not a seal, and the type cannot make it one. Every remaining
-/// accessor hands out a `&mut RigidBody<S>`, and two of them reach a
-/// permutation: [`Self::iter_mut`] yields items whose lifetimes are
-/// independent of the iterator, so `mem::swap` on two of them typechecks;
-/// [`Self::get_mut`] and the [`IndexMut`] impls forbid that pair, but
-/// `mem::replace` through a filler body reaches the same state in three
-/// statements. Keeping dense positions in the order the arena assigned them
-/// is the caller's contract, not an invariant this type enforces.
+/// It is not a seal, and the type cannot make it one. [`Self::iter_mut`]
+/// returns `std::slice::IterMut`, whose `into_slice` hands back the whole
+/// `&mut [RigidBody<S>]`, so `arena.iter_mut().into_slice().reverse()` is one
+/// expression that restores everything dropping `DerefMut` removed. Two of its
+/// items held at once and `mem::swap`ped is a second route, and `mem::replace`
+/// through a filler body reaches the same state through [`Self::get_mut`] or
+/// the [`IndexMut`] impls in three statements. Keeping dense positions in the
+/// order the arena assigned them is the caller's contract, not an invariant
+/// this type enforces.
 ///
 /// The three `compile_fail` blocks below share the hidden setup of the passing
 /// one, so each fails on its visible line and not on its fixture.
@@ -334,20 +335,20 @@ impl<S: PhysicsSpace> BodyArena<S> {
 
     /// Mutable iteration in dense order: per-body edits without a handle.
     ///
-    /// Edit bodies in place; do not move them between items. The items
-    /// borrow the slice, not the iterator, so two can be held at once and
-    /// swapped, and that permutes the dense slice without the slot table
-    /// following, which is the desynchronization [`BodyArena`] describes.
-    /// Dropping [`DerefMut`](std::ops::DerefMut) made that deliberate rather
-    /// than a one-token slip; it did not make it impossible.
+    /// Edit bodies in place; do not move them between items. Two routes out
+    /// of this iterator permute the dense slice without the slot table
+    /// following, which is the desynchronization [`BodyArena`] describes:
+    /// `into_slice` returns the whole `&mut [RigidBody<S>]`, and the items
+    /// borrow the slice rather than the iterator, so two can be held at once
+    /// and swapped. Dropping [`DerefMut`](std::ops::DerefMut) made that
+    /// deliberate rather than a one-token slip; it did not make it impossible.
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, RigidBody<S>> {
         self.dense.iter_mut()
     }
 
     /// The dense slice, mutable. Split-borrowing the two bodies of a contact
     /// needs it and cannot go through [`Self::get_mut`] twice; it does not
-    /// leave the crate, where the phase loops are the only callers and none of
-    /// them permutes.
+    /// leave the crate, and no in-crate caller permutes.
     pub(crate) fn dense_mut(&mut self) -> &mut [RigidBody<S>] {
         &mut self.dense
     }
@@ -724,6 +725,27 @@ mod tests {
             Vec3::Y,
             "the handle stopped naming the body it was minted for, and no \
              arena query reports it"
+        );
+        assert_eq!(arena[second].position, Vec3::X);
+    }
+
+    /// The cheapest route back to a permutation, and the one the type doc has
+    /// to name: `IterMut::into_slice` returns the whole `&mut [RigidBody<S>]`,
+    /// so a single expression restores every method dropping `DerefMut`
+    /// removed. Pinned so the doc cannot drift into claiming a seal.
+    #[test]
+    fn into_slice_reopens_every_reordering_method_in_one_expression() {
+        let mut arena = BodyArena::new();
+        let first = arena.spawn(body_r3(Vec3::X, 1.0, 1.0));
+        let second = arena.spawn(body_r3(Vec3::Y, 1.0, 1.0));
+
+        arena.iter_mut().into_slice().reverse();
+
+        assert_eq!(arena.id_at(0), first, "the slot table did not follow");
+        assert_eq!(
+            arena[first].position,
+            Vec3::Y,
+            "one expression desynchronized the handle from its body"
         );
         assert_eq!(arena[second].position, Vec3::X);
     }

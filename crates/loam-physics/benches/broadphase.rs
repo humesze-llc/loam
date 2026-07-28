@@ -4,12 +4,12 @@
 //! Three timings per size, because "the sweep is Nx faster" means two different
 //! things depending on the denominator.
 //!
-//! `ap_ns` is the broadphase the sweep replaced: every pair that is not
-//! two static bodies, with no distance test and no sort. A speedup claim for
-//! the sweep is a claim over this, and it is also what the narrowphase used to
-//! be handed, so `ap/emitted` is the factor by which the narrowphase's
-//! input shrank. That is where the larger win lives, since the narrowphase runs
-//! GJK per emitted pair.
+//! `ap_ns` is the broadphase the sweep replaced: every pair that is not two
+//! static bodies, with no distance test and no sort. A speedup claim for the
+//! sweep is a claim over this, and it is also what the narrowphase used to be
+//! handed, so `ap/emitted` is the factor by which the narrowphase's input
+//! shrank. That is where the win lives, since the narrowphase runs GJK per
+//! emitted pair.
 //!
 //! `scan_ns` is the harder denominator: the sweep's own candidate predicate
 //! with no acceleration structure, radii hoisted out of the quadratic loop so
@@ -17,35 +17,38 @@
 //! to hoist. The scan already does the culling the sweep is credited for above,
 //! so `scan/sweep` isolates what the sort buys over identical output.
 //!
-//! All three grow an owned `Vec<PairKey>` inside the timed region. The sweep is
-//! not otherwise handed the same deal: `World::broadphase` allocates the two
-//! sweep scratch buffers per call where the step reuses buffers the world
-//! retains, so `sweep_ns` is an upper bound on what a step pays. The sweep's
-//! output is asserted equal to the scan's and contained in the all-pairs set,
-//! the only relation that holds against a denominator with no distance test.
+//! Both denominators fill caller-owned buffers, because the code the sweep
+//! replaced filled the world's retained `pair_order` rather than a fresh `Vec`.
+//! Timing them against an owned allocation inflates them in proportion to their
+//! output, and at 131x the emitted count that is most of the measurement. The
+//! sweep is deliberately left on `World::broadphase`, which allocates its two
+//! scratch buffers and its output per call where a step reuses all three, so
+//! `sweep_ns` is an upper bound and every ratio below is a floor.
 //!
 //! Measured on a 13th Gen Intel Core i9-13980HX, Windows 11 Pro 10.0.26200,
 //! rustc 1.95.0, `cargo bench` (opt-level 3, no debug assertions). Each cell is
-//! the median over seven process runs. Run-to-run spread is large and bimodal
-//! at 101 and 201 bodies: `ap_ns` at 101 was observed from 12 to 55
-//! microseconds, and at 201 from 34 to 103, splitting around 50k and 89k. Only
-//! the 401 row is stable, within 1.2x. Read the 101 and 201 ratios as an order
-//! of magnitude, not a figure; the shape, ap/sweep growing with body
-//! count, is what survives the noise.
+//! the median of five process runs, each itself the median of nine batches.
+//! Run-to-run spread is within 1.1x on every cell.
 //!
 //! ```text
 //! bodies  emitted  ap_pairs  sweep_ns  scan_ns   ap_ns  scan/sweep  ap/sweep  ap/emitted
-//!    101      160      5050      9946     6907   31698        0.7x      3.2x         32x
-//!    201      312     20100     26848    24770   95717        0.9x      3.6x         64x
-//!    401      611     80200     74506    89880  563359        1.2x      7.6x        131x
+//!    101      160      5050      9585     6852    7107        0.7x      0.7x         32x
+//!    201      312     20100     24724    24290   28296        1.0x      1.1x         64x
+//!    401      611     80200     63976    91855  113825        1.4x      1.8x        131x
 //! ```
 //!
-//! The sweep's win over the broadphase it replaced grows with the body count,
-//! 3.2x to 7.6x over a 4x range, so what it buys is the acceleration structure
-//! and not a fixed overhead difference. Against the identical-predicate scan it
-//! is behind at 101 bodies and only crosses over near 401, so at these sizes
-//! the sweep's lead is the pairs it never emits and not the pairs it never
-//! tests. Whether the interval sort or the active-list churn dominates that
+//! The sweep does not pay for itself in wall-clock time at these sizes. It is
+//! slower than the broadphase it replaced at 101 bodies, break-even at 201, and
+//! only 1.8x ahead at 401; against the identical-predicate scan it crosses over
+//! later still. The ratios do grow with body count, which is the acceleration
+//! structure doing what it is for, but 400 bodies is well short of where that
+//! growth pays the sort back.
+//!
+//! What the sweep actually buys is `ap/emitted`: 32x to 131x fewer pairs handed
+//! to the narrowphase, which runs GJK on each one. That is the number the
+//! change was worth making for, and it is the one that is not close.
+//!
+//! Whether the interval sort or the active-list churn dominates the sweep's own
 //! overhead is unmeasured.
 
 use std::hint::black_box;
@@ -158,13 +161,15 @@ fn bounding_radius(collider: &Collider) -> f32 {
 
 /// The candidate definition without an acceleration structure: every pair that
 /// is not two static bodies and whose bounding balls overlap.
-fn scan(world: &World<EuclideanR3>) -> Vec<PairKey> {
-    let radii: Vec<f32> = world
-        .bodies
-        .iter()
-        .map(|body| bounding_radius(&body.collider))
-        .collect();
-    let mut pairs = Vec::new();
+fn scan(world: &World<EuclideanR3>, radii: &mut Vec<f32>, pairs: &mut Vec<PairKey>) {
+    radii.clear();
+    radii.extend(
+        world
+            .bodies
+            .iter()
+            .map(|body| bounding_radius(&body.collider)),
+    );
+    pairs.clear();
     let n = world.bodies.len();
     for i in 0..n {
         for j in (i + 1)..n {
@@ -178,15 +183,14 @@ fn scan(world: &World<EuclideanR3>) -> Vec<PairKey> {
         }
     }
     pairs.sort_unstable();
-    pairs
 }
 
 /// The broadphase the sweep replaced: every pair that is not two static bodies,
 /// with no bounding test and no sort. The scene never despawns, so handles
 /// ascend with storage order and this emission is already sorted; dropping the
 /// sort is faithful to the original rather than a head start.
-fn all_pairs(world: &World<EuclideanR3>) -> Vec<PairKey> {
-    let mut pairs = Vec::new();
+fn all_pairs(world: &World<EuclideanR3>, pairs: &mut Vec<PairKey>) {
+    pairs.clear();
     let n = world.bodies.len();
     for i in 0..n {
         for j in (i + 1)..n {
@@ -196,7 +200,6 @@ fn all_pairs(world: &World<EuclideanR3>) -> Vec<PairKey> {
             pairs.push(canonical(world.bodies.id_at(i), world.bodies.id_at(j)));
         }
     }
-    pairs
 }
 
 fn canonical(a: BodyId, b: BodyId) -> PairKey {
@@ -227,59 +230,61 @@ fn median_nanos(mut body: impl FnMut()) -> f64 {
 
 fn main() {
     println!(
-        "bodies emitted allpairs sweep_ns scan_ns allpairs_ns \
-         scan/sweep allpairs/sweep allpairs/emitted"
+        "bodies emitted ap_pairs sweep_ns scan_ns ap_ns          scan/sweep ap/sweep ap/emitted"
     );
+    let mut radii = Vec::new();
+    let mut scan_out = Vec::new();
+    let mut ap_out = Vec::new();
     for count in BODY_COUNTS {
         let world = settled_scene(count);
         let emitted = world.broadphase();
+        scan(&world, &mut radii, &mut scan_out);
         assert_eq!(
-            emitted,
-            scan(&world),
-            "{count}: the sweep and the scan disagree, so the timings below \
-             compare different work"
+            emitted, scan_out,
+            "{count}: the sweep and the scan disagree, so the timings below              compare different work"
         );
 
-        let mut baseline = all_pairs(&world);
+        all_pairs(&world, &mut ap_out);
         let n = world.bodies.len();
         assert_eq!(
-            baseline.len(),
+            ap_out.len(),
             n * (n - 1) / 2,
-            "{count}: the baseline dropped a pair, so it is culling and is no \
-             longer the unaccelerated denominator"
+            "{count}: the baseline dropped a pair, so it is culling and is no              longer the unaccelerated denominator"
         );
+        let mut baseline = ap_out.clone();
         baseline.sort_unstable();
         assert!(
             emitted
                 .iter()
                 .all(|key| baseline.binary_search(key).is_ok()),
-            "{count}: the sweep emits a pair the baseline never did, so the \
-             ratio below is not a pruning factor"
+            "{count}: the sweep emits a pair the baseline never did, so the              ratio below is not a pruning factor"
         );
 
         // One untimed pass each, so the timed loop measures a warm cache and
-        // not the scene's first-touch faults.
+        // not the scene's first-touch faults, and so both denominators enter
+        // the timed region with their buffers already at steady size.
         black_box(world.broadphase());
-        black_box(scan(&world));
-        black_box(all_pairs(&world));
+        scan(&world, &mut radii, &mut scan_out);
+        all_pairs(&world, &mut ap_out);
 
         let sweep_ns = median_nanos(|| {
             black_box(world.broadphase());
         });
         let scan_ns = median_nanos(|| {
-            black_box(scan(&world));
+            scan(&world, &mut radii, &mut scan_out);
+            black_box(&scan_out);
         });
-        let allpairs_ns = median_nanos(|| {
-            black_box(all_pairs(&world));
+        let ap_ns = median_nanos(|| {
+            all_pairs(&world, &mut ap_out);
+            black_box(&ap_out);
         });
 
         println!(
-            "{n:6} {:7} {:8} {sweep_ns:8.0} {scan_ns:7.0} {allpairs_ns:11.0} \
-             {:9.1}x {:13.1}x {:15.0}x",
+            "{n:6} {:7} {:8} {sweep_ns:8.0} {scan_ns:7.0} {ap_ns:11.0}              {:9.1}x {:13.1}x {:15.0}x",
             emitted.len(),
             baseline.len(),
             scan_ns / sweep_ns,
-            allpairs_ns / sweep_ns,
+            ap_ns / sweep_ns,
             baseline.len() as f64 / emitted.len() as f64,
         );
     }

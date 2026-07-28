@@ -503,6 +503,10 @@ impl<S: PhysicsSpace> World<S> {
         for unit in &units {
             #[cfg(test)]
             self.visit_log.prepare_solve.push(unit.key);
+            // The hoist replaced a `dense_index(..).expect(..)` that would have
+            // panicked on a stale handle. This keeps that alarm in debug builds
+            // without paying the lookup in release.
+            debug_assert_eq!(unit.dense, self.dense_pair(unit.key));
             let (i, j) = unit.dense;
             let manifold = self
                 .manifolds
@@ -550,6 +554,7 @@ impl<S: PhysicsSpace> World<S> {
         for unit in &units {
             #[cfg(test)]
             self.visit_log.warm_start.push(unit.key);
+            debug_assert_eq!(unit.dense, self.dense_pair(unit.key));
             let (i, j) = unit.dense;
             let manifold = self.manifolds.get(&unit.key).expect(STALE_CONSTRAINT_KEY);
             let (a, b) = split_two_mut(self.bodies.dense_mut(), i, j);
@@ -582,6 +587,7 @@ impl<S: PhysicsSpace> World<S> {
             for unit in &units {
                 #[cfg(test)]
                 self.visit_log.solve_sweeps.push(unit.key);
+                debug_assert_eq!(unit.dense, self.dense_pair(unit.key));
                 let (i, j) = unit.dense;
                 let manifold = self
                     .manifolds
@@ -785,17 +791,18 @@ impl<S: PhysicsSpace> World<S> {
     }
 
     /// Storage positions of a key's two bodies, in the key's own order. Both
-    /// resolve, but as a property of the four callers rather than of the
-    /// manifold map: `update_manifolds` passes keys its own broadphase minted
-    /// from the live arena this step, and the three solve phases pass
-    /// `constraint_keys`, filled after that phase evicted every key it did not
-    /// touch.
+    /// resolve, but as a property of the three callers rather than of the
+    /// manifold map: `update_manifolds` and `collect_constraints` pass keys the
+    /// broadphase minted from the live arena this step, and [`Self::islands`]
+    /// walks the map after `update_manifolds` has evicted every key it did not
+    /// touch. The solve phases do not come here at all; they read the dense
+    /// pair `collect_constraints` cached on each [`ConstraintUnit`].
     ///
     /// The map itself carries no such guarantee. `despawn_body` prunes it, but
     /// [`BodyArena::despawn`] is reachable on `bodies` directly and does not,
     /// so between one of those and the next `update_manifolds` the map can name
-    /// a dead body. Nothing in that window reaches here; [`Self::islands`],
-    /// which walks the map, is where it surfaces as a panic.
+    /// a dead body. [`Self::islands`] called in that window is where it
+    /// surfaces, as a panic rather than a wrong answer.
     fn dense_pair(&self, key: PairKey) -> (usize, usize) {
         (
             self.bodies.dense_index(key.0).expect(STALE_MANIFOLD_BODY),
