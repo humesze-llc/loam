@@ -123,10 +123,10 @@ pub fn gjk_intersect_r4<A: SupportFn4, B: SupportFn4>(
     simplex.push(minkowski_support_r4(a, b, dir));
     dir = -simplex[0].point;
 
-    // ---- Phase 1: standard GJK, searching toward the origin.
+    // ---- Stage 1: standard GJK, searching toward the origin.
     // Terminates when either (a) a new support fails to cross the origin along the search
     // direction (-> Separated) or (b) the current simplex's closest-point to origin is already
-    // at the origin (-> shapes intersect, exit to Phase 2 to grow the simplex to 5 points for
+    // at the origin (-> shapes intersect, exit to stage 2 to grow the simplex to 5 points for
     // EPA).
     for _ in 0..GJK_MAX_ITERATIONS {
         if dir.length_squared() < GJK_EPS {
@@ -164,7 +164,7 @@ pub fn gjk_intersect_r4<A: SupportFn4, B: SupportFn4>(
         dir = -closest;
     }
 
-    // ---- Phase 2: grow the (already-enclosing) simplex to 5 points.
+    // ---- Stage 2: grow the (already-enclosing) simplex to 5 points.
     // Each iteration picks a direction orthogonal to the current simplex's affine hull and adds
     // the support point there; either it's a genuine new hull vertex (simplex grows) or it's
     // co-located with an existing vertex (polytope is too thin along that axis, try the opposite
