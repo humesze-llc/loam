@@ -39,9 +39,8 @@ struct Face4 {
 struct Polytope4 {
     vertices: Vec<MinkowskiPoint4>,
     faces: Vec<Face4>,
-    /// Centroid of the seed 5-simplex; stays interior under all convex expansions,
-    /// so it tiebreaks face orientation when the origin sits on a face plane
-    /// (common for symmetric Minkowski differences).
+    /// Centroid of the seed 5-simplex, and the sole orientation reference for
+    /// every face: expansion only adds vertices, so it stays interior.
     centroid: Vec4,
 }
 
@@ -78,22 +77,22 @@ impl Polytope4 {
         }
     }
 
-    /// Closest face to the origin, preferring strictly positive-distance faces.
+    /// Face whose plane is nearest the origin, as in the 3D
+    /// [`super::epa`][mod@super::epa].
     ///
-    /// Distance-0 faces are common in 4D (coplanar Minkowski-diff vertices spawn
-    /// through-origin faces); chasing the global minimum never converges. Prefer
-    /// the smallest positive-distance face, falling back to distance-0 only when
-    /// none exists (genuine tangency, or a fully symmetric seed needing expansion).
+    /// Distance-0 faces are the rule rather than the exception in 4D:
+    /// [`gjk_intersect_r4`][super::gjk_r4::gjk_intersect_r4] grows its
+    /// terminating sub-simplex to five vertices by adding supports on one side
+    /// of it, so whenever that sub-simplex has fewer than five vertices the
+    /// origin ends up on a proper face of the seed and every seed face through
+    /// it starts at distance 0. Those are the faces EPA has to expand across,
+    /// so they compete for the minimum on equal terms. Skipping them starts the
+    /// expansion on the far side of the difference body, where it converges to
+    /// a supporting face that is not the minimum: a normal that points through
+    /// the obstacle instead of out of it, at whatever depth that far facet
+    /// sits. Expanding across them terminates because [`FACE_COPLANAR_EPS`]
+    /// retires the coplanar tiles they belong to.
     fn closest_face(&self) -> Option<usize> {
-        if let Some((idx, _)) = self
-            .faces
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.distance > ORIGIN_ON_PLANE_EPS)
-            .min_by(|a, b| a.1.distance.total_cmp(&b.1.distance))
-        {
-            return Some(idx);
-        }
         self.faces
             .iter()
             .enumerate()
@@ -132,11 +131,6 @@ impl Polytope4 {
     }
 }
 
-/// Threshold below which the origin counts as on a face plane, switching the
-/// interior reference to the seed centroid. Empirical: above f32 noise (~1e-7 at
-/// unit scale), below any real penetration depth.
-const ORIGIN_ON_PLANE_EPS: f32 = 1e-4;
-
 /// Band around a face plane in which a support point counts as lying on it, so
 /// that `expand` retires the face instead of keeping it.
 ///
@@ -146,10 +140,10 @@ const ORIGIN_ON_PLANE_EPS: f32 = 1e-4;
 /// shared plane. Keeping those tiles while their neighbours are retired stitches
 /// the new vertex into a facet that is already covered: the surface stops being
 /// convex, later iterations chase interior faces, and EPA returns a normal that
-/// can point from B toward A. Same conditioning class as [`ORIGIN_ON_PLANE_EPS`]:
-/// the plane residual of a unit-scale 4-term dot product is a few ULPs (~4e-7,
-/// and 1e-7 measurably misses coplanar tiles), while the gap that is the
-/// precondition for calling `expand` at all is `EPA_TOLERANCE`, two orders up.
+/// can point from B toward A. The plane residual of a unit-scale 4-term dot
+/// product is a few ULPs (~4e-7, and 1e-7 measurably misses coplanar tiles),
+/// while the gap that is the precondition for calling `expand` at all is
+/// `EPA_TOLERANCE`, two orders up.
 const FACE_COPLANAR_EPS: f32 = 1e-5;
 
 /// A triangle index triple; winding implicit in order.
@@ -182,9 +176,12 @@ fn sort_triangle(t: Triangle) -> (usize, usize, usize) {
 /// Build a tetrahedral face `(a, b, c, d)` with outward unit normal and distance
 /// from origin. `None` when degenerate (near-coplanar edges, tiny normal).
 ///
-/// Orientation: keep both the origin and the centroid on the interior side. They
-/// agree except when the origin lies on the face plane (symmetric Minkowski
-/// differences); there the origin test gives no signal and the centroid decides.
+/// Orientation comes from the seed centroid alone. The origin is the tempting
+/// second reference and is wrong: it is interior only while GJK's containment
+/// verdict holds exactly, and GJK accepts a simplex whose closest point is
+/// within its own tolerance of the origin, so on a near-tangency the origin can
+/// sit outside the seed. Orienting one face against it there inverts that face
+/// and EPA converges on a plane that is not the boundary at all.
 fn build_face(
     verts: &[MinkowskiPoint4],
     a: usize,
@@ -205,16 +202,8 @@ fn build_face(
     }
     let normal = raw_normal / len;
 
-    // `normal · pa` is the plane offset; positive means origin is on the interior
-    // (`-normal`) side, so `+normal` is already outward.
-    let signed_origin = normal.dot(pa);
-    let flip = if signed_origin.abs() > ORIGIN_ON_PLANE_EPS {
-        signed_origin < 0.0
-    } else {
-        // Origin on the plane: the centroid decides. Interior on `+normal` -> flip.
-        let signed_c = normal.dot(centroid - pa);
-        signed_c > 0.0
-    };
+    // Interior on the `+normal` side means `+normal` points inward.
+    let flip = normal.dot(centroid - pa) > 0.0;
 
     let (outward, v_order) = if flip {
         (-normal, [a, b, d, c])
@@ -222,7 +211,8 @@ fn build_face(
         (normal, [a, b, c, d])
     };
 
-    // Clamp at 0: the origin-on-plane case can dip slightly negative from noise.
+    // Clamp at 0: on a near-tangency the origin can sit a hair outside the
+    // face, and a negative offset is not a penetration depth.
     let distance = outward.dot(pa).max(0.0);
 
     Some(Face4 {
@@ -375,7 +365,7 @@ fn face_barycentrics(points: &[Vec4; 4], closest: Vec4) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::super::gjk_r4::{gjk_intersect_r4, GjkResult4, Sphere4};
+    use super::super::gjk_r4::{gjk_intersect_r4, ConvexHull4, GjkResult4, Sphere4};
     use super::*;
 
     fn assert_close(a: f32, b: f32, tol: f32) {
@@ -541,6 +531,182 @@ mod tests {
             "contact {:?} should be {expected:?}",
             contact.point
         );
+    }
+
+    /// Pre-images are irrelevant to a seed that never reaches contact
+    /// reconstruction, so they are the difference points themselves.
+    fn seed(points: [Vec4; 5]) -> [MinkowskiPoint4; 5] {
+        points.map(|point| MinkowskiPoint4 {
+            point,
+            sa: point,
+            sb: Vec4::ZERO,
+        })
+    }
+
+    /// Base tetrahedron around the origin in `w = 0` plus an apex at height
+    /// `h`, giving `|det| = 8·h` against the seed's 1e-8 volume floor: `h = 0`
+    /// is the flat seed, everything above it is admissible.
+    fn seed_of_height(h: f32) -> [MinkowskiPoint4; 5] {
+        seed([
+            Vec4::new(-1.0, -1.0, -1.0, 0.0),
+            Vec4::new(1.0, -1.0, -1.0, 0.0),
+            Vec4::new(0.0, 1.0, -1.0, 0.0),
+            Vec4::new(0.0, 0.0, 1.0, 0.0),
+            Vec4::new(0.0, 0.0, 0.0, h),
+        ])
+    }
+
+    /// The 4D twin of the 3D floor. A seed confined to a hyperplane has no
+    /// interior for `build_face` to orient against, and the Hodge dual of
+    /// three dependent edges normalizes to NaN, which reaches the solver as a
+    /// contact. One rung above the floor the answer has to be a number.
+    #[test]
+    fn seeds_across_the_volume_floor_resolve_finitely_or_not_at_all() {
+        let a = Sphere4 {
+            center: Vec4::ZERO,
+            radius: 1.0,
+        };
+        let b = Sphere4 {
+            center: Vec4::new(0.5, 0.0, 0.0, 0.0),
+            radius: 1.0,
+        };
+
+        assert!(
+            epa_r4(&a, &b, seed_of_height(0.0)).is_none(),
+            "a seed inside a hyperplane has no interior to orient against"
+        );
+        for h in [1e-6, 1e-4, 1e-2, 1.0] {
+            let contact = epa_r4(&a, &b, seed_of_height(h))
+                .unwrap_or_else(|| panic!("seed of height {h} clears the volume floor"));
+            assert!(
+                contact.normal.is_finite()
+                    && contact.point.is_finite()
+                    && contact.penetration.is_finite(),
+                "seed of height {h} resolved to {contact:?}"
+            );
+            assert!(
+                contact.penetration >= 0.0,
+                "seed of height {h}: negative depth"
+            );
+        }
+    }
+
+    /// The rest of the degeneracy ladder: a seed collapsed onto a line, and one
+    /// with a repeated vertex. Both have zero 4-volume by a different route
+    /// than lying in a hyperplane, and both take the same exit.
+    #[test]
+    fn collinear_and_repeated_vertex_seeds_are_rejected_rather_than_resolved() {
+        let a = Sphere4 {
+            center: Vec4::ZERO,
+            radius: 1.0,
+        };
+        let b = Sphere4 {
+            center: Vec4::new(0.5, 0.0, 0.0, 0.0),
+            radius: 1.0,
+        };
+        let collinear = seed([
+            Vec4::new(-1.0, 0.0, 0.0, 0.0),
+            Vec4::new(-0.5, 0.0, 0.0, 0.0),
+            Vec4::ZERO,
+            Vec4::new(0.5, 0.0, 0.0, 0.0),
+            Vec4::new(1.0, 0.0, 0.0, 0.0),
+        ]);
+        let mut repeated = seed_of_height(1.0);
+        repeated[2] = repeated[1];
+        assert!(epa_r4(&a, &b, collinear).is_none());
+        assert!(epa_r4(&a, &b, repeated).is_none());
+    }
+
+    /// 16 corners of an axis-aligned R⁴ box centred at the origin.
+    fn box4_vertices(half: Vec4) -> Vec<Vec4> {
+        let mut vertices = Vec::with_capacity(16);
+        for &x in &[-half.x, half.x] {
+            for &y in &[-half.y, half.y] {
+                for &z in &[-half.z, half.z] {
+                    for &w in &[-half.w, half.w] {
+                        vertices.push(Vec4::new(x, y, z, w));
+                    }
+                }
+            }
+        }
+        vertices
+    }
+
+    const WALL_HALF: f32 = 0.05;
+    const BALL_RADIUS: f32 = 0.1;
+    /// Distance from the wall's midplane at which the ball stops touching it,
+    /// and so the half-width of the interval the sweep below covers.
+    const CAPTURE: f32 = WALL_HALF + BALL_RADIUS;
+
+    fn ball_vs_wall(x: f32) -> ContactInfo4 {
+        let vertices = box4_vertices(Vec4::new(WALL_HALF, 2.0, 2.0, 2.0));
+        let wall = ConvexHull4 {
+            vertices: &vertices,
+        };
+        let ball = Sphere4 {
+            center: Vec4::new(x, 0.0, 0.0, 0.0),
+            radius: BALL_RADIUS,
+        };
+        let simplex = match gjk_intersect_r4(&ball, &wall, -ball.center) {
+            GjkResult4::Intersecting { simplex } => simplex,
+            GjkResult4::Separated => panic!("ball at {x} overlaps the wall"),
+        };
+        epa_r4(&ball, &wall, simplex).expect("EPA should resolve an overlap")
+    }
+
+    /// A ball inside a wall thinner than itself overlaps both faces at once, so
+    /// the wrong exit is always available, and a contact resolved against it
+    /// drives the ball through instead of back. `Contact::normal` runs A -> B
+    /// and the solver drives A along `−normal`, so `−normal` has to be the way
+    /// back out of the face the ball entered.
+    ///
+    /// The depth is closed form: the difference body is the box of half extents
+    /// `WALL_HALF + BALL_RADIUS` on the launch axis rounded by the radius, so on
+    /// that axis the boundary is `CAPTURE − |x|` away.
+    ///
+    /// Swept rather than sampled because the failure this pins occupied
+    /// isolated depths, roughly one sample in twenty, rather than a band.
+    #[test]
+    fn wall_contact_leaves_through_the_face_the_ball_entered() {
+        for side in [-1.0_f32, 1.0] {
+            for k in 1..(CAPTURE / 5e-4) as u32 {
+                let x = side * (CAPTURE - 5e-4 * k as f32);
+                let contact = ball_vs_wall(x);
+                assert!(
+                    contact.normal.x * side < -0.99,
+                    "ball at {x} leaves along {:?}, not back out of its own face",
+                    -contact.normal
+                );
+                assert_close(contact.penetration, CAPTURE - x.abs(), EPA_TOLERANCE);
+            }
+        }
+    }
+
+    /// The contact boundary. A ball exactly `CAPTURE` out is touching, not
+    /// overlapping, so the depth is zero there and grows only as it comes in.
+    /// A non-zero depth at a non-negative gap is a phantom contact the solver
+    /// cannot tell from a real one, and it appears the moment face orientation
+    /// takes the origin for an interior point: GJK's containment verdict has a
+    /// tolerance, so on a near-tangency the origin sits outside the seed.
+    #[test]
+    fn wall_contact_depth_stays_zero_up_to_exact_touching() {
+        for gap in [1e-3_f32, 1e-4, 1e-5, 0.0] {
+            let contact = ball_vs_wall(-(CAPTURE + gap));
+            assert_eq!(
+                contact.penetration, 0.0,
+                "a ball {gap} clear of the wall is not {} deep in it",
+                contact.penetration
+            );
+        }
+        for overlap in [1e-5_f32, 1e-4, 1e-3, 1e-2] {
+            let contact = ball_vs_wall(-(CAPTURE - overlap));
+            assert_close(contact.penetration, overlap, EPA_TOLERANCE);
+            assert!(
+                contact.normal.x > 0.99,
+                "an overlap of {overlap} leaves along {:?}",
+                -contact.normal
+            );
+        }
     }
 
     // The polytope fixtures below all take `B = A + t`, so the Minkowski
