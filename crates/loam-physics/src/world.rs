@@ -3177,28 +3177,27 @@ mod tests {
         /// the ceiling the other two would reach with the defects below fixed.
         const GEOMETRIC_BOUND: f32 = WALL_HALF_THICKNESS + PROJECTILE_RADIUS;
 
-        /// R²'s sphere-polygon narrowphase pushes a sphere whose centre is
-        /// inside the polygon along `centre − closest_boundary_point`, which
-        /// points into the polygon rather than out of it. The near half of the
-        /// slab is therefore a trap rather than a stop, and what resolves is
-        /// the sphere radius alone.
-        const RECORDED_R2: f32 = 0.100;
-        /// R³ reaches the geometric bound: GJK plus EPA returns the true
-        /// minimum-translation vector everywhere inside the slab.
+        /// Each constant is a FLOOR, not a two-sided pin. The assertion below
+        /// fires when a space resolves LESS than its recorded reach, which is a
+        /// regression, and says nothing when it resolves more, which is not: a
+        /// scan that finds more reach should raise the constant, not fail.
+        ///
+        /// All three sit at [`GEOMETRIC_BOUND`], measured at 64 and again at
+        /// 257 launch alignments. R² and R⁴ reached it only after the
+        /// narrowphase normal fixes; before those, R² resolved the sphere
+        /// radius alone (0.100) because a sphere centred inside the polygon was
+        /// pushed further in, and R⁴ had no floor at all (a cliff at 0.0725)
+        /// because its EPA reported normals pointing through the wall at
+        /// isolated depths.
+        const RECORDED_R2: f32 = 0.150;
         const RECORDED_R3: f32 = 0.150;
-        /// R⁴ has no floor, only this cliff. Its EPA returns a normal pointing
-        /// through the wall at isolated penetration depths
-        /// ([`r4_polytope_contact_normal_points_through_the_wall_at_isolated_depths`]),
-        /// and a lattice coarse enough to leave a single sample in the slab
-        /// can leave it in one of those. Below the cliff R⁴ still tunnels at
-        /// isolated alignments: 1 offset in 256 at a displacement of 0.0125,
-        /// and 1 in 256 at 0.015. Nothing below the cliff is safe in R⁴ until
-        /// that normal is fixed.
-        const RECORDED_R4: f32 = 0.0725;
+        const RECORDED_R4: f32 = 0.150;
 
-        /// The R⁴ depth this fixture's EPA reports an outward normal at, in
-        /// launch-axis coordinates with the slab spanning `|x| ≤ 0.05`. One of
-        /// five under 2 mm wide found by sweeping the interval at 1 mm.
+        /// The R⁴ depth whose EPA normal used to point through the wall, in
+        /// launch-axis coordinates with the slab spanning `|x| ≤ 0.05`. It was
+        /// one of five holes under 2 mm wide found by sweeping at 1 mm. Kept as
+        /// the fixture for the regression pin: a normal that inverts again is
+        /// likeliest to do it at the depth that already caught it once.
         const R4_TRAP_DEPTH: f32 = -0.090;
 
         /// 16 corners of an axis-aligned R⁴ slab centred at the origin.
@@ -3362,12 +3361,6 @@ mod tests {
                 "{space} resolves only {measured} per step against the recorded \
                  {recorded}: the safe throw ceiling dropped"
             );
-            assert!(
-                measured < recorded + SCAN_STEP,
-                "{space} resolves {measured} per step, past the recorded \
-                 {recorded}: raise the recorded bound so callers can use the \
-                 reach that was added"
-            );
         }
 
         #[test]
@@ -3412,21 +3405,15 @@ mod tests {
         /// When the R⁴ narrowphase is fixed this test fails, and the fix is to
         /// re-measure [`RECORDED_R4`], not to keep this assertion.
         #[test]
-        fn r4_polytope_contact_normal_points_through_the_wall_at_isolated_depths() {
-            let trapped = released_at_rest_r4(R4_TRAP_DEPTH);
-            assert!(
-                trapped > 0.0,
-                "R4 no longer drives a body at {R4_TRAP_DEPTH} toward the far \
-                 face: it left at {trapped}. Re-measure the recorded R4 bound"
-            );
-            let control = released_at_rest_r4(R4_TRAP_DEPTH - 0.002);
-            assert!(
-                control < 0.0,
-                "R4 drives a body at {} toward the far face too, so the defect \
-                 is not the isolated hole this fixture measures: it left at \
-                 {control}",
-                R4_TRAP_DEPTH - 0.002
-            );
+        fn r4_contact_normal_leaves_through_the_near_face_at_every_depth() {
+            // Three depths through the hole that used to invert: R4's EPA
+            // reported a normal pointing through the wall here and drove the
+            // body toward the far face. A negative exit is the near face,
+            // the one the ball entered.
+            for depth in [R4_TRAP_DEPTH - 0.002, R4_TRAP_DEPTH, R4_TRAP_DEPTH + 0.002] {
+                let left = released_at_rest_r4(depth);
+                assert!(left < 0.0, "R4 drove a body at {depth} toward the FAR face, leaving at {left}: the contact normal points through the wall again");
+            }
         }
 
         /// The failing half of the verdict, asserted rather than described for
