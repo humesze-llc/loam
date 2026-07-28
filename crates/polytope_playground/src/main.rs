@@ -101,8 +101,8 @@ use consts::{
 use loam_physics::polytope::Polytope4;
 use physics::PlaygroundPhysics;
 use state::{
-    CameraMode, Demo, RotationMode, RowFrame, SurfaceMode, ViewMode, WireframeColorMode,
-    WireframeProjection,
+    set_if_changed, CameraMode, Demo, RotationMode, RowFrame, SurfaceMode, ViewMode,
+    WireframeColorMode, WireframeProjection,
 };
 use wireframe_geom::*;
 
@@ -151,22 +151,28 @@ fn formula_popup_seat(ctx: &egui::Context) -> egui::Pos2 {
     egui::pos2(area.right() - RIGHT_INSET, area.top() + TOP_INSET)
 }
 
+/// The playground's complete WGSL: hyperslice kernel, the extended polytope
+/// SDFs, and the gated scene emit.
+///
+/// Always includes every shape's WGSL so any can be added at runtime. Floor
+/// visibility is gated at runtime via `u.params.x` (set each frame in
+/// `update`): 0.0 makes the halfspace SDF return 1e9 so the marcher never
+/// paints the checkerboard. See [`Scene4::to_hyperslice_wgsl_gated`].
+fn shader_source() -> String {
+    let scene = Scene4::new(SceneNode4::halfspace(Vec4::Y, 0.0));
+    format!(
+        "{kernel}\n{polytope}\n{scene}\n",
+        kernel = HYPERSLICE_KERNEL_WGSL,
+        polytope = polytope_extended_sdfs_wgsl(),
+        scene = scene.to_hyperslice_wgsl_gated("u.w_slice", "u.params.x"),
+    )
+}
+
 impl Demo {
     pub(crate) fn new(ctx: &mut SetupCtx<'_>) -> Result<Self> {
         let row = parse_row(&Args::current())?;
 
-        let scene = Scene4::new(SceneNode4::halfspace(Vec4::Y, 0.0));
-        // Always include every shape's WGSL so any can be added at runtime.
-        // Floor visibility is gated at runtime via `u.params.x` (set each
-        // frame in `update`): 0.0 makes the halfspace SDF return 1e9 so the
-        // marcher never paints the checkerboard. See
-        // [`Scene4::to_hyperslice_wgsl_gated`].
-        let shader_source = format!(
-            "{kernel}\n{polytope}\n{scene}\n",
-            kernel = HYPERSLICE_KERNEL_WGSL,
-            polytope = polytope_extended_sdfs_wgsl(),
-            scene = scene.to_hyperslice_wgsl_gated("u.w_slice", "u.params.x"),
-        );
+        let shader_source = shader_source();
         let module = ctx
             .rd
             .device
@@ -292,6 +298,10 @@ impl Demo {
             freecam,
             camera_mode: CameraMode::default(),
             node,
+            // The `set_bodies` above only touched the CPU-side struct, so the
+            // first frame owes the buffer an upload.
+            sdf_upload_pending: true,
+            uploaded_rotor: Rotor4::IDENTITY,
             section_edges,
             parent_wireframe,
             wireframe_enabled: false,
@@ -454,9 +464,14 @@ impl Demo {
         }
         // Rigid bodies advance on the tick count, not on `dt_secs`, so a
         // trajectory is frame-rate independent. `write_all` then reconciles
-        // the world with the rendered row and uploads the resulting poses.
+        // the world with the rendered row and uploads the resulting poses,
+        // but only on a frame that moved something: see
+        // [`state::body_upload_needed`] for why the motion test is read first.
+        let bodies_moving = !self.physics.at_rest();
         self.physics.step(ctx.n_ticks);
-        self.write_all(self.rot_state);
+        if state::body_upload_needed(self.rot_state, self.uploaded_rotor, bodies_moving) {
+            self.write_all(self.rot_state);
+        }
 
         // Gate the orbit on `!ui_has_focus` so dragging the egui slider
         // doesn't also rotate the camera. In the 2D grid filmstrip, lift the
@@ -479,24 +494,32 @@ impl Demo {
         }
         let view = self.camera.view();
 
-        // Hyperslice uniforms.
+        // Hyperslice uniforms. Written through `set_if_changed` so a frame that
+        // moved neither camera, slice nor window leaves the buffer clean and
+        // `render` skips the upload. The flush itself lives there, once: the
+        // viewport is only known at render time, so a flush here would be
+        // wholly overwritten by the one after it.
         let cfg = &ctx.rd.surface_bundle.config;
         {
+            let mut changed = false;
             let u = self.node.uniforms_mut();
-            u.camera_pos = view.position.to_array();
-            u.camera_forward = view.forward.to_array();
-            u.camera_right = view.right.to_array();
-            u.camera_up = view.up.to_array();
-            u.fov_y_tan = (60.0_f32.to_radians() * 0.5).tan();
-            u.resolution = [cfg.width as f32, cfg.height as f32];
-            u.time = ctx.time;
-            u.tick = ctx.tick as f32;
-            u.w_slice = self.w_slice;
+            changed |= set_if_changed(&mut u.camera_pos, view.position.to_array());
+            changed |= set_if_changed(&mut u.camera_forward, view.forward.to_array());
+            changed |= set_if_changed(&mut u.camera_right, view.right.to_array());
+            changed |= set_if_changed(&mut u.camera_up, view.up.to_array());
+            changed |= set_if_changed(&mut u.fov_y_tan, (60.0_f32.to_radians() * 0.5).tan());
+            changed |= set_if_changed(&mut u.resolution, [cfg.width as f32, cfg.height as f32]);
+            changed |= set_if_changed(&mut u.w_slice, self.w_slice);
             // Floor gate read by the injected wrapper around `loam_scene_sdf`:
             // 1.0 = floor on, 0.0 = wrapper short-circuits to 1e9.
-            u.params[0] = if self.floor_enabled { 1.0 } else { 0.0 };
+            changed |= set_if_changed(&mut u.params[0], if self.floor_enabled { 1.0 } else { 0.0 });
+            // Refreshed but excluded from the test: no part of the assembled
+            // shader reads them (pinned by `assembled_shader_reads_no_clock`),
+            // so a clock tick alone must not cost an upload.
+            u.time = ctx.time;
+            u.tick = ctx.tick as f32;
+            self.sdf_upload_pending |= changed;
         }
-        self.node.flush_uniforms(&ctx.rd.queue);
     }
 
     pub(crate) fn ui(&mut self, ctx: &egui::Context, frame: &mut FrameCtx<'_>) {
@@ -2935,5 +2958,27 @@ mod section_cap_projection_tests {
             cap_after_first,
             "fill clip must reuse the projected-point scratch without growth"
         );
+    }
+}
+
+#[cfg(test)]
+mod shader_clock_tests {
+    use super::shader_source;
+
+    /// `u.time` and `u.tick` are refreshed every frame but excluded from the
+    /// upload-dirty test in `Demo::update`, which is sound only while nothing
+    /// in the assembled shader reads them. A kernel or scene emit that starts
+    /// animating on the clock fails here rather than silently rendering a
+    /// frozen frame on an otherwise idle scene.
+    #[test]
+    fn assembled_shader_reads_no_clock() {
+        let src = shader_source();
+        for field in ["u.time", "u.tick"] {
+            assert!(
+                !src.contains(field),
+                "assembled shader reads {field}; the idle-frame flush elision \
+                 no longer holds"
+            );
+        }
     }
 }
