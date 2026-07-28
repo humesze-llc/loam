@@ -598,6 +598,18 @@ pub(crate) fn build_points_mesh(
     }
 }
 
+/// The caller-owned working set [`build_section_layer_meshes`] fills. Bundled
+/// rather than passed one by one because they are taken from `Demo` and
+/// restored together, so a struct keeps them from drifting apart at a call
+/// site.
+pub(crate) struct SectionBuffers<'a> {
+    pub(crate) local_vertices: &'a mut Vec<Vec4>,
+    pub(crate) proj_scratch: &'a mut Vec<Vec3>,
+    pub(crate) cross_mesh: &'a mut loam_shape::TriangleMesh<3>,
+    pub(crate) cap_mesh: &'a mut loam_shape::TriangleMesh<3>,
+    pub(crate) section_scratch: &'a mut SectionScratch,
+}
+
 /// Append every polychoral body's cross-section caps into the visible layer
 /// meshes, each under its own projection ([`state::section_layer_projection`]:
 /// drop-w for the honest cross-section, the active projection for the cap).
@@ -610,18 +622,6 @@ pub(crate) fn build_points_mesh(
 /// Free function over [`RowFrame`] so "the caps are cut from the body physics
 /// put there" is unit-testable without a GPU-backed [`Demo`];
 /// [`Demo::render_section_faces`] is the one production caller.
-/// The caller-owned working set [`build_section_layer_meshes`] fills. Bundled
-/// rather than passed one by one because they are always taken from `Demo` and
-/// restored together, and threading the section scratch through put the
-/// parameter list over clippy's limit; a struct beats another `allow`.
-pub(crate) struct SectionBuffers<'a> {
-    pub(crate) local_vertices: &'a mut Vec<Vec4>,
-    pub(crate) proj_scratch: &'a mut Vec<Vec3>,
-    pub(crate) cross_mesh: &'a mut loam_shape::TriangleMesh<3>,
-    pub(crate) cap_mesh: &'a mut loam_shape::TriangleMesh<3>,
-    pub(crate) section_scratch: &'a mut SectionScratch,
-}
-
 pub(crate) fn build_section_layer_meshes(
     frame: &RowFrame<'_>,
     cross: state::SectionLayer,
@@ -1046,6 +1046,12 @@ mod tests {
     /// at the other slot's layout position, so a builder that read slot 0's
     /// pose for every slot collapses the halves onto each other.
     const ROW_16_PAIR: &[ShapeEntry] = &[CELL16, CELL16];
+    /// Two slots of DIFFERENT shapes, which every other fixture here is not.
+    /// The production row is heterogeneous (`catalog::DEFAULT_ROW` is four
+    /// distinct polytopes), so a builder that serves one slot another slot's
+    /// topology is invisible to a homogeneous fixture: the counts still agree
+    /// with each other and nothing is length-inconsistent.
+    const ROW_MIXED: &[ShapeEntry] = &[CELL16, ROW[0]];
 
     /// A slice off `w = 0`, inside the 16-cell's w-extent (`±BODY_SIZE`) so the
     /// cut is non-degenerate. A builder that substituted `0.0` for the frame's
@@ -1883,6 +1889,10 @@ mod tests {
         }
     }
 
+    // Crate-wide, not test-wide: `#[global_allocator]` is a per-binary
+    // singleton, so every test in this crate allocates through `Counting` and a
+    // second declaration anywhere in it is an E0152 hard error, not a merge
+    // conflict. Only the three alloc pins read the counter.
     #[global_allocator]
     static COUNTING_ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
 
@@ -1979,6 +1989,42 @@ mod tests {
     /// different `loam_shape` entry points and each owned its own working set
     /// until the scratch was threaded through both.
     #[test]
+    /// The cell-centre memo is keyed by [`Polytope4`]. Keyed by anything
+    /// constant instead, slot 1 draws slot 0's cell table: wrong count, wrong
+    /// positions, no panic, because the sprite buffers stay length-consistent
+    /// with each other. Only a row of two different shapes can see it.
+    #[test]
+    fn cell_centre_sprites_come_from_each_slots_own_polytope() {
+        let physics = PlaygroundPhysics::new(2, BODY_SIZE);
+        let frame = frame_of(
+            &physics,
+            ROW_MIXED,
+            rotor_at(Plane4::Xz, 0.5),
+            Projection::Identity,
+            SLICE_W,
+            CAMERA_DISTANCE,
+        );
+        let mut style = points_style_for(&slice_colored_style());
+        style.show_vertices = false;
+        style.show_cell_centers = true;
+
+        let mut buffers = OverlayBuffers::default();
+        buffers.points(&frame, &style);
+
+        let expected =
+            Polytope4::Cell16.topology().cells.len() + Polytope4::Pentatope.topology().cells.len();
+        assert_ne!(
+            Polytope4::Cell16.topology().cells.len(),
+            Polytope4::Pentatope.topology().cells.len(),
+            "the two fixture shapes have the same cell count, so this pin              cannot see a memo that served one slot the other's table"
+        );
+        assert_eq!(
+            buffers.sprites.positions.len(),
+            expected,
+            "the cell-centre memo served a slot the wrong polytope's cells"
+        );
+    }
+
     fn the_fill_path_reaches_the_allocator_zero_times() {
         let physics = PlaygroundPhysics::new(1, BODY_SIZE);
         let frame = frame_of(

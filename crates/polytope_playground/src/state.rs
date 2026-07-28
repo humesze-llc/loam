@@ -548,18 +548,24 @@ pub(crate) struct Demo {
     /// `mem::take` so the Stereographic arc path does not allocate per frame.
     pub(crate) slerp_scratch: Vec<glam::Vec4>,
     /// Combined section-perimeter mesh for the wireframe overlay, reused across
-    /// frames. A full row of 600-cells under Stereographic pushes tens of
-    /// thousands of segments, so a fresh mesh per frame costs megabytes and
-    /// tens of grow-and-copy rounds.
+    /// frames. Worst measured case is an eight-slot row of 600-cells with both
+    /// perimeters on: ~12k segments, about 0.7 MB and a dozen grow-and-copy
+    /// rounds if rebuilt from empty each frame. Unlike the parent mesh this
+    /// does not scale with the projection, since the perimeter emits at most
+    /// one segment per cap edge whatever the projection is.
     pub(crate) wireframe_section_edges_scratch: loam_shape::LineMesh<3>,
     /// One body's body-local section perimeter, refilled per body and consumed
     /// once per enabled section layer (the two layers project the same outline
     /// differently), then folded into
     /// [`Self::wireframe_section_edges_scratch`].
     pub(crate) body_perimeter_scratch: loam_shape::LineMesh<3>,
-    /// Per-cell working set of the section core, handed to
-    /// `polytope_section_perimeter_append` so the cap fit runs out of retained
-    /// buffers instead of allocating per crossed cell.
+    /// Per-cell working set of the section core, handed to both
+    /// `polytope_section_perimeter_append` and `polytope_section_faces_append`
+    /// so the cap fit runs out of retained buffers instead of allocating per
+    /// crossed cell. The two are called from different render passes, which is
+    /// why `Demo::render_section_faces` running before
+    /// `Demo::render_wireframe_overlay` is load-bearing and not incidental:
+    /// each takes this buffer and restores it before the other runs.
     pub(crate) section_cap_scratch: loam_shape::polytope::SectionScratch,
     /// Combined parent-wireframe edge mesh, reused across frames. Separate from
     /// [`Self::wireframe_section_edges_scratch`] because both are built in one
