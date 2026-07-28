@@ -353,6 +353,53 @@ mod tests {
         ));
     }
 
+    /// Exact touching, the case the overlap fixtures step around. GJK accepts
+    /// a simplex whose closest point is within `GJK_EPS` of the origin, so a
+    /// pair at zero separation can be called either way and pinning that
+    /// verdict would pin the tolerance instead of the geometry. What has to
+    /// hold is that the verdict is monotone in the gap, and that a gap never
+    /// resolves to a depth: a phantom depth is indistinguishable from a real
+    /// one by the time it reaches the solver.
+    #[test]
+    fn tesseract_face_touching_is_bracketed_and_never_resolves_to_a_depth() {
+        use crate::collision::epa_r4::epa_r4;
+        use crate::euclidean_r4::tesseract_vertices;
+
+        let va: Vec<Vec4> = tesseract_vertices(1.0);
+        let a = ConvexHull4 { vertices: &va };
+        // `tesseract_vertices(r)` is the box of half extent `r/2`, so the
+        // faces meet at a shift of `r`; below that the boxes overlap by the
+        // difference, above it they are clear.
+        for (shift, expect_overlap) in [
+            (1.0 - 1e-1, true),
+            (1.0 - 1e-2, true),
+            (1.0, false),
+            (1.0 + 1e-1, false),
+            (1.0 + 1.0, false),
+        ] {
+            let vb: Vec<Vec4> = tesseract_vertices(1.0)
+                .into_iter()
+                .map(|v| v + Vec4::new(shift, 0.0, 0.0, 0.0))
+                .collect();
+            let b = ConvexHull4 { vertices: &vb };
+            let depth = match gjk_intersect_r4(&a, &b, Vec4::X) {
+                GjkResult4::Intersecting { simplex } => {
+                    epa_r4(&a, &b, simplex).map_or(0.0, |c| c.penetration)
+                }
+                GjkResult4::Separated => 0.0,
+            };
+            if expect_overlap {
+                assert!(
+                    (depth - (1.0 - shift)).abs() < 1e-2,
+                    "shift {shift} overlaps by {} but resolved to {depth}",
+                    1.0 - shift
+                );
+            } else {
+                assert_eq!(depth, 0.0, "shift {shift} is clear but resolved to {depth}");
+            }
+        }
+    }
+
     #[test]
     fn sphere_and_tesseract_inside() {
         use crate::euclidean_r4::tesseract_vertices;

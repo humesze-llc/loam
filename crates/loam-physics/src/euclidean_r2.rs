@@ -316,28 +316,30 @@ fn point_in_convex_ccw(poly: &[Vec2], p: Vec2) -> bool {
     true
 }
 
-/// Closest point on the polygon boundary (edges) to an external point, plus its distance.
-fn closest_on_polygon_boundary(poly: &[Vec2], p: Vec2) -> (Vec2, f32) {
-    let mut best = poly[0];
-    let mut best_d2 = (best - p).length_squared();
+/// Closest point on the polygon boundary (edges) to `p`, its distance, and the
+/// outward unit normal of the edge realizing it. `None` when no edge has usable
+/// length, which leaves the polygon without a boundary to be closest to.
+///
+/// The edge normal is the only orientation signal left when `p` sits on the
+/// boundary, where `p − closest` underflows and carries no direction.
+fn closest_on_polygon_boundary(poly: &[Vec2], p: Vec2) -> Option<(Vec2, f32, Vec2)> {
+    let mut best: Option<(Vec2, f32, Vec2)> = None;
     for i in 0..poly.len() {
         let v0 = poly[i];
         let v1 = poly[(i + 1) % poly.len()];
         let edge = v1 - v0;
-        let e2 = edge.length_squared();
-        let t = if e2 > 1e-12 {
-            ((p - v0).dot(edge) / e2).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let len = edge.length();
+        if len < 1e-6 {
+            continue;
+        }
+        let t = ((p - v0).dot(edge) / (len * len)).clamp(0.0, 1.0);
         let q = v0 + edge * t;
         let d2 = (q - p).length_squared();
-        if d2 < best_d2 {
-            best_d2 = d2;
-            best = q;
+        if best.is_none_or(|(_, best_d2, _)| d2 < best_d2) {
+            best = Some((q, d2, Vec2::new(edge.y, -edge.x) / len));
         }
     }
-    (best, best_d2.sqrt())
+    best.map(|(q, d2, outward)| (q, d2.sqrt(), outward))
 }
 
 fn sphere_polygon_r2(
@@ -357,34 +359,33 @@ fn sphere_polygon_r2(
 
     let vb = world_vertices(b_local, b.position, b.orientation.rotation);
     let center = a.position;
-    let (closest, dist) = closest_on_polygon_boundary(&vb, center);
+    let (closest, dist, edge_outward) = closest_on_polygon_boundary(&vb, center)?;
+    let inside = point_in_convex_ccw(&vb, center);
 
-    if point_in_convex_ccw(&vb, center) {
-        // Center inside the polygon: push out toward the nearest edge along
-        // (center - closest), flipped so the normal stays A->B.
-        let dir = (center - closest).try_normalize().unwrap_or(Vec2::Y);
-        return Some(Contact {
-            normal: -dir,
-            point: closest,
-            penetration: dist + radius,
-            restitution: (a.restitution + b.restitution) * 0.5,
-        });
-    }
-
-    if dist >= radius {
+    if !inside && dist >= radius {
         return None;
     }
 
-    let normal = if dist > 1e-8 {
-        (closest - center) / dist
+    // The solver drives A along `−normal`, so `−normal` has to be the way out
+    // of the polygon. The nearest boundary point lies that way from inside and
+    // the opposite way from outside; `center − closest` for both points into
+    // the polygon from inside, which makes a slab thinner than the disk a trap
+    // rather than a stop.
+    let out_of_polygon = if inside {
+        closest - center
     } else {
-        Vec2::Y
+        center - closest
     };
+    let normal = -out_of_polygon.try_normalize().unwrap_or(edge_outward);
+
+    // Distance to travel to clear the surface: `dist` to reach the boundary
+    // from inside, or `dist` already covered from outside, plus the radius.
+    let penetration = if inside { radius + dist } else { radius - dist };
 
     Some(Contact {
         normal,
         point: closest,
-        penetration: radius - dist,
+        penetration,
         restitution: (a.restitution + b.restitution) * 0.5,
     })
 }
@@ -635,6 +636,173 @@ mod tests {
             "penetration: {}",
             c.penetration
         );
+    }
+
+    const SLAB_HALF: f32 = 0.05;
+    /// Larger than the slab's half thickness, so a disk inside overlaps both
+    /// faces at once and the wrong exit is always available.
+    const DISK_RADIUS: f32 = 0.1;
+
+    /// Disk on the x axis against a slab spanning `|x| ≤ SLAB_HALF`, tall
+    /// enough on y that the disk meets a face and never a corner.
+    fn slab_and_disk(center_x: f32) -> (RigidBody<EuclideanR2>, RigidBody<EuclideanR2>) {
+        (
+            sphere_body(Vec2::new(center_x, 0.0), Vec2::ZERO, DISK_RADIUS, 1.0),
+            static_wall(Vec2::ZERO, Vec2::new(SLAB_HALF, 2.0)),
+        )
+    }
+
+    /// `Contact::normal` runs A -> B and the solver drives A along `−normal`,
+    /// so `−normal` is the direction the disk leaves along. From inside the
+    /// polygon that is the way to the nearest face, which is `closest −
+    /// centre`; `centre − closest` points at the interior instead, and a slab
+    /// thinner than the disk then holds it rather than stopping it.
+    #[test]
+    fn sphere_polygon_normal_leaves_through_the_nearest_face_from_inside() {
+        let mut np = Narrowphase::<EuclideanR2>::new();
+        register_default_narrowphase(&mut np);
+
+        for (center_x, exit) in [(-0.03, -Vec2::X), (0.03, Vec2::X)] {
+            let (disk, wall) = slab_and_disk(center_x);
+            let c = np
+                .test(&disk, &wall, &EuclideanR2)
+                .expect("centre is inside");
+            assert!(
+                (-c.normal).dot(exit) > 0.999,
+                "disk at x = {center_x} leaves along {:?}, not {exit:?}",
+                -c.normal
+            );
+            assert!(
+                (c.penetration - (DISK_RADIUS + SLAB_HALF - center_x.abs())).abs() < 1e-5,
+                "depth {} is not the run to the near face plus the radius",
+                c.penetration
+            );
+        }
+    }
+
+    /// Crossing into the polygon does not change which face is nearest, so it
+    /// must not change the normal or the rate the depth grows. A sign
+    /// convention that only holds on one side reads as a reversal here.
+    #[test]
+    fn sphere_polygon_contact_is_continuous_across_the_face() {
+        let mut np = Narrowphase::<EuclideanR2>::new();
+        register_default_narrowphase(&mut np);
+
+        const STEP: f32 = 1e-4;
+        let (outside, wall) = slab_and_disk(-SLAB_HALF - STEP);
+        let (inside, _) = slab_and_disk(-SLAB_HALF + STEP);
+        let out = np.test(&outside, &wall, &EuclideanR2).expect("overlapping");
+        let inn = np.test(&inside, &wall, &EuclideanR2).expect("overlapping");
+
+        assert!(
+            (out.normal - inn.normal).length() < 1e-3,
+            "normal jumps from {:?} to {:?} across the face",
+            out.normal,
+            inn.normal
+        );
+        assert!(
+            (inn.penetration - out.penetration - 2.0 * STEP).abs() < 1e-5,
+            "depth jumps from {} to {} over a {} crossing",
+            out.penetration,
+            inn.penetration,
+            2.0 * STEP
+        );
+    }
+
+    /// A disk centred exactly on a face has no `centre − closest` to take a
+    /// direction from, so the face's own outward normal is the only signal
+    /// left. Without it the contact is finite but points wherever the fallback
+    /// constant happens to.
+    #[test]
+    fn sphere_polygon_centre_on_the_face_leaves_along_that_face_normal() {
+        let mut np = Narrowphase::<EuclideanR2>::new();
+        register_default_narrowphase(&mut np);
+
+        let (disk, wall) = slab_and_disk(-SLAB_HALF);
+        let c = np
+            .test(&disk, &wall, &EuclideanR2)
+            .expect("touching the face");
+        assert!(
+            (-c.normal).dot(-Vec2::X) > 0.999,
+            "leaves along {:?}, not −x̂",
+            -c.normal
+        );
+        assert!((c.penetration - DISK_RADIUS).abs() < 1e-5);
+    }
+
+    /// The contact boundary itself: at exactly `radius` from the face the disk
+    /// touches without overlapping, and the verdict must not oscillate within
+    /// an epsilon of it.
+    #[test]
+    fn sphere_polygon_grazing_at_exactly_the_radius_reports_no_contact() {
+        let mut np = Narrowphase::<EuclideanR2>::new();
+        register_default_narrowphase(&mut np);
+
+        const STEP: f32 = 1e-5;
+        let graze = -(SLAB_HALF + DISK_RADIUS);
+        for (center_x, expected) in [
+            (graze - STEP, None),
+            (graze, None),
+            (graze + STEP, Some(STEP)),
+        ] {
+            let (disk, wall) = slab_and_disk(center_x);
+            match (np.test(&disk, &wall, &EuclideanR2), expected) {
+                (None, None) => {}
+                (Some(c), Some(depth)) => {
+                    assert!(
+                        (c.penetration - depth).abs() < 1e-6,
+                        "depth {} at x = {center_x} is not the {depth} of overlap",
+                        c.penetration
+                    );
+                    assert!((-c.normal).dot(-Vec2::X) > 0.999);
+                }
+                (got, _) => panic!("x = {center_x} reported {:?}", got.map(|c| c.penetration)),
+            }
+        }
+    }
+
+    /// `d ≥ r_a + r_b` is the sphere-sphere no-contact test, so exactly
+    /// touching reports nothing and the first epsilon of overlap reports that
+    /// epsilon rather than a jump.
+    #[test]
+    fn sphere_sphere_grazing_at_exactly_the_combined_radius_reports_no_contact() {
+        let mut np = Narrowphase::<EuclideanR2>::new();
+        register_default_narrowphase(&mut np);
+
+        const STEP: f32 = 1e-5;
+        let a = sphere_body(Vec2::ZERO, Vec2::ZERO, 0.5, 1.0);
+        for (gap, expected) in [(STEP, None), (0.0, None), (-STEP, Some(STEP))] {
+            let b = sphere_body(Vec2::new(1.0 + gap, 0.0), Vec2::ZERO, 0.5, 1.0);
+            match (np.test(&a, &b, &EuclideanR2), expected) {
+                (None, None) => {}
+                (Some(c), Some(depth)) => assert!(
+                    (c.penetration - depth).abs() < 1e-6,
+                    "depth {} at gap {gap} is not {depth}",
+                    c.penetration
+                ),
+                (got, _) => panic!("gap {gap} reported {:?}", got.map(|c| c.penetration)),
+            }
+        }
+    }
+
+    /// A polygon whose vertices coincide has no boundary, so no distance to it
+    /// is a number and no depth built on one is either. Reporting nothing is
+    /// the only finite answer.
+    #[test]
+    fn polygon_with_no_edge_length_reports_no_contact() {
+        let mut np = Narrowphase::<EuclideanR2>::new();
+        register_default_narrowphase(&mut np);
+
+        let degenerate = RigidBody::fixed(
+            Vec2::ZERO,
+            Collider::Polygon2D {
+                vertices: vec![Vec2::ZERO; 4],
+            },
+            1.0,
+            &EuclideanR2,
+        );
+        let disk = sphere_body(Vec2::new(0.01, 0.0), Vec2::ZERO, 0.5, 1.0);
+        assert!(np.test(&disk, &degenerate, &EuclideanR2).is_none());
     }
 
     #[test]
