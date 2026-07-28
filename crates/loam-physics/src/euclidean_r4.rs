@@ -483,6 +483,49 @@ mod tests {
         assert_close(body.inertia, ball4_inertia(2.5, 1.0), 1e-5);
     }
 
+    /// The dispatch table registers `(Sphere, ConvexPolytope4D)` and flips the
+    /// reversed pair, and a wall is normally pushed before what hits it, so the
+    /// flipped order is the one the solver actually sees. The exit direction is
+    /// the ball's own, in both orders: A -> B negates with the pair, `−normal`
+    /// applied to the ball does not.
+    ///
+    /// The wall is thinner than the ball, so both its faces overlap the ball
+    /// and the exit through the far one is always available.
+    #[test]
+    fn wall_contact_leaves_through_the_near_face_in_either_pair_order() {
+        let mut np = Narrowphase::<EuclideanR4>::new();
+        register_default_narrowphase(&mut np);
+
+        let wall = RigidBody::fixed(
+            Vec4::ZERO,
+            Collider::ConvexPolytope4D {
+                vertices: tesseract_vertices(0.2)
+                    .into_iter()
+                    .map(|v| v * Vec4::new(1.0, 20.0, 20.0, 20.0))
+                    .collect(),
+            },
+            1.0,
+            &EuclideanR4,
+        );
+        // Wall half thickness 0.1, ball radius 0.2, ball centre in the near
+        // half: the near face is at x = −0.1 and the exit runs along −x̂.
+        let ball = sphere_body_r4(Vec4::new(-0.05, 0.0, 0.0, 0.0), Vec4::ZERO, 0.2, 1.0);
+
+        let forward = np.test(&ball, &wall, &EuclideanR4).expect("overlapping");
+        assert!(
+            (-forward.normal).dot(Vec4::X) < -0.99,
+            "ball leaves along {:?}, not back out of the near face",
+            -forward.normal
+        );
+        let reversed = np.test(&wall, &ball, &EuclideanR4).expect("overlapping");
+        assert!(
+            reversed.normal.dot(Vec4::X) < -0.99,
+            "flipped pair leaves the ball along {:?}",
+            reversed.normal
+        );
+        assert_close(forward.penetration, reversed.penetration, 1e-6);
+    }
+
     /// 4D sphere settles above a `y = 0` half-space without tunneling. Exercises
     /// `sphere_halfspace_r4` end-to-end through integrator + solver.
     #[test]
