@@ -750,11 +750,11 @@ mod invariants {
                     let ladder = pole_ladder(f, &s, a, b, v);
                     let residual = metric_residual(f, b, s.parallel_transport(a, b, v), ladder);
                     let ratio = residual / (tol.vector * metric_norm(f, b, ladder).max(1.0));
-                    // `!(ratio <= worst.0)` rather than `ratio > worst.0`: a NaN
-                    // ratio compares false against everything, so the ordinary
-                    // form would leave `worst` at its seed and report the item
+                    // The `is_nan` arm is load-bearing: a NaN ratio compares
+                    // false against everything, so tracking the worst by `>`
+                    // alone would leave the seed in place and report this item
                     // green on a transport that returned NaN.
-                    if !(ratio <= worst.0) {
+                    if ratio.is_nan() || ratio > worst.0 {
                         worst = (ratio, a, b, v);
                     }
                 }
@@ -984,7 +984,7 @@ mod invariants {
                 let residual = metric_residual(f, b, transported, forward);
                 let ratio = residual / (tol.vector * metric_norm(f, b, forward).max(1.0));
                 // NaN-safe, for the reason given at the ladder item above.
-                if !(ratio <= worst.0) {
+                if ratio.is_nan() || ratio > worst.0 {
                     worst = (ratio, a, b);
                 }
             }

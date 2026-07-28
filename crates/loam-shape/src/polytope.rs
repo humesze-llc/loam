@@ -248,7 +248,9 @@ pub fn vertex_color_by_position(v: Vec4) -> [f32; 4] {
 // ---------------------------------------------------------------------------
 
 /// Cross-section fill: translucent white; alpha 0.55 keeps the surface behind
-/// it visible.
+/// it visible. Only the test-only by-value overlay bakes a colour in; the
+/// append forms production uses take one from the caller.
+#[cfg(test)]
 const SECTION_FILL_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.55];
 /// Cross-section perimeter: opaque bright cyan, reads against both the dim
 /// parent wireframe and the SDF.
@@ -262,7 +264,11 @@ const SECTION_EDGE_WIDTH: f32 = 2.0;
 /// `for_each_section_cap`; it reproduces the classical sections (5-cell
 /// midpoint -> tetrahedron, tesseract -> cube, etc.) with no special-casing.
 /// Either returned mesh may be empty if the slice misses the polytope.
-pub fn polytope4_section_overlay(
+#[cfg(test)]
+/// Test-only: the append forms above are what production calls, and these
+/// by-value twins exist as their reference oracle. `pub` would be four
+/// contracts with no holder.
+fn polytope4_section_overlay(
     polytope: Polytope4,
     slice: loam_math::WPlane,
 ) -> (crate::TriangleMesh<3>, crate::LineMesh<3>) {
@@ -275,7 +281,11 @@ pub fn polytope4_section_overlay(
 /// [`polytope4_section_overlay`] cannot see. `vertices` must stay
 /// index-compatible with `edges` and `cells`; rigid transforms leave topology
 /// unchanged, so callers reuse the parent's edge / cell arrays.
-pub fn polytope_section_overlay_with_vertices(
+#[cfg(test)]
+/// Test-only: the append forms above are what production calls, and these
+/// by-value twins exist as their reference oracle. `pub` would be four
+/// contracts with no holder.
+fn polytope_section_overlay_with_vertices(
     edges: &[[u32; 2]],
     cells: &[&[u32]],
     vertices: &[Vec4],
@@ -360,7 +370,11 @@ fn push_cap_perimeter(ordered: &[Vec3], out: &mut crate::LineMesh<3>) {
 /// `FragmentShading::FaceNormalLambert` in `loam-render` for per-face shading;
 /// uniform color (not [`vertex_color_by_position`]) avoids a heatmap gradient
 /// that would bleed across bodies at different world positions.
-pub fn polytope_section_faces_with_vertices(
+#[cfg(test)]
+/// Test-only: the append forms above are what production calls, and these
+/// by-value twins exist as their reference oracle. `pub` would be four
+/// contracts with no holder.
+fn polytope_section_faces_with_vertices(
     edges: &[[u32; 2]],
     cells: &[&[u32]],
     vertices: &[Vec4],
@@ -410,7 +424,11 @@ pub fn polytope_section_faces_append(
 /// Section faces using the polytope's own canonical (unrotated) topology
 /// vertices. Mirrors [`polytope4_section_overlay`] but returns just the opaque
 /// solid-colored triangle mesh.
-pub fn polytope4_section_faces(
+#[cfg(test)]
+/// Test-only: the append forms above are what production calls, and these
+/// by-value twins exist as their reference oracle. `pub` would be four
+/// contracts with no holder.
+fn polytope4_section_faces(
     polytope: Polytope4,
     slice: loam_math::WPlane,
     color: [f32; 4],
@@ -422,7 +440,7 @@ pub fn polytope4_section_faces(
 /// Per-cell working set of the section algorithm, held by the caller so a
 /// per-frame section reuses one set of buffers instead of allocating three per
 /// crossed cell.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SectionScratch {
     cap: Vec<Vec3>,
     keys: Vec<(usize, f32)>,

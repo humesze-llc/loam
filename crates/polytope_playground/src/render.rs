@@ -1984,11 +1984,6 @@ mod tests {
         );
     }
 
-    /// The fill half of the section layers, which `CROSS_SECTION_DEFAULT` ships
-    /// on. Separate from the perimeter pin because the two run through
-    /// different `loam_shape` entry points and each owned its own working set
-    /// until the scratch was threaded through both.
-    #[test]
     /// The cell-centre memo is keyed by [`Polytope4`]. Keyed by anything
     /// constant instead, slot 1 draws slot 0's cell table: wrong count, wrong
     /// positions, no panic, because the sprite buffers stay length-consistent
@@ -2025,6 +2020,11 @@ mod tests {
         );
     }
 
+    /// The fill half of the section layers, which `CROSS_SECTION_DEFAULT`
+    /// ships on. Separate from the perimeter pin because the two run through
+    /// different `loam_shape` entry points and each owned its own working set
+    /// until the scratch was threaded through both.
+    #[test]
     fn the_fill_path_reaches_the_allocator_zero_times() {
         let physics = PlaygroundPhysics::new(1, BODY_SIZE);
         let frame = frame_of(

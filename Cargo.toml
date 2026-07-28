@@ -42,6 +42,7 @@ winit = "0.30"
 naga = { version = "27", features = ["wgsl-in"] }
 bytemuck = { version = "1", features = ["derive"] }
 notify = "6"
+pollster = "0.3"
 
 # `web-time` is a drop-in for `std::time::Instant` / `Duration`: on native it re-exports
 # the std types verbatim; on wasm32 it backs `Instant` with `performance.now()`. Used in

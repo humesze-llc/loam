@@ -39,5 +39,5 @@ loam-scene = { path = "../loam-scene" }
 # and must keep working with any producer of one. Tests need the real producer
 # to pin the assembly chain feeding them.
 loam-shader = { path = "../loam-shader" }
-pollster = "0.3"
+pollster.workspace = true
 tempfile = "3"
