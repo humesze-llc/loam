@@ -51,12 +51,15 @@ jobs:
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
             mesa-vulkan-drivers \
+            fonts-dejavu-core \
             pkg-config
       - name: cargo test --workspace --all-targets
         run: cargo test --workspace --all-targets
-      # CPU/GPU parity probes in loam-shader/db.rs are #[ignore]d
-      # locally because they need a wgpu adapter. lavapipe (from
-      # mesa-vulkan-drivers above) provides one in CI. Filter by
+      # The gpu_probe selector means "needs a real adapter": the CPU/GPU
+      # parity probes in loam-shader/db.rs plus the device-bound chain
+      # smoke tests. lavapipe (from mesa-vulkan-drivers above) provides
+      # the adapter; fonts-dejavu-core provides the system TTF loam-text's
+      # probe panics without, its candidates being absolute paths. Filter by
       # name so the loam-camera perf bench (the other #[ignore]d
       # test) does not run here. This is the gate behind docs/QUALITY.md
       # item 6.

@@ -447,12 +447,20 @@ impl RenderDevice {
             .unwrap_or(self.surface_bundle.config.format)
     }
 
-    /// Format the egui/UI pipeline should target: the swapchain format with the
-    /// sRGB suffix stripped, so blending happens in gamma space as egui's
-    /// feathering assumes. Falls back to the sRGB format where the adapter's
-    /// downlevel capabilities forbid reinterpreting swapchain views. On the
-    /// composite path the UI renders into the scene texture before the
-    /// composite, so this stays `target_format`.
+    /// Format the egui/UI pipeline should target, which decides the blending
+    /// space egui-wgpu selects.
+    ///
+    /// Direct-to-swapchain: the swapchain format with the sRGB suffix
+    /// stripped, so blending happens in gamma space as egui's feathering
+    /// assumes. Falls back to the sRGB format where the adapter's downlevel
+    /// capabilities forbid reinterpreting swapchain views.
+    ///
+    /// Composite: the UI renders into the scene texture, so this is that
+    /// texture's format, the surface format's sRGB sibling where it has one.
+    /// Blending is then linear, not gamma. Where the surface format has no
+    /// sRGB sibling the suffix-add is the identity, the format is not sRGB,
+    /// and egui-wgpu takes its gamma-framebuffer path into a target the
+    /// composite encodes again; see this module's doc for that arm.
     pub fn ui_format(&self) -> TextureFormat {
         self.ui_targets.ui_format
     }

@@ -18,8 +18,10 @@ A red required item blocks the merge.
    `--no-default-features` drops the native-only `capture` feature, matching
    what `index.html` tells Trunk to run.
 6. **GPU probes**: `cargo test --workspace gpu_probe -- --include-ignored`
-   green on a software Vulkan adapter: every WGSL `Space`/SDF kernel that has
-   a CPU counterpart is checked for parity.
+   green on a software Vulkan adapter. The selector means "needs a real
+   adapter"; CPU/GPU parity for every WGSL `Space`/SDF kernel with a CPU
+   counterpart is the largest member, alongside device-bound smoke tests that
+   only check a chain still assembles.
 7. **Determinism**: `cargo test -p loam-physics determinism` green: a
    fixed-seed simulation replays bit-identically on the same architecture (the
    reproducibility contract).

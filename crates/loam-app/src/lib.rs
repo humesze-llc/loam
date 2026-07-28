@@ -209,11 +209,12 @@ pub trait App: Sized + 'static {
 
 /// Run one frame's fixed-timestep ticks: advance the accumulator and call
 /// `App::tick` for every tick it yields. Shared by the native runner and the
-/// wasm worker so what a tick observes has a single definition and cannot
-/// drift between platforms. How many ticks a stalled frame yields belongs to
-/// the caller's accumulator and does differ; see
-/// [`DEFAULT_MAX_TICKS_PER_FRAME`]. Returns the tick count (for
-/// `FrameCtx::n_ticks`).
+/// wasm worker, so the accumulator-to-`App::tick` mapping has one definition.
+/// The values it is called with are the caller's and do differ: the native
+/// runner passes `RunConfig::fixed_hz` and `RunConfig::max_ticks_per_frame`,
+/// the worker hardcodes 60Hz and [`DEFAULT_MAX_TICKS_PER_FRAME`], so both the
+/// `dt` a tick sees and how many ticks a stalled frame yields diverge once a
+/// demo sets either. Returns the tick count (for `FrameCtx::n_ticks`).
 ///
 /// The catch-up cap lives solely in the `FixedTimestep`
 /// (`with_max_catch_up`); capping again here would book ticks the accumulator
@@ -337,6 +338,9 @@ pub const DEFAULT_MAX_TICKS_PER_FRAME: u32 = 4;
 /// Runtime knobs. New fields land with defaults so adding configuration is non-breaking.
 pub struct RunConfig {
     pub window: WindowAttributes,
+    /// Simulation rate; `App::tick` receives `dt = 1.0 / fixed_hz`. Native
+    /// only: `RunConfig` does not cross the worker's postMessage boundary, so
+    /// the wasm build simulates at 60Hz whatever this says.
     pub fixed_hz: u32,
     /// Spiral-of-death cap, applied by the native runner's [`FixedTimestep`].
     /// Ticks beyond this in one frame are dropped, not deferred; `0` stops the
