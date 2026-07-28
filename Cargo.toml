@@ -13,6 +13,7 @@ members = [
   "crates/loam-physics",
   "crates/loam-app",
   "crates/loam-text",
+  "crates/loam-console",
   "crates/loam-egui",
   "crates/polytope_playground",
   "crates/tesseract_demo",
