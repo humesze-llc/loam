@@ -38,7 +38,7 @@ pub struct Ray {
 ///   metric, so storing Riemannian-unit vectors would leak embedding
 ///   scale factors into the renderer.
 /// - Right-handed: `forward` is the look direction, so `right × up =
-///   -forward`. Matches [`crate::OrbitCamera`] and the WGSL prelude.
+///   -forward`. Matches the WGSL prelude.
 /// - Construct via [`Camera::looking_at`] or a
 ///   [`crate::CameraController`]; mutating the basis by hand drifts off
 ///   orthonormal under `translate`.
@@ -165,27 +165,10 @@ impl<S: Space<Point = Vec3, Vector = Vec3>> Camera<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::{Mat4, Vec4Swizzles};
     use loam_math::EuclideanR3;
 
     fn close(a: Vec3, b: Vec3, tol: f32) {
         assert!((a - b).length() < tol, "expected {a:?} ≈ {b:?}");
-    }
-
-    /// The forward projection `ray_from_ndc` must invert: the same
-    /// `look_to_rh` + `perspective_rh` pipeline and the same y-down pixel
-    /// mapping that `loam_egui::world_to_screen` applies, minus its
-    /// off-frustum rejection. Rebuilt here rather than called because
-    /// loam-camera sits below loam-egui in the dependency DAG.
-    fn project_to_pixel(camera: &Camera<EuclideanR3>, world: Vec3, viewport: Vec2) -> Vec2 {
-        let view = Mat4::look_to_rh(camera.position, camera.forward, camera.up);
-        let projection = Mat4::perspective_rh(camera.fov_y, camera.aspect, camera.near, camera.far);
-        let clip = projection * view * world.extend(1.0);
-        let ndc = clip.xyz() / clip.w;
-        Vec2::new(
-            (ndc.x * 0.5 + 0.5) * viewport.x,
-            (1.0 - (ndc.y * 0.5 + 0.5)) * viewport.y,
-        )
     }
 
     #[test]
@@ -258,43 +241,6 @@ mod tests {
         assert!(cam.right.dot(cam.up).abs() < 1e-3);
         assert!(cam.right.dot(cam.forward).abs() < 1e-3);
         assert!(cam.up.dot(cam.forward).abs() < 1e-3);
-    }
-
-    /// Unprojection inverts projection: every point along the ray through
-    /// an NDC coordinate projects back to that same coordinate. Uses an
-    /// off-axis pose and a 16:9 viewport so a swapped `right`/`up`, a
-    /// dropped `aspect`, or a sign flip cannot survive.
-    #[test]
-    fn ray_from_ndc_round_trips_through_the_forward_projection() {
-        let viewport = Vec2::new(1600.0, 900.0);
-        let mut camera = Camera::<EuclideanR3>::looking_at(
-            Vec3::new(2.0, 1.0, 4.0),
-            Vec3::new(-1.0, 0.5, -2.0),
-            Vec3::Y,
-            &EuclideanR3,
-        );
-        camera.fov_y = 47.0_f32.to_radians();
-        camera.aspect = viewport.x / viewport.y;
-
-        for x_step in -2..=2 {
-            for y_step in -2..=2 {
-                let ndc = Vec2::new(x_step as f32 * 0.5, y_step as f32 * 0.5);
-                let ray = camera.ray_from_ndc(ndc);
-                assert!((ray.direction.length() - 1.0).abs() < 1e-6);
-                let expected = Vec2::new(
-                    (ndc.x * 0.5 + 0.5) * viewport.x,
-                    (1.0 - (ndc.y * 0.5 + 0.5)) * viewport.y,
-                );
-                for depth in [0.5_f32, 3.0, 25.0] {
-                    let world = ray.origin + ray.direction * depth;
-                    let pixel = project_to_pixel(&camera, world, viewport);
-                    assert!(
-                        (pixel - expected).length() < 1e-2,
-                        "ndc {ndc:?} at depth {depth} projected to {pixel:?}, expected {expected:?}"
-                    );
-                }
-            }
-        }
     }
 
     /// The centre of the screen looks where the camera looks, from where

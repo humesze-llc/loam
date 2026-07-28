@@ -1322,14 +1322,9 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "loam"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "bytemuck",
- "gif",
- "glam",
  "loam-app",
  "loam-asset",
  "loam-camera",
- "loam-egui",
  "loam-input",
  "loam-math",
  "loam-physics",
@@ -1340,12 +1335,6 @@ dependencies = [
  "loam-shape",
  "loam-text",
  "loam-time",
- "png 0.17.16",
- "pollster",
- "tracing",
- "tracing-subscriber",
- "wgpu",
- "winit",
 ]
 
 [[package]]
@@ -1470,9 +1459,12 @@ dependencies = [
  "glam",
  "loam-math",
  "loam-scene",
+ "loam-shader",
  "loam-shape",
  "loam-time",
  "naga",
+ "pollster",
+ "tempfile",
  "tracing",
  "wgpu",
  "winit",
@@ -1525,6 +1517,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "bytemuck",
+ "pollster",
  "tracing",
  "wgpu",
 ]

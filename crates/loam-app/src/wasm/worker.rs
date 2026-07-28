@@ -439,13 +439,13 @@ where
     /// `last_redraw_at`. `None` when uncapped.
     last_redraw_anchor: Option<web_time::Instant>,
     tick_index: u64,
-    /// Fixed-timestep accumulator at 60Hz (matching `RunConfig::default()`)
-    /// so demos reading `FrameCtx::n_ticks` see the native cadence. A
-    /// different rate would need RunConfig plumbed through postMessage.
+    /// Fixed-timestep accumulator at 60Hz with the catch-up cap at
+    /// `DEFAULT_MAX_TICKS_PER_FRAME`, both matching `RunConfig::default()` so
+    /// demos reading `FrameCtx::n_ticks` see the native cadence. Overriding
+    /// either would need RunConfig plumbed through postMessage; a demo that
+    /// sets `RunConfig::max_ticks_per_frame` changes the native stall cadence
+    /// only.
     timestep: FixedTimestep,
-    /// Mirror of the windowed runner's `max_ticks_per_frame` (4) so a slow
-    /// frame doesn't spiral by running a burst of catch-up ticks.
-    max_ticks_per_frame: usize,
     _marker: PhantomData<A::Space>,
 }
 
@@ -507,8 +507,7 @@ where
             last_update_at: None,
             last_redraw_anchor: None,
             tick_index: 0,
-            timestep: FixedTimestep::new(60),
-            max_ticks_per_frame: 4,
+            timestep: FixedTimestep::new(60).with_max_catch_up(crate::DEFAULT_MAX_TICKS_PER_FRAME),
             _marker: PhantomData,
         })
     }
@@ -696,15 +695,16 @@ where
         };
         self.last_update_at = Some(now);
 
-        // Fixed-timestep ticks via the shared `drive_fixed_ticks`, so the sim
-        // cadence is identical to the windowed runner (60Hz here).
-        let n_capped = crate::drive_fixed_ticks(
+        // Fixed-timestep ticks via the shared `drive_fixed_ticks`. The
+        // accumulator logic matches the windowed runner; the rate is hardcoded
+        // at 60Hz here and diverges from any `RunConfig::fixed_hz` a demo set,
+        // because `RunConfig` does not cross the postMessage boundary.
+        let n_ticks = crate::drive_fixed_ticks(
             &mut self.app,
             &mut self.timestep,
             &mut self.tick_index,
             now,
             60,
-            self.max_ticks_per_frame,
         );
 
         // `take_frame` drains the accumulated FrameInput and resets per-tick
@@ -718,7 +718,7 @@ where
                 input,
                 time: self.start.elapsed().as_secs_f32(),
                 fps: 0.0, // worker-side FPS bookkeeping not yet wired.
-                n_ticks: n_capped,
+                n_ticks,
                 tick: self.tick_index,
                 dt,
                 ui_has_focus,

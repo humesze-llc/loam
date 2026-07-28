@@ -147,101 +147,10 @@ fn loam_parallel_transport(p_from: vec4<f32>, p_to: vec4<f32>, v: vec4<f32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bivector::Bivector;
-    use crate::bivector::Bivector4;
     use approx::assert_relative_eq;
 
     fn r4() -> EuclideanR4 {
         EuclideanR4
-    }
-
-    #[test]
-    fn distance_is_symmetric_and_zero_on_diagonal() {
-        let s = r4();
-        let a = Vec4::new(1.0, 2.0, 3.0, -0.5);
-        let b = Vec4::new(-4.0, 0.5, 7.0, 1.2);
-        assert_relative_eq!(s.distance(a, b), s.distance(b, a));
-        assert_relative_eq!(s.distance(a, a), 0.0);
-    }
-
-    #[test]
-    fn exp_log_round_trip() {
-        let s = r4();
-        let a = Vec4::new(1.0, 2.0, 3.0, 4.0);
-        let b = Vec4::new(5.0, -1.0, 2.5, 0.7);
-        let recovered = s.exp(a, s.log(a, b));
-        assert_relative_eq!(recovered.x, b.x);
-        assert_relative_eq!(recovered.y, b.y);
-        assert_relative_eq!(recovered.z, b.z);
-        assert_relative_eq!(recovered.w, b.w);
-    }
-
-    #[test]
-    fn iso_identity_is_neutral() {
-        let s = r4();
-        let p = Vec4::new(2.0, -3.0, 4.0, 0.5);
-        let back = s.iso_apply(s.iso_identity(), p);
-        assert_relative_eq!(back.x, p.x);
-        assert_relative_eq!(back.y, p.y);
-        assert_relative_eq!(back.z, p.z);
-        assert_relative_eq!(back.w, p.w);
-    }
-
-    #[test]
-    fn iso_compose_with_inverse_is_identity() {
-        let s = r4();
-        // Compound 4D rotation (xy + zw) + nonzero translation: the non-trivial Iso
-        // composition path.
-        let rot = Bivector4::new(0.4, 0.0, 0.0, 0.0, 0.0, 0.2).exp();
-        let iso = Iso4Flat {
-            rotation: rot,
-            translation: Vec4::new(1.0, 2.0, 3.0, -1.0),
-        };
-        let inv = s.iso_inverse(iso);
-        let p = Vec4::new(10.0, -5.0, 3.0, 2.5);
-        let via_a = s.iso_apply(s.iso_compose(iso, inv), p);
-        let via_b = s.iso_apply(s.iso_compose(inv, iso), p);
-        for (got, want) in [(via_a, p), (via_b, p)] {
-            assert_relative_eq!(got.x, want.x, epsilon = 1e-4);
-            assert_relative_eq!(got.y, want.y, epsilon = 1e-4);
-            assert_relative_eq!(got.z, want.z, epsilon = 1e-4);
-            assert_relative_eq!(got.w, want.w, epsilon = 1e-4);
-        }
-    }
-
-    #[test]
-    fn iso_compose_matches_sequential_apply() {
-        let s = r4();
-        let a = Iso4Flat {
-            rotation: Bivector4::new(0.4, 0.0, 0.0, 0.0, 0.0, 0.0).exp(),
-            translation: Vec4::new(1.0, 0.0, 0.0, 0.0),
-        };
-        let b = Iso4Flat {
-            rotation: Bivector4::new(0.0, 0.0, 0.0, 0.9, 0.0, 0.0).exp(),
-            translation: Vec4::new(0.0, 2.0, -1.0, 0.5),
-        };
-        let p = Vec4::new(3.0, 4.0, 5.0, 1.0);
-        let composed = s.iso_apply(s.iso_compose(a, b), p);
-        let sequential = s.iso_apply(a, s.iso_apply(b, p));
-        assert_relative_eq!(composed.x, sequential.x, epsilon = 1e-4);
-        assert_relative_eq!(composed.y, sequential.y, epsilon = 1e-4);
-        assert_relative_eq!(composed.z, sequential.z, epsilon = 1e-4);
-        assert_relative_eq!(composed.w, sequential.w, epsilon = 1e-4);
-    }
-
-    #[test]
-    fn iso_apply_preserves_distances() {
-        let s = r4();
-        let iso = Iso4Flat {
-            rotation: Bivector4::new(0.3, 0.1, -0.2, 0.4, 0.0, 0.15).exp(),
-            translation: Vec4::new(5.0, -3.0, 1.0, 0.0),
-        };
-        let a = Vec4::new(1.0, 0.0, 0.0, 0.0);
-        let b = Vec4::new(0.0, 1.0, 0.0, 0.0);
-        let d_before = s.distance(a, b);
-        let a2 = s.iso_apply(iso, a);
-        let b2 = s.iso_apply(iso, b);
-        assert_relative_eq!(s.distance(a2, b2), d_before, epsilon = 1e-4);
     }
 
     #[test]

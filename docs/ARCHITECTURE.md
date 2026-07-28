@@ -23,7 +23,8 @@ tier 5  polytope_playground   tesseract_demo                        (demos, not 
 - `loam-shape` (math + the geometry/topology data: `Shape`, polytope topology,
   the vertex/face generators) is the other stable surface. The two together are
   the foundation; promoting anything into them is a deliberate decision.
-- `loam-render` depends on `loam-math`, `loam-shape`, `loam-time`, `loam-scene` and
+- `loam-render` depends on `loam-math`, `loam-shape`, `loam-time`, `loam-scene`
+  (and on `loam-shader` for tests only) and
   NOT on `loam-physics`: rendering must not pull in the simulation layer. Polytope
   topology lives in `loam-shape` precisely so the renderer can use it without the
   physics dependency.

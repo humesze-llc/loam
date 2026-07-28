@@ -53,10 +53,10 @@ pub trait CameraController<S: Space> {
 /// Spherical-coordinate orbit camera that circles a target point. Left-drag orbits;
 /// scroll zooms.
 ///
-/// In flat space this is the same math as the legacy [`crate::OrbitCamera`]. In H³ /
-/// S³ the camera position is computed by `Space::exp` from the target along the
-/// orbit-direction tangent vector, and the camera basis parallel-transports from the
-/// target to the camera position so it arrives orthonormal in any geometry.
+/// In flat space this is plain spherical-coordinate framing. In H³ / S³ the camera
+/// position is computed by `Space::exp` from the target along the orbit-direction
+/// tangent vector, and the camera basis parallel-transports from the target to the
+/// camera position so it arrives orthonormal in any geometry.
 #[derive(Clone, Copy, Debug)]
 pub struct OrbitController<S: Space> {
     /// Orbit centre in the manifold's coordinates.
@@ -95,8 +95,7 @@ impl<S: Space<Point = Vec3, Vector = Vec3>> OrbitController<S> {
         }
     }
 
-    /// Snap to a fixed orbit position. Used by capture / movie mode (mirror of the
-    /// legacy [`crate::OrbitCamera::set_orbit`]).
+    /// Snap to a fixed orbit position. Used by capture / movie mode.
     pub fn set_orbit(&mut self, distance: f32, pitch: f32) {
         self.distance = distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
         self.pitch = pitch.clamp(MIN_ORBIT_PITCH, MAX_ORBIT_PITCH);
@@ -252,13 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn orbit_default_in_e3_matches_legacy_pose() {
+    fn orbit_default_in_e3_frames_the_origin_from_the_x_axis() {
         let mut camera = Camera::<EuclideanR3>::at_origin();
         let mut ctrl: OrbitController<EuclideanR3> = OrbitController::default();
         ctrl.advance(FrameInput::default(), &mut camera, &EuclideanR3, 0.0);
-        // Same expected pose as the legacy `OrbitCamera::default()`
-        // test in lib.rs: position (3.5, 0.6, 0).
         close(camera.position, Vec3::new(3.5, 0.6, 0.0), 1e-5);
+        // Default yaw of π/2 sends the local +X to -Z, so a sign flip in the
+        // yaw quaternion or a swapped basis axis shows up here and not in the
+        // position, which is symmetric under that swap.
+        close(camera.right, Vec3::new(0.0, 0.0, -1.0), 1e-5);
         // Frame is orthonormal.
         assert!((camera.right.length() - 1.0).abs() < 1e-5);
         assert!((camera.up.length() - 1.0).abs() < 1e-5);

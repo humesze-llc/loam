@@ -98,7 +98,7 @@ where
     for _ in 0..steps {
         world.step(dt);
         let step_start = run.trajectory.len();
-        for body in &world.bodies {
+        for body in world.bodies.iter() {
             sample(body, &mut run.trajectory);
         }
 
@@ -107,8 +107,10 @@ where
         // read the same state in a different order.
         contact_words.clear();
         for (key, manifold) in &world.manifolds {
-            contact_words.push(key.0 as u32);
-            contact_words.push(key.1 as u32);
+            // Slot only: no fixture despawns, so the generation is a constant
+            // zero and would add a word without adding a distinction.
+            contact_words.push(key.0.slot());
+            contact_words.push(key.1.slot());
             contact_words.push(manifold.points.len() as u32);
             for cp in &manifold.points {
                 contact_words.push(cp.normal_impulse.to_bits());
@@ -231,8 +233,9 @@ const ISLAND_GAP: f32 = 0.05;
 pub const MULTI_ISLAND_DT: f32 = 1.0 / 60.0;
 pub const MULTI_ISLAND_STEPS: usize = 240;
 
-/// Dynamic body index ranges, one per group. Body 0 is the static floor and
-/// belongs to no group.
+/// Dynamic body slot ranges, one per group. Slot 0 is the static floor and
+/// belongs to no group. Slots rather than handles because the fixture never
+/// despawns, so slot allocation is dense and contiguous by group.
 pub fn multi_island_groups() -> [Range<usize>; 3] {
     std::array::from_fn(|group| {
         let start = 1 + ISLAND_SIZES[..group].iter().sum::<usize>();

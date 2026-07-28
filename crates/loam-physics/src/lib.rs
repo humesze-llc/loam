@@ -37,11 +37,11 @@ pub mod euclidean_r3;
 pub mod euclidean_r4;
 pub use loam_shape::polytope;
 
-pub use body::RigidBody;
+pub use body::{BodyArena, BodyId, RigidBody};
 pub use collider::{Collider, ColliderKind};
 pub use field::{ForceField, Gravity};
 pub use integrator::{integrate_body, PhysicsSpace};
 pub use manifold::{ContactPoint, Manifold};
 pub use narrowphase::{Narrowphase, NarrowphaseFn};
 pub use response::{Contact, FRICTION_COEFF};
-pub use world::{OrderPolicy, Schedule, SchedulePhase, World};
+pub use world::{Island, OrderPolicy, Schedule, SchedulePhase, World};
