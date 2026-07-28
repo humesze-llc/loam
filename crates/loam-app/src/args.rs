@@ -225,6 +225,22 @@ mod tests {
     }
 
     #[test]
+    fn argv_pairs_split_on_the_first_equals_so_values_keep_the_rest() {
+        let args = Args::from_argv(["--state=a=b", "--a=1=2=3", "--eq==", "--t=abc=="]);
+        assert_eq!(args.get("state"), Some("a=b"));
+        assert_eq!(args.get("a"), Some("1=2=3"));
+        assert_eq!(args.get("eq"), Some("="));
+        // Base64 padding is the value shape that reaches a command line with
+        // a trailing '=' and no encoding to hide it.
+        assert_eq!(args.get("t"), Some("abc=="));
+
+        // Splitting on the last '=' instead would mint these keys.
+        assert_eq!(args.get("state=a"), None);
+        assert_eq!(args.get("eq="), None);
+        assert!(!args.has_bare_flag("state=a=b"));
+    }
+
+    #[test]
     fn a_bare_flag_is_recorded_and_its_value_is_not_absorbed() {
         let args = Args::from_argv(["--shapes", "5-cell,8-cell", "--seed=42"]);
         // The value the user meant to attach is gone, so a missing key
