@@ -73,6 +73,32 @@ pub(crate) fn render_row_entries<'a>(
     }
 }
 
+/// Whether `Demo::update` must re-emit the body uniforms this frame.
+///
+/// Row, size and surface-mode edits are deliberately absent: each re-emits at
+/// the edit through [`Demo::rebuild_bodies`], so the per-frame test only has to
+/// catch what moves without one. `bodies_moving` must be read BEFORE the
+/// physics step: a body that comes to rest during the step still has a final
+/// pose to upload, and an at-rest world is an exact fixpoint of the integrator
+/// (see [`PlaygroundPhysics::at_rest`]), so it has none.
+pub(crate) fn body_upload_needed(
+    rot_state: Rotor4,
+    uploaded_rotor: Rotor4,
+    bodies_moving: bool,
+) -> bool {
+    bodies_moving || rot_state != uploaded_rotor
+}
+
+/// Assign `value` and report whether it differed, so a uniform write that
+/// changes nothing does not cost a buffer upload.
+pub(crate) fn set_if_changed<T: PartialEq>(slot: &mut T, value: T) -> bool {
+    if *slot == value {
+        return false;
+    }
+    *slot = value;
+    true
+}
+
 /// How the parent-wireframe edges are colored. Orthogonal to
 /// [`Demo::wireframe_nearest_active`]: the color mode picks the hue, the
 /// nearest-active toggle modulates alpha on top.
@@ -418,6 +444,15 @@ pub(crate) struct Demo {
     /// Active camera control mode (default `Orbit`).
     pub(crate) camera_mode: CameraMode,
     pub(crate) node: Hyperslice4DNode,
+    /// Set when the CPU-side hyperslice uniforms stop matching the GPU copy: a
+    /// rotor, w-slice, camera, viewport, floor, surface-mode or row edit.
+    /// Cleared by the single flush in [`crate::Demo::render`], so a frame in
+    /// which nothing moved uploads nothing.
+    pub(crate) sdf_upload_pending: bool,
+    /// Rotor the body slots were last built from. [`RotationMode::Active`]
+    /// recomposes `rot_state` from `rot_time` every frame, so only a value
+    /// comparison separates a spinning frame from a still one.
+    pub(crate) uploaded_rotor: Rotor4,
     /// Rasterizer node for the cross-section perimeter (cyan edges around each cap
     /// polygon). Filled caps are not drawn here; this only outlines the boundaries
     /// between adjacent cell contributions.
@@ -522,10 +557,11 @@ pub(crate) struct Demo {
     /// Scratch buffer reused across frames + bodies inside `render_points`.
     pub(crate) points_mesh_scratch: loam_shape::PointMesh<3>,
     /// Shared depth attachment for the Shapes-view rasterizer chain, sized to the
-    /// swapchain via [`loam_render::DepthBuffer::ensure`]. Cleared once per frame in
-    /// [`crate::Demo::ensure_and_clear_shared_depth`]; `section_faces` writes it,
-    /// `parent_wireframe` reads it for occlusion. In SDF mode the cleared `1.0`
-    /// leaves every wireframe fragment passing, preserving the historical visual.
+    /// swapchain via [`loam_render::DepthBuffer::ensure`]. Ensured and cleared in
+    /// [`crate::Demo::ensure_and_clear_shared_depth`] on the frames something
+    /// reads it; `section_faces` writes it, `parent_wireframe` reads it for
+    /// occlusion. In SDF mode the cleared `1.0` leaves every wireframe fragment
+    /// passing, preserving the historical visual.
     pub(crate) section_faces_depth: Option<loam_render::DepthBuffer>,
     /// Scratch reused across frames + bodies inside `render_section_faces` to avoid
     /// per-body allocation on the 240 fps hot path.
@@ -901,8 +937,13 @@ impl Demo {
     ///
     /// The single choke point where the rendered row's slot count is
     /// materialized, so it is also where the physics world is reconciled with
-    /// it ([`PlaygroundPhysics::sync`]).
+    /// it ([`PlaygroundPhysics::sync`]) and where [`Self::sdf_upload_pending`]
+    /// is raised. Every row, size and surface-mode edit calls it at the edit,
+    /// which is what lets `update` skip it on a frame that changed neither the
+    /// rotor nor a body pose.
     fn upload_render_row_bodies(&mut self, rotor: Rotor4) {
+        self.uploaded_rotor = rotor;
+        self.sdf_upload_pending = true;
         let n = self.render_row().len();
         let size = self.effective_body_size();
         self.physics.sync(n, size);
@@ -973,11 +1014,12 @@ impl Demo {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_plane_angle, apply_projection_selection_defaults, body_position,
+        active_plane_angle, apply_projection_selection_defaults, body_position, body_upload_needed,
         compose_active_rotor, default_edge_blend, hyperslice_cull_active, mode_annotation,
         render_row_entries, resolve_schlegel_params, row_blocks_sdf, sdf_body_uniform,
-        section_layer_projection, synced_schlegel_projection, SectionLayer, SurfaceMode, ViewMode,
-        WireframeProjection, BASE_ROTATION_RATE, BODY_SIZE, STEREOGRAPHIC_DEFAULT_POLE,
+        section_layer_projection, set_if_changed, synced_schlegel_projection, SectionLayer,
+        SurfaceMode, ViewMode, WireframeProjection, BASE_ROTATION_RATE, BODY_SIZE,
+        STEREOGRAPHIC_DEFAULT_POLE,
     };
     use crate::catalog::ShapeEntry;
     use crate::physics::{composed_rotor, PlaygroundPhysics};
@@ -1910,5 +1952,43 @@ mod tests {
                 "smooth surface opted out in {mode:?}"
             );
         }
+    }
+
+    /// The per-frame body-upload gate never skips a frame whose rendered pose
+    /// changed. `Active` mode recomposes `rot_state` from `rot_time` every
+    /// frame, so the test has to be a value comparison against the rotor the
+    /// last upload used, not "was it assigned".
+    #[test]
+    fn body_upload_gate_fires_on_every_pose_change_and_nothing_else() {
+        let spun = (Plane4::Xw.unit_bivector() * 0.4).exp().normalize();
+        assert!(!body_upload_needed(
+            Rotor4::IDENTITY,
+            Rotor4::IDENTITY,
+            false
+        ));
+        assert!(!body_upload_needed(spun, spun, false));
+        assert!(body_upload_needed(spun, Rotor4::IDENTITY, false));
+        assert!(body_upload_needed(Rotor4::IDENTITY, spun, false));
+        // Motion alone forces it: the poses moved under an unchanged rotor.
+        assert!(body_upload_needed(spun, spun, true));
+    }
+
+    /// The dirty test gating the uniform flush reports a change on exactly the
+    /// writes that move a value. A false negative renders a stale slice; a
+    /// false positive is the per-frame upload this gate exists to remove.
+    #[test]
+    fn set_if_changed_reports_a_change_only_when_the_value_moves() {
+        let mut w_slice = 0.0_f32;
+        assert!(!set_if_changed(&mut w_slice, 0.0));
+        assert!(set_if_changed(&mut w_slice, 0.25));
+        assert_eq!(w_slice, 0.25);
+        assert!(!set_if_changed(&mut w_slice, 0.25));
+
+        // Component-wise, not whole-array identity: the camera uniforms are
+        // arrays, and one moved component has to dirty the buffer.
+        let mut camera_pos = [0.0_f32, 0.0, 5.0];
+        assert!(!set_if_changed(&mut camera_pos, [0.0, 0.0, 5.0]));
+        assert!(set_if_changed(&mut camera_pos, [0.0, 1e-7, 5.0]));
+        assert_eq!(camera_pos, [0.0, 1e-7, 5.0]);
     }
 }

@@ -345,6 +345,93 @@ mod tests {
         assert_close(info.penetration, 0.5 - 3.0_f32.sqrt() * 0.2, 1e-2);
     }
 
+    /// Pre-images are irrelevant to a seed that never reaches contact
+    /// reconstruction, so they are the difference points themselves.
+    fn seed(points: [Vec3; 4]) -> [MinkowskiPoint; 4] {
+        points.map(|point| MinkowskiPoint {
+            point,
+            sa: point,
+            sb: Vec3::ZERO,
+        })
+    }
+
+    /// Base triangle around the origin plus an apex at height `h`, giving
+    /// `|det| = 4·h` against the seed's 1e-8 volume floor: `h = 0` is the flat
+    /// seed, everything above it is admissible.
+    fn seed_of_height(h: f32) -> [MinkowskiPoint; 4] {
+        seed([
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, h),
+        ])
+    }
+
+    /// The floor is a threshold on a determinant, so seeds sit arbitrarily
+    /// close on both sides of it. Below, there is no interior to orient faces
+    /// against and the only honest answer is none; above, however thin, the
+    /// answer has to be a number. A cross product of two nearly parallel edges
+    /// normalizes to NaN, and NaN reaches the solver as a contact.
+    #[test]
+    fn seeds_across_the_volume_floor_resolve_finitely_or_not_at_all() {
+        let a = Sphere {
+            center: Vec3::ZERO,
+            radius: 1.0,
+        };
+        let b = Sphere {
+            center: Vec3::new(0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
+
+        assert!(
+            epa(&a, &b, seed_of_height(0.0)).is_none(),
+            "a seed with no 3-volume has no interior to orient against"
+        );
+        for h in [1e-6, 1e-4, 1e-2, 1.0] {
+            let contact = epa(&a, &b, seed_of_height(h))
+                .unwrap_or_else(|| panic!("seed of height {h} clears the volume floor"));
+            assert!(
+                contact.normal.is_finite()
+                    && contact.point.is_finite()
+                    && contact.penetration.is_finite(),
+                "seed of height {h} resolved to {contact:?}"
+            );
+            assert!(
+                contact.penetration >= 0.0,
+                "seed of height {h}: negative depth"
+            );
+        }
+    }
+
+    /// The rest of the degeneracy ladder: a seed collapsed to a segment, and
+    /// one with a repeated vertex. Both have zero volume by a different route
+    /// than coplanarity, and both must take the same exit.
+    #[test]
+    fn collinear_and_repeated_vertex_seeds_are_rejected_rather_than_resolved() {
+        let a = Sphere {
+            center: Vec3::ZERO,
+            radius: 1.0,
+        };
+        let b = Sphere {
+            center: Vec3::new(0.5, 0.0, 0.0),
+            radius: 1.0,
+        };
+        let collinear = seed([
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(-0.5, 0.0, 0.0),
+            Vec3::new(0.5, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+        ]);
+        let repeated = seed([
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(1.0, -1.0, -1.0),
+            Vec3::new(0.0, 1.0, 1.0),
+        ]);
+        assert!(epa(&a, &b, collinear).is_none());
+        assert!(epa(&a, &b, repeated).is_none());
+    }
+
     /// Boxes nested deeply enough that separating along the shallowest axis is a
     /// translation of nearly a full body width. The difference body of two unit
     /// half-extent boxes is the half-extent-2 box, so the depth is

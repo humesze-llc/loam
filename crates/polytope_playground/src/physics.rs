@@ -109,7 +109,7 @@ impl PlaygroundPhysics {
     /// Reconcile with a row of `slots` bodies. A slot-count change respawns
     /// the row, because the layout position is a function of the count and so
     /// every body moves. A same-count call only refreshes the collider, which
-    /// is what makes this safe to run every frame: a throw in flight survives.
+    /// is what makes this safe to run on any frame: a throw in flight survives.
     pub(crate) fn sync(&mut self, slots: usize, radius: f32) {
         if self.world.bodies.len() != slots {
             self.respawn(slots, radius);
@@ -154,8 +154,8 @@ impl PlaygroundPhysics {
     /// layout is frozen into each body at [`Self::respawn`] time, so a world
     /// that missed a row edit would draw every body at another slot's layout
     /// position and index past the end on the tail. [`Self::sync`] is the
-    /// reconciliation point, and the body upload runs it once per frame before
-    /// any render path reads a pose.
+    /// reconciliation point, and the body upload runs it at every row and size
+    /// edit, before any render path reads a pose.
     pub(crate) fn pose(&self, slot: usize, slots: usize, spin: Rotor4) -> BodyPose {
         assert_eq!(
             self.world.bodies.len(),

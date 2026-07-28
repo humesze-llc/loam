@@ -86,18 +86,30 @@ impl Demo {
             {
                 let _scope = loam_time::frame_trace::scope("pp-sdf");
                 {
+                    let mut changed = false;
                     let u = self.node.uniforms_mut();
-                    u.resolution = viewport.resolution_f32();
-                    u.viewport_origin = [viewport.x as f32, viewport.y as f32];
+                    changed |= set_if_changed(&mut u.resolution, viewport.resolution_f32());
+                    changed |= set_if_changed(
+                        &mut u.viewport_origin,
+                        [viewport.x as f32, viewport.y as f32],
+                    );
+                    self.sdf_upload_pending |= changed;
                 }
-                self.node.flush_uniforms(&rd.queue);
+                // The only flush on this path: `update` leaves the dirty flag
+                // rather than uploading a buffer this would overwrite.
+                if self.sdf_upload_pending {
+                    self.node.flush_uniforms(&rd.queue);
+                    self.sdf_upload_pending = false;
+                }
                 self.node.execute_in_viewport(rd, view, viewport)?;
             }
             // Shared depth for the section pass + the wireframe's depth-test.
             // Order: SDF (color only) -> section_faces (writes depth in Raster) ->
             // wireframe (tests, no write). In SDF mode no pass writes depth, so the
             // cleared `1.0` lets every wireframe fragment pass.
-            self.ensure_and_clear_shared_depth(rd)?;
+            if shared_depth_is_read(self.surface_mode, self.wireframe_enabled) {
+                self.ensure_and_clear_shared_depth(rd)?;
+            }
             if matches!(self.surface_mode, SurfaceMode::Raster) {
                 let _scope = loam_time::frame_trace::scope("pp-section-faces");
                 self.render_section_faces(rd, view)?;
@@ -121,7 +133,8 @@ impl Demo {
     /// Ensure the shared section-faces depth attachment exists at the current
     /// swapchain size + sample count, then clear it to `1.0`. Shared between
     /// `section_faces` (writes depth in Raster) and `parent_wireframe` (tests, no
-    /// write), so one ensure + clear per frame covers both.
+    /// write), so one ensure + clear covers both. Skipped on a frame where
+    /// neither runs; see [`shared_depth_is_read`].
     fn ensure_and_clear_shared_depth(&mut self, rd: &RenderDevice) -> Result<()> {
         let cfg = &rd.surface_bundle.config;
         DepthBuffer::ensure(
@@ -427,6 +440,19 @@ impl Demo {
             .execute(rd, view, Some(depth_view), None)?;
         Ok(())
     }
+}
+
+/// Whether any pass this frame samples the shared section-faces depth
+/// attachment: `section_faces` writes it in [`SurfaceMode::Raster`], and both
+/// wireframe layers depth-test against it. The points overlay is
+/// `DepthMode::Off` and the SDF pass has no depth attachment, so with raster
+/// faces and the wireframe both off, ensuring and clearing the buffer is an
+/// encoder and a submit nothing reads.
+///
+/// Free function so the "clear exactly when something reads it" pairing is
+/// unit-testable without a device.
+pub(crate) fn shared_depth_is_read(surface_mode: SurfaceMode, wireframe_enabled: bool) -> bool {
+    matches!(surface_mode, SurfaceMode::Raster) || wireframe_enabled
 }
 
 /// Style inputs for [`build_points_mesh`] that do not come from the bodies.
@@ -1020,6 +1046,22 @@ mod tests {
     use loam_math::{EuclideanR4, Plane4, Projection};
     use loam_physics::polytope::Polytope4;
     use loam_render::raymarch::RaymarchShape;
+
+    /// The shared depth attachment is ensured and cleared on exactly the frames
+    /// a pass reads it. Skipping a frame that reads it leaves the previous
+    /// frame's depth standing and occludes caps against stale geometry;
+    /// clearing a frame that does not read it is the encoder + submit this
+    /// predicate exists to elide.
+    #[test]
+    fn shared_depth_is_cleared_exactly_when_a_pass_reads_it() {
+        for wireframe_enabled in [false, true] {
+            assert!(shared_depth_is_read(SurfaceMode::Raster, wireframe_enabled));
+        }
+        for surface_mode in [SurfaceMode::Sdf, SurfaceMode::Off] {
+            assert!(shared_depth_is_read(surface_mode, true));
+            assert!(!shared_depth_is_read(surface_mode, false));
+        }
+    }
 
     /// A one-slot row, so every primitive a builder emits belongs to slot 0 and
     /// a pin can read the whole mesh instead of slicing per-slot offsets.

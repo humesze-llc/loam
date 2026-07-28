@@ -114,6 +114,32 @@ jobs:
       # `index.html`'s `data-cargo-no-default-features` directive.
       - run: cargo build --target wasm32-unknown-unknown -p polytope_playground --no-default-features
 
+  perf-budget:
+    name: perf budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The test itself is pure CPU (loam-math + loam-scene), but it lives in
+      # the root `loam` package's test target, so cargo builds that facade and
+      # with it wgpu/winit; hence the same apt set the other jobs carry.
+      - name: Install Linux deps for wgpu/winit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev \
+            pkg-config
+      # Its own job rather than a step in `test`, because it needs `--release`
+      # (the budget is a release number and the test refuses to run otherwise)
+      # and because a perf failure should be readable as a perf failure without
+      # scrolling past the rest of the suite. `--nocapture` so the measured
+      # median lands in the log on green runs too, which is the only way the
+      # budget's runner margin ever gets replaced by a measurement.
+      - name: cargo test --release perf_budget
+        run: cargo test --release -p loam --test perf_budget -- --ignored --nocapture
+
   determinism:
     name: determinism
     runs-on: ubuntu-latest

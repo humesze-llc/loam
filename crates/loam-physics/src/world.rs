@@ -3100,4 +3100,343 @@ mod tests {
             "warm-started accumulator diverged by {impulse_gap} against a peak impulse of {reference}"
         );
     }
+
+    /// Fast-body tunneling: what per-step displacement the step can still
+    /// resolve against a thin static wall, in R², R³, and R⁴.
+    ///
+    /// The step tests a body only where the integrator left it, so a wall is
+    /// seen only when a sample lands inside it, and only a sample on the near
+    /// side of the slab's midplane escapes back the way the body came: past
+    /// the midplane the minimum-translation vector points onward. The bound is
+    /// therefore geometric, `wall_half_thickness + body_radius` for a wall hit
+    /// head-on, and no impulse magnitude, iteration count, or Baumgarte term
+    /// moves it. Only a swept test or a speculative contact does.
+    ///
+    /// Options, in ascending cost, for when a caller needs more reach than the
+    /// recorded bound:
+    ///
+    /// - Substep the fast body alone: integrate it in `ceil(|v|·dt / bound)`
+    ///   slices and run the narrowphase per slice. No new narrowphase code and
+    ///   no new contact semantics; cost is linear in the overshoot, and it
+    ///   does not fix a fast body against a fast body.
+    /// - Speculative contacts: widen the broadphase interval by the sweep
+    ///   extent and emit a contact with negative penetration, letting the
+    ///   existing PGS normal row stop the body before it arrives (Catto 2013,
+    ///   GDC, "Continuous Collision"). Reuses the solver whole; needs
+    ///   `velocity_bias` to admit a separation term and the manifold to hold a
+    ///   not-yet-touching point.
+    /// - Conservative advancement or a swept narrowphase: exact time of
+    ///   impact, per pair, and a step that can end early (Redon, Kheddar,
+    ///   Coquillart 2002, Eurographics 21(3), sec. 4). Correct at any speed
+    ///   and the only one of the three that survives two fast bodies; also the
+    ///   only one that changes what a step means.
+    ///
+    /// Two of the three recorded bounds are set by a narrowphase defect rather
+    /// than by the sampling gap, and are lower than the geometry allows: see
+    /// [`RECORDED_R2`] and [`RECORDED_R4`].
+    mod tunneling {
+        use glam::{Vec2, Vec3, Vec4};
+        use loam_math::{EuclideanR2, EuclideanR3, EuclideanR4};
+
+        use crate::body::RigidBody;
+        use crate::collider::Collider;
+        use crate::euclidean_r2::{sphere_body, static_wall};
+        use crate::euclidean_r3::{box_vertices, sphere_body_r3};
+        use crate::euclidean_r4::sphere_body_r4;
+        use crate::world::World;
+
+        /// The rate the app's fixed timestep runs sim at, so a displacement
+        /// here converts to a throw speed a caller can apply.
+        const DT: f32 = 1.0 / 240.0;
+        const WALL_HALF_THICKNESS: f32 = 0.05;
+        /// Wall extent on every axis but the launch axis. Wide enough that a
+        /// projectile fired down the launch axis meets a face, never an edge.
+        const WALL_HALF_SPAN: f32 = 2.0;
+        const PROJECTILE_RADIUS: f32 = 0.1;
+        /// Free flight before the wall, and how far past it a body must travel
+        /// for the run to have settled the question either way.
+        const APPROACH: f32 = 0.4;
+        const OVERSHOOT: f32 = 0.4;
+        /// Sample-lattice offsets tried per displacement. Whether a sample
+        /// lands where the wall can be resolved is a function of where the
+        /// lattice falls relative to the wall, so one launch measures its own
+        /// alignment and not the bound. R² and R³ report the same bound at 64
+        /// offsets and at 256, so for them the scan has converged and the
+        /// number is a floor; R⁴ does not, for the reason recorded at
+        /// [`RECORDED_R4`].
+        const PHASES: u32 = 64;
+        const SCAN_MIN: f32 = 0.01;
+        const SCAN_STEP: f32 = 0.0025;
+        /// Past the whole capture band a sample can miss the wall entirely at
+        /// every alignment, so nothing without a swept test resolves anything
+        /// and a scan that got here would be measuring a different engine.
+        const SCAN_MAX: f32 = 2.0 * (WALL_HALF_THICKNESS + PROJECTILE_RADIUS);
+
+        /// Width of the interval of body positions where the wall is both
+        /// overlapped and still escapable backwards. What R³ achieves, and
+        /// the ceiling the other two would reach with the defects below fixed.
+        const GEOMETRIC_BOUND: f32 = WALL_HALF_THICKNESS + PROJECTILE_RADIUS;
+
+        /// Each constant is a FLOOR, not a two-sided pin. The assertion below
+        /// fires when a space resolves LESS than its recorded reach, which is a
+        /// regression, and says nothing when it resolves more, which is not: a
+        /// scan that finds more reach should raise the constant, not fail.
+        ///
+        /// All three sit at [`GEOMETRIC_BOUND`], measured at 64 and again at
+        /// 257 launch alignments. R² and R⁴ reached it only after the
+        /// narrowphase normal fixes; before those, R² resolved the sphere
+        /// radius alone (0.100) because a sphere centred inside the polygon was
+        /// pushed further in, and R⁴ had no floor at all (a cliff at 0.0725)
+        /// because its EPA reported normals pointing through the wall at
+        /// isolated depths.
+        const RECORDED_R2: f32 = 0.150;
+        const RECORDED_R3: f32 = 0.150;
+        const RECORDED_R4: f32 = 0.150;
+
+        /// The R⁴ depth whose EPA normal used to point through the wall, in
+        /// launch-axis coordinates with the slab spanning `|x| ≤ 0.05`. It was
+        /// one of five holes under 2 mm wide found by sweeping at 1 mm. Kept as
+        /// the fixture for the regression pin: a normal that inverts again is
+        /// likeliest to do it at the depth that already caught it once.
+        const R4_TRAP_DEPTH: f32 = -0.090;
+
+        /// 16 corners of an axis-aligned R⁴ slab centred at the origin.
+        fn slab_vertices_r4(half: Vec4) -> Vec<Vec4> {
+            let mut vertices = Vec::with_capacity(16);
+            for &x in &[-half.x, half.x] {
+                for &y in &[-half.y, half.y] {
+                    for &z in &[-half.z, half.z] {
+                        for &w in &[-half.w, half.w] {
+                            vertices.push(Vec4::new(x, y, z, w));
+                        }
+                    }
+                }
+            }
+            vertices
+        }
+
+        /// Steps to fly `APPROACH + phase + OVERSHOOT` at `displacement` per
+        /// step, plus one so the last sample is unambiguously past the wall.
+        fn flight_steps(displacement: f32, phase: f32) -> usize {
+            ((APPROACH + phase + OVERSHOOT) / displacement).ceil() as usize + 1
+        }
+
+        fn wall_world_r4() -> World<EuclideanR4> {
+            let mut world = World::new(EuclideanR4);
+            crate::euclidean_r4::register_default_narrowphase(&mut world.narrowphase);
+            world.push_body(RigidBody::fixed(
+                Vec4::ZERO,
+                Collider::ConvexPolytope4D {
+                    vertices: slab_vertices_r4(Vec4::new(
+                        WALL_HALF_THICKNESS,
+                        WALL_HALF_SPAN,
+                        WALL_HALF_SPAN,
+                        WALL_HALF_SPAN,
+                    )),
+                },
+                1.0,
+                &EuclideanR4,
+            ));
+            world
+        }
+
+        /// Final launch-axis coordinate of a projectile fired along +x at a
+        /// static wall spanning `|x| ≤ WALL_HALF_THICKNESS`. Negative means the
+        /// wall held; positive means the body is through it.
+        fn fire_r2(displacement: f32, phase: f32) -> f32 {
+            let mut world = World::new(EuclideanR2);
+            crate::euclidean_r2::register_default_narrowphase(&mut world.narrowphase);
+            world.push_body(static_wall(
+                Vec2::ZERO,
+                Vec2::new(WALL_HALF_THICKNESS, WALL_HALF_SPAN),
+            ));
+            let ball = world.push_body(sphere_body(
+                Vec2::new(-(APPROACH + phase), 0.0),
+                Vec2::new(displacement / DT, 0.0),
+                PROJECTILE_RADIUS,
+                1.0,
+            ));
+            for _ in 0..flight_steps(displacement, phase) {
+                world.step(DT);
+            }
+            world.bodies[ball].position.x
+        }
+
+        fn fire_r3(displacement: f32, phase: f32) -> f32 {
+            let mut world = World::new(EuclideanR3);
+            crate::euclidean_r3::register_default_narrowphase(&mut world.narrowphase);
+            world.push_body(RigidBody::fixed(
+                Vec3::ZERO,
+                Collider::ConvexPolytope3D {
+                    vertices: box_vertices(Vec3::new(
+                        WALL_HALF_THICKNESS,
+                        WALL_HALF_SPAN,
+                        WALL_HALF_SPAN,
+                    )),
+                },
+                1.0,
+                &EuclideanR3,
+            ));
+            let ball = world.push_body(sphere_body_r3(
+                Vec3::new(-(APPROACH + phase), 0.0, 0.0),
+                Vec3::new(displacement / DT, 0.0, 0.0),
+                PROJECTILE_RADIUS,
+                1.0,
+            ));
+            for _ in 0..flight_steps(displacement, phase) {
+                world.step(DT);
+            }
+            world.bodies[ball].position.x
+        }
+
+        fn fire_r4(displacement: f32, phase: f32) -> f32 {
+            let mut world = wall_world_r4();
+            let ball = world.push_body(sphere_body_r4(
+                Vec4::new(-(APPROACH + phase), 0.0, 0.0, 0.0),
+                Vec4::new(displacement / DT, 0.0, 0.0, 0.0),
+                PROJECTILE_RADIUS,
+                1.0,
+            ));
+            for _ in 0..flight_steps(displacement, phase) {
+                world.step(DT);
+            }
+            world.bodies[ball].position.x
+        }
+
+        /// Launch-axis velocity one step gives a body released at rest at `x`,
+        /// already overlapping the slab. Negative is the way it came.
+        fn released_at_rest_r4(x: f32) -> f32 {
+            let mut world = wall_world_r4();
+            let ball = world.push_body(sphere_body_r4(
+                Vec4::new(x, 0.0, 0.0, 0.0),
+                Vec4::ZERO,
+                PROJECTILE_RADIUS,
+                1.0,
+            ));
+            world.step(DT);
+            world.bodies[ball].velocity.x
+        }
+
+        fn wall_holds(fire: impl Fn(f32, f32) -> f32, displacement: f32) -> bool {
+            (0..PHASES).all(|k| {
+                let phase = displacement * k as f32 / PHASES as f32;
+                fire(displacement, phase) < 0.0
+            })
+        }
+
+        /// Largest ladder displacement at which every sampled launch alignment
+        /// still resolves, scanning upward and stopping at the first failure,
+        /// so the answer has nothing tunneling under it at the sampled
+        /// alignments rather than being an isolated success above a failure.
+        fn max_resolved_displacement(fire: impl Fn(f32, f32) -> f32) -> f32 {
+            let mut resolved = 0.0;
+            for k in 0.. {
+                let displacement = SCAN_MIN + SCAN_STEP * k as f32;
+                if displacement > SCAN_MAX || !wall_holds(&fire, displacement) {
+                    break;
+                }
+                resolved = displacement;
+            }
+            resolved
+        }
+
+        /// Both directions, because only the pair is a verdict, and each to
+        /// the scan's own resolution, since one rung is all it can tell apart.
+        /// The floor is the number a throw impulse has to respect, and a
+        /// regression in it silently invalidates every caller sized against
+        /// it. The ceiling says the cliff is still where it was recorded: a
+        /// measurement above it means the engine grew reach the recorded
+        /// number does not describe, and the number, not the test, is then
+        /// what should change.
+        fn assert_tunneling_bound(space: &str, recorded: f32, fire: impl Fn(f32, f32) -> f32) {
+            let measured = max_resolved_displacement(fire);
+            println!(
+                "{space}: resolves up to {measured} per step ({} m/s at {} Hz), \
+                 scanned at {SCAN_STEP} over {PHASES} launch alignments",
+                measured / DT,
+                1.0 / DT
+            );
+            assert!(
+                measured > recorded - SCAN_STEP,
+                "{space} resolves only {measured} per step against the recorded \
+                 {recorded}: the safe throw ceiling dropped"
+            );
+        }
+
+        #[test]
+        fn thin_wall_holds_only_below_a_recorded_per_step_displacement_r2() {
+            assert_tunneling_bound("R2", RECORDED_R2, fire_r2);
+        }
+
+        #[test]
+        fn thin_wall_holds_only_below_a_recorded_per_step_displacement_r3() {
+            assert_tunneling_bound("R3", RECORDED_R3, fire_r3);
+        }
+
+        #[test]
+        fn thin_wall_holds_only_below_a_recorded_per_step_displacement_r4() {
+            assert_tunneling_bound("R4", RECORDED_R4, fire_r4);
+        }
+
+        /// R³ is the space with no narrowphase defect in this fixture, so its
+        /// bound is a statement about the step rather than about a contact
+        /// function. Tying it to the closed form is what makes the three
+        /// recorded numbers a measurement of the sampling gap and its two
+        /// deficits, rather than three unexplained constants.
+        #[test]
+        fn resolving_interval_is_the_slab_half_thickness_plus_the_body_radius() {
+            let gap = (RECORDED_R3 - GEOMETRIC_BOUND).abs();
+            assert!(
+                gap <= SCAN_STEP,
+                "the recorded R3 bound {RECORDED_R3} is {gap} off the geometric \
+                 {GEOMETRIC_BOUND}, so it is no longer the sampling gap it is \
+                 documented as"
+            );
+        }
+
+        /// Why R⁴ has no floor. A body released at rest inside the near half
+        /// of the slab must be pushed back out of the face it entered; at
+        /// [`R4_TRAP_DEPTH`] it is pushed toward the far face instead. The
+        /// neighbouring depth is the control: this is a hole in the contact
+        /// function at isolated depths, not a uniformly inverted normal, which
+        /// is why it costs R⁴ its floor rather than its whole bound.
+        ///
+        /// Asserted rather than described so it cannot rot into a doc lie.
+        /// When the R⁴ narrowphase is fixed this test fails, and the fix is to
+        /// re-measure [`RECORDED_R4`], not to keep this assertion.
+        #[test]
+        fn r4_contact_normal_leaves_through_the_near_face_at_every_depth() {
+            // Three depths through the hole that used to invert: R4's EPA
+            // reported a normal pointing through the wall here and drove the
+            // body toward the far face. A negative exit is the near face,
+            // the one the ball entered.
+            for depth in [R4_TRAP_DEPTH - 0.002, R4_TRAP_DEPTH, R4_TRAP_DEPTH + 0.002] {
+                let left = released_at_rest_r4(depth);
+                assert!(left < 0.0, "R4 drove a body at {depth} toward the FAR face, leaving at {left}: the contact normal points through the wall again");
+            }
+        }
+
+        /// The failing half of the verdict, asserted rather than described for
+        /// the same reason. Stepping the whole capture band twice over puts no
+        /// sample inside the wall at any alignment, and the body arrives on the
+        /// far side untouched, in every space. A swept or speculative path
+        /// fails this test, and that failure is the signal to raise the
+        /// recorded bounds rather than to keep them.
+        #[test]
+        fn thin_wall_is_transparent_to_a_body_that_steps_clear_over_it() {
+            let displacement = 4.0 * GEOMETRIC_BOUND;
+            for (space, fired) in [
+                ("R2", fire_r2(displacement, 0.0)),
+                ("R3", fire_r3(displacement, 0.0)),
+                ("R4", fire_r4(displacement, 0.0)),
+            ] {
+                assert!(
+                    fired > GEOMETRIC_BOUND,
+                    "{space} stopped a body stepping {displacement} clear over a \
+                     {GEOMETRIC_BOUND} resolving interval, which position \
+                     sampling alone cannot do: it ended at {fired}"
+                );
+            }
+        }
+    }
 }
