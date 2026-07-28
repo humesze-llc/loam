@@ -79,16 +79,3 @@ loam-text      = { path = "crates/loam-text" }
 
 [features]
 default = []
-
-[dev-dependencies]
-anyhow = "1"
-pollster = "0.3"
-winit = { workspace = true }
-wgpu  = { workspace = true }
-bytemuck = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-glam = { workspace = true }
-png = "0.17"
-gif = "0.13"
-loam-egui = { path = "crates/loam-egui" }
