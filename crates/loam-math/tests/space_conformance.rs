@@ -708,8 +708,8 @@ mod invariants {
     /// The geodesics determine the transport: the pole ladder rebuilds
     /// `PT(a, b, .)` from `exp` and `log` alone (Pennec, *Parallel Transport
     /// with Pole Ladder: a Third Order Scheme in Affine Connection Spaces which
-    /// is Exact in Affine Symmetric Spaces*, J. Math. Imaging Vis. 60, 2018,
-    /// §3), so an impl whose `exp` and `log` are already pinned has no freedom
+    /// is Exact in Affine Symmetric Spaces*, arXiv:1805.11436, 2018, §3), so an
+    /// impl whose `exp` and `log` are already pinned has no freedom
     /// left in its transport. This is the item that sees a twist about the
     /// direction of travel: the geodesic-tangent item above pins the image of
     /// that direction alone, and any rotation about it fixes that image, while
@@ -1751,16 +1751,19 @@ impl SpaceFixture for BlendedSpaceFixture {
     /// otherwise leave one unpinned. Two tests in `blended.rs` cover the RK4
     /// kernel this fixture's `Space` methods call, from the other side:
     ///
-    /// - `transport_is_invariant_to_how_its_own_path_is_subdivided` replaces
-    ///   the oracle with refinement, which is the pin an integrated transport
-    ///   admits. RK4 steps are counted per segment, so subdividing the same
-    ///   chart line is a finer discretization of the same integral; a rotation
-    ///   committed once per segment or per step scales with the subdivision
-    ///   while the truncation falls as h⁴. That is the item a twist fails.
-    /// - `parallel_transport_in_h3_matches_closed_form_for_short_paths` pins
-    ///   the connection itself against the one source metric that has a closed
-    ///   form. Refinement cannot: every discretization of a wrong RHS
-    ///   converges to the same wrong flow.
+    /// - `transport_is_invariant_to_how_its_own_path_is_subdivided` pins that
+    ///   the kernel is a convergent discretization and that the answer does not
+    ///   depend on how the path is chopped. It does not pin which connection is
+    ///   integrated, and a rotation proportional to arc length passes it
+    ///   unchanged: every discretization of a wrong RHS converges to the same
+    ///   wrong flow.
+    /// - `h3_transport_agrees_with_the_closed_form_by_a_vanishing_coefficient`
+    ///   is what pins the connection, against the one source metric that has a
+    ///   closed form. It divides the disagreement by the step and shrinks the
+    ///   step: following the chord instead of the geodesic costs O(h³), so its
+    ///   coefficient vanishes, while a wrong connection contributes a term
+    ///   linear in h whose coefficient does not. That separation is what an
+    ///   absolute budget on one short segment cannot make.
     const TRANSPORT_FOLLOWS_THE_GEODESIC: bool = false;
 
     fn space(&self) -> Self::S {

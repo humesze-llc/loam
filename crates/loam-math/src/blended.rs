@@ -1380,25 +1380,78 @@ mod tests {
         close(len_from, len_to, 5e-3);
     }
 
-    /// Numerical transport agrees with the closed-form
-    /// `HyperbolicH3::parallel_transport` (gyration formula) only for short
-    /// paths, where the geodesic ≈ the Euclidean segment our RK4 follows.
+    /// The RK4 kernel integrates the same connection the closed-form gyration
+    /// formula implements, checked as a *coefficient* rather than a distance.
+    ///
+    /// A single short segment under an absolute budget cannot do this job: the
+    /// residual it admits is dominated by how short the segment is, so a
+    /// spurious rotation inside the RHS hides under the tolerance as long as
+    /// the sample is small enough. The two error terms separate by order
+    /// instead. Following the chord rather than the geodesic costs O(h³); a
+    /// wrong connection contributes a term linear in h, because the erroneous
+    /// rotation rate is integrated over the path. Dividing by h and shrinking
+    /// h therefore drives the honest error to zero while a wrong connection's
+    /// coefficient converges to a nonzero constant.
+    ///
+    /// So this sweeps base points, directions and tangents at three
+    /// separations, and asserts the worst coefficient both stays small and
+    /// keeps falling as h halves. Measured worst coefficients are 1.5e-3,
+    /// 4.0e-4 and 1.0e-4 at h = 0.04, 0.02 and 0.01: falling by ~4x per
+    /// halving, which is the h² signature of an O(h³) residual.
     #[test]
-    fn parallel_transport_in_h3_matches_closed_form_for_short_paths() {
+    fn h3_transport_agrees_with_the_closed_form_by_a_vanishing_coefficient() {
         use crate::{HyperbolicH3, Space};
-        let from = Vec3::new(0.05, 0.0, 0.0);
-        let to = Vec3::new(0.06, 0.01, 0.0);
-        let v = Vec3::new(0.1, 0.0, 0.0);
+        let bases = [
+            Vec3::new(0.05, 0.0, 0.0),
+            Vec3::new(0.0, 0.12, -0.04),
+            Vec3::new(-0.2, 0.1, 0.15),
+        ];
+        let directions = [
+            Vec3::new(1.0, 0.6, 0.0).normalize(),
+            Vec3::new(-0.3, 1.0, 0.5).normalize(),
+            Vec3::new(0.2, -0.4, 1.0).normalize(),
+        ];
+        let tangents = [
+            Vec3::new(0.1, 0.0, 0.0),
+            Vec3::new(0.0, 0.07, 0.05),
+            Vec3::new(-0.06, 0.03, 0.08),
+        ];
 
-        let numerical = parallel_transport_segment_rk4(
-            &HyperbolicH3,
-            from,
-            to,
-            v,
-            PARALLEL_TRANSPORT_DEFAULT_STEPS,
+        let mut coefficients = Vec::new();
+        for h in [0.04_f32, 0.02, 0.01] {
+            let mut worst = 0.0_f32;
+            for from in bases {
+                for dir in directions {
+                    let to = from + dir * h;
+                    for v in tangents {
+                        let numerical = parallel_transport_segment_rk4(
+                            &HyperbolicH3,
+                            from,
+                            to,
+                            v,
+                            PARALLEL_TRANSPORT_DEFAULT_STEPS,
+                        );
+                        let closed_form = HyperbolicH3.parallel_transport(from, to, v);
+                        worst = worst.max((numerical - closed_form).length() / h);
+                    }
+                }
+            }
+            coefficients.push(worst);
+        }
+
+        assert!(
+            coefficients[2] <= 3.0e-4,
+            "the transport disagrees with the closed form by a coefficient of              {} at h = 0.01, which does not vanish with the step",
+            coefficients[2]
         );
-        let closed_form = HyperbolicH3.parallel_transport(from, to, v);
-        close((numerical - closed_form).length(), 0.0, 5e-3);
+        for pair in coefficients.windows(2) {
+            assert!(
+                pair[1] < pair[0] * 0.6,
+                "halving h moved the disagreement coefficient from {} to {},                  not the ~4x fall an O(h³) residual has: a term linear in h,                  i.e. a different connection, is the shape that does this",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     /// Transport is the flow of an ODE along a fixed curve, so chopping that
@@ -1412,12 +1465,13 @@ mod tests {
     /// than its geodesic, so the pole ladder of the conformance suite has
     /// nothing to compare a single call against; refinement compares the kernel
     /// against itself at a step size where the truncation is orders smaller.
-    /// It is a rotation this sees, which norm and linearity are blind to: an
-    /// error committed once per segment or once per step scales with `k` while
-    /// the truncation falls as h⁴. A 0.05 rad twist about the direction of
-    /// travel, gated on nonzero curvature so the flat-region items stay green,
-    /// lands at 4.5e2 of the budget below while leaving every other test in the
-    /// crate, including the whole conformance suite, passing.
+    /// What it does not see is which connection is being integrated. Every
+    /// discretization of a wrong RHS converges to the same wrong flow, so a
+    /// spurious rotation proportional to arc length is subdivision-invariant
+    /// by construction and passes here unchanged; only a rotation applied once
+    /// per segment, independent of that segment's length, scales with `k`.
+    /// `h3_transport_agrees_with_the_closed_form_by_a_vanishing_coefficient`
+    /// is the item that pins the connection, by order rather than by distance.
     #[test]
     fn transport_is_invariant_to_how_its_own_path_is_subdivided() {
         use crate::{EuclideanR3, HyperbolicH3, Space};
